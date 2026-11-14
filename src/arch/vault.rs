@@ -12,12 +12,17 @@ use serde_json::json;
 
 use super::revision::{self, Revision};
 use super::types::{
-    Anchor, Binding, DESCRIPTION_MAX, Emphasis, LABEL_MAX, Manifest, Module, RESPONSIBILITY_MAX,
-    Relationship, SCHEMA_VERSION, State, VaultConfig,
+    Anchor, Binding, Collection, DESCRIPTION_MAX, Emphasis, LABEL_MAX, Manifest, Module,
+    RESPONSIBILITY_MAX, Relationship, SCHEMA_VERSION, State, VaultConfig,
 };
 use super::{Code, Refusal, ids, one_line, state};
 use crate::history::{refuse_symlink, write_atomic};
 use crate::sync_rules::hash;
+
+mod flows;
+
+pub use flows::{CollectionView, FlowEntry, FlowView, Found};
+pub(super) use flows::{Ends, collection_position, flow_position, message_problems};
 
 /// Boundrail's state folder at the checkout root, and the vault folder inside it.
 const STATE: &str = ".boundrail";
@@ -26,8 +31,12 @@ const MANIFEST: &str = "model.json";
 const CONFIG: &str = "config.yaml";
 const MODULES: &str = "modules";
 const MODULE_SUFFIX: &str = ".module.json";
+const COLLECTIONS: &str = "collections";
+const COLLECTION_SUFFIX: &str = ".collection.json";
+/// The folders of per-ID vault files, each with the suffix its files end in.
+const FOLDERS: [(&str, &str); 2] = [(MODULES, MODULE_SUFFIX), (COLLECTIONS, COLLECTION_SUFFIX)];
 const CURRENT: &str = "Current";
-/// The longest model or module name.
+/// The longest model, module, collection or flow name.
 const NAME_MAX: usize = 120;
 
 #[derive(Debug)]
@@ -37,6 +46,8 @@ pub struct Model {
     pub config: VaultConfig,
     /// Sorted by local ID.
     pub modules: Vec<Module>,
+    /// Sorted by local ID.
+    pub collections: Vec<Collection>,
     pub revision: Revision,
 }
 
@@ -171,12 +182,13 @@ pub fn load(start: &Path) -> Result<Model> {
 
 const LINKED: &str = "is a symbolic link";
 
-/// The state, vault and modules folders by their vault-relative paths.
-fn folders(dir: &Path) -> [(&'static str, PathBuf); 3] {
+/// The state, vault, modules and collections folders by their vault-relative paths.
+fn folders(dir: &Path) -> [(&'static str, PathBuf); 4] {
     [
         ("..", dir.parent().unwrap_or(dir).to_path_buf()),
         (".", dir.to_path_buf()),
         (MODULES, dir.join(MODULES)),
+        (COLLECTIONS, dir.join(COLLECTIONS)),
     ]
 }
 
@@ -184,7 +196,7 @@ fn is_link(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
 }
 
-/// Refuses to write through a linked state, vault or modules folder.
+/// Refuses to write through a linked state, vault, modules or collections folder.
 fn refuse_links(dir: &Path) -> Result<()> {
     folders(dir)
         .iter()
@@ -223,55 +235,31 @@ pub fn load_dir(dir: PathBuf) -> Result<Model> {
             Err(e) => return Err(e).with_context(|| format!("reading {path}")),
         }
     }
-    let modules_dir = dir.join(MODULES);
-    let mut names = Vec::new();
-    match fs::read_dir(&modules_dir) {
-        Ok(entries) => {
-            for entry in entries {
-                let entry = entry?;
-                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                    continue;
-                };
-                if !name.ends_with(MODULE_SUFFIX) {
-                    continue;
-                }
-                // `file_type` does not follow links: a linked module file is reported, not read.
-                let kind = entry.file_type()?;
-                let path = format!("{MODULES}/{name}");
-                if kind.is_symlink() {
-                    problems.push(&path, file_subject(&path), LINKED);
-                } else if kind.is_file() {
-                    names.push(name);
-                } else if !kind.is_dir() {
-                    // As in `file_digests`, a folder named like a module file is not a vault file.
-                    problems.push(&path, file_subject(&path), "is not a regular file");
-                }
-            }
+    for (folder, suffix) in FOLDERS {
+        for path in listed(&dir, folder, suffix, &mut problems)? {
+            let bytes = fs::read(dir.join(&path)).with_context(|| format!("reading {path}"))?;
+            inputs.push((path, bytes));
         }
-        Err(e) if e.kind() == ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("reading {MODULES}")),
-    }
-    names.sort();
-    for name in names {
-        let bytes = fs::read(modules_dir.join(&name))
-            .with_context(|| format!("reading {MODULES}/{name}"))?;
-        inputs.push((format!("{MODULES}/{name}"), bytes));
     }
     let revision = revision::of(inputs.iter().map(|(p, b)| (p.as_str(), b.as_slice())));
 
     let mut manifest = None;
     let mut config = None;
     let mut modules = Vec::new();
+    let mut collections = Vec::new();
     for (path, bytes) in &inputs {
-        let parsed = match path.as_str() {
-            MANIFEST => serde_json::from_slice(bytes)
+        let parsed = match (path.as_str(), vault_file(path)) {
+            (MANIFEST, _) => serde_json::from_slice(bytes)
                 .map(|m| manifest = Some(m))
                 .map_err(|e| parse_message(&e)),
-            CONFIG => serde_yaml_ng::from_slice(bytes)
+            (CONFIG, _) => serde_yaml_ng::from_slice(bytes)
                 .map(|c| config = Some(c))
                 .map_err(|e| parse_message(&e)),
-            _ => serde_json::from_slice::<Module>(bytes)
+            (_, Some((MODULES, _))) => serde_json::from_slice::<Module>(bytes)
                 .map(|m| modules.push((path.as_str(), m)))
+                .map_err(|e| parse_message(&e)),
+            _ => serde_json::from_slice::<Collection>(bytes)
+                .map(|c| collections.push((path.as_str(), c)))
                 .map_err(|e| parse_message(&e)),
         };
         if let Err(message) = parsed {
@@ -283,22 +271,67 @@ pub fn load_dir(dir: PathBuf) -> Result<Model> {
         }
     }
     let pairs: Vec<(&str, &Module)> = modules.iter().map(|(f, m)| (*f, m)).collect();
-    check(manifest.as_ref(), config.as_ref(), &pairs, &mut problems);
+    let groups: Vec<(&str, &Collection)> = collections.iter().map(|(f, c)| (*f, c)).collect();
+    check(
+        manifest.as_ref(),
+        config.as_ref(),
+        &pairs,
+        &groups,
+        &mut problems,
+    );
     let problems = problems.0;
     match (manifest, config) {
         (Some(manifest), Some(config)) if problems.is_empty() => {
             let mut modules: Vec<Module> = modules.into_iter().map(|(_, m)| m).collect();
             modules.sort_by(|a, b| a.id.cmp(&b.id));
+            let mut collections: Vec<Collection> =
+                collections.into_iter().map(|(_, c)| c).collect();
+            collections.sort_by(|a, b| a.id.cmp(&b.id));
             Ok(Model {
                 dir,
                 manifest,
                 config,
                 modules,
+                collections,
                 revision,
             })
         }
         _ => Err(invalid(&dir, problems)),
     }
+}
+
+/// The vault-relative paths of the regular files in `folder` whose names end in `suffix`,
+/// sorted. A linked or special file is a problem and is not read.
+fn listed(dir: &Path, folder: &str, suffix: &str, problems: &mut Problems) -> Result<Vec<String>> {
+    let mut paths = Vec::new();
+    match fs::read_dir(dir.join(folder)) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry?;
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                if !name.ends_with(suffix) {
+                    continue;
+                }
+                // `file_type` does not follow links: a linked vault file is reported, not read.
+                let kind = entry.file_type()?;
+                let path = format!("{folder}/{name}");
+                if kind.is_symlink() {
+                    problems.push(&path, file_subject(&path), LINKED);
+                } else if kind.is_file() {
+                    paths.push(path);
+                } else if !kind.is_dir() {
+                    // As in `file_digests`, a folder named like a vault file is not one.
+                    problems.push(&path, file_subject(&path), "is not a regular file");
+                }
+            }
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("reading {folder}")),
+    }
+    paths.sort();
+    Ok(paths)
 }
 
 /// `MODEL_INVALID` listing every problem.
@@ -339,11 +372,15 @@ pub(super) fn problems(
     manifest: &Manifest,
     config: &VaultConfig,
     modules: &[Module],
+    collections: &[Collection],
 ) -> Vec<Problem> {
     let files: Vec<String> = modules.iter().map(|m| module_file(&m.id)).collect();
     let pairs: Vec<(&str, &Module)> = files.iter().map(String::as_str).zip(modules).collect();
+    let files: Vec<String> = collections.iter().map(|c| collection_file(&c.id)).collect();
+    let groups: Vec<(&str, &Collection)> =
+        files.iter().map(String::as_str).zip(collections).collect();
     let mut problems = Problems::default();
-    check(Some(manifest), Some(config), &pairs, &mut problems);
+    check(Some(manifest), Some(config), &pairs, &groups, &mut problems);
     problems.0
 }
 
@@ -351,9 +388,16 @@ fn check(
     manifest: Option<&Manifest>,
     config: Option<&VaultConfig>,
     modules: &[(&str, &Module)],
+    collections: &[(&str, &Collection)],
     problems: &mut Problems,
 ) {
-    check_ids(manifest, modules, problems);
+    check_ids(manifest, modules, collections, problems);
+    flows::check(
+        manifest.map(|m| m.id.as_str()),
+        modules,
+        collections,
+        problems,
+    );
     for (file, module) in modules {
         check_module(file, module, config, problems);
     }
@@ -380,8 +424,12 @@ fn check(
     }
 }
 
-fn module_file(id: &str) -> String {
+pub(super) fn module_file(id: &str) -> String {
     format!("{MODULES}/{id}{MODULE_SUFFIX}")
+}
+
+pub(super) fn collection_file(id: &str) -> String {
+    format!("{COLLECTIONS}/{id}{COLLECTION_SUFFIX}")
 }
 
 /// Every relationship by its local ID, with the local ID of the module that owns it.
@@ -403,29 +451,34 @@ pub(super) struct FileWrite {
     pub(super) content: Option<String>,
 }
 
-/// The writes that store `manifest` (when given) and `modules` and delete the `removed` module
-/// files, in the order they apply: the manifest first, so retired IDs are recorded before any
-/// file leaves, then the modules, then the deletions.
+/// The writes that store `manifest` (when given), `modules` and `collections` and delete the
+/// `removed` vault files, in the order they apply: the manifest first, so retired IDs are
+/// recorded before any file leaves, then the modules and collections, then the deletions.
 pub(super) fn plan_writes(
     manifest: Option<&Manifest>,
     modules: &[&Module],
-    removed: &[&str],
+    collections: &[&Collection],
+    removed: &[String],
 ) -> Result<Vec<FileWrite>> {
-    let mut writes = Vec::with_capacity(modules.len() + removed.len() + 1);
+    let write = |path: String, content: String| FileWrite {
+        path,
+        content: Some(content),
+    };
+    let mut writes = Vec::with_capacity(modules.len() + collections.len() + removed.len() + 1);
     if let Some(manifest) = manifest {
-        writes.push(FileWrite {
-            path: MANIFEST.to_owned(),
-            content: Some(file_json(manifest)?),
-        });
+        writes.push(write(MANIFEST.to_owned(), file_json(manifest)?));
     }
     for module in modules {
-        writes.push(FileWrite {
-            path: module_file(&module.id),
-            content: Some(file_json(module)?),
-        });
+        writes.push(write(module_file(&module.id), file_json(module)?));
     }
-    writes.extend(removed.iter().map(|id| FileWrite {
-        path: module_file(id),
+    for collection in collections {
+        writes.push(write(
+            collection_file(&collection.id),
+            file_json(collection)?,
+        ));
+    }
+    writes.extend(removed.iter().map(|path| FileWrite {
+        path: path.clone(),
         content: None,
     }));
     Ok(writes)
@@ -438,14 +491,19 @@ pub(super) fn apply_writes(dir: &Path, writes: &[FileWrite]) -> Result<()> {
     for write in writes {
         let path = write.path.as_str();
         ensure!(
-            path == MANIFEST
-                || (path.starts_with(&format!("{MODULES}/")) && ids::is_local(file_subject(path))),
+            path == MANIFEST || vault_file(path).is_some_and(|(_, id)| ids::is_local(id)),
             "`{path}` is not a vault file an edit writes"
         );
         let file = dir.join(path);
         match &write.content {
-            Some(content) => write_atomic(&file, content.as_bytes())
-                .with_context(|| format!("writing {path}"))?,
+            Some(content) => {
+                // The collections folder appears with the first collection.
+                if let Some(folder) = file.parent() {
+                    fs::create_dir_all(folder).with_context(|| format!("creating {path}"))?;
+                }
+                write_atomic(&file, content.as_bytes())
+                    .with_context(|| format!("writing {path}"))?;
+            }
             None => match fs::remove_file(&file) {
                 Ok(()) => {}
                 Err(e) if e.kind() == ErrorKind::NotFound => {}
@@ -455,9 +513,11 @@ pub(super) fn apply_writes(dir: &Path, writes: &[FileWrite]) -> Result<()> {
     }
     // The renames and removals must reach the disk before the journal records the edit done.
     state::sync_dir(dir)?;
-    let modules = dir.join(MODULES);
-    if modules.is_dir() {
-        state::sync_dir(&modules)?;
+    for (folder, _) in FOLDERS {
+        let folder = dir.join(folder);
+        if folder.is_dir() {
+            state::sync_dir(&folder)?;
+        }
     }
     Ok(())
 }
@@ -467,21 +527,23 @@ pub(super) fn apply_writes(dir: &Path, writes: &[FileWrite]) -> Result<()> {
 /// that no content hashes to.
 pub(super) fn file_digests(dir: &Path) -> Result<BTreeMap<String, String>> {
     let mut paths = vec![MANIFEST.to_owned(), CONFIG.to_owned()];
-    match fs::read_dir(dir.join(MODULES)) {
-        Ok(entries) => {
-            for entry in entries {
-                let entry = entry?;
-                // As in `load_dir`, a folder named like a module file is not a vault file.
-                if let Some(name) = entry.file_name().to_str()
-                    && name.ends_with(MODULE_SUFFIX)
-                    && !entry.file_type()?.is_dir()
-                {
-                    paths.push(format!("{MODULES}/{name}"));
+    for (folder, suffix) in FOLDERS {
+        match fs::read_dir(dir.join(folder)) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry?;
+                    // As in `load_dir`, a folder named like a vault file is not one.
+                    if let Some(name) = entry.file_name().to_str()
+                        && name.ends_with(suffix)
+                        && !entry.file_type()?.is_dir()
+                    {
+                        paths.push(format!("{folder}/{name}"));
+                    }
                 }
             }
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("reading {folder}")),
         }
-        Err(e) if e.kind() == ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("reading {MODULES}")),
     }
     let mut digests = BTreeMap::new();
     for path in paths {
@@ -499,15 +561,29 @@ pub(super) fn file_digests(dir: &Path) -> Result<BTreeMap<String, String>> {
     Ok(digests)
 }
 
-fn file_subject(path: &str) -> &str {
-    path.strip_prefix(&format!("{MODULES}/"))
-        .and_then(|name| name.strip_suffix(MODULE_SUFFIX))
-        .unwrap_or(path)
+/// The folder and local ID of a module or collection file, by its vault-relative path.
+fn vault_file(path: &str) -> Option<(&'static str, &str)> {
+    FOLDERS.iter().find_map(|(folder, suffix)| {
+        let id = path
+            .strip_prefix(folder)?
+            .strip_prefix('/')?
+            .strip_suffix(suffix)?;
+        Some((*folder, id))
+    })
 }
 
-/// Every allocated ID (model, state, module, relationship) shares one namespace: each must be
-/// well formed, unique and not retired.
-fn check_ids(manifest: Option<&Manifest>, modules: &[(&str, &Module)], problems: &mut Problems) {
+fn file_subject(path: &str) -> &str {
+    vault_file(path).map_or(path, |(_, id)| id)
+}
+
+/// Every allocated ID (model, state, module, relationship, collection, flow, step, branch)
+/// shares one namespace: each must be well formed, unique and not retired.
+fn check_ids(
+    manifest: Option<&Manifest>,
+    modules: &[(&str, &Module)],
+    collections: &[(&str, &Collection)],
+    problems: &mut Problems,
+) {
     let retired: BTreeSet<&str> = manifest
         .map(|m| m.retired_ids.iter().map(String::as_str).collect())
         .unwrap_or_default();
@@ -535,6 +611,9 @@ fn check_ids(manifest: Option<&Manifest>, modules: &[(&str, &Module)], problems:
         ids.push((file, &module.id));
         ids.extend(module.outgoing.iter().map(|r| (*file, r.id.as_str())));
     }
+    for (file, collection) in collections {
+        ids.extend(collection.ids().into_iter().map(|id| (*file, id)));
+    }
     let mut seen: BTreeMap<&str, &str> = BTreeMap::new();
     for (file, id) in ids {
         if !ids::is_local(id) {
@@ -549,6 +628,31 @@ fn check_ids(manifest: Option<&Manifest>, modules: &[(&str, &Module)], problems:
     }
 }
 
+/// A module or collection file's version, file name and name.
+fn check_file(problems: &mut Problems, file: &str, id: &str, schema_version: u32, name: &str) {
+    if schema_version != SCHEMA_VERSION {
+        problems.push(
+            file,
+            id,
+            format!("schema_version {schema_version} is not {SCHEMA_VERSION}"),
+        );
+    }
+    if file_subject(file) != id {
+        problems.push(file, id, format!("file name does not match ID {id}"));
+    }
+    check_name(problems, file, id, name);
+}
+
+fn check_name(problems: &mut Problems, file: &str, id: &str, name: &str) {
+    if !one_line(name, NAME_MAX) {
+        problems.push(
+            file,
+            id,
+            format!("name needs 1 to {NAME_MAX} characters and no control characters"),
+        );
+    }
+}
+
 /// One module's own fields: version, file name, lengths and vocabulary.
 fn check_module(
     file: &str,
@@ -557,26 +661,7 @@ fn check_module(
     problems: &mut Problems,
 ) {
     let id = module.id.as_str();
-    if module.schema_version != SCHEMA_VERSION {
-        problems.push(
-            file,
-            id,
-            format!(
-                "schema_version {} is not {SCHEMA_VERSION}",
-                module.schema_version
-            ),
-        );
-    }
-    if file_subject(file) != id {
-        problems.push(file, id, format!("file name does not match ID {id}"));
-    }
-    if !one_line(&module.name, NAME_MAX) {
-        problems.push(
-            file,
-            id,
-            format!("name needs 1 to {NAME_MAX} characters and no control characters"),
-        );
-    }
+    check_file(problems, file, id, module.schema_version, &module.name);
     let text = |problems: &mut Problems, field: &str, value: Option<&str>, max, subject: &str| {
         check_text(problems, file, subject, field, value, max, false);
     };
@@ -814,20 +899,27 @@ where
     I: IntoIterator<Item = &'a Module>,
     I::IntoIter: Clone,
 {
-    let modules = modules.into_iter();
-    let by_id: Vec<&Module> = modules
-        .clone()
-        .filter(|m| m.id == subject || ids::qualify(model, &m.id) == subject)
-        .collect();
+    let keyed = modules.into_iter().map(|m| ((), m));
+    find_keyed(model, keyed, subject).map(|(_, module)| module)
+}
+
+/// [`find`] among `modules` paired with keys, returning the key with the module.
+pub(super) fn find_keyed<'a, K: Copy>(
+    model: &str,
+    modules: impl Iterator<Item = (K, &'a Module)> + Clone,
+    subject: &str,
+) -> Result<(K, &'a Module), Refusal> {
+    let local = ids::local(model, subject);
+    let by_id: Vec<(K, &Module)> = modules.clone().filter(|(_, m)| m.id == local).collect();
     let matches = if by_id.is_empty() {
         modules
-            .filter(|m| m.name == subject || m.former_names.iter().any(|n| n == subject))
+            .filter(|(_, m)| m.name == subject || m.former_names.iter().any(|n| n == subject))
             .collect()
     } else {
         by_id
     };
     match matches.as_slice() {
-        [module] => Ok(module),
+        [found] => Ok(*found),
         [] => Err(Refusal::new(
             Code::SubjectNotFound,
             format!("no module has the ID or name `{subject}`"),
@@ -835,7 +927,7 @@ where
         _ => {
             let listed: Vec<_> = matches
                 .iter()
-                .map(|m| json!({"id": ids::qualify(model, &m.id), "name": m.name, "former_names": m.former_names}))
+                .map(|(_, m)| json!({"id": ids::qualify(model, &m.id), "name": m.name, "former_names": m.former_names}))
                 .collect();
             Err(Refusal::new(
                 Code::SubjectAmbiguous,

@@ -20,9 +20,18 @@ use super::request::{
 };
 use super::revision::{self, Revision};
 use super::state::{self, Locked};
-use super::types::{Anchor, Binding, Emphasis, Module, Relationship, SCHEMA_VERSION};
+use super::types::{
+    Anchor, Binding, Collection, Emphasis, Module, Relationship, SCHEMA_VERSION, Step, walk,
+};
 use super::vault::{self, FileWrite, Model, relationships};
 use super::{Code, Refusal, ids};
+
+mod flow;
+
+pub use flow::{
+    CollectionField, CollectionSet, FlowField, FlowSet, NewBranch, NewCollection, NewFlow, NewStep,
+    StepField, StepSet,
+};
 
 const CHANGES_MAX: usize = 1000;
 /// Debug builds stop after writing the journal when this is set, so tests can simulate a crash.
@@ -54,8 +63,9 @@ pub struct EditRequest {
 }
 
 /// One change. A module subject or reference is a qualified ID, a local ID, or a unique current
-/// or former name, modules added earlier in the batch included; a relationship subject is a
-/// qualified or local relationship ID.
+/// or former name, modules added earlier in the batch included; a collection or flow subject is a
+/// qualified or local ID or a unique name, likewise; a relationship, step or branch subject is a
+/// qualified or local ID. A step's position is its index in its list, the end when absent.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Change {
@@ -87,6 +97,78 @@ pub enum Change {
         clear: Vec<RelationshipField>,
     },
     RemoveRelationship {
+        subject: String,
+    },
+    AddCollection {
+        collection: NewCollection,
+    },
+    EditCollection {
+        subject: String,
+        #[serde(default)]
+        set: CollectionSet,
+        #[serde(default)]
+        clear: Vec<CollectionField>,
+    },
+    /// Removes the collection with its flows.
+    RemoveCollection {
+        subject: String,
+    },
+    /// Adds a flow, with the steps it starts with, to a collection.
+    AddFlow {
+        collection: String,
+        flow: NewFlow,
+    },
+    EditFlow {
+        subject: String,
+        #[serde(default)]
+        set: FlowSet,
+        #[serde(default)]
+        clear: Vec<FlowField>,
+    },
+    RemoveFlow {
+        subject: String,
+    },
+    /// Moves a flow with its steps, keeping their IDs, to a collection, at `order` when given.
+    MoveFlow {
+        subject: String,
+        collection: String,
+        order: Option<u32>,
+    },
+    /// Adds a step to the flow's own steps, or to those of the branch or loop `parent` names.
+    AddStep {
+        flow: String,
+        parent: Option<String>,
+        position: Option<usize>,
+        step: NewStep,
+    },
+    /// Sets or clears a step's fields; only a message has fields besides its label.
+    EditStep {
+        subject: String,
+        #[serde(default)]
+        set: StepSet,
+        #[serde(default)]
+        clear: Vec<StepField>,
+    },
+    /// Removes the step with the steps inside it.
+    RemoveStep {
+        subject: String,
+    },
+    /// Moves a step with the steps inside it, keeping their IDs, to where `add-step` would put a
+    /// new one; a step cannot move inside itself.
+    MoveStep {
+        subject: String,
+        flow: String,
+        parent: Option<String>,
+        position: Option<usize>,
+    },
+    /// Adds a branch to a decision.
+    AddBranch {
+        decision: String,
+        position: Option<usize>,
+        branch: NewBranch,
+    },
+    /// Removes the branch with its steps; a decision keeps at least two.
+    RemoveBranch {
         subject: String,
     },
 }
@@ -198,8 +280,10 @@ pub struct Receipt {
     pub allocated: Vec<Allocation>,
 }
 
-/// Qualified IDs of the modules and relationships the edit added, changed or removed. A module
-/// counts as changed when its file changed, including its outgoing relationships.
+/// Qualified IDs of the modules, relationships, collections and flows the edit added, changed or
+/// removed. A module counts as changed when its file changed, including its outgoing
+/// relationships, and a collection when its file changed, including its flows. Steps and branches
+/// are not listed; the flow holding them counts as changed.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Subjects {
     pub added: Vec<String>,
@@ -428,11 +512,12 @@ fn plan(
         batch.apply(index, change)?;
     }
     batch.finish()?;
-    let diff = diff(model, &batch.modules, &batch.fresh);
+    let diff = diff(model, &batch.modules, &batch.collections, &batch.fresh);
 
     let mut manifest = model.manifest.clone();
     manifest.retired_ids.extend(diff.retired.iter().cloned());
-    let mut problems = vault::problems(&manifest, &model.config, &batch.modules);
+    let mut problems =
+        vault::problems(&manifest, &model.config, &batch.modules, &batch.collections);
     if !problems.is_empty() {
         for problem in &mut problems {
             problem.change = batch.touched.get(&problem.subject).copied();
@@ -441,7 +526,7 @@ fn plan(
     }
 
     let manifest = (!diff.retired.is_empty()).then_some(&manifest);
-    let writes = vault::plan_writes(manifest, &diff.write, &diff.remove)?;
+    let writes = vault::plan_writes(manifest, &diff.write, &diff.write_collections, &diff.remove)?;
     let after = model.revision.updated(
         writes
             .iter()
@@ -564,8 +649,10 @@ fn apply(vault: &Path, journal: &Journal, mut record: Record) -> Result<Receipt>
 struct Diff<'a> {
     /// Module files to write: added and changed modules.
     write: Vec<&'a Module>,
-    /// Local IDs of module files to delete.
-    remove: Vec<&'a str>,
+    /// Collection files to write: added and changed collections.
+    write_collections: Vec<&'a Collection>,
+    /// Vault-relative paths of module and collection files to delete.
+    remove: Vec<String>,
     /// IDs leaving the model, allocated-then-removed ones included; they stay reserved.
     retired: Vec<String>,
     subjects: Subjects,
@@ -575,13 +662,22 @@ struct Diff<'a> {
     moves: Vec<claims::Move>,
 }
 
-fn diff<'a>(model: &'a Model, new: &'a [Module], fresh: &[String]) -> Diff<'a> {
+fn diff<'a>(
+    model: &'a Model,
+    new: &'a [Module],
+    collections: &'a [Collection],
+    fresh: &[String],
+) -> Diff<'a> {
     let (old_modules, new_modules) = (by_id(&model.modules), by_id(new));
     let (old_relationships, new_relationships) =
         (relationships(&model.modules), relationships(new));
-    let live = |id: &str| new_modules.contains_key(id) || new_relationships.contains_key(id);
+    let grouped: BTreeSet<&str> = collections.iter().flat_map(Collection::ids).collect();
+    let live = |id: &str| {
+        new_modules.contains_key(id) || new_relationships.contains_key(id) || grouped.contains(id)
+    };
     let mut diff = Diff {
         write: Vec::new(),
+        write_collections: Vec::new(),
         remove: Vec::new(),
         retired: Vec::new(),
         subjects: Subjects::default(),
@@ -611,9 +707,11 @@ fn diff<'a>(model: &'a Model, new: &'a [Module], fresh: &[String]) -> Diff<'a> {
     }
     diff.remove = old_modules
         .keys()
-        .copied()
-        .filter(|id| !new_modules.contains_key(id))
+        .filter(|id| !new_modules.contains_key(*id))
+        .map(|id| vault::module_file(id))
         .collect();
+    let mut touched: Vec<Option<String>> = Vec::new();
+    flow::diff_collections(model, collections, &mut diff, &mut touched);
     diff.retired
         .extend(fresh.iter().filter(|id| !live(id)).cloned());
     for list in [
@@ -629,8 +727,8 @@ fn diff<'a>(model: &'a Model, new: &'a [Module], fresh: &[String]) -> Diff<'a> {
     // gaining or losing a part, or the root level for a root module, and the old and new source
     // and target of each relationship added, changed, moved or removed. So is every module whose
     // current or former name an added or renamed module takes, since the name would then stop
-    // naming it alone. IDs this batch allocates are left out: nobody could have claimed them.
-    let mut touched: Vec<Option<String>> = Vec::new();
+    // naming it alone. Collections and flows are touched as `flow::diff_collections` says. IDs
+    // this batch allocates are left out: nobody could have claimed them.
     let module_ids: BTreeSet<&str> = old_modules
         .keys()
         .chain(new_modules.keys())
@@ -680,7 +778,9 @@ fn diff<'a>(model: &'a Model, new: &'a [Module], fresh: &[String]) -> Diff<'a> {
     }
     let existed = |id: &str| {
         let local = ids::local(&model.manifest.id, id);
-        old_modules.contains_key(local) || old_relationships.contains_key(local)
+        old_modules.contains_key(local)
+            || old_relationships.contains_key(local)
+            || model.find_grouping(local).is_some()
     };
     diff.affected = touched
         .into_iter()
@@ -718,13 +818,17 @@ fn by_id(modules: &[Module]) -> BTreeMap<&str, &Module> {
 struct Batch<'a> {
     model: &'a str,
     modules: Vec<Module>,
+    collections: Vec<Collection>,
     removed: BTreeSet<String>,
+    /// Local IDs of relationships the batch removed or gave another source or target.
+    moved: BTreeSet<String>,
     /// Every ID the model holds or retired, and those allocated so far, in ASCII lowercase.
     taken: BTreeSet<String>,
     fresh: Vec<String>,
     allocated: Vec<Allocation>,
     edited: BTreeSet<String>,
-    /// The last change that touched each module or relationship, by local ID.
+    /// The last change that touched each module, relationship, collection, flow, step or branch,
+    /// by local ID.
     touched: BTreeMap<String, usize>,
 }
 
@@ -741,11 +845,20 @@ impl<'a> Batch<'a> {
                     .flat_map(|m| iter::once(&m.id).chain(m.outgoing.iter().map(|r| &r.id))),
             )
             .map(|id| id.to_ascii_lowercase())
+            .chain(
+                model
+                    .collections
+                    .iter()
+                    .flat_map(Collection::ids)
+                    .map(str::to_ascii_lowercase),
+            )
             .collect();
         Self {
             model: &manifest.id,
             modules: model.modules.clone(),
+            collections: model.collections.clone(),
             removed: BTreeSet::new(),
+            moved: BTreeSet::new(),
             taken,
             fresh: Vec::new(),
             allocated: Vec::new(),
@@ -774,6 +887,49 @@ impl<'a> Batch<'a> {
                 clear,
             } => self.edit_relationship(index, &subject, source.as_deref(), set, &clear),
             Change::RemoveRelationship { subject } => self.remove_relationship(index, &subject),
+            Change::AddCollection { collection } => self.add_collection(index, collection),
+            Change::EditCollection {
+                subject,
+                set,
+                clear,
+            } => self.edit_collection(index, &subject, set, &clear),
+            Change::RemoveCollection { subject } => self.remove_collection(index, &subject),
+            Change::AddFlow { collection, flow } => self.add_flow(index, &collection, flow),
+            Change::EditFlow {
+                subject,
+                set,
+                clear,
+            } => self.edit_flow(index, &subject, set, &clear),
+            Change::RemoveFlow { subject } => self.remove_flow(index, &subject),
+            Change::MoveFlow {
+                subject,
+                collection,
+                order,
+            } => self.move_flow(index, &subject, &collection, order),
+            Change::AddStep {
+                flow,
+                parent,
+                position,
+                step,
+            } => self.add_step(index, &flow, parent.as_deref(), position, step),
+            Change::EditStep {
+                subject,
+                set,
+                clear,
+            } => self.edit_step(index, &subject, set, &clear),
+            Change::RemoveStep { subject } => self.take_step(index, &subject).map(drop),
+            Change::MoveStep {
+                subject,
+                flow,
+                parent,
+                position,
+            } => self.move_step(index, &subject, &flow, parent.as_deref(), position),
+            Change::AddBranch {
+                decision,
+                position,
+                branch,
+            } => self.add_branch(index, &decision, position, branch),
+            Change::RemoveBranch { subject } => self.remove_branch(index, &subject),
         }
     }
 
@@ -788,17 +944,22 @@ impl<'a> Batch<'a> {
         Ok(id)
     }
 
+    /// A fresh ID for what change `index` adds, reported as allocated for `name`.
+    fn new_id(&mut self, index: usize, name: String) -> Result<String> {
+        let id = self.allocate()?;
+        self.allocated.push(Allocation {
+            name,
+            id: ids::qualify(self.model, &id),
+        });
+        self.touched.insert(id.clone(), index);
+        Ok(id)
+    }
+
     /// The position of the module `subject` names among those not removed.
     fn module(&self, index: usize, subject: &str) -> Result<usize> {
-        let live = self
-            .modules
-            .iter()
-            .filter(|m| !self.removed.contains(&m.id));
-        let found = vault::find(self.model, live, subject).map_err(at(index))?;
-        self.modules
-            .iter()
-            .position(|m| m.id == found.id)
-            .with_context(|| format!("module {} is not in the batch", found.id))
+        let live = (self.modules.iter().enumerate()).filter(|(_, m)| !self.removed.contains(&m.id));
+        let (at, _) = vault::find_keyed(self.model, live, subject).map_err(at(index))?;
+        Ok(at)
     }
 
     /// The owning module's position and the relationship's position in its outgoing list.
@@ -842,12 +1003,7 @@ impl<'a> Batch<'a> {
 
     fn add_module(&mut self, index: usize, new: NewModule) -> Result<()> {
         let parent = self.reference(index, new.parent.as_deref())?;
-        let id = self.allocate()?;
-        self.allocated.push(Allocation {
-            name: new.name.clone(),
-            id: ids::qualify(self.model, &id),
-        });
-        self.touched.insert(id.clone(), index);
+        let id = self.new_id(index, new.name.clone())?;
         self.modules.push(Module {
             schema_version: SCHEMA_VERSION,
             id,
@@ -928,15 +1084,11 @@ impl<'a> Batch<'a> {
     fn add_relationship(&mut self, index: usize, source: &str, new: NewRelationship) -> Result<()> {
         let from = self.module(index, source)?;
         let target = self.module(index, &new.to)?;
-        let id = self.allocate()?;
-        self.allocated.push(Allocation {
-            name: format!(
-                "relationship from {} to {}",
-                self.modules[from].name, self.modules[target].name
-            ),
-            id: ids::qualify(self.model, &id),
-        });
-        self.touched.insert(id.clone(), index);
+        let name = format!(
+            "relationship from {} to {}",
+            self.modules[from].name, self.modules[target].name
+        );
+        let id = self.new_id(index, name)?;
         let to = self.qualify(target);
         self.modules[from].outgoing.push(Relationship {
             id,
@@ -970,6 +1122,9 @@ impl<'a> Batch<'a> {
             .transpose()?
             .unwrap_or(from);
         let to = self.reference(index, set.to.as_deref())?;
+        if owner != from || to.is_some() {
+            self.moved.insert(id.clone());
+        }
         // Only a transfer moves the relationship, so an edit keeps its place in the file.
         let at = if owner == from {
             at
@@ -1015,6 +1170,7 @@ impl<'a> Batch<'a> {
     fn remove_relationship(&mut self, index: usize, subject: &str) -> Result<()> {
         let (from, at) = self.relationship(index, subject)?;
         let relationship = self.modules[from].outgoing.remove(at);
+        self.moved.insert(relationship.id.clone());
         self.touched.insert(relationship.id, index);
         Ok(())
     }
@@ -1049,7 +1205,72 @@ impl<'a> Batch<'a> {
         for module in &mut self.modules {
             module.outgoing.retain(|r| !gone.contains(&r.to));
         }
-        Ok(())
+        self.refuse_flow_references(&gone)
+    }
+
+    /// Refuses when a message step the batch did not edit references a module the batch removes,
+    /// or a relationship it removes or moves, and the reference no longer holds. A step the batch
+    /// edited is judged by validation instead.
+    fn refuse_flow_references(&self, gone: &BTreeSet<String>) -> Result<()> {
+        if gone.is_empty() && self.moved.is_empty() {
+            return Ok(());
+        }
+        let ends = vault::Ends::new(self.model, &self.modules);
+        let moved: BTreeSet<String> = (self.moved.iter())
+            .map(|id| ids::qualify(self.model, id))
+            .collect();
+        // The changes that removed or moved what each broken step references.
+        let mut causes: BTreeSet<usize> = BTreeSet::new();
+        let mut steps = Vec::new();
+        for (step, _) in (self.collections.iter())
+            .flat_map(|c| &c.flows)
+            .flat_map(|f| walk(&f.steps))
+        {
+            let Step::Message {
+                id,
+                from,
+                to,
+                relationship,
+                ..
+            } = step
+            else {
+                continue;
+            };
+            let broken: Vec<&String> = [from, to]
+                .into_iter()
+                .filter(|m| gone.contains(*m))
+                .chain(relationship.iter().filter(|r| moved.contains(*r)))
+                .collect();
+            if broken.is_empty()
+                || self.edited.contains(id)
+                || vault::message_problems(&ends, step).is_empty()
+            {
+                continue;
+            }
+            let local = |subject: &String| ids::local(self.model, subject).to_owned();
+            causes.extend(
+                broken
+                    .into_iter()
+                    .filter_map(|s| self.touched.get(&local(s)).copied()),
+            );
+            steps.push(ids::qualify(self.model, id));
+        }
+        if steps.is_empty() {
+            return Ok(());
+        }
+        let refusal = Refusal::new(
+            Code::ReferencedByFlow,
+            format!(
+                "{} flow step(s) reference modules or relationships the batch removes or moves; edit or remove them in the same batch",
+                steps.len()
+            ),
+        )
+        .with_details(json!({ "steps": steps }));
+        Err(match causes.into_iter().collect::<Vec<_>>().as_slice() {
+            [index] => at(*index)(refusal),
+            _ => refusal,
+        }
+        .into())
     }
 }
 

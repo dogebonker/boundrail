@@ -8,8 +8,8 @@ use boundrail::arch::diagnostic::{Diagnostic, Severity};
 use boundrail::arch::edit::{self, Receipt};
 use boundrail::arch::request::INPUT_MAX;
 use boundrail::arch::semantic;
-use boundrail::arch::types::{self, SCHEMAS};
-use boundrail::arch::vault::{self, Model, ModuleView, RelationshipView};
+use boundrail::arch::types::{self, Collection, Flow, SCHEMAS, Step};
+use boundrail::arch::vault::{self, CollectionView, Found, Model, ModuleView, RelationshipView};
 use boundrail::arch::{Code, Refusal};
 use serde_json::{Value, json};
 
@@ -52,14 +52,19 @@ enum ModelCmd {
         #[arg(long)]
         name: String,
     },
-    /// Print the model, or one module with its parts and relationships
+    /// Print the model, one module with its parts and relationships, a collection, or a flow
     Read {
-        /// Qualified ID, local ID, or a unique current or former module name
+        /// Qualified ID, local ID, or a unique current or former module name; or a collection or
+        /// flow ID
+        #[arg(conflicts_with = "flow")]
         subject: Option<String>,
+        /// Print one flow with its steps: its qualified or local ID, or its unique name
+        #[arg(long)]
+        flow: Option<String>,
     },
     /// List the vault file and request schemas, or print one as JSON Schema
     Schema { name: Option<String> },
-    /// Apply a batch of module and relationship changes (schema `model-edit`)
+    /// Apply a batch of module, relationship, collection, flow and step changes (schema `model-edit`)
     Edit {
         /// Request file; `-` or absent reads standard input
         #[arg(long)]
@@ -74,7 +79,7 @@ enum ModelCmd {
         #[arg(long, value_name = "OPERATION_ID")]
         abandon: Option<String>,
     },
-    /// Reserve modules, relationships or the model's structure for one writer (schema `model-claim`)
+    /// Reserve modules, relationships, collections, flows or the model's structure for one writer (schema `model-claim`)
     Claim {
         /// Request file; `-` or absent reads standard input
         #[arg(long)]
@@ -149,12 +154,17 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
                 }),
             )
         }
-        ModelCmd::Read { subject: None } => {
+        ModelCmd::Read {
+            subject: None,
+            flow: None,
+        } => {
             let (model, state, pending) = load_for_read(root)?;
             let reading = model.read();
+            let collections = model.collection_views();
             let active = state.as_deref().and_then(active_claims);
             if markdown {
                 print_reading(&model, &reading);
+                print_collections(&collections);
                 print_claims(active.as_deref());
                 return Ok(());
             }
@@ -168,6 +178,7 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
                 "roots": reading.roots,
                 "modules": reading.modules,
                 "relationships": reading.relationships,
+                "collections": collections,
                 "revision": model.revision,
             });
             if let Some(active) = active {
@@ -178,10 +189,26 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
             }
             write(None, &output)
         }
-        ModelCmd::Read {
-            subject: Some(subject),
-        } => {
+        ModelCmd::Read { subject, flow } => {
             let (model, state, pending) = load_for_read(root)?;
+            let found = match &flow {
+                Some(flow) => {
+                    let (collection, flow) = model.flow(flow)?;
+                    Some(Found::Flow(collection, flow))
+                }
+                None => subject.as_deref().and_then(|s| model.find_grouping(s)),
+            };
+            if let Some(found) = found {
+                let read = GroupingRead {
+                    model: &model,
+                    state,
+                    pending,
+                    markdown,
+                };
+                return read.print(found);
+            }
+            // The arm above reads the whole model, so a subject is given here.
+            let subject = subject.unwrap_or_default();
             let selection = model.select(&subject)?;
             let subjects: Vec<&str> = iter::once(&selection.module.id)
                 .chain(selection.parts.iter().map(|m| &m.id))
@@ -373,6 +400,62 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
     }
 }
 
+/// A `model read` of one collection or flow.
+struct GroupingRead<'a> {
+    model: &'a Model,
+    state: Option<PathBuf>,
+    pending: Option<Value>,
+    markdown: bool,
+}
+
+impl GroupingRead<'_> {
+    /// Prints the collection or flow with the active claims holding it.
+    fn print(self, found: Found<'_>) -> Result<()> {
+        let model = self.model;
+        let (subject, mut output) = match found {
+            Found::Collection(collection) => {
+                let view = model.collection_view(collection);
+                if self.markdown {
+                    print_collections(std::slice::from_ref(&view));
+                }
+                (
+                    view.id.clone(),
+                    json!({"kind": "read-collection", "collection": view}),
+                )
+            }
+            Found::Flow(collection, flow) => {
+                if self.markdown {
+                    print_flow(model, collection, flow);
+                }
+                let view = model.flow_view(flow);
+                let id = view.id.clone();
+                let output = json!({"kind": "read-flow", "collection": model.qualify(&collection.id), "flow": view});
+                (id, output)
+            }
+        };
+        let active = self
+            .state
+            .as_deref()
+            .and_then(active_claims)
+            .map(|active| claims::holding(model, active, &[subject.as_str()]));
+        if self.markdown {
+            print_claims(active.as_deref());
+            return Ok(());
+        }
+        output["schema"] = MODEL_SCHEMA.into();
+        output["success"] = true.into();
+        output["vault"] = json!(model.dir);
+        output["revision"] = json!(model.revision);
+        if let Some(active) = active {
+            output["claims"] = json!(active);
+        }
+        if let Some(pending) = self.pending {
+            output["pending_operation"] = pending;
+        }
+        write(None, &output)
+    }
+}
+
 /// `model check`: exit 0 without warnings, 1 with any. Like `model read`, it names a pending edit.
 /// The skips are reported only when the code check ran.
 fn check(root: &Path, markdown: bool, only: Option<CheckOnly>) -> Result<ExitCode> {
@@ -380,7 +463,7 @@ fn check(root: &Path, markdown: bool, only: Option<CheckOnly>) -> Result<ExitCod
     let mut diagnostics = if only == Some(CheckOnly::Code) {
         Vec::new()
     } else {
-        semantic::check(&model.manifest.id, &model.modules)
+        semantic::check(&model.manifest.id, &model.modules, &model.collections)
     };
     let mut skips = None;
     if only != Some(CheckOnly::Semantic) {
@@ -674,6 +757,68 @@ fn print_reading(model: &Model, reading: &vault::Reading<'_>) {
         println!("Relationships:");
         for relationship in &reading.relationships {
             print_relationship(&names, relationship);
+        }
+    }
+}
+
+fn print_collections(collections: &[CollectionView<'_>]) {
+    if collections.is_empty() {
+        return;
+    }
+    println!("Collections:");
+    for collection in collections {
+        println!("- {} {}", collection.name, collection.id);
+        for flow in &collection.flows {
+            let summary = flow.summary.map(|s| format!(": {s}")).unwrap_or_default();
+            println!("  - {} {}{summary}", flow.name, flow.id);
+        }
+    }
+}
+
+/// The flow as a numbered sequence, decisions and loops indenting the steps inside them.
+fn print_flow(model: &Model, collection: &Collection, flow: &Flow) {
+    println!(
+        "Flow {} {} in {}",
+        flow.name,
+        model.qualify(&flow.id),
+        collection.name
+    );
+    if let Some(summary) = &flow.summary {
+        println!("{summary}");
+    }
+    print_steps(&names(model), &flow.steps, 0);
+}
+
+fn print_steps(names: &BTreeMap<String, &str>, steps: &[Step], depth: usize) {
+    let indent = "  ".repeat(depth);
+    for (n, step) in (1..).zip(steps) {
+        match step {
+            Step::Message {
+                from,
+                to,
+                label,
+                reply,
+                repeat,
+                ..
+            } => {
+                let repeat = repeat.map(|r| format!(" x{r}")).unwrap_or_default();
+                let reply = if *reply { " (reply)" } else { "" };
+                let (from, to) = (name_of(names, from), name_of(names, to));
+                println!("{indent}{n}. {from} -> {to}: {label}{repeat}{reply}");
+            }
+            Step::Decision {
+                label, branches, ..
+            } => {
+                println!("{indent}{n}. decision: {label}");
+                for branch in branches {
+                    println!("{indent}  - {}:", branch.label);
+                    print_steps(names, &branch.steps, depth + 2);
+                }
+            }
+            Step::Loop { label, steps, .. } => {
+                println!("{indent}{n}. loop: {label}");
+                print_steps(names, steps, depth + 1);
+            }
         }
     }
 }

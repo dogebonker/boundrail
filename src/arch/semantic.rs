@@ -1,16 +1,16 @@
 //! The semantic check: warnings about the shape of the authored model itself, read from the
-//! modules alone before any code is compared with them.
+//! modules and flows alone before any code is compared with them.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::diagnostic::{Diagnostic, DiagnosticCode};
 use super::index::Index;
-use super::segments;
-use super::types::{Binding, Module};
+use super::types::{Binding, Collection, Module, Step, walk};
+use super::{ids, segments};
 
-/// Every semantic diagnostic of the modules of model `model`, sorted. The modules must have
-/// loaded, so parents and targets exist and containment has no cycle.
-pub fn check(model: &str, modules: &[Module]) -> Vec<Diagnostic> {
+/// Every semantic diagnostic of the modules and collections of model `model`, sorted. They must
+/// have loaded, so parents, targets and step references exist and containment has no cycle.
+pub fn check(model: &str, modules: &[Module], collections: &[Collection]) -> Vec<Diagnostic> {
     let index = Index::new(model, modules);
     let mut out = Vec::new();
     containers(&index, &mut out);
@@ -19,8 +19,64 @@ pub fn check(model: &str, modules: &[Module]) -> Vec<Diagnostic> {
     shared_bindings(&index, &mut out);
     repeated_relationships(&index, &mut out);
     relationship_ends(&index, &mut out);
+    flows(model, &index, collections, &mut out);
     out.sort();
     out
+}
+
+/// `FLOW_SUMMARY_MISSING`, and `MESSAGE_UNDRAWN` for a message between two modules, neither
+/// containing the other, that no relationship between the modules or their ancestors connects
+/// in either direction. Ancestors the two modules share do not count: a line from one module's
+/// container to a shared container joins nothing between them.
+fn flows(model: &str, index: &Index<'_>, collections: &[Collection], out: &mut Vec<Diagnostic>) {
+    if collections.is_empty() {
+        return;
+    }
+    let drawn: BTreeSet<(&str, &str)> = index
+        .lines
+        .iter()
+        .map(|l| (l.from.as_str(), l.to))
+        .collect();
+    let connected = |a: &str, b: &str| {
+        let (mut above_a, mut above_b) = (index.chain(a), index.chain(b));
+        while above_a.last().is_some() && above_a.last() == above_b.last() {
+            above_a.pop();
+            above_b.pop();
+        }
+        above_a.iter().any(|x| {
+            above_b
+                .iter()
+                .any(|y| drawn.contains(&(*x, *y)) || drawn.contains(&(*y, *x)))
+        })
+    };
+    for flow in collections.iter().flat_map(|c| &c.flows) {
+        if flow.summary.is_none() {
+            out.push(Diagnostic::new(
+                DiagnosticCode::FlowSummaryMissing,
+                vec![ids::qualify(model, &flow.id)],
+                format!("{} has no summary", flow.name),
+            ));
+        }
+        for (step, _) in walk(&flow.steps) {
+            let Step::Message { id, from, to, .. } = step else {
+                continue;
+            };
+            if from == to || index.is_below(from, to) || index.is_below(to, from) {
+                continue;
+            }
+            if !connected(from, to) {
+                let (sender, receiver) = (index.name(from), index.name(to));
+                out.push(Diagnostic::new(
+                    DiagnosticCode::MessageUndrawn,
+                    vec![ids::qualify(model, id), from.clone(), to.clone()],
+                    format!(
+                        "{}: {sender} -> {receiver} has no relationship between them",
+                        flow.name
+                    ),
+                ));
+            }
+        }
+    }
 }
 
 /// Whether `inner` names `outer`'s path or one below it, in the same repository.
@@ -218,7 +274,7 @@ mod tests {
     use super::*;
     use crate::arch::diagnostic::Severity;
     use crate::arch::ids;
-    use crate::arch::types::{Relationship, SCHEMA_VERSION};
+    use crate::arch::types::{Collection, Relationship, SCHEMA_VERSION};
 
     const M: &str = "Model001";
 
@@ -261,7 +317,7 @@ mod tests {
     }
 
     fn of(code: DiagnosticCode, modules: &[Module]) -> Vec<Diagnostic> {
-        check(M, modules)
+        check(M, modules, &[])
             .into_iter()
             .filter(|d| d.code == code)
             .collect()
@@ -281,7 +337,7 @@ mod tests {
             module("Web", Some("App"), Some("app/web")),
             module("Db", None, None),
         ];
-        assert_eq!(check(M, &modules), []);
+        assert_eq!(check(M, &modules, &[]), []);
     }
 
     #[test]
@@ -467,9 +523,80 @@ mod tests {
     }
 
     #[test]
+    fn flows_without_a_summary_and_messages_without_a_relationship_are_information() {
+        let mut container = module("Box", None, None);
+        link(&mut container, "R1", "Db", "call");
+        let modules = [
+            container,
+            module("Part", Some("Box"), None),
+            module("Other", Some("Box"), None),
+            module("Db", None, None),
+            module("Web", None, None),
+        ];
+        let message = |id: &str, from: &str, to: &str| serde_json::json!({"kind": "message", "id": id, "from": q(from), "to": q(to), "label": "x"});
+        let collection: Collection = serde_json::from_value(serde_json::json!({
+            "schema_version": 1, "id": "Coll0001", "name": "Orders", "order": 0, "flows": [
+                {"id": "Flow0001", "name": "Told", "order": 0, "summary": "Has one", "steps": [
+                    // Drawn from the parts' box, either way round; within the box needs none.
+                    message("S1", "Part", "Db"),
+                    message("S2", "Db", "Other"),
+                    message("S3", "Box", "Other"),
+                    {"kind": "loop", "id": "L1", "label": "again", "steps": [message("S4", "Web", "Db")]},
+                ]},
+                {"id": "Flow0002", "name": "Untold", "order": 1},
+            ],
+        }))
+        .unwrap();
+        let mut collection = collection;
+        // A in P in Q and B in Q: the line P -> Q joins nothing between A and B.
+        let mut p = module("P", Some("Q"), None);
+        link(&mut p, "R2", "Q", "call");
+        let modules: Vec<Module> = modules
+            .into_iter()
+            .chain([
+                module("Q", None, None),
+                p,
+                module("A", Some("P"), None),
+                module("B", Some("Q"), None),
+            ])
+            .collect();
+        collection.flows[0]
+            .steps
+            .push(serde_json::from_value(message("S5", "A", "B")).unwrap());
+        let found: Vec<_> = check(M, &modules, &[collection])
+            .into_iter()
+            .filter(|d| matches!(d.code, FlowSummaryMissing | MessageUndrawn))
+            .map(|d| (d.code, d.severity, d.subjects, d.message))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (
+                    FlowSummaryMissing,
+                    Severity::Information,
+                    vec![q("Flow0002")],
+                    "Untold has no summary".to_owned()
+                ),
+                (
+                    MessageUndrawn,
+                    Severity::Information,
+                    vec![q("S4"), q("Web"), q("Db")],
+                    "Told: Web -> Db has no relationship between them".to_owned()
+                ),
+                (
+                    MessageUndrawn,
+                    Severity::Information,
+                    vec![q("S5"), q("A"), q("B")],
+                    "Told: A -> B has no relationship between them".to_owned()
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn diagnostics_serialize_with_screaming_codes_and_omit_absent_suggestions() {
         let modules = [module("Box", None, None), module("Part", Some("Box"), None)];
-        let value = serde_json::to_value(check(M, &modules)).unwrap();
+        let value = serde_json::to_value(check(M, &modules, &[])).unwrap();
         assert_eq!(value[0]["code"], "CONTAINER_UNBOUND");
         assert_eq!(value[0]["severity"], "warning");
         assert!(value[0].get("suggested_binding").is_none());

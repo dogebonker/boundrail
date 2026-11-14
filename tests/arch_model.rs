@@ -396,7 +396,7 @@ fn read_returns_containment_and_relationships_in_order() {
 #[test]
 fn every_invalid_model_is_refused_with_its_problems() {
     type Break = fn(&Checkout, &str);
-    let cases: [(&str, Break, &str, &str, &str); 14] = [
+    let cases: [(&str, Break, &str, &str, &str); 16] = [
         (
             "module JSON",
             |c, _| c.write("modules/Broken01.module.json", "{ not json"),
@@ -540,6 +540,34 @@ fn every_invalid_model_is_refused_with_its_problems() {
             "RelTab01",
             "label contains a control character",
         ),
+        (
+            "unknown step field",
+            |c, m| {
+                let step = json!({"kind": "message", "id": "Step0001", "from": format!("{m}#WebApp01"), "to": format!("{m}#Billing1"), "label": "pay", "colour": "red"});
+                let collection = json!({"schema_version": 1, "id": "Coll0001", "name": "Orders", "order": 0, "flows": [{"id": "Flow0001", "name": "Pay", "order": 0, "steps": [step]}]});
+                c.write(
+                    "collections/Coll0001.collection.json",
+                    &collection.to_string(),
+                );
+            },
+            "collections/Coll0001.collection.json",
+            "Coll0001",
+            "does not parse: unknown field `colour`",
+        ),
+        (
+            "step naming a missing module",
+            |c, m| {
+                let step = json!({"kind": "message", "id": "Step0001", "from": format!("{m}#WebApp01"), "to": format!("{m}#Missing1"), "label": "pay"});
+                let collection = json!({"schema_version": 1, "id": "Coll0001", "name": "Orders", "order": 0, "flows": [{"id": "Flow0001", "name": "Pay", "order": 0, "steps": [step]}]});
+                c.write(
+                    "collections/Coll0001.collection.json",
+                    &collection.to_string(),
+                );
+            },
+            "collections/Coll0001.collection.json",
+            "Step0001",
+            "is not a module",
+        ),
     ];
     for (case, breaks, file, subject, message) in cases {
         let checkout = Checkout::new();
@@ -642,6 +670,7 @@ fn schemas_describe_the_vault_files() {
         names["schemas"],
         json!([
             "model-claim",
+            "model-collection",
             "model-edit",
             "model-manifest",
             "model-release",
@@ -776,6 +805,8 @@ fn edit_applies_every_change_type() {
         {"type": "add-relationship", "source": "Ledger", "relationship": {"to": "Bank", "kind": "call", "order": 0, "label": "settles"}},
     ]));
     assert_eq!(out["schema"], "boundrail/model/v1");
+    // Only a collection creates the collections folder.
+    assert!(!checkout.vault().join("collections").exists());
     assert!(out["operation_id"].as_str().unwrap().starts_with("op-"));
     assert_eq!(out["writer"], "tester");
     assert_eq!(out["doing"], "testing edits");
@@ -2406,4 +2437,292 @@ fn recovery_finishes_a_landed_edit_whose_result_no_longer_validates() {
     assert!(!pending.exists());
     assert!(journal.join(format!("{operation}.json")).exists());
     checkout.refused(&["read"], "MODEL_INVALID");
+}
+
+/// The changes that add Orders, holding Checkout, to the shop: Web places an order with
+/// Billing, which charges Bank when the card is valid and declines otherwise, then reserves
+/// each item.
+fn checkout_changes() -> Value {
+    json!([
+        {"type": "add-collection", "collection": {"name": "Orders", "order": 0, "description": "Buying"}},
+        {"type": "add-flow", "collection": "Orders", "flow": {"name": "Checkout", "order": 0, "summary": "A customer pays", "steps": [
+            {"kind": "message", "from": "Web", "to": "Billing", "label": "place order", "relationship": "RelWeb01"},
+            {"kind": "decision", "label": "card valid?", "branches": [
+                {"label": "yes", "steps": [
+                    {"kind": "message", "from": "Billing", "to": "Bank", "label": "charge", "relationship": "RelBil01", "repeat": 3},
+                ]},
+                {"label": "no", "steps": [
+                    {"kind": "message", "from": "Billing", "to": "Web", "label": "decline", "relationship": "RelWeb01", "reply": true},
+                ]},
+            ]},
+            {"kind": "loop", "label": "each item", "steps": [
+                {"kind": "message", "from": "Billing", "to": "Billing", "label": "reserve"},
+            ]},
+        ]}},
+    ])
+}
+
+/// Adds Checkout and returns the qualified IDs allocated: Orders, Checkout, place order, card
+/// valid?, yes, charge, no, decline, each item, reserve.
+fn add_checkout(checkout: &Checkout) -> Vec<String> {
+    let out = checkout.edited(checkout_changes());
+    let allocated = out["allocated"].as_array().unwrap();
+    allocated
+        .iter()
+        .map(|a| a["id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+fn local(id: &str) -> &str {
+    id.split_once('#').unwrap().1
+}
+
+#[test]
+fn a_collection_flow_and_steps_added_in_one_batch_read_back() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let q = |id: &str| format!("{model}#{id}");
+    let request = checkout.request(checkout_changes());
+    let (_, schema) = checkout.run(&["schema", "model-edit"]);
+    let errors: Vec<String> = jsonschema::validator_for(&schema)
+        .unwrap()
+        .iter_errors(&request)
+        .map(|e| e.to_string())
+        .collect();
+    assert!(errors.is_empty(), "{errors:#?}");
+    let (code, out) = checkout.edit(&request);
+    assert_eq!(code, 0, "{out:#}");
+    let ids: Vec<String> = out["allocated"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["id"].as_str().unwrap().to_owned())
+        .collect();
+    let (orders, flow) = (&ids[0], &ids[1]);
+    assert_eq!(out["subjects"]["added"], json!(sorted(&[orders, flow])));
+    let names: Vec<&Value> = out["allocated"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| &a["name"])
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "Orders",
+            "Checkout",
+            "message place order",
+            "decision card valid?",
+            "branch yes",
+            "message charge",
+            "branch no",
+            "message decline",
+            "loop each item",
+            "message reserve"
+        ]
+    );
+
+    let read = checkout.ok(&["read", "--flow", flow]);
+    assert_eq!(read["kind"], "read-flow");
+    assert_eq!(read["collection"], *orders);
+    assert_eq!(read["revision"]["digest"], checkout.digest());
+    let steps = &read["flow"]["steps"];
+    assert_eq!(read["flow"]["id"], *flow);
+    assert_eq!(
+        steps[0],
+        json!({"kind": "message", "id": ids[2], "from": q("WebApp01"), "to": q("Billing1"),
+               "label": "place order", "relationship": q("RelWeb01")})
+    );
+    assert_eq!(steps[1]["branches"][1]["id"], ids[6]);
+    assert_eq!(steps[1]["branches"][1]["steps"][0]["reply"], true);
+    assert_eq!(
+        checkout.ok(&["read", "--flow", "Checkout"])["flow"],
+        read["flow"]
+    );
+    assert_eq!(checkout.ok(&["read", local(flow)])["flow"], read["flow"]);
+    let (code, text) = checkout.run_raw(&["read", "--flow", flow, "--format", "markdown"]);
+    assert_eq!(code, 0);
+    assert_eq!(
+        text,
+        format!(
+            "Flow Checkout {flow} in Orders\n\
+             A customer pays\n\
+             1. Web -> Billing: place order\n\
+             2. decision: card valid?\n  \
+               - yes:\n    \
+                 1. Billing -> Bank: charge x3\n  \
+               - no:\n    \
+                 1. Billing -> Web: decline (reply)\n\
+             3. loop: each item\n  \
+               1. Billing -> Billing: reserve\n"
+        )
+    );
+
+    let read = checkout.ok(&["read", orders]);
+    assert_eq!(read["kind"], "read-collection");
+    let listed = json!({"id": orders, "name": "Orders", "order": 0, "description": "Buying",
+        "flows": [{"id": flow, "name": "Checkout", "order": 0, "summary": "A customer pays"}]});
+    assert_eq!(read["collection"], listed);
+    assert_eq!(checkout.ok(&["read"])["collections"], json!([listed]));
+    let (_, text) = checkout.run_raw(&["read", "--format", "markdown"]);
+    assert!(
+        text.ends_with(&format!(
+            "Collections:\n- Orders {orders}\n  - Checkout {flow}: A customer pays\n"
+        )),
+        "{text}"
+    );
+    checkout.refused(&["read", "--flow", "Missing"], "SUBJECT_NOT_FOUND");
+
+    let file = checkout
+        .vault()
+        .join(format!("collections/{}.collection.json", local(orders)));
+    let file: Value = serde_json::from_str(&fs::read_to_string(file).unwrap()).unwrap();
+    let (_, schema) = checkout.run(&["schema", "model-collection"]);
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    assert!(validator.is_valid(&file));
+    let mut bad = file.clone();
+    bad["flows"][0]["steps"][0]["colour"] = "red".into();
+    assert!(!validator.is_valid(&bad));
+    let files = checkout.ok(&["read"])["revision"]["files"].clone();
+    assert!(
+        files
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["path"] == format!("collections/{}.collection.json", local(orders)))
+    );
+}
+
+#[test]
+fn a_step_moves_across_a_decisions_branches() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let ids = add_checkout(&checkout);
+    let (yes, decline) = (&ids[4], &ids[7]);
+    let out = checkout.edited(json!([
+        {"type": "move-step", "subject": decline, "flow": "Checkout", "parent": yes, "position": 0},
+    ]));
+    assert_eq!(
+        out["subjects"]["changed"],
+        json!(sorted(&[&ids[0], &ids[1]]))
+    );
+    let read = checkout.ok(&["read", "--flow", &ids[1]]);
+    let branches = &read["flow"]["steps"][1]["branches"];
+    let moved: Vec<&Value> = branches[0]["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| &s["id"])
+        .collect();
+    assert_eq!(moved, [decline, &ids[5]]);
+    assert_eq!(branches[1]["steps"], json!([]));
+}
+
+#[test]
+fn removing_a_module_a_step_references_refuses() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let ids = add_checkout(&checkout);
+    let error = checkout.edit_refused(
+        &checkout.request(json!([{"type": "remove-module", "subject": "Bank"}])),
+        "REFERENCED_BY_FLOW",
+    );
+    assert_eq!(error["details"]["steps"], json!([ids[5]]));
+    checkout.edited(json!([
+        {"type": "remove-step", "subject": ids[5]},
+        {"type": "remove-module", "subject": "Bank"},
+    ]));
+}
+
+#[test]
+fn a_flow_claim_blocks_another_writers_step_edit() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let ids = add_checkout(&checkout);
+    let (orders, flow) = (&ids[0], &ids[1]);
+    let claim = checkout.claim("alice", json!([flow]));
+    assert_eq!(claim["subjects"], json!([flow]));
+    let rename = json!([{"type": "edit-step", "subject": ids[2], "set": {"label": "order"}}]);
+    let error = checkout.edit_refused(
+        &checkout.request_by("bob", None, rename.clone()),
+        "CLAIM_CONFLICT",
+    );
+    assert_eq!(error["details"]["conflicts"][0]["subjects"], json!([flow]));
+    // Holding a flow conflicts with holding its collection.
+    checkout.claim_refused("bob", json!([orders]), "CLAIM_CONFLICT");
+    let (code, out) = checkout.edit(&checkout.request_by("alice", Some(&claim), rename));
+    assert_eq!(code, 0, "{out:#}");
+    let read = checkout.ok(&["read", "--flow", flow]);
+    assert_eq!(read["claims"][0]["id"], claim["id"]);
+
+    // Adding a collection needs the root level, which the model ID holds.
+    let add = json!([{"type": "add-collection", "collection": {"name": "Returns", "order": 1}}]);
+    let error = checkout.edit_refused(
+        &checkout.request_by("alice", Some(&claim), add),
+        "CLAIM_INCOMPLETE",
+    );
+    assert_eq!(error["details"]["missing"], json!([model]));
+}
+
+#[test]
+fn check_reports_flows_without_a_summary_and_undrawn_messages() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    bind(&checkout, "Platfrm1", "shop");
+    checkout.edited(json!([
+        {"type": "add-collection", "collection": {"name": "Orders", "order": 0}},
+        {"type": "add-flow", "collection": "Orders", "flow": {"name": "Refund", "order": 0, "steps": [
+            {"kind": "message", "from": "Web", "to": "Bank", "label": "refund"},
+        ]}},
+    ]));
+    let out = checkout.ok(&["check", "--only", "semantic"]);
+    assert_eq!(out["passed"], true);
+    assert_eq!(out["counts"], json!({"warning": 0, "information": 2}));
+    let codes: Vec<&Value> = out["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| &d["code"])
+        .collect();
+    assert_eq!(codes, ["FLOW_SUMMARY_MISSING", "MESSAGE_UNDRAWN"]);
+    assert_eq!(out["diagnostics"][0]["message"], "Refund has no summary");
+    assert_eq!(
+        out["diagnostics"][1]["subjects"][1],
+        format!("{model}#WebApp01")
+    );
+}
+
+#[test]
+fn taking_a_claimed_collections_or_flows_name_conflicts() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let ids = add_checkout(&checkout);
+    checkout.claim("alice", json!([ids[0]]));
+    let error = checkout.edit_refused(
+        &checkout.request_by(
+            "bob",
+            None,
+            json!([{"type": "add-collection", "collection": {"name": "Orders", "order": 1}}]),
+        ),
+        "CLAIM_CONFLICT",
+    );
+    assert_eq!(
+        error["details"]["conflicts"][0]["subjects"],
+        json!([ids[0]])
+    );
+    let error = checkout.edit_refused(
+        &checkout.request_by(
+            "bob",
+            None,
+            json!([
+                {"type": "add-collection", "collection": {"name": "Returns", "order": 1}},
+                {"type": "add-flow", "collection": "Returns", "flow": {"name": "Checkout", "order": 0}},
+            ]),
+        ),
+        "CLAIM_CONFLICT",
+    );
+    assert_eq!(
+        error["details"]["conflicts"][0]["subjects"],
+        json!([ids[1]])
+    );
 }

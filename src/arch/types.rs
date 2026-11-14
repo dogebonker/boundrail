@@ -1,6 +1,7 @@
 //! The vault's file formats. The same serde types produce the JSON Schemas `model schema` prints.
 
 use std::collections::BTreeMap;
+use std::iter;
 
 use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
@@ -179,6 +180,220 @@ pub struct Anchor {
     pub symbol: String,
 }
 
+/// The longest flow summary.
+pub const SUMMARY_MAX: usize = 200;
+/// How many decisions and loops may nest inside each other.
+pub const NESTING_MAX: usize = 4;
+/// The most steps one flow holds, decisions and loops included.
+pub const FLOW_STEPS_MAX: usize = 500;
+/// The least `repeat` of a message: once is the default.
+pub const REPEAT_MIN: u32 = 2;
+/// The fewest branches a decision has.
+pub const BRANCHES_MIN: usize = 2;
+
+/// `collections/<id>.collection.json`: a named group of flows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Collection {
+    #[schemars(range(min = 1, max = 1))]
+    pub schema_version: u32,
+    #[schemars(pattern(LOCAL_ID))]
+    pub id: String,
+    pub name: String,
+    pub order: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = DESCRIPTION_MAX))]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub flows: Vec<Flow>,
+}
+
+/// An authored exchange between modules: steps in order that read as a sequence diagram.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Flow {
+    #[schemars(pattern(LOCAL_ID))]
+    pub id: String,
+    pub name: String,
+    pub order: u32,
+    /// One line saying what the flow does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = SUMMARY_MAX))]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = DESCRIPTION_MAX))]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub steps: Vec<Step>,
+}
+
+/// One step of a flow. Decisions and loops hold steps of their own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Step {
+    /// One module sends a message to another.
+    Message {
+        #[schemars(pattern(LOCAL_ID))]
+        id: String,
+        /// Qualified ID of the sending module.
+        #[schemars(pattern(QUALIFIED_ID))]
+        from: String,
+        /// Qualified ID of the receiving module.
+        #[schemars(pattern(QUALIFIED_ID))]
+        to: String,
+        #[schemars(length(min = 1, max = LABEL_MAX))]
+        label: String,
+        /// Qualified ID of the relationship that carries the message: from `from` to `to`, or
+        /// from `to` to `from` for a reply.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(pattern(QUALIFIED_ID))]
+        relationship: Option<String>,
+        /// The message answers an earlier one.
+        #[serde(default, skip_serializing_if = "is_false")]
+        reply: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        emphasis: Option<Emphasis>,
+        /// The exchange happens this many times.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(range(min = REPEAT_MIN))]
+        repeat: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(length(max = DESCRIPTION_MAX))]
+        note: Option<String>,
+    },
+    /// The flow takes one of two or more branches.
+    Decision {
+        #[schemars(pattern(LOCAL_ID))]
+        id: String,
+        #[schemars(length(min = 1, max = LABEL_MAX))]
+        label: String,
+        #[schemars(length(min = BRANCHES_MIN))]
+        branches: Vec<Branch>,
+    },
+    /// The steps inside repeat.
+    Loop {
+        #[schemars(pattern(LOCAL_ID))]
+        id: String,
+        #[schemars(length(min = 1, max = LABEL_MAX))]
+        label: String,
+        #[serde(default)]
+        steps: Vec<Step>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Branch {
+    #[schemars(pattern(LOCAL_ID))]
+    pub id: String,
+    #[schemars(length(min = 1, max = LABEL_MAX))]
+    pub label: String,
+    #[serde(default)]
+    pub steps: Vec<Step>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
+impl Step {
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Message { id, .. } | Self::Decision { id, .. } | Self::Loop { id, .. } => id,
+        }
+    }
+
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Message { label, .. }
+            | Self::Decision { label, .. }
+            | Self::Loop { label, .. } => label,
+        }
+    }
+
+    /// The step lists directly inside this step, each with the ID that names it as a parent: a
+    /// loop's own list by the loop's ID, a decision's branches by their IDs.
+    pub fn lists(&self) -> impl DoubleEndedIterator<Item = (&str, &[Step])> {
+        let (branches, own): (&[Branch], _) = match self {
+            Self::Message { .. } => (&[], None),
+            Self::Decision { branches, .. } => (branches, None),
+            Self::Loop { id, steps, .. } => (&[], Some((id.as_str(), steps.as_slice()))),
+        };
+        branches
+            .iter()
+            .map(|b| (b.id.as_str(), b.steps.as_slice()))
+            .chain(own)
+    }
+
+    /// [`Step::lists`], mutable.
+    pub fn lists_mut(&mut self) -> impl Iterator<Item = (&str, &mut Vec<Step>)> {
+        let (branches, own): (&mut [Branch], _) = match self {
+            Self::Message { .. } => (&mut [], None),
+            Self::Decision { branches, .. } => (branches, None),
+            Self::Loop { id, steps, .. } => (&mut [], Some((id.as_str(), steps))),
+        };
+        branches
+            .iter_mut()
+            .map(|Branch { id, steps, .. }| (id.as_str(), steps))
+            .chain(own)
+    }
+
+    /// Whether `id` names this step or a step, branch or loop inside it.
+    pub fn holds(&self, id: &str) -> bool {
+        self.id() == id
+            || self
+                .lists()
+                .any(|(list, steps)| list == id || steps.iter().any(|s| s.holds(id)))
+    }
+}
+
+/// The first step at any depth of `steps`, in reading order, that `wanted` accepts.
+pub fn find_step<'a>(steps: &'a [Step], wanted: &impl Fn(&Step) -> bool) -> Option<&'a Step> {
+    steps.iter().find_map(|step| {
+        if wanted(step) {
+            return Some(step);
+        }
+        step.lists().find_map(|(_, list)| find_step(list, wanted))
+    })
+}
+
+/// Every step of `steps` at any depth in reading order, each with the number of decisions and
+/// loops around it.
+pub fn walk(steps: &[Step]) -> Vec<(&Step, usize)> {
+    let mut out = Vec::new();
+    let mut stack: Vec<(&Step, usize)> = steps.iter().rev().map(|s| (s, 0)).collect();
+    while let Some((step, depth)) = stack.pop() {
+        out.push((step, depth));
+        for (_, list) in step.lists().rev() {
+            stack.extend(list.iter().rev().map(|s| (s, depth + 1)));
+        }
+    }
+    out
+}
+
+impl Flow {
+    /// The flow's ID and those of its steps and branches.
+    pub fn ids(&self) -> Vec<&str> {
+        let mut ids = vec![self.id.as_str()];
+        for (step, _) in walk(&self.steps) {
+            ids.push(step.id());
+            if let Step::Decision { branches, .. } = step {
+                ids.extend(branches.iter().map(|b| b.id.as_str()));
+            }
+        }
+        ids
+    }
+}
+
+impl Collection {
+    /// The collection's ID and those of its flows, steps and branches.
+    pub fn ids(&self) -> Vec<&str> {
+        iter::once(self.id.as_str())
+            .chain(self.flows.iter().flat_map(Flow::ids))
+            .collect()
+    }
+}
+
 impl Default for VaultConfig {
     fn default() -> Self {
         use Evidence::{BuildDependency, Call, ConfiguredPath, Import};
@@ -246,8 +461,9 @@ impl Default for VaultConfig {
 pub type SchemaFn = fn() -> Schema;
 
 /// Every vault file format and request, by its `model schema` name.
-pub const SCHEMAS: [(&str, SchemaFn); 6] = [
+pub const SCHEMAS: [(&str, SchemaFn); 7] = [
     ("model-claim", root::<super::claims::ClaimRequest>),
+    ("model-collection", root::<Collection>),
     ("model-edit", root::<super::edit::EditRequest>),
     ("model-manifest", root::<Manifest>),
     ("model-release", root::<super::claims::ReleaseRequest>),

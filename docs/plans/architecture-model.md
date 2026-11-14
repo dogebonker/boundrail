@@ -36,7 +36,7 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 | T3 | Claims: `model claim`, `model release`, `model claims`; an edit inside another writer's claim refuses, an edit with a claim must be covered by it | done |
 | T4 | Semantic check: container binding, parts outside container, unconnected roots, shared bindings, repeated relationships, relationships on containers, lines to own part, `model check` | done |
 | T5 | Code check: binding and anchor paths and symbols, relationships undrawn / unsupported / backwards from the scanned graph, module interface exposure | done |
-| T6 | Flows: collections, flows, message/decision/loop steps, step moves, `model read --flow`, flow summary check (`FLOW_SUMMARY_MISSING`) | open |
+| T6 | Flows: collections of flows in `collections/<id>.collection.json`, message/decision/loop steps, collection/flow/step/branch edits with flow and step moves, `REFERENCED_BY_FLOW`, collection and flow claims, `model read --flow`, `FLOW_SUMMARY_MISSING` and `MESSAGE_UNDRAWN` in the semantic check | done |
 | T7 | Checkpoints: history branch, `model retain`, `model checkpoints`, `model read --checkpoint` | open |
 | T8 | Proposals: create/edit drafts against a predecessor, `model compare`, adopt, shelve, planning models without a current state | open |
 | T9 | Render: SVG architecture view with automatic layout, sequence and flowchart views of a flow, comparison marks | open |
@@ -67,3 +67,14 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   scan cannot fully index (CommonJS exports, destructured exports, syntax errors) skips a missing
   symbol as `symbols-incomplete`. Elixir files whose definitions `use` macros generate are not
   marked yet, so a symbol such a macro defines reports missing.
+- T6: a flow's place in its collection is its `order`, as for modules; a step's place is its index
+  in its list, since a sequence has no other order. Collections and flows resolve by ID or unique
+  name, so one batch can add a collection and its flows; steps, branches and loops resolve by ID
+  only, and `add-flow`, `add-step` and `add-branch` take nested steps so a whole tree lands in one
+  change. `model read <subject>` and claims resolve collection and flow IDs, not names, before
+  module names. `model read --flow` prints every flow, step and branch ID qualified.
+- T6: a claim on a flow covers its steps; a claim on a collection covers its flows. A step's
+  module references need no claim. Adding or renaming a collection or flow touches every one that
+  already has the name, as for modules. `REFERENCED_BY_FLOW` refuses only references the batch
+  broke by removing a module or removing or moving a relationship, in steps the batch did not
+  edit; an edited step whose reference does not hold is `MODEL_INVALID`.

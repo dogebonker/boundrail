@@ -1,8 +1,9 @@
 //! Claims: machine-local reservations that keep the agents and people editing one checkout out of
 //! each other's way. A claim names its writer and the subjects it holds: qualified module and
-//! relationship IDs, and the model ID, which holds the root level (adding, removing or moving a
-//! root module). A module claim also holds everything inside the module: its parts, their parts,
-//! and the relationships they own.
+//! relationship IDs, qualified collection and flow IDs, and the model ID, which holds the root
+//! level (adding, removing or moving a root module, adding or removing a collection). A module
+//! claim also holds everything inside the module: its parts, their parts, and the relationships
+//! they own. A collection claim holds its flows, and a flow claim holds its steps.
 //!
 //! Claims are cooperative coordination, not authorization: writers name themselves, and anyone
 //! may revoke a claim. They live in `<git dir>/boundrail/claims.json`, so they are never committed
@@ -67,8 +68,8 @@ pub struct ClaimRequest {
     #[schemars(length(min = 1, max = REASON_MAX))]
     pub reason: String,
     /// The model ID, which holds the root level; module IDs or unique current or former names,
-    /// each holding the module and everything inside it; and relationship IDs. IDs may be
-    /// qualified or local.
+    /// each holding the module and everything inside it; relationship IDs; and collection and
+    /// flow IDs, each holding what is inside it. IDs may be qualified or local.
     #[schemars(length(min = 1, max = SUBJECTS_MAX))]
     pub subjects: Vec<String>,
     /// Repeating an operation ID with the same request returns the claim it recorded.
@@ -376,7 +377,8 @@ pub(super) fn check_edit(
     Ok(())
 }
 
-/// The stored form of `subject`: the model ID, or a qualified module or relationship ID.
+/// The stored form of `subject`: the model ID, or a qualified module, relationship, collection or
+/// flow ID. Collection and flow IDs resolve before module names, as in `model read`.
 /// Modules resolve first, as in an edit, so a name never shadows a relationship ID by accident.
 fn resolve(
     model: &Model,
@@ -387,16 +389,21 @@ fn resolve(
     if subject == id {
         return Ok(subject.to_owned());
     }
+    let local = ids::local(id, subject);
+    if model.find_grouping(local).is_some() {
+        return Ok(model.qualify(local));
+    }
     match vault::find(id, &model.modules, subject) {
         Ok(module) => Ok(model.qualify(&module.id)),
         Err(refusal) if refusal.code == Code::SubjectNotFound => {
-            let local = ids::local(id, subject);
             if relationships.contains_key(local) {
                 return Ok(model.qualify(local));
             }
             Err(Refusal::new(
                 Code::SubjectNotFound,
-                format!("no model, module or relationship has the ID or name `{subject}`"),
+                format!(
+                    "no model, module, relationship, collection or flow has the ID or name `{subject}`"
+                ),
             )
             .into())
         }
@@ -404,8 +411,8 @@ fn resolve(
     }
 }
 
-/// The container of each module and relationship, by qualified ID: a module's parent, a
-/// relationship's owning module.
+/// The container of each module, relationship and flow, by qualified ID: a module's parent, a
+/// relationship's owning module, a flow's collection.
 fn containers(model: &Model) -> BTreeMap<String, String> {
     let parents = model
         .modules
@@ -414,7 +421,12 @@ fn containers(model: &Model) -> BTreeMap<String, String> {
     let owners = vault::relationships(&model.modules)
         .into_iter()
         .map(|(id, (owner, _))| (model.qualify(id), model.qualify(owner)));
-    parents.chain(owners).collect()
+    let collections = model.collections.iter().flat_map(|c| {
+        c.flows
+            .iter()
+            .map(|f| (model.qualify(&f.id), model.qualify(&c.id)))
+    });
+    parents.chain(owners).chain(collections).collect()
 }
 
 /// Whether holding `held` holds `subject`: it is the subject or one of its containers.
