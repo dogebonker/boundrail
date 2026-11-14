@@ -130,10 +130,22 @@ impl<'s> Chart<'_, 's> {
             let (entry, exit) = match step {
                 Step::Message {
                     id,
+                    from,
+                    to,
                     reply,
                     emphasis,
                     ..
-                } => self.message(id, *reply, *emphasis, (cx, y)),
+                } => {
+                    let dim = self.ctx.dims_message(from, to);
+                    if dim {
+                        self.svg.dimmed();
+                    }
+                    let ends = self.message(id, *reply, *emphasis, (cx, y));
+                    if dim {
+                        self.svg.close_group();
+                    }
+                    ends
+                }
                 Step::Decision {
                     id,
                     label,

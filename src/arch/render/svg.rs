@@ -17,6 +17,8 @@ const DESCENT: f64 = 4.0;
 /// The arrowhead's length and half its width.
 const HEAD_LENGTH: f64 = 9.0;
 const HEAD_HALF: f64 = 4.5;
+/// How strongly what a focus leaves out still shows.
+const DIMMED_OPACITY: f64 = 0.3;
 
 pub(super) type Point = (f64, f64);
 
@@ -132,6 +134,15 @@ impl Svg {
         if let Some(id) = id {
             self.attr("data-id", id);
         }
+        self.body.push_str(">\n");
+    }
+
+    /// Opens a group that fades what it holds, for what a focus leaves out; close it with
+    /// [`Svg::close_group`].
+    pub(super) fn dimmed(&mut self) {
+        self.body.push_str("<g");
+        self.attr("class", "dimmed");
+        self.num("opacity", DIMMED_OPACITY);
         self.body.push_str(">\n");
     }
 

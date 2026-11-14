@@ -45,7 +45,7 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 | T11 | Live browser view: model canvas, drill-down, focus and filters, detail panel, warnings, comparison, history, split panes | done |
 | T12 | Infrastructure evidence: docker-compose, Kubernetes, Terraform bindings and configured-address hops between modules | done |
 | T13 | Language-server evidence: call-level references through configured language servers | done |
-| T14 | Walkthroughs: ordered beats over readings, playback in the browser | open |
+| T14 | Walkthroughs: ordered beats over readings, playback in the browser | done |
 | T15 | Embedded pictures: render recipes in SVG/PNG, `check embeds`, PNG rasterize | open |
 | T16 | Agent integration: `init`, skills for authoring/planning/PRs, CI action with PR annotations and footprint comment | open |
 | T17 | Reconcile drafts after current changes, export/import bundles, history publication | open |
@@ -557,3 +557,57 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   script from `$BOUNDRAIL_FAKE_LSP_SCRIPT`. It asks the client for its configuration first, as
   real servers do. A Unix test starts it through `/usr/bin/env` with a planted program of its name
   on a relative `PATH` entry, which never runs.
+- T14: a walkthrough is `walkthroughs/<id>.walkthrough.json` (schema `model-walkthrough`):
+  `{schema_version, id, name, order, description?, beats}`, each beat `{id, title, narration,
+  reading}` and each reading `{view, state?, against?, scope?, depth?, flow?, focus?}`. A state is
+  `current` (the default, left out of the file), `{"proposal": <qualified ID>}` or
+  `{"checkpoint": <ID>}`; module and flow references are qualified. Walkthroughs belong to the
+  current state: its revision, `file_digests`, the journal's write allow-list, checkpoints and
+  committed reads cover them, and proposal loads never read a `walkthroughs` folder; a proposal
+  edit with a walkthrough change refuses `REQUEST_INVALID`. Walkthrough and beat IDs come from the
+  model-wide allocator and are retired on removal. Limits: 200 beats (`BEATS_MAX`), a title of 60
+  characters on one line, a narration of 1 to 2000 characters with line breaks
+  (`NARRATION_MAX`), depth 1 to 9 (`READING_DEPTH_MAX`).
+- T14: validation. A reading keeps the `model render` rules: sequence and flowchart need a flow,
+  the architecture view takes none, scope and depth are for the architecture view, `against` is
+  the current state or a proposal, never the drawn state and never newer than it (`state` is
+  always the state drawn), and focus lists a module once.
+  Reading the current state, scope, focus and flow must exist; reading a proposal or checkpoint,
+  they and the proposal must only be qualified IDs of this model (a checkpoint 8 base62
+  characters), since those states change on their own. Adoption checks the adopted state with the
+  current walkthroughs, so a beat reading a module or flow the proposal drops refuses
+  `MODEL_INVALID` until it is edited. A proposal's predecessor digest leaves out the
+  `walkthroughs/` files, so editing a walkthrough does not move it; `expected_revision` still
+  names the full revision.
+- T14: edits. `add-walkthrough` (with beats), `edit-walkthrough` (set name, order, description;
+  clear description), `remove-walkthrough`, `add-beat` (walkthrough, position), `edit-beat` (set
+  title, narration and any reading field; clear state, against, scope, depth, flow, focus),
+  `remove-beat`, and `move-beat` (to a position of the same or another walkthrough). A
+  walkthrough resolves by ID or unique name, a beat by ID. Current-state references resolve like
+  step references (module names, flow names); others are qualified as given. `edit-beat`
+  resolves only the fields it sets, so a stored reference the batch broke is judged by
+  validation. Focus is deduplicated in order. Walkthroughs have no former names. Removing a
+  module or flow (or the collection holding it) that a current-state beat the batch did not edit
+  reads refuses `REFERENCED_BY_WALKTHROUGH` with the beats in `details.beats`, after
+  `REFERENCED_BY_FLOW`; an edited beat is `MODEL_INVALID` instead. The receipt lists walkthroughs
+  as subjects, not beats. A claim on a walkthrough covers its beats; adding or removing one
+  touches the model ID, and moving a beat touches both walkthroughs.
+- T14: `model check` adds `WALKTHROUGH_EMPTY` (information) and `WALKTHROUGH_TARGET_MISSING`
+  (warning) for a beat whose proposal or checkpoint does not load, or whose scope, focus or flow
+  the state it draws lacks; each such state loads once per check, through `load_proposal` and
+  `checkpoint::load`, and only when a beat names it. `model read --walkthrough` (or `model read
+  <walkthrough ID>`) prints it with qualified IDs, or as a script in Markdown: numbered beats with
+  the narration indented and a `Shows:` line; `model read` lists walkthroughs with their beat
+  counts. `model render --walkthrough W --beat N|ID` draws the beat's reading through the same
+  path as the flags, which it refuses beside it (`REQUEST_INVALID`); a beat number counts from 1.
+  A focus highlights the focused modules and everything inside them, keeps the containers around
+  them, and wraps the rest in `<g class="dimmed" opacity="0.3">`; an arrow or message stays when
+  either end is focused. A focus the architecture drawing does not show dims nothing.
+- T14: the browser lists the current state's walkthroughs in the sidebar. Playing one shows a
+  panel above the canvas with the beat's title and narration, Previous and Next, one marker per
+  beat, and Left and Right arrow keys (which pan the canvas otherwise). Each beat sets the active
+  pane's state, comparison, view, flow, scope and depth, draws through
+  `/api/render?walkthrough=&beat=` so the server applies the focus, and fits the picture. Any
+  change made by hand drops the beat from the pane. `#walkthrough=<id>&beat=<n>` opens a beat
+  and follows the playback; a live update reads the walkthrough again and stays on the same beat
+  number. `/api/walkthrough?id=` is `model read --walkthrough`.

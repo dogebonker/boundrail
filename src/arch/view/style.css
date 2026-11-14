@@ -191,7 +191,7 @@ button.toggle.open::before { transform: rotate(45deg); }
 button.diagnostic:hover { background: var(--accent-soft); }
 .diagnostic code { display: block; font: var(--text-xs) var(--mono); color: var(--muted); }
 
-.stage { display: grid; grid-template-rows: auto minmax(0, 1fr); min-width: 0; min-height: 0; }
+.stage { display: grid; grid-template-rows: auto auto minmax(0, 1fr); min-width: 0; min-height: 0; }
 .toolbar {
   display: flex; align-items: center; gap: 8px;
   padding: 6px 12px;
@@ -199,7 +199,7 @@ button.diagnostic:hover { background: var(--accent-soft); }
   background: var(--panel);
 }
 .field.inline { margin-right: 6px; }
-.panes { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); min-height: 0; }
+.panes { grid-row: 3; display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); min-height: 0; }
 .panes.split { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
 .pane {
   position: relative;
@@ -218,6 +218,49 @@ button.diagnostic:hover { background: var(--accent-soft); }
 .crumbs button { border: 0; background: none; padding: 0 4px; color: var(--accent); }
 .crumbs .here { color: var(--ink); font-weight: 600; }
 .crumbs .caption { margin-left: auto; font-style: italic; }
+/* What a walkthrough's focus leaves out; the SVG's own opacity attribute serves it standalone. */
+svg g.dimmed { opacity: var(--dim); }
+
+/* The play panel reads as a drawing's title block: a ruled box that names the sheet and says
+   what it shows. Its beat markers are survey stakes, one per beat, the current one set. */
+.play {
+  grid-row: 2;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px 28px;
+  align-items: start;
+  padding: 12px 16px 14px;
+  background: var(--sheet);
+  border-bottom: 1px solid var(--rule);
+  box-shadow: inset 0 3px 0 var(--accent);
+}
+.play .where { margin: 0; color: var(--muted); font-size: var(--text-s); }
+.play .beat-title {
+  margin: 2px 0 4px; padding: 0; border: 0;
+  font: 600 var(--text-title)/1.25 var(--serif); color: var(--ink);
+}
+.play .narration {
+  margin: 0; max-width: 72ch; max-height: 9.5em; overflow: auto;
+  font: var(--text-lead)/1.55 var(--serif); white-space: pre-line;
+}
+.play .controls { display: grid; justify-items: end; gap: 8px; }
+.play .steps { display: flex; gap: 6px; }
+.play .next { border-color: var(--accent); }
+.play [aria-disabled="true"] { opacity: 0.6; cursor: default; }
+.play .dots { display: flex; flex-wrap: wrap; justify-content: flex-end; max-width: 280px; }
+.play .dot {
+  display: grid; place-items: center;
+  width: var(--target); height: var(--target); min-height: var(--target);
+  padding: 0; border: 0; background: none;
+}
+.play .dot::before {
+  content: ""; width: 9px; height: 9px;
+  border: 1.5px solid var(--muted); transform: rotate(45deg);
+}
+.play .dot:hover::before { border-color: var(--ink); }
+.play .dot[aria-current="step"]::before { background: var(--accent); border-color: var(--accent); }
+.play .end { border: 0; background: none; padding: 0 2px; color: var(--muted); text-decoration: underline; text-underline-offset: 2px; }
+.play .end:hover { color: var(--ink); }
 .sheet {
   position: relative; overflow: hidden; cursor: grab; touch-action: none;
   background-color: var(--sheet);
@@ -287,4 +330,7 @@ svg g.is-dim { opacity: var(--dim); }
   .stage { order: -1; }
   .sidebar, .detail { overflow: visible; border: 0; border-top: 1px solid var(--rule); }
   .panes.split { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) minmax(0, 1fr); }
+  .play { grid-template-columns: minmax(0, 1fr); max-height: 40vh; overflow-y: auto; }
+  .play .controls { justify-items: start; }
+  .play .dots { justify-content: flex-start; }
 }

@@ -172,7 +172,7 @@ impl Batch<'_> {
     }
 
     /// The positions of the flow `subject` names and of its collection.
-    fn flow_at(&self, index: usize, subject: &str) -> Result<(usize, usize)> {
+    pub(super) fn flow_at(&self, index: usize, subject: &str) -> Result<(usize, usize)> {
         let found = vault::flow_position(self.model, &self.collections, subject);
         Ok(found.map_err(at(index))?)
     }
@@ -217,6 +217,10 @@ impl Batch<'_> {
     pub(super) fn remove_collection(&mut self, index: usize, subject: &str) -> Result<()> {
         let c = self.collection_at(index, subject)?;
         let removed = self.collections.remove(c);
+        // A beat reading one of its flows names the change that removed it.
+        for flow in &removed.flows {
+            self.touched.insert(flow.id.clone(), index);
+        }
         self.touched.insert(removed.id, index);
         Ok(())
     }
@@ -398,7 +402,7 @@ impl Batch<'_> {
         })
     }
 
-    fn module_id(&self, index: usize, subject: &str) -> Result<String> {
+    pub(super) fn module_id(&self, index: usize, subject: &str) -> Result<String> {
         self.module(index, subject).map(|at| self.qualify(at))
     }
 
@@ -596,7 +600,12 @@ fn apply_set(step: &mut Step, set: StepSet, clear: &[StepField]) {
 }
 
 /// Inserts `item` at `position` of `list`, at its end when absent.
-fn insert<T>(index: usize, list: &mut Vec<T>, position: Option<usize>, item: T) -> Result<()> {
+pub(super) fn insert<T>(
+    index: usize,
+    list: &mut Vec<T>,
+    position: Option<usize>,
+    item: T,
+) -> Result<()> {
     let at = position.unwrap_or(list.len());
     if at > list.len() {
         let message = format!("position {at} is past the end of a list of {}", list.len());
@@ -817,6 +826,7 @@ mod tests {
                 module("OpsSvc01", "Ops", json!([])),
             ],
             collections,
+            walkthroughs: Vec::new(),
             revision: revision::of(std::iter::empty()),
             proposal: None,
         }

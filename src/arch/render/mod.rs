@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use super::compare::{self, Changes, Comparison, Entry};
+use super::index::Index;
 use super::types::{Dash, EXTERNAL_KIND, Emphasis, Flow, Module, Step, VaultConfig, walk};
 use super::vault::{self, Model};
 use super::{Code, Refusal, ids};
@@ -134,14 +135,41 @@ impl Mark {
     }
 }
 
-/// What one render draws with: the vocabulary, module names, comparison marks and the title.
+/// What one render draws with: the vocabulary, module names, comparison marks, the focus and the
+/// title.
 struct Context<'a> {
     model: &'a str,
     config: &'a VaultConfig,
     names: BTreeMap<String, &'a str>,
     /// `None` when nothing is compared; marks by qualified ID otherwise.
     marks: Option<BTreeMap<String, Mark>>,
+    /// `None` when nothing is focused.
+    focus: Option<Focus>,
     title: String,
+}
+
+/// The modules a focus highlights, by qualified ID: the focused ones and everything inside them.
+/// The containers around them are context and stay undimmed; everything else is dimmed.
+struct Focus {
+    lit: BTreeSet<String>,
+    around: BTreeSet<String>,
+}
+
+impl Focus {
+    /// The focus on the modules `focus` among `modules`, `None` for an empty list.
+    fn new(model: &str, modules: &[Module], focus: &[String]) -> Option<Self> {
+        if focus.is_empty() {
+            return None;
+        }
+        let index = Index::new(model, modules);
+        let (mut lit, mut around) = (BTreeSet::new(), BTreeSet::new());
+        for id in focus {
+            lit.insert(id.clone());
+            lit.extend(index.descendants(id).into_iter().map(|(d, _)| d.to_owned()));
+            around.extend(index.chain(id).into_iter().skip(1).map(str::to_owned));
+        }
+        Some(Self { lit, around })
+    }
 }
 
 impl Context<'_> {
@@ -156,6 +184,16 @@ impl Context<'_> {
     /// The mark of the element with qualified ID `id`.
     fn mark(&self, id: &str) -> Option<Mark> {
         self.marks.as_ref()?.get(id).copied()
+    }
+
+    /// Whether the module `id` is drawn dimmed: a focus neither holds it nor lies inside it.
+    fn dims(&self, id: &str) -> bool {
+        (self.focus.as_ref()).is_some_and(|f| !f.lit.contains(id) && !f.around.contains(id))
+    }
+
+    /// Whether a message between `from` and `to` is drawn dimmed: a focus holds neither end.
+    fn dims_message(&self, from: &str, to: &str) -> bool {
+        (self.focus.as_ref()).is_some_and(|f| !f.lit.contains(from) && !f.lit.contains(to))
     }
 
     fn kind_name<'s>(&'s self, kind: &'s str) -> &'s str {
@@ -305,11 +343,14 @@ fn class(base: &str, mark: Option<Mark>) -> Cow<'_, str> {
 }
 
 /// Draws `view` of the state `drawn`. With `base`, marks what `drawn` adds, removes and changes
-/// against it; removed modules, relationships and steps are drawn too, faded and struck.
+/// against it; removed modules, relationships and steps are drawn too, faded and struck. With a
+/// `focus` of qualified module IDs, those modules and what touches them are drawn as usual and
+/// the rest dimmed.
 pub fn render(
     drawn: &Side<'_>,
     base: Option<&Side<'_>>,
     view: &View<'_>,
+    focus: &[String],
 ) -> Result<String, Refusal> {
     let model = drawn.model;
     let id = model.manifest.id.as_str();
@@ -332,6 +373,7 @@ pub fn render(
             .map(|m| (ids::qualify(id, &m.id), m.name.as_str()))
             .collect(),
         marks: comparison.as_ref().map(marks),
+        focus: Focus::new(id, &modules, focus),
         title: title(drawn, base),
     };
     match *view {
@@ -581,6 +623,7 @@ mod tests {
             config: VaultConfig::default(),
             modules,
             collections,
+            walkthroughs: Vec::new(),
             revision: Revision {
                 digest: "x".into(),
                 files: Vec::new(),
@@ -601,7 +644,7 @@ mod tests {
     /// `view` of the current state `model`, compared with nothing.
     pub(super) fn draw(model: &Model, view: &View<'_>) -> Result<String, Refusal> {
         let drawn = Side { model, name: None };
-        render(&drawn, None, view)
+        render(&drawn, None, view, &[])
     }
 
     const WHOLE: View<'static> = View::Architecture {
@@ -703,6 +746,7 @@ mod tests {
             config,
             names: BTreeMap::new(),
             marks: None,
+            focus: None,
             title: String::new(),
         };
         context.fill(kind).to_owned()
@@ -731,6 +775,48 @@ mod tests {
         service.color = Some("url(#x)".into());
         let out = draw(&shop, &WHOLE).unwrap();
         assert!(!out.contains("url(#x)"));
+    }
+
+    #[test]
+    fn a_focus_dims_what_it_leaves_out() {
+        let mut shop = shop();
+        shop.collections = flow(json!([
+            {"kind": "message", "id": "Step0001", "from": q("WebApp01"), "to": q("Billing1"), "label": "pay"},
+            {"kind": "message", "id": "Step0002", "from": q("BankApi1"), "to": q("BankApi1"), "label": "settle"},
+        ]));
+        let drawn = Side {
+            model: &shop,
+            name: None,
+        };
+        let focus = [q("Billing1")];
+        let dimmed = |out: &str, class: &str, id: &str| {
+            out.contains(&format!(
+                "<g class=\"dimmed\" opacity=\"0.3\">\n<g class=\"{class}\" data-id=\"{id}\">"
+            ))
+        };
+        // Web and Bank dim; the arrows into and out of Billing stay, as Platform around it does.
+        let out = render(&drawn, None, &WHOLE, &focus).unwrap();
+        assert_eq!(out.matches("class=\"dimmed\"").count(), 2, "{out}");
+        assert!(dimmed(&out, "module", &q("WebApp01")) && dimmed(&out, "module", &q("BankApi1")));
+        let sequence = render(&drawn, None, &View::Sequence("Checkout"), &focus).unwrap();
+        assert!(dimmed(&sequence, "lifeline", &q("BankApi1")), "{sequence}");
+        assert!(dimmed(&sequence, "message", &q("Step0002")));
+        assert!(!dimmed(&sequence, "message", &q("Step0001")));
+        let flowchart = render(&drawn, None, &View::Flowchart("Checkout"), &focus).unwrap();
+        assert!(
+            dimmed(&flowchart, "step message", &q("Step0002")),
+            "{flowchart}"
+        );
+        assert!(!dimmed(&flowchart, "step message", &q("Step0001")));
+        assert!(!draw(&shop, &WHOLE).unwrap().contains("dimmed"));
+        // A focus the drawing does not show dims nothing.
+        let platform = View::Architecture {
+            scope: Some("Platfrm1"),
+            depth: DEFAULT_DEPTH,
+        };
+        let bank = [q("BankApi1")];
+        let inside = render(&drawn, None, &platform, &bank).unwrap();
+        assert!(!inside.contains("dimmed"), "{inside}");
     }
 
     #[test]

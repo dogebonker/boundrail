@@ -426,6 +426,10 @@ impl Server {
             "/api/inspect" => {
                 model_cli::inspect_output(root, param("subject"), param("proposal"), false)?
             }
+            "/api/walkthrough" => {
+                let id = param("id").ok_or_else(|| invalid("walkthrough needs id"))?;
+                model_cli::walkthrough_output(root, id)?
+            }
             _ => return Ok(None),
         }))
     }
@@ -442,6 +446,8 @@ impl Server {
             })
             .transpose()?;
         let spec = RenderSpec {
+            walkthrough: owned("walkthrough"),
+            beat: owned("beat"),
             proposal: owned("proposal"),
             checkpoint: owned("checkpoint"),
             view,
@@ -450,7 +456,7 @@ impl Server {
             depth,
             against: owned("against"),
         };
-        model_cli::render_svg(&self.root, &spec, None)
+        model_cli::render_svg(&self.root, &spec, None).map(|(svg, _)| svg)
     }
 
     /// Streams `changed` events with the current state's revision (null when it does not load)

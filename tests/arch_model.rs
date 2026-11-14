@@ -701,6 +701,7 @@ fn schemas_describe_the_vault_files() {
             "model-manifest",
             "model-proposal",
             "model-release",
+            "model-walkthrough",
             "module",
             "vault-config"
         ])
@@ -6112,4 +6113,405 @@ fn a_server_never_finds_programs_in_relative_path_folders() {
     assert!(!checkout.path().join("ran").exists(), "{stderr}");
     assert_eq!(code, 0, "{out:#} {stderr}");
     assert_eq!(out["skips"], json!([]));
+}
+
+/// Tour over the shop with Checkout: the architecture with Billing and Web in focus, the parts of
+/// Platform one level deep, and Checkout as a sequence with Bank in focus.
+fn tour_changes() -> Value {
+    json!([{"type": "add-walkthrough", "walkthrough": {"name": "Tour", "order": 0,
+        "description": "How a purchase works", "beats": [
+        {"title": "The shop", "narration": "Web sells.\nBilling charges.",
+         "reading": {"view": "architecture", "focus": ["Billing", "Web", "Billing"]}},
+        {"title": "Inside the platform", "narration": "Two parts.",
+         "reading": {"view": "architecture", "scope": "Platform", "depth": 1}},
+        {"title": "A purchase", "narration": "Step by step.",
+         "reading": {"view": "sequence", "flow": "Checkout", "focus": ["Bank"]}},
+    ]}}])
+}
+
+/// Adds Checkout and Tour: Checkout's IDs, then Tour's and its three beats'.
+fn add_tour(checkout: &Checkout) -> (Vec<String>, Vec<String>) {
+    let flows = add_checkout(checkout);
+    let out = checkout.edited(tour_changes());
+    let allocated = out["allocated"].as_array().unwrap();
+    let tour = allocated
+        .iter()
+        .map(|a| a["id"].as_str().unwrap().to_owned())
+        .collect();
+    (flows, tour)
+}
+
+#[test]
+fn a_walkthrough_with_three_beats_reads_back_as_json_and_a_script() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let q = |id: &str| format!("{model}#{id}");
+    let flows = add_checkout(&checkout);
+    let request = checkout.request(tour_changes());
+    let (_, schema) = checkout.run(&["schema", "model-edit"]);
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    assert!(validator.is_valid(&request));
+    let (code, out) = checkout.edit(&request);
+    assert_eq!(code, 0, "{out:#}");
+    let ids: Vec<&str> = (out["allocated"].as_array().unwrap().iter())
+        .map(|a| a["id"].as_str().unwrap())
+        .collect();
+    let names: Vec<&Value> = (out["allocated"].as_array().unwrap().iter())
+        .map(|a| &a["name"])
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "Tour",
+            "beat The shop",
+            "beat Inside the platform",
+            "beat A purchase"
+        ]
+    );
+    let tour = ids[0];
+    assert_eq!(out["subjects"]["added"], json!([tour]));
+
+    let read = checkout.ok(&["read", "--walkthrough", "Tour"]);
+    assert_eq!(read["kind"], "read-walkthrough");
+    assert_eq!(read["revision"]["digest"], checkout.digest());
+    assert_eq!(
+        read["walkthrough"],
+        json!({"id": tour, "name": "Tour", "order": 0, "description": "How a purchase works", "beats": [
+            {"id": ids[1], "title": "The shop", "narration": "Web sells.\nBilling charges.",
+             "reading": {"view": "architecture", "focus": [q("Billing1"), q("WebApp01")]}},
+            {"id": ids[2], "title": "Inside the platform", "narration": "Two parts.",
+             "reading": {"view": "architecture", "scope": q("Platfrm1"), "depth": 1}},
+            {"id": ids[3], "title": "A purchase", "narration": "Step by step.",
+             "reading": {"view": "sequence", "flow": flows[1], "focus": [q("BankApi1")]}},
+        ]})
+    );
+    assert_eq!(
+        checkout.ok(&["read", local(tour)])["walkthrough"],
+        read["walkthrough"]
+    );
+    let (code, text) = checkout.run_raw(&["read", "--walkthrough", tour, "--format", "markdown"]);
+    assert_eq!(code, 0);
+    assert_eq!(
+        text,
+        format!(
+            "Walkthrough Tour {tour}\n\
+             How a purchase works\n\
+             1. The shop\n   \
+                Web sells.\n   \
+                Billing charges.\n   \
+                Shows: architecture in the current state, focus on Billing, Web\n\
+             2. Inside the platform\n   \
+                Two parts.\n   \
+                Shows: architecture in the current state, parts of Platform, depth 1\n\
+             3. A purchase\n   \
+                Step by step.\n   \
+                Shows: sequence of flow Checkout in the current state, focus on Bank\n"
+        )
+    );
+
+    let listed = json!([{"id": tour, "name": "Tour", "order": 0,
+        "description": "How a purchase works", "beats": 3}]);
+    let whole = checkout.ok(&["read"]);
+    assert_eq!(whole["walkthroughs"], listed);
+    let (_, text) = checkout.run_raw(&["read", "--format", "markdown"]);
+    assert!(
+        text.ends_with(&format!("Walkthroughs:\n- Tour {tour}: 3 beats\n")),
+        "{text}"
+    );
+    let path = format!("walkthroughs/{}.walkthrough.json", local(tour));
+    let files = whole["revision"]["files"].as_array().unwrap();
+    assert!(files.iter().any(|f| f["path"] == path.as_str()));
+    let file: Value =
+        serde_json::from_str(&fs::read_to_string(checkout.vault().join(&path)).unwrap()).unwrap();
+    let (_, schema) = checkout.run(&["schema", "model-walkthrough"]);
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    assert!(validator.is_valid(&file));
+    let mut bad = file.clone();
+    bad["beats"][0]["reading"]["zoom"] = 2.into();
+    assert!(!validator.is_valid(&bad));
+    checkout.refused(&["read", "--walkthrough", "Missing"], "SUBJECT_NOT_FOUND");
+}
+
+#[test]
+fn a_beat_moves_across_walkthroughs() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let (_, tour) = add_tour(&checkout);
+    let out = checkout.edited(json!([
+        {"type": "add-walkthrough", "walkthrough": {"name": "Short", "order": 1}},
+        {"type": "move-beat", "subject": tour[3], "walkthrough": "Short", "position": 0},
+        {"type": "move-beat", "subject": tour[2], "walkthrough": "Tour", "position": 0},
+    ]));
+    let short = out["allocated"][0]["id"].as_str().unwrap();
+    assert_eq!(out["subjects"]["added"], json!([short]));
+    assert_eq!(out["subjects"]["changed"], json!([tour[0]]));
+    let beats = |subject: &str| -> Vec<String> {
+        let read = checkout.ok(&["read", "--walkthrough", subject]);
+        (read["walkthrough"]["beats"].as_array().unwrap().iter())
+            .map(|b| b["id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(beats("Tour"), [tour[2].clone(), tour[1].clone()]);
+    assert_eq!(beats(short), [tour[3].clone()]);
+    let read = checkout.ok(&["read", "--walkthrough", short]);
+    assert_eq!(read["walkthrough"]["beats"][0]["title"], "A purchase");
+}
+
+#[test]
+fn removing_a_module_a_beat_reads_refuses() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let out = checkout.edited(
+        json!([{"type": "add-walkthrough", "walkthrough": {"name": "Tour", "order": 0,
+        "beats": [{"title": "The bank", "narration": "Outside us.",
+                   "reading": {"view": "architecture", "focus": ["Bank"]}}]}}]),
+    );
+    let beat = out["allocated"][1]["id"].as_str().unwrap();
+    let error = checkout.edit_refused(
+        &checkout.request(json!([{"type": "remove-module", "subject": "Bank"}])),
+        "REFERENCED_BY_WALKTHROUGH",
+    );
+    assert_eq!(error["details"]["beats"], json!([beat]));
+    assert_eq!(error["details"]["change"], 0);
+    checkout.edited(json!([
+        {"type": "edit-beat", "subject": beat, "clear": ["focus"]},
+        {"type": "remove-module", "subject": "Bank"},
+    ]));
+
+    // Proposals hold no walkthroughs.
+    let id = propose(&checkout, "Next", "current");
+    let request = proposal_request(
+        &checkout,
+        &id,
+        "tester",
+        json!([{"type": "add-walkthrough", "walkthrough": {"name": "Plan", "order": 0}}]),
+    );
+    let (code, out) = edit_proposal(&checkout, &id, &request);
+    assert_eq!(code, 2, "{out:#}");
+    assert_eq!(out["error"]["code"], "REQUEST_INVALID");
+}
+
+#[test]
+fn rendering_a_beat_with_focus_dims_the_other_modules() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let q = |id: &str| format!("{model}#{id}");
+    let (_, tour) = add_tour(&checkout);
+    let dimmed = |svg: &str, class: &str, id: &str| {
+        svg.contains(&format!(
+            "<g class=\"dimmed\" opacity=\"0.3\">\n<g class=\"{class}\" data-id=\"{id}\">"
+        ))
+    };
+    let first = checkout.render(&["--walkthrough", "Tour", "--beat", "1"]);
+    assert!(dimmed(&first, "module", &q("BankApi1")), "{first}");
+    assert!(!dimmed(&first, "module", &q("Billing1")));
+    assert!(!dimmed(&first, "module", &q("WebApp01")));
+    assert!(!dimmed(&first, "module", &q("Platfrm1")));
+    assert_eq!(
+        first,
+        checkout.render(&["--walkthrough", &tour[0], "--beat", &tour[1]])
+    );
+    let third = checkout.render(&["--walkthrough", "Tour", "--beat", "3"]);
+    assert!(dimmed(&third, "lifeline", &q("WebApp01")), "{third}");
+    assert!(!dimmed(&third, "lifeline", &q("BankApi1")));
+    let second = checkout.render(&["--walkthrough", "Tour", "--beat", "2"]);
+    assert!(!second.contains("dimmed"));
+    assert!(second.contains("parts of Platform"), "{second}");
+
+    let out = checkout.ok(&[
+        "render",
+        "--walkthrough",
+        "Tour",
+        "--beat",
+        "3",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(out["view"], "sequence");
+    checkout.refused(
+        &["render", "--walkthrough", "Tour", "--beat", "4"],
+        "SUBJECT_NOT_FOUND",
+    );
+    checkout.refused(&["render", "--walkthrough", "Tour"], "REQUEST_INVALID");
+    checkout.refused(
+        &[
+            "render",
+            "--walkthrough",
+            "Tour",
+            "--beat",
+            "1",
+            "--view",
+            "sequence",
+        ],
+        "REQUEST_INVALID",
+    );
+}
+
+#[test]
+fn check_warns_about_beats_whose_target_state_is_missing() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let proposal = propose(&checkout, "Next", "current");
+    let out = checkout.edited(json!([
+        {"type": "add-walkthrough", "walkthrough": {"name": "Plans", "order": 0, "beats": [
+            {"title": "Next", "narration": "The plan.",
+             "reading": {"view": "architecture", "state": {"proposal": proposal}, "scope": "Platfrm1",
+                         "focus": ["BankApi1"]}},
+            {"title": "Then", "narration": "How it was.",
+             "reading": {"view": "architecture", "state": {"checkpoint": "Check001"}}},
+        ]}},
+        {"type": "add-walkthrough", "walkthrough": {"name": "Empty", "order": 1}},
+    ]));
+    let ids: Vec<&str> = (out["allocated"].as_array().unwrap().iter())
+        .map(|a| a["id"].as_str().unwrap())
+        .collect();
+    let found = |checkout: &Checkout| -> Vec<(String, Value, String)> {
+        let (code, out) = checkout.run(&["check", "--only", "semantic"]);
+        assert_eq!(code, 1, "{out:#}");
+        (out["diagnostics"].as_array().unwrap().iter())
+            .filter(|d| d["code"].as_str().unwrap().starts_with("WALKTHROUGH_"))
+            .map(|d| {
+                let message = d["message"].as_str().unwrap().to_owned();
+                (
+                    d["code"].as_str().unwrap().to_owned(),
+                    d["subjects"].clone(),
+                    message,
+                )
+            })
+            .collect()
+    };
+    let first = found(&checkout);
+    assert_eq!(first.len(), 2, "{first:#?}");
+    assert_eq!(first[0].0, "WALKTHROUGH_TARGET_MISSING");
+    assert_eq!(first[0].1, json!([ids[0], ids[2]]));
+    assert!(
+        first[0]
+            .2
+            .starts_with("Plans, beat 2 (Then): checkpoint Check001 does not load"),
+        "{}",
+        first[0].2
+    );
+    assert_eq!(
+        (first[1].0.as_str(), &first[1].1, first[1].2.as_str()),
+        ("WALKTHROUGH_EMPTY", &json!([ids[3]]), "Empty has no beats")
+    );
+    // A beat drawing the proposal focuses on modules the proposal holds.
+    edited_proposal(
+        &checkout,
+        &proposal,
+        json!([{"type": "remove-module", "subject": "Bank"}]),
+    );
+    let dropped = found(&checkout);
+    assert_eq!(dropped.len(), 3, "{dropped:#?}");
+    assert_eq!(dropped[0].1, json!([ids[0], ids[1]]));
+    assert_eq!(
+        dropped[0].2,
+        format!(
+            "Plans, beat 1 (Next): focus {model}#BankApi1 is not a module of proposal {model}#{proposal}"
+        )
+    );
+
+    let digest = proposal_digest(&checkout, &proposal);
+    let shelved = checkout.ok(&[
+        "shelve",
+        &proposal,
+        "--expected-revision",
+        &digest,
+        "--doing",
+        "not now",
+        "--writer",
+        "tester",
+        "--operation-id",
+        &operation(),
+    ]);
+    assert_eq!(shelved["kind"], "shelve");
+    assert_eq!(found(&checkout).len(), 3, "a shelved proposal still loads");
+    fs::remove_dir_all(checkout.vault().join("proposals").join(&proposal)).unwrap();
+    let after = found(&checkout);
+    assert_eq!(after.len(), 3, "{after:#?}");
+    let gone = (after.iter())
+        .find(|(_, subjects, _)| *subjects == json!([ids[0], ids[1]]))
+        .unwrap();
+    assert_eq!(gone.0, "WALKTHROUGH_TARGET_MISSING");
+    assert!(
+        gone.2.starts_with(&format!(
+            "Plans, beat 1 (Next): proposal {model}#{proposal} does not load"
+        )),
+        "{}",
+        gone.2
+    );
+}
+
+#[test]
+fn view_serves_walkthroughs_and_plays_them() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let (_, tour) = add_tour(&checkout);
+    let view = View::start(&checkout);
+    let t = &view.token;
+
+    let (status, read) = view.get(&format!("/api/walkthrough?t={t}&id=Tour"));
+    assert_eq!(status, 200, "{read}");
+    let read: Value = serde_json::from_str(View::body(&read)).unwrap();
+    assert_eq!(read, checkout.ok(&["read", "--walkthrough", "Tour"]));
+    assert_eq!(view.get("/api/walkthrough?id=Tour").0, 403);
+    assert_eq!(view.get(&format!("/api/walkthrough?t={t}")).0, 400);
+    assert_eq!(view.get(&format!("/api/walkthrough?t={t}&id=Gone")).0, 404);
+    let (status, body) = view.get(&format!("/api/render?t={t}&beat=1"));
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("REQUEST_INVALID"), "{body}");
+
+    let (status, svg) = view.get(&format!(
+        "/api/render?t={t}&walkthrough={}&beat=1",
+        tour[0].replace('#', "%23")
+    ));
+    assert_eq!(status, 200, "{svg}");
+    let svg = View::body(&svg);
+    assert_xml(svg);
+    let bank = format!("<g class=\"module\" data-id=\"{model}#BankApi1\">");
+    assert!(
+        svg.contains(&format!("<g class=\"dimmed\" opacity=\"0.3\">\n{bank}")),
+        "{svg}"
+    );
+
+    let (_, page) = view.get("/");
+    assert!(page.contains("id=\"walkthroughs\"") && page.contains("id=\"play\""));
+    let (_, script) = view.get("/app.js");
+    for control in [
+        "api('walkthrough'",
+        "playWalkthrough",
+        "'Previous'",
+        "'Next'",
+        "ArrowRight",
+        "#walkthrough=",
+        "aria-current': k === index ? 'step'",
+    ] {
+        assert!(script.contains(control), "{control}");
+    }
+}
+
+#[test]
+fn walkthrough_edits_leave_a_draft_adoptable() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let out = checkout.edited(
+        json!([{"type": "add-walkthrough", "walkthrough": {"name": "Tour", "order": 0,
+        "beats": [{"title": "The bank", "narration": "Outside us.",
+                   "reading": {"view": "architecture", "focus": ["Bank"]}}]}}]),
+    );
+    let beat = out["allocated"][1]["id"].as_str().unwrap().to_owned();
+    // The draft drops Bank, which the beat focuses on.
+    let (id, _) = next(&checkout);
+    checkout.edited(json!([
+        {"type": "edit-beat", "subject": beat, "set": {"narration": "Still outside us."}},
+    ]));
+    let (code, out) = adopt(&checkout, &id, &checkout.digest());
+    assert_eq!(code, 2, "{out:#}");
+    assert_eq!(out["error"]["code"], "MODEL_INVALID");
+    let problems = out["error"]["details"]["problems"].to_string();
+    assert!(problems.contains("is not a module"), "{problems}");
+    checkout.edited(json!([{"type": "edit-beat", "subject": beat, "clear": ["focus"]}]));
+    let (code, out) = adopt(&checkout, &id, &checkout.digest());
+    assert_eq!(code, 0, "{out:#}");
+    assert_eq!(out["kind"], "adopt");
 }

@@ -86,7 +86,7 @@ fn inherited(current: &Model, source: Option<&Model>) -> Result<(Predecessor, Ve
     let state = current.manifest.current.as_ref().map(|c| c.id.clone());
     let of_current = Predecessor {
         state: state.clone(),
-        revision: current.revision.digest.clone(),
+        revision: current.predecessor_digest(),
     };
     let Some((source, drawn)) = source.and_then(|s| Some((s, s.proposal.as_ref()?))) else {
         return Ok((of_current, Vec::new()));
@@ -137,6 +137,7 @@ fn drawing(
         Some(&proposal),
         &source.modules,
         &source.collections,
+        &[],
     );
     if !problems.is_empty() {
         return Err(vault::invalid(&source.dir, problems));
@@ -144,7 +145,7 @@ fn drawing(
     let modules: Vec<&Module> = source.modules.iter().collect();
     let collections: Vec<_> = source.collections.iter().collect();
     let mut writes = vec![vault::proposal_write(&proposal)?];
-    let copies = vault::plan_writes(None, &modules, &collections, &[])?;
+    let copies = vault::plan_writes(None, &modules, &collections, &[], &[])?;
     writes.extend(vault::in_proposal(&proposal.id, copies));
     let id = source.qualify(&proposal.id);
     Ok(Plan {
@@ -188,7 +189,15 @@ pub fn adopt(
         refuse_compared(&drawn, compared)?;
         let taken = taken(vault, &[&current, &drawn])?;
         let state = ids::allocate(|candidate| taken.contains(candidate))?;
-        let diff = edit::diff(&current, &drawn.modules, &drawn.collections, &[]);
+        // Walkthroughs belong to the current state and stay as they are.
+        let walkthroughs = &current.walkthroughs;
+        let diff = edit::diff(
+            &current,
+            &drawn.modules,
+            &drawn.collections,
+            walkthroughs,
+            &[],
+        );
         let id = current.qualify(&proposal.id);
         let mut touched = diff.affected.clone();
         touched.extend([current.manifest.id.clone(), id.clone()]);
@@ -234,6 +243,7 @@ impl Adoption<'_> {
             Some(&manifest),
             &diff.write,
             &diff.write_collections,
+            &diff.write_walkthroughs,
             &diff.remove,
         )?;
         self.proposal.status = ProposalStatus::Adopted;
@@ -263,8 +273,10 @@ impl Adoption<'_> {
 }
 
 /// The manifest after adopting `drawn` as the state `state` named `name`, refusing
-/// `MODEL_INVALID` when the adopted state would not load. The state it replaces leaves the model
-/// with the IDs it drops, `retired`, and all stay reserved, as do the IDs the proposal dropped.
+/// `MODEL_INVALID` when the adopted state would not load, the current state's walkthroughs
+/// included: a beat reading a module or flow the adopted state drops must be edited first. The
+/// state it replaces leaves the model with the IDs it drops, `retired`, and all stay reserved, as
+/// do the IDs the proposal dropped.
 fn adopted_manifest(
     current: &Model,
     drawn: &Model,
@@ -297,6 +309,7 @@ fn adopted_manifest(
         None,
         &drawn.modules,
         &drawn.collections,
+        &current.walkthroughs,
     );
     if !problems.is_empty() {
         return Err(vault::invalid(&current.dir, problems));
@@ -426,7 +439,9 @@ fn refuse_moved(current: &Model, proposal: &Proposal, expected: &str) -> Result<
         .with_details(json!({ "current": now }))
         .into());
     }
-    if proposal.predecessor.revision != *now {
+    // Walkthroughs change on their own beside a proposal, so its predecessor leaves them out.
+    let drawn_from = current.predecessor_digest();
+    if proposal.predecessor.revision != drawn_from {
         return Err(Refusal::new(
             Code::PredecessorMoved,
             format!(
@@ -437,7 +452,7 @@ fn refuse_moved(current: &Model, proposal: &Proposal, expected: &str) -> Result<
         .with_details(json!({
             "proposal": proposal.id,
             "predecessor": proposal.predecessor,
-            "current": now,
+            "current": drawn_from,
         }))
         .into());
     }

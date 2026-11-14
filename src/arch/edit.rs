@@ -1,4 +1,4 @@
-//! `model edit`: one batch of module and relationship changes, applied in order in memory and
+//! `model edit`: one batch of model changes, applied in order in memory and
 //! validated as a whole, then written through a journal under the edit lock so an interrupted
 //! write can be completed and every operation replays its receipt.
 
@@ -21,16 +21,21 @@ use super::request::{
 use super::revision::{self, Revision};
 use super::state::{self, Locked};
 use super::types::{
-    Anchor, Binding, Collection, Emphasis, Module, Relationship, SCHEMA_VERSION, Step, walk,
+    Anchor, Binding, Collection, Emphasis, Module, Relationship, SCHEMA_VERSION, Step, Walkthrough,
+    walk,
 };
 use super::vault::{self, FileWrite, Model, Scope, relationships};
 use super::{Code, Refusal, ids, proposal};
 
 mod flow;
+mod walkthrough;
 
 pub use flow::{
     CollectionField, CollectionSet, FlowField, FlowSet, NewBranch, NewCollection, NewFlow, NewStep,
     StepField, StepSet,
+};
+pub use walkthrough::{
+    BeatField, BeatSet, NewBeat, NewReading, NewWalkthrough, WalkthroughField, WalkthroughSet,
 };
 
 const CHANGES_MAX: usize = 1000;
@@ -64,9 +69,10 @@ pub struct EditRequest {
 }
 
 /// One change. A module subject or reference is a qualified ID, a local ID, or a unique current
-/// or former name, modules added earlier in the batch included; a collection or flow subject is a
-/// qualified or local ID or a unique name, likewise; a relationship, step or branch subject is a
-/// qualified or local ID. A step's position is its index in its list, the end when absent.
+/// or former name, modules added earlier in the batch included; a collection, flow or walkthrough
+/// subject is a qualified or local ID or a unique name, likewise; a relationship, step, branch or
+/// beat subject is a qualified or local ID. A step's or beat's position is its index in its list,
+/// the end when absent. Walkthrough changes apply to the current state only.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Change {
@@ -171,6 +177,44 @@ pub enum Change {
     /// Removes the branch with its steps; a decision keeps at least two.
     RemoveBranch {
         subject: String,
+    },
+    /// Adds a walkthrough with the beats it starts with.
+    AddWalkthrough {
+        walkthrough: NewWalkthrough,
+    },
+    EditWalkthrough {
+        subject: String,
+        #[serde(default)]
+        set: WalkthroughSet,
+        #[serde(default)]
+        clear: Vec<WalkthroughField>,
+    },
+    /// Removes the walkthrough with its beats.
+    RemoveWalkthrough {
+        subject: String,
+    },
+    AddBeat {
+        walkthrough: String,
+        position: Option<usize>,
+        beat: NewBeat,
+    },
+    /// Sets or clears a beat's title, narration and reading fields.
+    EditBeat {
+        subject: String,
+        #[serde(default)]
+        set: BeatSet,
+        #[serde(default)]
+        clear: Vec<BeatField>,
+    },
+    RemoveBeat {
+        subject: String,
+    },
+    /// Moves a beat, keeping its ID, to `position` of a walkthrough, this one or another. Within
+    /// the same walkthrough, `position` counts the beats after this one is taken out.
+    MoveBeat {
+        subject: String,
+        walkthrough: String,
+        position: Option<usize>,
     },
 }
 
@@ -281,10 +325,10 @@ pub struct Receipt {
     pub allocated: Vec<Allocation>,
 }
 
-/// Qualified IDs of the modules, relationships, collections and flows the edit added, changed or
-/// removed. A module counts as changed when its file changed, including its outgoing
-/// relationships, and a collection when its file changed, including its flows. Steps and branches
-/// are not listed; the flow holding them counts as changed.
+/// Qualified IDs of the modules, relationships, collections, flows and walkthroughs the edit
+/// added, changed or removed. A module counts as changed when its file changed, including its
+/// outgoing relationships, and a collection when its file changed, including its flows. Steps,
+/// branches and beats are not listed; the flow or walkthrough holding them counts as changed.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Subjects {
     pub added: Vec<String>,
@@ -604,7 +648,13 @@ fn plan(
         batch.apply(index, change)?;
     }
     batch.finish()?;
-    let diff = diff(model, &batch.modules, &batch.collections, &batch.fresh);
+    let diff = diff(
+        model,
+        &batch.modules,
+        &batch.collections,
+        &batch.walkthroughs,
+        &batch.fresh,
+    );
 
     // A proposal keeps the IDs it held before the batch and removes, so it never allocates
     // them again; IDs the batch both allocates and removes were never written.
@@ -629,6 +679,7 @@ fn plan(
         drawn,
         &batch.modules,
         &batch.collections,
+        &batch.walkthroughs,
     );
     if !problems.is_empty() {
         for problem in &mut problems {
@@ -638,7 +689,13 @@ fn plan(
     }
 
     let manifest = (!retired.is_empty()).then_some(&manifest);
-    let writes = vault::plan_writes(manifest, &diff.write, &diff.write_collections, &diff.remove)?;
+    let writes = vault::plan_writes(
+        manifest,
+        &diff.write,
+        &diff.write_collections,
+        &diff.write_walkthroughs,
+        &diff.remove,
+    )?;
     let (scope, writes) = match drawn {
         Some(p) => {
             let mut writes = vault::in_proposal(&p.id, writes);
@@ -762,7 +819,9 @@ pub(super) struct Diff<'a> {
     pub(super) write: Vec<&'a Module>,
     /// Collection files to write: added and changed collections.
     pub(super) write_collections: Vec<&'a Collection>,
-    /// Vault-relative paths of module and collection files to delete.
+    /// Walkthrough files to write: added and changed walkthroughs.
+    pub(super) write_walkthroughs: Vec<&'a Walkthrough>,
+    /// Vault-relative paths of module, collection and walkthrough files to delete.
     pub(super) remove: Vec<String>,
     /// IDs leaving the model, allocated-then-removed ones included; they stay reserved.
     pub(super) retired: Vec<String>,
@@ -778,18 +837,22 @@ pub(super) fn diff<'a>(
     model: &'a Model,
     new: &'a [Module],
     collections: &'a [Collection],
+    walkthroughs: &'a [Walkthrough],
     fresh: &[String],
 ) -> Diff<'a> {
     let (old_modules, new_modules) = (by_id(&model.modules), by_id(new));
     let (old_relationships, new_relationships) =
         (relationships(&model.modules), relationships(new));
-    let grouped: BTreeSet<&str> = collections.iter().flat_map(Collection::ids).collect();
+    let grouped: BTreeSet<&str> = (collections.iter().flat_map(Collection::ids))
+        .chain(walkthroughs.iter().flat_map(Walkthrough::ids))
+        .collect();
     let live = |id: &str| {
         new_modules.contains_key(id) || new_relationships.contains_key(id) || grouped.contains(id)
     };
     let mut diff = Diff {
         write: Vec::new(),
         write_collections: Vec::new(),
+        write_walkthroughs: Vec::new(),
         remove: Vec::new(),
         retired: Vec::new(),
         subjects: Subjects::default(),
@@ -824,6 +887,7 @@ pub(super) fn diff<'a>(
         .collect();
     let mut touched: Vec<Option<String>> = Vec::new();
     flow::diff_collections(model, collections, &mut diff, &mut touched);
+    walkthrough::diff_walkthroughs(model, walkthroughs, &mut diff, &mut touched);
     diff.retired
         .extend(fresh.iter().filter(|id| !live(id)).cloned());
     for list in [
@@ -839,7 +903,8 @@ pub(super) fn diff<'a>(
     // gaining or losing a part, or the root level for a root module, and the old and new source
     // and target of each relationship added, changed, moved or removed. So is every module whose
     // current or former name an added or renamed module takes, since the name would then stop
-    // naming it alone. Collections and flows are touched as `flow::diff_collections` says. IDs
+    // naming it alone. Collections and flows are touched as `flow::diff_collections` says, and
+    // walkthroughs as `walkthrough::diff_walkthroughs` says. IDs
     // this batch allocates are left out: allocation skips every ID the edited state holds or
     // reserves, so a claim holds one only by a random clash with an ID that only another state
     // holds (a proposal's, or for a proposal edit the current state's).
@@ -933,6 +998,9 @@ struct Batch<'a> {
     model: &'a str,
     modules: Vec<Module>,
     collections: Vec<Collection>,
+    walkthroughs: Vec<Walkthrough>,
+    /// Whether the batch edits a proposal, which holds no walkthroughs.
+    in_proposal: bool,
     removed: BTreeSet<String>,
     /// Local IDs of relationships the batch removed or gave another source or target.
     moved: BTreeSet<String>,
@@ -942,8 +1010,8 @@ struct Batch<'a> {
     fresh: Vec<String>,
     allocated: Vec<Allocation>,
     edited: BTreeSet<String>,
-    /// The last change that touched each module, relationship, collection, flow, step or branch,
-    /// by local ID.
+    /// The last change that touched each module, relationship, collection, flow, step, branch,
+    /// walkthrough or beat, by local ID.
     touched: BTreeMap<String, usize>,
 }
 
@@ -954,6 +1022,8 @@ impl<'a> Batch<'a> {
             model: &model.manifest.id,
             modules: model.modules.clone(),
             collections: model.collections.clone(),
+            walkthroughs: model.walkthroughs.clone(),
+            in_proposal: model.proposal.is_some(),
             removed: BTreeSet::new(),
             moved: BTreeSet::new(),
             taken,
@@ -1027,6 +1097,39 @@ impl<'a> Batch<'a> {
                 branch,
             } => self.add_branch(index, &decision, position, branch),
             Change::RemoveBranch { subject } => self.remove_branch(index, &subject),
+            Change::AddWalkthrough { walkthrough } => {
+                self.apply_walkthrough(index, |b| b.add_walkthrough(index, walkthrough))
+            }
+            Change::EditWalkthrough {
+                subject,
+                set,
+                clear,
+            } => {
+                self.apply_walkthrough(index, |b| b.edit_walkthrough(index, &subject, set, &clear))
+            }
+            Change::RemoveWalkthrough { subject } => {
+                self.apply_walkthrough(index, |b| b.remove_walkthrough(index, &subject))
+            }
+            Change::AddBeat {
+                walkthrough,
+                position,
+                beat,
+            } => self.apply_walkthrough(index, |b| b.add_beat(index, &walkthrough, position, beat)),
+            Change::EditBeat {
+                subject,
+                set,
+                clear,
+            } => self.apply_walkthrough(index, |b| b.edit_beat(index, &subject, set, &clear)),
+            Change::RemoveBeat { subject } => {
+                self.apply_walkthrough(index, |b| b.take_beat(index, &subject).map(drop))
+            }
+            Change::MoveBeat {
+                subject,
+                walkthrough,
+                position,
+            } => self.apply_walkthrough(index, |b| {
+                b.move_beat(index, &subject, &walkthrough, position)
+            }),
         }
     }
 
@@ -1302,7 +1405,8 @@ impl<'a> Batch<'a> {
         for module in &mut self.modules {
             module.outgoing.retain(|r| !gone.contains(&r.to));
         }
-        self.refuse_flow_references(&gone)
+        self.refuse_flow_references(&gone)?;
+        self.refuse_walkthrough_references()
     }
 
     /// Refuses when a message step the batch did not edit references a module the batch removes,
@@ -1478,6 +1582,7 @@ mod tests {
             config: VaultConfig::default(),
             modules: Vec::new(),
             collections: Vec::new(),
+            walkthroughs: Vec::new(),
             revision: revision::of(iter::empty()),
             // After the proposal removed Billing, which its predecessor holds.
             proposal: Some(Proposal {

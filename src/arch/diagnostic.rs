@@ -14,6 +14,8 @@ pub enum DiagnosticCode {
     RelationshipOnContainer,
     FlowSummaryMissing,
     MessageUndrawn,
+    WalkthroughTargetMissing,
+    WalkthroughEmpty,
     BindingPathMissing,
     BindingSymbolMissing,
     AnchorPathMissing,
@@ -38,6 +40,8 @@ impl DiagnosticCode {
             Self::RelationshipOnContainer => "RELATIONSHIP_ON_CONTAINER",
             Self::FlowSummaryMissing => "FLOW_SUMMARY_MISSING",
             Self::MessageUndrawn => "MESSAGE_UNDRAWN",
+            Self::WalkthroughTargetMissing => "WALKTHROUGH_TARGET_MISSING",
+            Self::WalkthroughEmpty => "WALKTHROUGH_EMPTY",
             Self::BindingPathMissing => "BINDING_PATH_MISSING",
             Self::BindingSymbolMissing => "BINDING_SYMBOL_MISSING",
             Self::AnchorPathMissing => "ANCHOR_PATH_MISSING",
@@ -56,6 +60,7 @@ impl DiagnosticCode {
             | Self::RelationshipOnContainer
             | Self::FlowSummaryMissing
             | Self::MessageUndrawn
+            | Self::WalkthroughEmpty
             | Self::EntryPointUnexposed => Severity::Information,
             Self::ContainerUnbound
             | Self::ContainerPartsOutside
@@ -63,6 +68,7 @@ impl DiagnosticCode {
             | Self::BindingShared
             | Self::RelationshipRepeated
             | Self::ContainerLineToOwnPart
+            | Self::WalkthroughTargetMissing
             | Self::BindingPathMissing
             | Self::BindingSymbolMissing
             | Self::AnchorPathMissing
@@ -93,7 +99,8 @@ pub enum Severity {
 pub struct Diagnostic {
     pub code: DiagnosticCode,
     pub severity: Severity,
-    /// Qualified IDs of the modules, relationships, flows or steps the diagnostic concerns.
+    /// Qualified IDs of the modules, relationships, flows, steps, walkthroughs or beats the
+    /// diagnostic concerns.
     pub subjects: Vec<String>,
     pub message: String,
     /// For `CONTAINER_UNBOUND`: the directory its bound parts share.

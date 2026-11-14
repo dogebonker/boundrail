@@ -8,7 +8,7 @@ use serde_json::json;
 use super::{Model, Problems, check_file, check_name, check_text};
 use crate::arch::types::{
     BRANCHES_MIN, Collection, DESCRIPTION_MAX, FLOW_STEPS_MAX, Flow, LABEL_MAX, Module,
-    NESTING_MAX, REPEAT_MIN, SUMMARY_MAX, Step, walk,
+    NESTING_MAX, REPEAT_MIN, SUMMARY_MAX, Step, Walkthrough, walk,
 };
 use crate::arch::{Code, Refusal, ids, one_line};
 
@@ -206,7 +206,7 @@ pub(crate) fn holds_name(current: &str, former_names: &[String], name: &str) -> 
 /// What `items` (key, local ID, name, former names) holds for the one item `subject` names: its
 /// qualified or local ID, else its unique current or former name. `what` names the kind of item
 /// in a refusal.
-fn pick<'a, K: Copy>(
+pub(super) fn pick<'a, K: Copy>(
     model: &str,
     what: &str,
     items: impl Iterator<Item = (K, &'a str, &'a str, &'a [String])> + Clone,
@@ -305,10 +305,11 @@ pub struct FlowView<'a> {
     pub steps: Vec<Step>,
 }
 
-/// A collection or a flow with the collection holding it.
+/// A collection, a flow with the collection holding it, or a walkthrough.
 pub enum Found<'a> {
     Collection(&'a Collection),
     Flow(&'a Collection, &'a Flow),
+    Walkthrough(&'a Walkthrough),
 }
 
 impl Model {
@@ -355,18 +356,26 @@ impl Model {
         }
     }
 
-    /// The collection or flow whose qualified or local ID is `subject`.
+    /// The collection, flow or walkthrough whose qualified or local ID is `subject`.
     pub fn find_grouping(&self, subject: &str) -> Option<Found<'_>> {
         let local = ids::local(&self.manifest.id, subject);
-        self.collections.iter().find_map(|c| {
-            if c.id == local {
-                return Some(Found::Collection(c));
-            }
-            c.flows
-                .iter()
-                .find(|f| f.id == local)
-                .map(|f| Found::Flow(c, f))
-        })
+        let walkthrough = || {
+            (self.walkthroughs.iter())
+                .find(|w| w.id == local)
+                .map(Found::Walkthrough)
+        };
+        self.collections
+            .iter()
+            .find_map(|c| {
+                if c.id == local {
+                    return Some(Found::Collection(c));
+                }
+                c.flows
+                    .iter()
+                    .find(|f| f.id == local)
+                    .map(|f| Found::Flow(c, f))
+            })
+            .or_else(walkthrough)
     }
 
     /// The flow `subject` names, its qualified or local ID or its unique current or former name,
@@ -450,6 +459,7 @@ mod tests {
             None,
             &modules(),
             &[collection],
+            &[],
         )
         .into_iter()
         .map(|p| {
@@ -557,6 +567,7 @@ mod tests {
             None,
             &modules(),
             &[collection],
+            &[],
         )
         .into_iter()
         .map(|p| (p.subject, p.message))

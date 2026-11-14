@@ -1,9 +1,10 @@
 //! Claims: machine-local reservations that keep the agents and people editing one checkout out of
 //! each other's way. A claim names its writer and the subjects it holds: qualified module and
-//! relationship IDs, qualified collection and flow IDs, and the model ID, which holds the root
-//! level (adding, removing or moving a root module, adding or removing a collection). A module
-//! claim also holds everything inside the module: its parts, their parts, and the relationships
-//! they own. A collection claim holds its flows, and a flow claim holds its steps. A proposal
+//! relationship IDs, qualified collection, flow and walkthrough IDs, and the model ID, which holds
+//! the root level (adding, removing or moving a root module, adding or removing a collection or a
+//! walkthrough). A module claim also holds everything inside the module: its parts, their parts,
+//! and the relationships they own. A collection claim holds its flows, a flow claim holds its
+//! steps, and a walkthrough claim holds its beats. A proposal
 //! claim holds everything inside the proposal. IDs are model-wide, so a claim on a module holds
 //! it in the current state and in every proposal; inside a proposal, the proposal's ID holds the
 //! root level in place of the model ID.
@@ -74,8 +75,8 @@ pub struct ClaimRequest {
     #[schemars(length(min = 1, max = REASON_MAX))]
     pub reason: String,
     /// The model ID, which holds the root level; module IDs or unique current or former names,
-    /// each holding the module and everything inside it; relationship IDs; and collection and
-    /// flow IDs, each holding what is inside it; and proposal IDs, each holding the whole
+    /// each holding the module and everything inside it; relationship IDs; collection, flow and
+    /// walkthrough IDs, each holding what is inside it; and proposal IDs, each holding the whole
     /// proposal. IDs may be qualified or local. Names resolve in the state `target` names: the
     /// current state, or a proposal by its ID.
     #[schemars(length(min = 1, max = SUBJECTS_MAX))]
@@ -318,8 +319,9 @@ pub(super) fn check_edit(
     Ok(())
 }
 
-/// The stored form of `subject`: the model ID, or a qualified module, relationship, collection or
-/// flow ID. Collection and flow IDs resolve before module names, as in `model read`.
+/// The stored form of `subject`: the model ID, or a qualified module, relationship, collection,
+/// flow or walkthrough ID. Collection, flow and walkthrough IDs resolve before module names, as
+/// in `model read`.
 /// Modules resolve first, as in an edit, so a name never shadows a relationship ID by accident.
 fn resolve(
     model: &Model,
@@ -343,7 +345,7 @@ fn resolve(
             Err(Refusal::new(
                 Code::SubjectNotFound,
                 format!(
-                    "no model, proposal, module, relationship, collection or flow has the ID or name `{subject}`"
+                    "no model, proposal, module, relationship, collection, flow or walkthrough has the ID or name `{subject}`"
                 ),
             )
             .into())

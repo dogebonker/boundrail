@@ -17,9 +17,11 @@ use boundrail::arch::proposal::{self, CURRENT, Writing};
 use boundrail::arch::render::{self, View};
 use boundrail::arch::request::INPUT_MAX;
 use boundrail::arch::semantic;
-use boundrail::arch::types::{self, Collection, Flow, SCHEMAS, Step};
+use boundrail::arch::types::{
+    self, BeatReading, Collection, Flow, ReadingState, ReadingView, SCHEMAS, Step, Walkthrough,
+};
 use boundrail::arch::vault::{
-    self, CollectionView, Found, Model, ModuleView, RelationshipView, Scope,
+    self, CollectionView, Found, Model, ModuleView, RelationshipView, Scope, WalkthroughEntry,
 };
 use boundrail::arch::{Code, Refusal};
 use serde_json::{Value, json};
@@ -77,8 +79,15 @@ struct RenderArgs {
 }
 
 /// What `model render` draws, as the command line and the live view ask for it.
-#[derive(Args)]
+#[derive(Args, Default)]
 pub(super) struct RenderSpec {
+    /// Draw a beat of this walkthrough, as its reading says: its ID or unique name; needs --beat
+    /// and no other flag that says what to draw
+    #[arg(long)]
+    pub(super) walkthrough: Option<String>,
+    /// The beat of --walkthrough to draw: its number, from 1, or its ID
+    #[arg(long, requires = "walkthrough")]
+    pub(super) beat: Option<String>,
     /// Draw this proposal, marked against the current state unless --against names another
     #[arg(long)]
     pub(super) proposal: Option<String>,
@@ -128,15 +137,20 @@ enum ModelCmd {
         #[arg(long)]
         planning: bool,
     },
-    /// Print the model, one module with its parts and relationships, a collection, or a flow
+    /// Print the model, one module with its parts and relationships, a collection, a flow, or a
+    /// walkthrough
     Read {
-        /// Qualified ID, local ID, or a unique current or former module name; or a collection or
-        /// flow ID
-        #[arg(conflicts_with = "flow")]
+        /// Qualified ID, local ID, or a unique current or former module name; or a collection,
+        /// flow or walkthrough ID
+        #[arg(conflicts_with_all = ["flow", "walkthrough"])]
         subject: Option<String>,
         /// Print one flow with its steps: its qualified or local ID, or its unique name
-        #[arg(long)]
+        #[arg(long, conflicts_with = "walkthrough")]
         flow: Option<String>,
+        /// Print one walkthrough with its beats: its qualified or local ID, or its unique name;
+        /// Markdown prints it as a script
+        #[arg(long)]
+        walkthrough: Option<String>,
         /// Read the model a checkpoint holds: its ID or a unique commit prefix
         #[arg(long)]
         checkpoint: Option<String>,
@@ -146,7 +160,7 @@ enum ModelCmd {
     },
     /// List the vault file and request schemas, or print one as JSON Schema
     Schema { name: Option<String> },
-    /// Apply a batch of module, relationship, collection, flow and step changes (schema `model-edit`)
+    /// Apply a batch of module, relationship, collection, flow, step, walkthrough and beat changes (schema `model-edit`)
     Edit {
         /// Request file; `-` or absent reads standard input
         #[arg(long)]
@@ -393,6 +407,7 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
         ModelCmd::Read {
             subject: None,
             flow: None,
+            walkthrough: None,
             checkpoint,
             proposal,
         } => {
@@ -412,12 +427,14 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
             print_proposal(&model);
             print_reading(&model, &model.read());
             print_collections(&model.collection_views());
+            print_walkthroughs(&model.walkthrough_entries());
             print_claims(state.as_deref().and_then(active_claims).as_deref());
             Ok(())
         }
         ModelCmd::Read {
             subject,
             flow,
+            walkthrough,
             checkpoint,
             proposal,
         } => {
@@ -427,12 +444,15 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
                 pending,
                 checkpoint,
             } = load_reading(root, checkpoint.as_deref(), proposal.as_deref())?;
-            let found = match &flow {
-                Some(flow) => {
+            let found = match (&flow, &walkthrough) {
+                (Some(flow), _) => {
                     let (collection, flow) = model.flow(flow)?;
                     Some(Found::Flow(collection, flow))
                 }
-                None => subject.as_deref().and_then(|s| model.find_grouping(s)),
+                (None, Some(walkthrough)) => {
+                    Some(Found::Walkthrough(model.walkthrough(walkthrough)?))
+                }
+                (None, None) => subject.as_deref().and_then(|s| model.find_grouping(s)),
             };
             if let Some(found) = found {
                 let read = GroupingRead {
@@ -772,6 +792,7 @@ pub(super) fn read_output(
         "modules": reading.modules,
         "relationships": reading.relationships,
         "collections": model.collection_views(),
+        "walkthroughs": model.walkthrough_entries(),
         "revision": model.revision,
     });
     extend(&mut output, json!({ "proposal": model.proposal }))?;
@@ -797,8 +818,16 @@ struct GroupingRead<'a> {
 }
 
 impl GroupingRead<'_> {
-    /// Prints the collection or flow with the active claims holding it.
+    /// Prints the collection, flow or walkthrough with the active claims holding it.
     fn print(self, found: Found<'_>) -> Result<()> {
+        match self.output(found)? {
+            Some(output) => write(None, &output),
+            None => Ok(()),
+        }
+    }
+
+    /// The JSON output of reading `found`, or `None` when it printed Markdown instead.
+    fn output(self, found: Found<'_>) -> Result<Option<Value>> {
         let model = self.model;
         if self.markdown {
             if let Some(checkpoint) = &self.checkpoint {
@@ -826,6 +855,14 @@ impl GroupingRead<'_> {
                 let output = json!({"kind": "read-flow", "collection": model.qualify(&collection.id), "flow": view});
                 (id, output)
             }
+            Found::Walkthrough(walkthrough) => {
+                if self.markdown {
+                    print_walkthrough(model, walkthrough);
+                }
+                let view = model.walkthrough_view(walkthrough);
+                let id = view.id.clone();
+                (id, json!({"kind": "read-walkthrough", "walkthrough": view}))
+            }
         };
         let active = self
             .state
@@ -834,7 +871,7 @@ impl GroupingRead<'_> {
             .map(|active| claims::holding(model, active, &[subject.as_str()]));
         if self.markdown {
             print_claims(active.as_deref());
-            return Ok(());
+            return Ok(None);
         }
         output["schema"] = MODEL_SCHEMA.into();
         output["success"] = true.into();
@@ -850,8 +887,27 @@ impl GroupingRead<'_> {
         if let Some(checkpoint) = self.checkpoint {
             output["checkpoint"] = json!(checkpoint);
         }
-        write(None, &output)
+        Ok(Some(output))
     }
+}
+
+/// The JSON output of `model read --walkthrough`.
+pub(super) fn walkthrough_output(root: &Path, subject: &str) -> Result<Value> {
+    let Loaded {
+        model,
+        state,
+        pending,
+        checkpoint,
+    } = load_reading(root, None, None)?;
+    let read = GroupingRead {
+        model: &model,
+        state,
+        pending,
+        checkpoint,
+        markdown: false,
+    };
+    let output = read.output(Found::Walkthrough(model.walkthrough(subject)?))?;
+    output.context("a JSON reading returns its output")
 }
 
 /// `model render`: the SVG on stdout or in `--output`; with `--format json`, inside the output
@@ -862,13 +918,13 @@ fn render_model(root: &Path, format: Option<Format>, args: &RenderArgs) -> Resul
         return Err(Refusal::new(Code::RequestInvalid, message).into());
     }
     let output = args.output.as_deref();
-    let svg = render_svg(root, &args.spec, output)?;
+    let (svg, view) = render_svg(root, &args.spec, output)?;
     if matches!(format, Some(Format::Json)) {
         let envelope = json!({
             "schema": MODEL_SCHEMA,
             "kind": "render",
             "success": true,
-            "view": args.spec.view()?.name(),
+            "view": view,
             "svg": svg,
         });
         return write(output, &envelope);
@@ -882,12 +938,41 @@ fn render_model(root: &Path, format: Option<Format>, args: &RenderArgs) -> Resul
     }
 }
 
-/// The SVG of what `spec` asks for, refusing an `output` it could not write to.
-pub(super) fn render_svg(root: &Path, spec: &RenderSpec, output: Option<&Path>) -> Result<String> {
+/// The SVG of what `spec` asks for, with the name of the view drawn, refusing an `output` it
+/// could not write to. A walkthrough beat is drawn as its reading says, with its focus.
+pub(super) fn render_svg(
+    root: &Path,
+    spec: &RenderSpec,
+    output: Option<&Path>,
+) -> Result<(String, &'static str)> {
+    if spec.walkthrough.is_none() && spec.beat.is_none() {
+        return draw(root, spec, &[], output, None);
+    }
+    let current = load_state(root, RenderState::Current)?;
+    let (reading, focus) = spec.beat(&current.0)?;
+    draw(root, &reading, &focus, output, Some(current))
+}
+
+/// The SVG of what `spec` asks for with `focus` highlighted, and the name of the view drawn.
+/// `current` is the current state when the caller already loaded it.
+fn draw(
+    root: &Path,
+    spec: &RenderSpec,
+    focus: &[String],
+    output: Option<&Path>,
+    mut current: Option<(Model, Option<String>)>,
+) -> Result<(String, &'static str)> {
     let view = spec.view()?;
     let (drawn, base) = spec.states()?;
-    let (model, name) = load_state(root, drawn)?;
-    let base = base.map(|b| load_state(root, b)).transpose()?;
+    let mut load = |state: RenderState<'_>| match (state, current.take()) {
+        (RenderState::Current, Some(loaded)) => Ok(loaded),
+        (_, loaded) => {
+            current = loaded;
+            load_state(root, state)
+        }
+    };
+    let (model, name) = load(drawn)?;
+    let base = base.map(load).transpose()?;
     // A proposal's local and qualified IDs name the same state.
     let id = |model: &Model| model.proposal.as_ref().map(|p| p.id.clone());
     if let Some((base, _)) = &base
@@ -908,7 +993,36 @@ pub(super) fn render_svg(root: &Path, spec: &RenderSpec, output: Option<&Path>) 
         model,
         name: name.clone(),
     });
-    Ok(render::render(&drawn, base.as_ref(), &view)?)
+    let svg = render::render(&drawn, base.as_ref(), &view, focus)?;
+    Ok((svg, view.name()))
+}
+
+/// What a beat's reading draws, as the flags would ask for it.
+fn reading_spec(reading: &BeatReading) -> RenderSpec {
+    let state = |state: &ReadingState| match state {
+        ReadingState::Current => CURRENT.to_owned(),
+        ReadingState::Proposal(id) | ReadingState::Checkpoint(id) => id.clone(),
+    };
+    RenderSpec {
+        proposal: match &reading.state {
+            ReadingState::Proposal(p) => Some(p.clone()),
+            _ => None,
+        },
+        checkpoint: match &reading.state {
+            ReadingState::Checkpoint(c) => Some(c.clone()),
+            _ => None,
+        },
+        view: Some(match reading.view {
+            ReadingView::Architecture => RenderView::Architecture,
+            ReadingView::Sequence => RenderView::Sequence,
+            ReadingView::Flowchart => RenderView::Flowchart,
+        }),
+        flow: reading.flow.clone(),
+        scope: reading.scope.clone(),
+        depth: reading.depth.and_then(|d| usize::try_from(d).ok()),
+        against: reading.against.as_ref().map(state),
+        ..RenderSpec::default()
+    }
 }
 
 /// A state `model render` draws or compares with, oldest first.
@@ -938,6 +1052,44 @@ fn load_state(root: &Path, state: RenderState<'_>) -> Result<(Model, Option<Stri
 }
 
 impl RenderSpec {
+    /// What the beat `--beat` of `--walkthrough` reads in `model`, the current state, as flags,
+    /// with its focus. Refuses `REQUEST_INVALID` without both flags or with any other flag that
+    /// says what to draw.
+    fn beat(&self, model: &Model) -> Result<(RenderSpec, Vec<String>)> {
+        let invalid = |message: &str| Refusal::new(Code::RequestInvalid, message);
+        let (walkthrough, beat) = match (&self.walkthrough, &self.beat) {
+            (Some(walkthrough), Some(beat)) => (walkthrough, beat),
+            (None, _) => return Err(invalid("--beat needs --walkthrough").into()),
+            (_, None) => return Err(invalid("--walkthrough needs --beat").into()),
+        };
+        let drawing = [
+            &self.proposal,
+            &self.checkpoint,
+            &self.flow,
+            &self.scope,
+            &self.against,
+        ];
+        if drawing.iter().any(|flag| flag.is_some()) || self.view.is_some() || self.depth.is_some()
+        {
+            let message = "--walkthrough draws what its beat reads; leave out the other flags";
+            return Err(invalid(message).into());
+        }
+        let walkthrough = model.walkthrough(walkthrough)?;
+        let by_number = (beat.parse::<usize>().ok())
+            .and_then(|n| n.checked_sub(1))
+            .and_then(|n| walkthrough.beats.get(n));
+        let found = by_number.or_else(|| {
+            (walkthrough.beats.iter()).find(|b| b.id == *beat || model.qualify(&b.id) == *beat)
+        });
+        let found = found.ok_or_else(|| {
+            let id = model.qualify(&walkthrough.id);
+            let message =
+                format!("walkthrough {id} has no beat `{beat}`; name one by number or ID");
+            Refusal::new(Code::SubjectNotFound, message)
+        })?;
+        Ok((reading_spec(&found.reading), found.reading.focus.clone()))
+    }
+
     /// The state to draw and the one to compare it with. The newer of the two is drawn; of two
     /// proposals, the one `--proposal` names. A proposal alone is compared with the current state.
     fn states(&self) -> Result<(RenderState<'_>, Option<RenderState<'_>>)> {
@@ -1084,7 +1236,9 @@ pub(super) fn run_check(
     let mut diagnostics = if only == Some(CheckOnly::Code) {
         Vec::new()
     } else {
-        semantic::check(&model.manifest.id, &model.modules, &model.collections)
+        let mut found = semantic::check(&model.manifest.id, &model.modules, &model.collections);
+        found.extend(semantic::walkthroughs(&model));
+        found
     };
     let (mut skips, mut units) = (None, None);
     if only != Some(CheckOnly::Semantic) {
@@ -2087,6 +2241,66 @@ fn print_collections(collections: &[CollectionView<'_>]) {
             println!("  - {} {}{summary}", flow.name, flow.id);
         }
     }
+}
+
+fn print_walkthroughs(walkthroughs: &[WalkthroughEntry<'_>]) {
+    if walkthroughs.is_empty() {
+        return;
+    }
+    println!("Walkthroughs:");
+    for walkthrough in walkthroughs {
+        let beats = count(walkthrough.beats, "beat");
+        println!("- {} {}: {beats}", walkthrough.name, walkthrough.id);
+    }
+}
+
+/// The walkthrough as a script: each beat numbered with its title, its narration indented below,
+/// and one line saying what it shows.
+fn print_walkthrough(model: &Model, walkthrough: &Walkthrough) {
+    let id = model.qualify(&walkthrough.id);
+    println!("Walkthrough {} {id}", walkthrough.name);
+    if let Some(description) = &walkthrough.description {
+        println!("{description}");
+    }
+    let names = names(model);
+    let flows: BTreeMap<String, &str> = (model.collections.iter())
+        .flat_map(|c| &c.flows)
+        .map(|f| (model.qualify(&f.id), f.name.as_str()))
+        .collect();
+    for (n, beat) in (1..).zip(&walkthrough.beats) {
+        println!("{n}. {}", beat.title);
+        for line in beat.narration.lines() {
+            println!("   {line}");
+        }
+        println!("   Shows: {}", describe(&names, &flows, &beat.reading));
+    }
+}
+
+/// One line saying what a reading shows, naming modules and flows by `names` and `flows`.
+fn describe(
+    names: &BTreeMap<String, &str>,
+    flows: &BTreeMap<String, &str>,
+    reading: &BeatReading,
+) -> String {
+    let mut text = reading.view.as_str().to_owned();
+    if let Some(flow) = &reading.flow {
+        text += &format!(" of flow {}", flows.get(flow).copied().unwrap_or(flow));
+    }
+    text += &format!(" in {}", reading.state.text());
+    if let Some(against) = &reading.against {
+        text += &format!(", compared with {}", against.text());
+    }
+    if let Some(scope) = &reading.scope {
+        text += &format!(", parts of {}", name_of(names, scope));
+    }
+    if let Some(depth) = reading.depth {
+        text += &format!(", depth {depth}");
+    }
+    if !reading.focus.is_empty() {
+        let focus: Vec<&str> = reading.focus.iter().map(|m| name_of(names, m)).collect();
+        text += &format!(", focus on {}", focus.join(", "));
+    }
+    text
 }
 
 /// The flow as a numbered sequence, decisions and loops indenting the steps inside them.

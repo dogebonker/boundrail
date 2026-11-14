@@ -2,7 +2,7 @@
 //! their parts, relationships as arrows routed between box sides. Parts deeper than the depth
 //! collapse into their container, and their relationships lift to it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::layout::{self, Boxed, Rect};
 use super::svg::{Anchor, BACKGROUND, Font, Point, Style, Svg};
@@ -83,14 +83,40 @@ pub(super) fn render(
     let routes = layout::routes(&rects, &pairs);
     let mut svg = Svg::default();
     ctx.title(&mut svg);
+    let lit = lit_boxes(ctx, &visible);
+    let dims = |i: usize| lit.as_ref().is_some_and(|l| !l.contains(&i));
     for (i, rect) in rects.iter().enumerate() {
+        let dim = dims(i) && ctx.dims(&visible.ids[i]);
+        if dim {
+            svg.dimmed();
+        }
         draw_box(&mut svg, ctx, rect, &visible, i);
+        if dim {
+            svg.close_group();
+        }
     }
     for (arrow, route) in arrows.iter().zip(&routes) {
+        let dim = dims(arrow.from) && dims(arrow.to);
+        if dim {
+            svg.dimmed();
+        }
         draw_arrow(&mut svg, ctx, arrow, route);
+        if dim {
+            svg.close_group();
+        }
     }
     ctx.legend(&mut svg);
     svg.finish()
+}
+
+/// The boxes a focus lights: those of the focused modules and of the modules inside them, drawn
+/// or collapsed. `None` when nothing is focused or no focused module is drawn, so nothing dims.
+fn lit_boxes(ctx: &Context<'_>, visible: &Visible<'_>) -> Option<BTreeSet<usize>> {
+    let focus = ctx.focus.as_ref()?;
+    let lit: BTreeSet<usize> = (focus.lit.iter())
+        .filter_map(|id| visible.at.get(id).copied())
+        .collect();
+    (!lit.is_empty()).then_some(lit)
 }
 
 /// Modules sorted as a reading lists them: by order, then name, then ID.

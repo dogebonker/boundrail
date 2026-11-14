@@ -15,7 +15,7 @@ use serde_json::json;
 use super::revision::{self, Revision};
 use super::types::{
     Anchor, Binding, Collection, DESCRIPTION_MAX, Emphasis, LABEL_MAX, Manifest, Module, Proposal,
-    RESPONSIBILITY_MAX, Relationship, SCHEMA_VERSION, State, VaultConfig,
+    RESPONSIBILITY_MAX, Relationship, SCHEMA_VERSION, State, VaultConfig, Walkthrough,
 };
 use super::{Code, Refusal, ids, one_line, state};
 use crate::history::{refuse_symlink, write_atomic};
@@ -23,7 +23,9 @@ use crate::sync_rules::hash;
 
 mod flows;
 mod proposals;
+mod walkthroughs;
 
+use flows::pick;
 pub use flows::{CollectionView, FlowEntry, FlowView, Found};
 pub(super) use flows::{Ends, collection_position, flow_position, holds_name, message_problems};
 use proposals::{PROPOSAL, PROPOSALS, check_proposal, prefix, split_proposal, unprefixed};
@@ -31,6 +33,9 @@ pub use proposals::{Scope, load_proposal, load_state, proposals};
 pub(super) use proposals::{
     in_proposal, is_proposal, is_proposal_path, proposal_file, proposal_write, read_proposal,
 };
+pub(crate) use walkthroughs::reading_ids;
+pub(super) use walkthroughs::walkthrough_position;
+pub use walkthroughs::{BeatView, WalkthroughEntry, WalkthroughView};
 
 /// Boundrail's state folder at the checkout root, and the vault folder inside it.
 const STATE: &str = ".boundrail";
@@ -41,11 +46,20 @@ const MODULES: &str = "modules";
 const MODULE_SUFFIX: &str = ".module.json";
 const COLLECTIONS: &str = "collections";
 const COLLECTION_SUFFIX: &str = ".collection.json";
-/// The folders of per-ID vault files, each with the suffix its files end in.
-const FOLDERS: [(&str, &str); 2] = [(MODULES, MODULE_SUFFIX), (COLLECTIONS, COLLECTION_SUFFIX)];
+const WALKTHROUGHS: &str = "walkthroughs";
+const WALKTHROUGH_SUFFIX: &str = ".walkthrough.json";
+/// The folders of the current state's per-ID vault files, each with the suffix its files end in.
+const FOLDERS: [(&str, &str); 3] = [
+    (MODULES, MODULE_SUFFIX),
+    (COLLECTIONS, COLLECTION_SUFFIX),
+    (WALKTHROUGHS, WALKTHROUGH_SUFFIX),
+];
+/// A proposal's folders: walkthroughs belong to the current state.
+const PROPOSAL_FOLDERS: [(&str, &str); 2] =
+    [(MODULES, MODULE_SUFFIX), (COLLECTIONS, COLLECTION_SUFFIX)];
 /// The name of a new model's current state.
 const DEFAULT_STATE_NAME: &str = "Current";
-/// The longest model, module, collection or flow name.
+/// The longest model, module, collection, flow or walkthrough name.
 const NAME_MAX: usize = 120;
 
 #[derive(Debug)]
@@ -57,6 +71,8 @@ pub struct Model {
     pub modules: Vec<Module>,
     /// Sorted by local ID.
     pub collections: Vec<Collection>,
+    /// Sorted by local ID; always empty in a proposal.
+    pub walkthroughs: Vec<Walkthrough>,
     /// The revision of what was loaded: the current state's files, or the proposal's.
     pub revision: Revision,
     /// The proposal this model holds the modules and collections of; `None` for the current state.
@@ -209,16 +225,25 @@ pub fn load(start: &Path) -> Result<Model> {
 
 const LINKED: &str = "is a symbolic link";
 
-/// The folders a load reads through, by their vault-relative paths: the state, vault, modules and
-/// collections folders, and for a proposal its folder, the folder holding it and its own modules
-/// and collections folders.
+/// The per-ID folders of the state or proposal folder `prefix` names, with their suffixes.
+fn state_folders(prefix: &str) -> &'static [(&'static str, &'static str)] {
+    if prefix.is_empty() {
+        &FOLDERS
+    } else {
+        &PROPOSAL_FOLDERS
+    }
+}
+
+/// The folders a load reads through, by their vault-relative paths: the state, vault, modules,
+/// collections and walkthroughs folders, and for a proposal its folder, the folder holding it and
+/// its own modules and collections folders.
 fn folders(dir: &Path, proposal: Option<&str>) -> Vec<(String, PathBuf)> {
     let mut folders = vec![
         ("..".to_owned(), dir.parent().unwrap_or(dir).to_path_buf()),
         (".".to_owned(), dir.to_path_buf()),
     ];
     let mut inside = |prefix: &str| {
-        for folder in [MODULES, COLLECTIONS] {
+        for (folder, _) in state_folders(prefix) {
             let path = format!("{prefix}{folder}");
             folders.push((path.clone(), dir.join(path)));
         }
@@ -286,13 +311,18 @@ fn load_scope(dir: PathBuf, proposal: Option<&str>) -> Result<Model> {
     let pairs: Vec<(&str, &Module)> = parsed.modules.iter().map(|(f, m)| (*f, m)).collect();
     let groups: Vec<(&str, &Collection)> =
         parsed.collections.iter().map(|(f, c)| (*f, c)).collect();
+    let told: Vec<(&str, &Walkthrough)> =
+        parsed.walkthroughs.iter().map(|(f, w)| (*f, w)).collect();
     let file = proposal.map(proposal_file);
     check(
         parsed.manifest.as_ref(),
         parsed.config.as_ref(),
         file.as_deref().zip(parsed.proposal.as_ref()),
-        &pairs,
-        &groups,
+        Contents {
+            modules: &pairs,
+            collections: &groups,
+            walkthroughs: &told,
+        },
         &mut problems,
     );
     let problems = problems.0;
@@ -303,12 +333,16 @@ fn load_scope(dir: PathBuf, proposal: Option<&str>) -> Result<Model> {
             let mut collections: Vec<Collection> =
                 parsed.collections.into_iter().map(|(_, c)| c).collect();
             collections.sort_by(|a, b| a.id.cmp(&b.id));
+            let mut walkthroughs: Vec<Walkthrough> =
+                parsed.walkthroughs.into_iter().map(|(_, w)| w).collect();
+            walkthroughs.sort_by(|a, b| a.id.cmp(&b.id));
             Ok(Model {
                 dir,
                 manifest,
                 config,
                 modules,
                 collections,
+                walkthroughs,
                 revision,
                 proposal: parsed.proposal,
             })
@@ -347,7 +381,7 @@ fn read_inputs(
         }
     }
     let prefix = proposal.map(prefix).unwrap_or_default();
-    for (folder, suffix) in FOLDERS {
+    for (folder, suffix) in state_folders(&prefix) {
         for path in listed(dir, &prefix, folder, suffix, problems)? {
             let bytes = fs::read(dir.join(&path)).with_context(|| format!("reading {path}"))?;
             inputs.push((path, bytes));
@@ -364,6 +398,7 @@ struct Parsed<'a> {
     proposal: Option<Proposal>,
     modules: Vec<(&'a str, Module)>,
     collections: Vec<(&'a str, Collection)>,
+    walkthroughs: Vec<(&'a str, Walkthrough)>,
 }
 
 fn parse_inputs<'a>(inputs: &'a [(String, Vec<u8>)], problems: &mut Problems) -> Parsed<'a> {
@@ -380,10 +415,11 @@ fn parse_inputs<'a>(inputs: &'a [(String, Vec<u8>)], problems: &mut Problems) ->
                 .map(|c| parsed.config = Some(c))
                 .map_err(|e| parse_message(&e)),
             _ if local == PROPOSAL => json(bytes).map(|p| parsed.proposal = Some(p)),
-            _ if vault_file(local).is_some_and(|(folder, _)| folder == MODULES) => {
-                json(bytes).map(|m| parsed.modules.push((path, m)))
-            }
-            _ => json(bytes).map(|c| parsed.collections.push((path, c))),
+            _ => match vault_file(local).map(|(folder, _)| folder) {
+                Some(MODULES) => json(bytes).map(|m| parsed.modules.push((path, m))),
+                Some(WALKTHROUGHS) => json(bytes).map(|w| parsed.walkthroughs.push((path, w))),
+                _ => json(bytes).map(|c| parsed.collections.push((path, c))),
+            },
         };
         if let Err(message) = result {
             problems.push(
@@ -470,6 +506,32 @@ pub(super) fn parse_message(error: &impl std::fmt::Display) -> String {
         })
 }
 
+/// The per-ID files of one load, each with its vault-relative path.
+#[derive(Clone, Copy)]
+struct Contents<'a> {
+    modules: &'a [(&'a str, &'a Module)],
+    collections: &'a [(&'a str, &'a Collection)],
+    walkthroughs: &'a [(&'a str, &'a Walkthrough)],
+}
+
+impl Contents<'_> {
+    fn is_empty(&self) -> bool {
+        self.modules.is_empty() && self.collections.is_empty() && self.walkthroughs.is_empty()
+    }
+}
+
+/// The vault-relative paths `file` names `items` by inside the folder `prefix`.
+fn files<T>(prefix: &str, items: &[T], file: impl Fn(&T) -> String) -> Vec<String> {
+    items
+        .iter()
+        .map(|i| format!("{prefix}{}", file(i)))
+        .collect()
+}
+
+fn pair<'a, T>(files: &'a [String], items: &'a [T]) -> Vec<(&'a str, &'a T)> {
+    files.iter().map(String::as_str).zip(items).collect()
+}
+
 /// Every problem of an in-memory current state, or of `proposal`'s modules and collections, as
 /// `load` would report it after writing them.
 pub(super) fn problems(
@@ -478,25 +540,23 @@ pub(super) fn problems(
     proposal: Option<&Proposal>,
     modules: &[Module],
     collections: &[Collection],
+    walkthroughs: &[Walkthrough],
 ) -> Vec<Problem> {
     let prefix = proposal.map(|p| prefix(&p.id)).unwrap_or_default();
-    let files: Vec<String> = (modules.iter())
-        .map(|m| format!("{prefix}{}", module_file(&m.id)))
-        .collect();
-    let pairs: Vec<(&str, &Module)> = files.iter().map(String::as_str).zip(modules).collect();
-    let files: Vec<String> = (collections.iter())
-        .map(|c| format!("{prefix}{}", collection_file(&c.id)))
-        .collect();
-    let groups: Vec<(&str, &Collection)> =
-        files.iter().map(String::as_str).zip(collections).collect();
+    let module_files = files(&prefix, modules, |m| module_file(&m.id));
+    let collection_files = files(&prefix, collections, |c| collection_file(&c.id));
+    let walkthrough_files = files(&prefix, walkthroughs, |w| walkthrough_file(&w.id));
     let file = proposal.map(|p| proposal_file(&p.id));
     let mut problems = Problems::default();
     check(
         Some(manifest),
         Some(config),
         file.as_deref().zip(proposal),
-        &pairs,
-        &groups,
+        Contents {
+            modules: &pair(&module_files, modules),
+            collections: &pair(&collection_files, collections),
+            walkthroughs: &pair(&walkthrough_files, walkthroughs),
+        },
         &mut problems,
     );
     problems.0
@@ -508,20 +568,21 @@ fn check(
     manifest: Option<&Manifest>,
     config: Option<&VaultConfig>,
     proposal: Option<(&str, &Proposal)>,
-    modules: &[(&str, &Module)],
-    collections: &[(&str, &Collection)],
+    contents: Contents<'_>,
     problems: &mut Problems,
 ) {
-    check_ids(manifest, proposal, modules, collections, problems);
+    let Contents {
+        modules,
+        collections,
+        ..
+    } = contents;
+    check_ids(manifest, proposal, contents, problems);
     if let Some((file, proposal)) = proposal {
         check_proposal(file, proposal, problems);
     }
-    flows::check(
-        manifest.map(|m| m.id.as_str()),
-        modules,
-        collections,
-        problems,
-    );
+    let model = manifest.map(|m| m.id.as_str());
+    flows::check(model, modules, collections, problems);
+    walkthroughs::check(model, contents, problems);
     for (file, module) in modules {
         check_module(file, module, config, problems);
     }
@@ -545,11 +606,11 @@ fn check(
                 None,
                 false,
             ),
-            None if proposal.is_none() && !(modules.is_empty() && collections.is_empty()) => {
+            None if proposal.is_none() && !contents.is_empty() => {
                 problems.push(
                     MANIFEST,
                     &m.id,
-                    "a planning model holds no modules or collections until a proposal is adopted",
+                    "a planning model holds no modules, collections or walkthroughs until a proposal is adopted",
                 );
             }
             None => {}
@@ -564,6 +625,10 @@ pub(super) fn module_file(id: &str) -> String {
 
 pub(super) fn collection_file(id: &str) -> String {
     format!("{COLLECTIONS}/{id}{COLLECTION_SUFFIX}")
+}
+
+pub(super) fn walkthrough_file(id: &str) -> String {
+    format!("{WALKTHROUGHS}/{id}{WALKTHROUGH_SUFFIX}")
 }
 
 /// Every relationship by its local ID, with the local ID of the module that owns it.
@@ -585,13 +650,14 @@ pub(super) struct FileWrite {
     pub(super) content: Option<String>,
 }
 
-/// The writes that store `manifest` (when given), `modules` and `collections` and delete the
-/// `removed` vault files, in the order they apply: the manifest first, so retired IDs are
-/// recorded before any file leaves, then the modules and collections, then the deletions.
+/// The writes that store `manifest` (when given), `modules`, `collections` and `walkthroughs` and
+/// delete the `removed` vault files, in the order they apply: the manifest first, so retired IDs
+/// are recorded before any file leaves, then the per-ID files, then the deletions.
 pub(super) fn plan_writes(
     manifest: Option<&Manifest>,
     modules: &[&Module],
     collections: &[&Collection],
+    walkthroughs: &[&Walkthrough],
     removed: &[String],
 ) -> Result<Vec<FileWrite>> {
     let write = |path: String, content: String| FileWrite {
@@ -610,6 +676,10 @@ pub(super) fn plan_writes(
             collection_file(&collection.id),
             file_json(collection)?,
         ));
+    }
+    for walkthrough in walkthroughs {
+        let path = walkthrough_file(&walkthrough.id);
+        writes.push(write(path, file_json(walkthrough)?));
     }
     writes.extend(removed.iter().map(|path| FileWrite {
         path: path.clone(),
@@ -708,11 +778,11 @@ pub(super) fn file_digests(dir: &Path, scope: &Scope) -> Result<BTreeMap<String,
     Ok(digests)
 }
 
-/// The vault-relative paths named like module and collection files in the state or proposal
-/// folder `prefix` names.
+/// The vault-relative paths named like per-ID files in the state or proposal folder `prefix`
+/// names.
 fn named(dir: &Path, prefix: &str) -> Result<Vec<String>> {
     let mut paths = Vec::new();
-    for (folder, suffix) in FOLDERS {
+    for (folder, suffix) in state_folders(prefix) {
         match fs::read_dir(dir.join(prefix).join(folder)) {
             Ok(entries) => {
                 for entry in entries {
@@ -733,7 +803,8 @@ fn named(dir: &Path, prefix: &str) -> Result<Vec<String>> {
     Ok(paths)
 }
 
-/// The folder and local ID of a module or collection file, by its vault-relative path.
+/// The folder and local ID of a module, collection or walkthrough file, by its vault-relative
+/// path.
 fn vault_file(path: &str) -> Option<(&'static str, &str)> {
     FOLDERS.iter().find_map(|(folder, suffix)| {
         let id = path
@@ -744,8 +815,8 @@ fn vault_file(path: &str) -> Option<(&'static str, &str)> {
     })
 }
 
-/// Whether `path` names a file `load_dir` reads: the manifest, the config, or a module or
-/// collection file directly inside its folder.
+/// Whether `path` names a file `load_dir` reads: the manifest, the config, or a module,
+/// collection or walkthrough file directly inside its folder.
 pub(super) fn is_vault_file(path: &str) -> bool {
     path == MANIFEST || path == CONFIG || vault_file(path).is_some_and(|(_, id)| !id.contains('/'))
 }
@@ -754,31 +825,33 @@ fn file_subject(path: &str) -> &str {
     vault_file(unprefixed(path)).map_or(path, |(_, id)| id)
 }
 
-/// Whether a journaled write may write or delete `path`: the manifest, a module or collection
-/// file of the current state or of a proposal, or a proposal's `proposal.json`.
+/// Whether a journaled write may write or delete `path`: the manifest, a module, collection or
+/// walkthrough file of the current state, a module or collection file of a proposal, or a
+/// proposal's `proposal.json`.
 fn is_written(path: &str) -> bool {
-    let local = match split_proposal(path) {
+    let (local, in_proposal) = match split_proposal(path) {
         Some((id, rest)) if ids::is_local(id) => {
             if rest == PROPOSAL {
                 return true;
             }
-            rest
+            (rest, true)
         }
         Some(_) => return false,
         None if path == MANIFEST => return true,
-        None => path,
+        None => (path, false),
     };
-    vault_file(local).is_some_and(|(_, id)| ids::is_local(id))
+    vault_file(local)
+        .is_some_and(|(folder, id)| ids::is_local(id) && !(in_proposal && folder == WALKTHROUGHS))
 }
 
 /// Every allocated ID (model, state, proposal, module, relationship, collection, flow, step,
-/// branch) shares one namespace: each must be well formed, unique and not retired. A proposal may
-/// hold IDs the current state retired after it was drawn: it cannot be adopted until reconciled.
+/// branch, walkthrough, beat) shares one namespace: each must be well formed, unique and not
+/// retired. A proposal may hold IDs the current state retired after it was drawn: it cannot be
+/// adopted until reconciled.
 fn check_ids(
     manifest: Option<&Manifest>,
     proposal: Option<(&str, &Proposal)>,
-    modules: &[(&str, &Module)],
-    collections: &[(&str, &Collection)],
+    contents: Contents<'_>,
     problems: &mut Problems,
 ) {
     let retired: BTreeSet<&str> = manifest
@@ -806,12 +879,15 @@ fn check_ids(
         }
     }
     ids.extend(proposal.map(|(file, p)| (file, p.id.as_str())));
-    for (file, module) in modules {
+    for (file, module) in contents.modules {
         ids.push((file, &module.id));
         ids.extend(module.outgoing.iter().map(|r| (*file, r.id.as_str())));
     }
-    for (file, collection) in collections {
+    for (file, collection) in contents.collections {
         ids.extend(collection.ids().into_iter().map(|id| (*file, id)));
+    }
+    for (file, walkthrough) in contents.walkthroughs {
+        ids.extend(walkthrough.ids().map(|id| (*file, id)));
     }
     let mut seen: BTreeMap<&str, &str> = BTreeMap::new();
     for (file, id) in ids {
@@ -1156,7 +1232,7 @@ impl Model {
 
     /// Every ID this model holds or reserves: the model's, its current state's, the retired
     /// ones, the proposal's, the state it became and the IDs it dropped, and every module,
-    /// relationship, collection, flow, step and branch.
+    /// relationship, collection, flow, step, branch, walkthrough and beat.
     pub(super) fn ids(&self) -> impl Iterator<Item = &str> {
         let manifest = &self.manifest;
         let proposal = self
@@ -1173,6 +1249,7 @@ impl Model {
             )
             .map(String::as_str)
             .chain(self.collections.iter().flat_map(Collection::ids))
+            .chain(self.walkthroughs.iter().flat_map(Walkthrough::ids))
     }
 
     /// Modules keyed by their parent's qualified ID (`None` for roots), each list in order.

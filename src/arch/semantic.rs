@@ -1,11 +1,14 @@
 //! The semantic check: warnings about the shape of the authored model itself, read from the
-//! modules and flows alone before any code is compared with them.
+//! modules, flows and walkthroughs alone before any code is compared with them.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::iter;
 
+use super::checkpoint;
 use super::diagnostic::{Diagnostic, DiagnosticCode};
 use super::index::Index;
-use super::types::{Binding, Collection, Module, Step, walk};
+use super::types::{BeatReading, Binding, Collection, Module, ReadingState, Step, walk};
+use super::vault::{self, Model};
 use super::{ids, segments};
 
 /// Every semantic diagnostic of the modules and collections of model `model`, sorted. They must
@@ -266,6 +269,77 @@ fn relationship_ends(index: &Index<'_>, out: &mut Vec<Diagnostic>) {
             ));
         }
     }
+}
+
+/// `WALKTHROUGH_EMPTY` for a walkthrough without beats, and `WALKTHROUGH_TARGET_MISSING` for a
+/// beat whose proposal or checkpoint does not load, or whose scope, focus or flow the state it
+/// draws lacks. `model` is the current state; each other state a beat names is loaded once, through
+/// the loaders `model read` uses, and only when a beat names it.
+pub fn walkthroughs(model: &Model) -> Vec<Diagnostic> {
+    let mut loaded: BTreeMap<&ReadingState, Result<Model, String>> = BTreeMap::new();
+    let mut out = Vec::new();
+    for walkthrough in &model.walkthroughs {
+        let id = model.qualify(&walkthrough.id);
+        let name = &walkthrough.name;
+        if walkthrough.beats.is_empty() {
+            let message = format!("{name} has no beats");
+            out.push(Diagnostic::new(
+                DiagnosticCode::WalkthroughEmpty,
+                vec![id.clone()],
+                message,
+            ));
+        }
+        for (n, beat) in (1..).zip(&walkthrough.beats) {
+            let reading = &beat.reading;
+            let states = iter::once((&reading.state, true))
+                .chain(reading.against.iter().map(|a| (a, false)));
+            for (state, drawn) in states.filter(|(s, _)| !s.is_current()) {
+                let target = loaded.entry(state).or_insert_with(|| load(model, state));
+                let missing = match target {
+                    Err(why) => vec![why.clone()],
+                    Ok(target) if drawn => lacks(target, reading, state),
+                    Ok(_) => Vec::new(),
+                };
+                let subjects = vec![id.clone(), model.qualify(&beat.id)];
+                out.extend(missing.into_iter().map(|why| {
+                    let message = format!("{name}, beat {n} ({}): {why}", beat.title);
+                    Diagnostic::new(
+                        DiagnosticCode::WalkthroughTargetMissing,
+                        subjects.clone(),
+                        message,
+                    )
+                }));
+            }
+        }
+    }
+    out
+}
+
+/// The proposal or checkpoint `state` names, or why it does not load.
+fn load(model: &Model, state: &ReadingState) -> Result<Model, String> {
+    let loaded = match state {
+        ReadingState::Current => unreachable!("`walkthroughs` loads only other states"),
+        ReadingState::Proposal(p) => vault::load_proposal(model.dir.clone(), p),
+        ReadingState::Checkpoint(c) => checkpoint::load(&model.dir, c).map(|(_, m)| m),
+    };
+    loaded.map_err(|error| format!("{} does not load: {error:#}", state.text()))
+}
+
+/// The scope, focus and flow of `reading` that `target`, the state named `state`, does not hold.
+fn lacks(target: &Model, reading: &BeatReading, state: &ReadingState) -> Vec<String> {
+    let place = state.text();
+    let (modules, flows) =
+        vault::reading_ids(&target.manifest.id, &target.modules, &target.collections);
+    let mut out = Vec::new();
+    let named = (reading.scope.iter().map(|s| ("scope", s)))
+        .chain(reading.focus.iter().map(|f| ("focus", f)));
+    for (field, module) in named.filter(|(_, m)| !modules.contains(*m)) {
+        out.push(format!("{field} {module} is not a module of {place}"));
+    }
+    if let Some(flow) = reading.flow.as_ref().filter(|f| !flows.contains(*f)) {
+        out.push(format!("flow {flow} is not a flow of {place}"));
+    }
+    out
 }
 
 #[cfg(test)]

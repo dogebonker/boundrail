@@ -150,6 +150,10 @@ impl Lanes<'_> {
         let w = self.col - COL_GAP;
         for &(id, x) in &self.columns {
             let mark = self.ctx.mark(id);
+            let dim = self.ctx.dims(id);
+            if dim {
+                svg.dimmed();
+            }
             svg.group(&class("lifeline", mark), Some(id));
             svg.polyline(&[(x, top + HEAD_H), (x, end)], &RULE);
             let head = outline(mark, HEAD_FILL);
@@ -161,6 +165,9 @@ impl Lanes<'_> {
             };
             svg.text((x, top + HEAD_H / 2.0 + BASELINE), self.ctx.name(id), &font);
             svg.close_group();
+            if dim {
+                svg.close_group();
+            }
         }
     }
 
@@ -208,6 +215,10 @@ impl Lanes<'_> {
             Some(n) => format!("{} x{n}", message.label),
             None => message.label.to_owned(),
         };
+        let dim = self.ctx.dims_message(message.from, message.to);
+        if dim {
+            self.body.dimmed();
+        }
         self.body.group(&class("message", mark), Some(&id));
         let (points, at, anchor, height) = self.arrow(a, b);
         self.body.polyline(&points, &style);
@@ -222,6 +233,9 @@ impl Lanes<'_> {
         self.body.text(at, &text, &font);
         let note = message.note.map_or(0.0, |n| self.note(n));
         self.body.close_group();
+        if dim {
+            self.body.close_group();
+        }
         self.y += height.max(note);
     }
 

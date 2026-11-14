@@ -381,6 +381,126 @@ fn is_false(value: &bool) -> bool {
     !value
 }
 
+/// The most beats one walkthrough holds.
+pub const BEATS_MAX: usize = 200;
+/// The longest beat narration.
+pub const NARRATION_MAX: usize = 2000;
+/// The deepest container level a reading opens.
+pub const READING_DEPTH_MAX: u32 = 9;
+
+/// `walkthroughs/<id>.walkthrough.json`: an authored narrative over the current state, beats in
+/// the order they are told.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Walkthrough {
+    #[schemars(range(min = 1, max = 1))]
+    pub schema_version: u32,
+    #[schemars(pattern(LOCAL_ID))]
+    pub id: String,
+    pub name: String,
+    pub order: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = DESCRIPTION_MAX))]
+    pub description: Option<String>,
+    #[serde(default)]
+    #[schemars(length(max = BEATS_MAX))]
+    pub beats: Vec<Beat>,
+}
+
+/// One step of a walkthrough: short narration and the exact reading of the model it explains.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Beat {
+    #[schemars(pattern(LOCAL_ID))]
+    pub id: String,
+    #[schemars(length(min = 1, max = LABEL_MAX))]
+    pub title: String,
+    /// Line breaks allowed.
+    #[schemars(length(min = 1, max = NARRATION_MAX))]
+    pub narration: String,
+    pub reading: BeatReading,
+}
+
+/// What a beat shows, as `model render` draws it. Module and flow IDs are qualified.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BeatReading {
+    pub view: ReadingView,
+    #[serde(default, skip_serializing_if = "ReadingState::is_current")]
+    pub state: ReadingState,
+    /// The state the drawn one is compared with: the current state or a proposal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub against: Option<ReadingState>,
+    /// The module whose parts the architecture view draws.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(pattern(QUALIFIED_ID))]
+    pub scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = READING_DEPTH_MAX))]
+    pub depth: Option<u32>,
+    /// The flow a sequence or flowchart view draws.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(pattern(QUALIFIED_ID))]
+    pub flow: Option<String>,
+    /// Modules drawn highlighted, the rest dimmed; in order, each once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(inner(pattern(QUALIFIED_ID)))]
+    pub focus: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ReadingView {
+    Architecture,
+    Sequence,
+    Flowchart,
+}
+
+impl ReadingView {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Architecture => "architecture",
+            Self::Sequence => "sequence",
+            Self::Flowchart => "flowchart",
+        }
+    }
+}
+
+/// A state a reading draws: `current`, `{"proposal": <qualified ID>}` or `{"checkpoint": <ID>}`.
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadingState {
+    #[default]
+    Current,
+    Proposal(String),
+    Checkpoint(String),
+}
+
+impl ReadingState {
+    pub fn is_current(&self) -> bool {
+        matches!(self, Self::Current)
+    }
+
+    /// How a message names the state: `the current state`, `proposal <ID>` or
+    /// `checkpoint <ID>`.
+    pub fn text(&self) -> String {
+        match self {
+            Self::Current => "the current state".to_owned(),
+            Self::Proposal(p) => format!("proposal {p}"),
+            Self::Checkpoint(c) => format!("checkpoint {c}"),
+        }
+    }
+}
+
+impl Walkthrough {
+    /// The walkthrough's ID and those of its beats.
+    pub fn ids(&self) -> impl Iterator<Item = &str> {
+        iter::once(self.id.as_str()).chain(self.beats.iter().map(|b| b.id.as_str()))
+    }
+}
+
 impl Step {
     pub fn id(&self) -> &str {
         match self {
@@ -546,13 +666,14 @@ impl Default for VaultConfig {
 pub type SchemaFn = fn() -> Schema;
 
 /// Every vault file format and request, by its `model schema` name.
-pub const SCHEMAS: [(&str, SchemaFn); 8] = [
+pub const SCHEMAS: [(&str, SchemaFn); 9] = [
     ("model-claim", root::<super::claims::ClaimRequest>),
     ("model-collection", root::<Collection>),
     ("model-edit", root::<super::edit::EditRequest>),
     ("model-manifest", root::<Manifest>),
     ("model-proposal", root::<Proposal>),
     ("model-release", root::<super::claims::ReleaseRequest>),
+    ("model-walkthrough", root::<Walkthrough>),
     ("module", root::<Module>),
     ("vault-config", root::<VaultConfig>),
 ];

@@ -48,6 +48,8 @@ const app = {
   active: 0,
   panes: [],
   ticket: 0, // drops answers to requests a newer load replaced
+  // The walkthrough being played: `{ id, walkthrough, index, error }`, null when none is.
+  play: null,
 };
 
 // ---------------------------------------------------------------- helpers
@@ -233,12 +235,14 @@ async function loadPane(pane) {
   await drawPane(pane);
 }
 
-/** Loads everything again, as on opening the page. */
+/** Loads everything again, as on opening the page; a walkthrough being played stays on its beat. */
 async function loadAll() {
   forget();
   app.currentFailed = false;
+  await refreshPlay();
   await Promise.all([loadLists(), ...app.panes.map(loadPane)]);
   showActive();
+  renderPlay();
 }
 
 /** Fills the top bar, the sidebar and the detail panel from the active pane. */
@@ -248,6 +252,7 @@ function showActive() {
   renderControls();
   renderTree();
   renderFlows();
+  renderWalkthroughs();
   renderDetail();
   app.panes.forEach(renderCrumbs);
   loadCheck(ticket);
@@ -452,6 +457,30 @@ function renderFlows() {
   });
 }
 
+/** The current state's walkthroughs, whatever the active pane shows: they belong to it. */
+async function renderWalkthroughs() {
+  const { data, error } = await loadModel({ kind: 'current' });
+  const box = $('#walkthroughs');
+  keepFocus(box, () => {
+    box.replaceChildren();
+    const list = data?.walkthroughs ?? [];
+    if (!data) return box.append(note(error));
+    if (!list.length) {
+      return box.append(note('No walkthroughs yet. A walkthrough tells the architecture beat by beat.'));
+    }
+    for (const w of list) {
+      const playing = app.play?.id === w.id;
+      box.append(item({
+        class: playing ? 'item selected' : 'item',
+        'data-key': w.id,
+        'aria-current': playing ? 'true' : null,
+        title: w.description,
+        onclick: () => playWalkthrough(w.id),
+      }, w.name, `${w.beats} beat${w.beats === 1 ? '' : 's'}`));
+    }
+  });
+}
+
 function renderWarnings() {
   const box = $('#warnings');
   box.replaceChildren();
@@ -609,10 +638,11 @@ function interfaceBody(report, id) {
 
 // ---------------------------------------------------------------- canvas
 
-/** A pane's own state, view and model; `box` is its zoom, `base` the drawing's bounds. */
+/** A pane's own state, view and model; `box` is its zoom, `base` the drawing's bounds, `beat`
+ * the walkthrough beat it draws, null when the pane was set by hand. */
 function newPane(from) {
   const { state = { kind: 'current' }, against = '', view = 'architecture', flow = null, scope = null, depth = 2 } = from ?? {};
-  return { state: { ...state }, against, view, flow, scope, depth, model: from?.model ?? null, loads: 0, ticket: 0 };
+  return { state: { ...state }, against, view, flow, scope, depth, beat: null, model: from?.model ?? null, loads: 0, ticket: 0 };
 }
 
 function buildPanes() {
@@ -687,8 +717,9 @@ function contentBox(svg) {
 async function drawPane(pane) {
   renderCrumbs(pane);
   const flowView = FLOW_VIEWS.includes(pane.view);
-  if (flowView && !pane.flow) return showNote(pane, 'This state has no flows to draw.');
-  const params = {
+  if (flowView && !pane.flow && !pane.beat) return showNote(pane, 'This state has no flows to draw.');
+  // A beat is drawn as the server reads it, focus included.
+  const params = pane.beat ? { ...pane.beat } : {
     ...stateParams(pane.state),
     view: pane.view,
     flow: flowView ? pane.flow : null,
@@ -724,6 +755,7 @@ async function drawPane(pane) {
 }
 
 function redraw(pane) {
+  pane.beat = null;
   if (pane === activePane()) {
     renderControls();
     renderFlows();
@@ -827,6 +859,8 @@ function attachPanZoom(pane) {
     if (id) drill(pane, id);
   });
   sheet.addEventListener('keydown', (event) => {
+    // While a walkthrough plays, Left and Right step through its beats instead of panning.
+    if (stepKey(event)) return;
     if (!pane.svg || !KEYS[event.key]) return;
     event.preventDefault();
     KEYS[event.key](pane);
@@ -875,6 +909,7 @@ function select(id, reveal = false) {
     const drawn = !pane.scope || (id !== pane.scope && subtree(model, pane.scope).includes(id));
     if (pane.view === 'architecture' && !drawn) {
       pane.scope = null;
+      pane.beat = null;
       drawPane(pane);
     }
   }
@@ -916,6 +951,7 @@ function setView(view) {
 async function setState(state) {
   const pane = activePane();
   pane.state = state;
+  pane.beat = null;
   if (pane.against === 'current' && state.kind === 'current') pane.against = '';
   if (state.kind === 'proposal' && pane.against === state.id) pane.against = '';
   await loadPane(pane);
@@ -943,6 +979,179 @@ function toggleSplit() {
   app.active = 0;
   buildPanes();
   Promise.all(app.panes.map(loadPane)).then(showActive);
+}
+
+// ---------------------------------------------------------------- walkthroughs
+
+const STEP_KEYS = { ArrowLeft: -1, ArrowRight: 1 };
+/** How far a key press steps through the walkthrough being played: -1, 1, or 0 for none. */
+const stepKey = (event) => (app.play && !(event.altKey || event.metaKey || event.ctrlKey || event.shiftKey)
+  ? STEP_KEYS[event.key] ?? 0 : 0);
+const localId = (id) => id.split('#').pop();
+
+/** The pane state a reading's `state` names. */
+function readingState(state) {
+  if (!state || state === 'current') return { kind: 'current' };
+  if (state.proposal) return { kind: 'proposal', id: localId(state.proposal) };
+  return { kind: 'checkpoint', id: state.checkpoint };
+}
+
+/** The pane's comparison a reading's `against` names: '' for none. */
+function readingAgainst(against) {
+  if (!against) return '';
+  return against === 'current' ? 'current' : localId(against.proposal ?? '');
+}
+
+/** Starts playing walkthrough `id` at beat `index`, counted from 0. */
+async function playWalkthrough(id, index = 0) {
+  app.play = { id, walkthrough: null, index, error: null };
+  await refreshPlay();
+  applyBeat();
+  await showBeat(true);
+}
+
+/** Reads the walkthrough being played again, keeping its beat where it still has one; a pane
+ * changed by hand keeps what it shows. */
+async function refreshPlay() {
+  if (!app.play) return;
+  const [data, error] = await attempt(api('walkthrough', { id: app.play.id }));
+  app.play.error = error;
+  if (!data) {
+    // Gone or unreadable: the panel says why, and the pane keeps what it shows.
+    app.play.walkthrough = null;
+    activePane().beat = null;
+    return;
+  }
+  const { walkthrough } = data;
+  app.play.id = walkthrough.id;
+  app.play.walkthrough = walkthrough;
+  app.play.index = Math.max(0, Math.min(app.play.index, walkthrough.beats.length - 1));
+  if (activePane().beat) applyBeat();
+}
+
+/** Sets the active pane to what the current beat reads; drawing it is the caller's. */
+function applyBeat() {
+  const { walkthrough, index } = app.play;
+  const beat = walkthrough?.beats[index];
+  const pane = activePane();
+  if (!beat) {
+    pane.beat = null;
+    return;
+  }
+  const { reading } = beat;
+  Object.assign(pane, {
+    state: readingState(reading.state),
+    against: readingAgainst(reading.against),
+    view: reading.view,
+    flow: reading.flow ?? null,
+    scope: reading.scope ?? null,
+    depth: reading.depth ?? 2,
+    beat: { walkthrough: walkthrough.id, beat: index + 1 },
+  });
+}
+
+/** Draws the current beat in the active pane, fitted to it, and says which beat it is. The
+ * sidebar and header follow only when `moved` says the pane's state or comparison changed. */
+async function showBeat(moved) {
+  const pane = activePane();
+  renderPlay();
+  if (!pane.beat) return renderWalkthroughs();
+  await loadPane(pane);
+  fit(pane);
+  if (moved) {
+    showActive();
+  } else {
+    renderControls();
+    renderFlows();
+  }
+  const { walkthrough, index } = app.play;
+  history.replaceState(null, '', `#walkthrough=${encodeURIComponent(walkthrough.id)}&beat=${index + 1}`);
+  $('#announce').textContent = `Beat ${index + 1} of ${walkthrough.beats.length}: ${walkthrough.beats[index].title}`;
+}
+
+/** Shows beat `k` of the walkthrough being played, counted from 0; does nothing past either end. */
+function goBeat(k) {
+  const beats = app.play?.walkthrough?.beats ?? [];
+  if (k < 0 || k >= beats.length) return;
+  const pane = activePane();
+  const before = JSON.stringify([pane.state, pane.against]);
+  app.play.index = k;
+  applyBeat();
+  showBeat(JSON.stringify([pane.state, pane.against]) !== before);
+}
+
+function stepBeat(by) {
+  if (app.play) goBeat(app.play.index + by);
+}
+
+async function endWalkthrough() {
+  const { id } = app.play;
+  app.play = null;
+  const pane = activePane();
+  pane.beat = null;
+  history.replaceState(null, '', location.pathname);
+  renderPlay();
+  drawPane(pane);
+  await renderWalkthroughs();
+  $('#walkthroughs').querySelector(`[data-key="${CSS.escape(id)}"]`)?.focus();
+}
+
+/** The play panel: where the walkthrough is, the beat's title and narration, and the controls. */
+function renderPlay() {
+  const panel = $('#play');
+  panel.hidden = !app.play;
+  if (!app.play) return panel.replaceChildren();
+  const { walkthrough, index, error } = app.play;
+  const beats = walkthrough?.beats ?? [];
+  const beat = beats[index];
+  const end = h('button', { class: 'end', onclick: endWalkthrough }, 'End walkthrough');
+  if (!walkthrough || !beat) {
+    const why = error ?? `${walkthrough?.name ?? 'This walkthrough'} has no beats yet.`;
+    return keepFocus(panel, () => panel.replaceChildren(h('p', { class: 'narration', text: why }), h('div', { class: 'controls' }, end)));
+  }
+  const dots = beats.map((b, k) => h('button', {
+    class: 'dot',
+    'data-key': `dot:${k}`,
+    'aria-label': `Beat ${k + 1}: ${b.title}`,
+    'aria-current': k === index ? 'step' : null,
+    title: b.title,
+    onclick: () => goBeat(k),
+  }));
+  // The step buttons stay focusable at either end, so focus is not lost on reaching it.
+  const step = (key, by, label, last) => h('button', {
+    'data-key': key,
+    class: key,
+    'aria-disabled': last ? 'true' : null,
+    'aria-keyshortcuts': by < 0 ? 'ArrowLeft' : 'ArrowRight',
+    onclick: () => stepBeat(by),
+  }, label);
+  const narration = h('p', { class: 'narration', text: beat.narration });
+  keepFocus(panel, () => panel.replaceChildren(
+    h('div', { class: 'script' },
+      h('p', { class: 'where', text: `${walkthrough.name}, beat ${index + 1} of ${beats.length}` }),
+      h('h2', { class: 'beat-title', text: beat.title }),
+      narration),
+    h('div', { class: 'controls' },
+      h('div', { class: 'steps' },
+        step('prev', -1, 'Previous', index === 0),
+        step('next', 1, 'Next', index === beats.length - 1)),
+      h('div', { class: 'dots', role: 'group', 'aria-label': 'Beats' }, dots),
+      end),
+  ));
+  // A narration longer than its box scrolls, so keyboard users can reach it.
+  if (narration.scrollHeight > narration.clientHeight) {
+    narration.tabIndex = 0;
+    narration.setAttribute('role', 'region');
+    narration.setAttribute('aria-label', `Narration of beat ${index + 1}`);
+  }
+}
+
+/** `#walkthrough=<id>&beat=<n>` in the address, as `{ id, index }`, or null. */
+function linkedBeat() {
+  if (!location.hash.startsWith('#walkthrough=')) return null;
+  const params = new URLSearchParams(location.hash.slice(1));
+  const beat = Number.parseInt(params.get('beat') ?? '1', 10);
+  return { id: params.get('walkthrough'), index: Number.isFinite(beat) && beat > 0 ? beat - 1 : 0 };
 }
 
 // ---------------------------------------------------------------- live updates
@@ -1030,7 +1239,10 @@ function bind() {
   $('#filter').addEventListener('input', (event) => { app.filter = event.target.value; renderTree(); });
   document.addEventListener('keydown', (event) => {
     const typing = /^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement?.tagName ?? '');
-    if (event.key === '/' && !typing) {
+    if (stepKey(event) && !typing) {
+      event.preventDefault();
+      stepBeat(stepKey(event));
+    } else if (event.key === '/' && !typing) {
       event.preventDefault();
       $('#filter').focus();
     } else if (event.key === 'Escape') {
@@ -1041,14 +1253,16 @@ function bind() {
 }
 
 app.panes = [newPane()];
-// `#<qualified module ID>` selects that module; a malformed one selects nothing.
+// `#walkthrough=<id>&beat=<n>` plays that beat; `#<qualified module ID>` selects that module; a
+// malformed one selects nothing.
+const linked = linkedBeat();
 try {
-  app.selected = decodeURIComponent(location.hash.slice(1)) || null;
+  app.selected = linked ? null : decodeURIComponent(location.hash.slice(1)) || null;
 } catch {
   app.selected = null;
 }
 bind();
 buildPanes();
 renderControls();
-loadAll();
+loadAll().then(() => linked?.id && playWalkthrough(linked.id, linked.index));
 connect();
