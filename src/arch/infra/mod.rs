@@ -534,10 +534,7 @@ mod tests {
 
     #[test]
     fn hosts_are_whole_names_of_urls_host_ports_and_host_variables() {
-        assert_eq!(
-            hosts("amqp://guest@rabbit:5672/vhost", false),
-            ["rabbit"]
-        );
+        assert_eq!(hosts("amqp://guest@rabbit:5672/vhost", false), ["rabbit"]);
         assert_eq!(hosts("http://abc:8080/b", false), ["abc"]);
         assert_eq!(hosts("db:5432", false), ["db"]);
         assert_eq!(hosts("mongodb://a:1,b:2", false), ["a", "b"]);
