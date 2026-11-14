@@ -88,13 +88,16 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   the one program repository config may name for us; a failed signature refuses `SIGNING_FAILED`
   before the ref moves, whatever the signer prints. A signing program named by repository config is
   accepted scope: writing `.git/config` already allows running code, and reading only global config
-  would break `include.path` and per-repository signing setups. The ref moves by compare-and-swap
-  with a reflog entry; a lost race or a held ref lock refuses `HISTORY_MOVED` and a retry builds on
-  the new tip. The new commit's parent and the swap's old value are the tip the history was read
-  from, even a commit without checkpoint trailers. Checkpoints restore the current state; drafts
-  travel with the committed vault, and publishing them is T17. A vault file larger than the 4 MiB a checkpoint
-  reader accepts refuses `MODEL_INVALID` before anything is written. Retaining an unchanged model
-  refuses `NOTHING_TO_RETAIN`. Trailers `Source` and `Operation` appear only when there is a value.
+  would break `include.path` and per-repository signing setups. The same holds for the clean and
+  process filter drivers repository config defines, which run when Git content-checks a working-tree
+  entry, for example in `model footprint`; `src/git.rs` states both exceptions. The ref moves by
+  compare-and-swap with a reflog entry; a lost race or a held ref lock refuses `HISTORY_MOVED` and a
+  retry builds on the new tip. The new commit's parent and the swap's old value are the tip the
+  history was read from, even a commit without checkpoint trailers. Checkpoints restore the current
+  state; drafts travel with the committed vault, and publishing them is T17. A vault file larger
+  than the 4 MiB a checkpoint reader accepts refuses `MODEL_INVALID` before anything is written.
+  Retaining an unchanged model refuses `NOTHING_TO_RETAIN`. Trailers `Source` and `Operation` appear
+  only when there is a value.
 - T7: `model retain` takes flags, not a request body. `--writer` defaults to the Git author name.
   `--expected-revision` refuses `STALE_REVISION` when the model is at another revision; agents
   should pass the revision they reviewed. Its operation fingerprint covers the writer, `--doing` and
@@ -266,61 +269,73 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   either way between the two or modules containing them, and neither contains the other. Locality
   counts the module owning each path, not its containers.
 - T10: `model footprint [--base <rev>] [--head <rev>]` diffs from the merge-base of the base and
-  the head to the head, or to the working tree with untracked files when `--head` is absent;
-  renames count as a deletion and an addition, and the vault's own files are left out. The base is
-  `--base`, else the first of origin/HEAD, main or master, else the head itself; `base` is
-  `{commit, source: explicit|merge-base|head-fallback, ref}` with the merge-base in `commit`. A
-  shallow checkout without a default branch refuses `REQUEST_INVALID` rather than fall back. Each
-  changed file's owner lists it under `files`, and every module containing that owner counts it in
-  `in_parts`. `outside` lists changed files no binding holds. `crossings` are module pairs, neither
-  containing the other, that an import edge with a changed file at either end joins, with the
-  relationships covering each (empty when undrawn). They are null with `crossings_skipped` when not
-  checked: `not-needed` (nothing to scan), `scan-failed` (with `scan_error`), or
-  `head-not-checked-out`, since the scan reads the checkout and serves only a head equal to HEAD;
-  with `--head HEAD` and a dirty tree the edges still come from the working tree. `model` is
-  `model compare` of the head's current state against the merge-base's, read from that commit's
-  tree as checkpoints are read (proposals left out; modes 100644 and 100755, anything else refuses
-  `MODEL_INVALID`), or null when the base holds no model, or null with `model_error` naming the
-  commit when its model does not load. With `--head` the model is the one committed there.
+  the head to the head, or to the working tree with untracked files when `--head` is absent, through
+  a disposable copy of the index with Git's stat refresh on, so a file whose stat alone changed is
+  content-checked and left out and the user's index is never written; renames count as a deletion
+  and an addition, and the vault's own files are left out. The base is `--base`, else the first of
+  origin/HEAD, main or master, else the head itself; `base` is `{commit, source:
+  explicit|merge-base|head-fallback, ref}` with the merge-base in `commit`. A shallow checkout
+  without a default branch refuses `REQUEST_INVALID` rather than fall back. Each changed file's
+  owner lists it under `files`, and every module containing that owner counts it in `in_parts`.
+  `outside` lists changed files no binding holds. `crossings` are module pairs, neither containing
+  the other, that an import edge with a changed file at either end joins, with the relationships
+  covering each (empty when undrawn). They are null with `crossings_skipped` when not checked:
+  `not-needed` (nothing to scan), `scan-failed` (with `scan_error`), or `head-not-checked-out`,
+  since the scan reads the checkout and serves only a head equal to HEAD; with `--head HEAD` and a
+  dirty tree the edges still come from the working tree. `model` is `model compare` of the head's
+  current state against the merge-base's, read from that commit's tree as checkpoints are read
+  (proposals left out; modes 100644 and 100755, anything else refuses `MODEL_INVALID`), or null when
+  the base holds no model, or null with `model_error` naming the commit when its model does not
+  load. With `--head` the model is the one committed there. The JSON always has every key, null when
+  unset: `schema`, `kind`, `success`, `vault`, `revision`, `base`, `head`, `modules`, `outside`,
+  `crossings`, `crossings_skipped`, `model`, `model_error` and `scan_error`.
 - T11: `model view [--port N] [--no-open]` serves the page and a JSON API on 127.0.0.1 only, port 0
   (a free one) by default, and prints the URL with its token as the first line on stdout. Without
-  `--no-open` it starts the platform opener (`open`, `xdg-open`, `cmd /c start ""`) with the URL as
-  one argument, never through a shell string. The page (`src/arch/view/index.html`, `app.js`,
-  `style.css`) is embedded with `include_str!`, uses no framework and loads nothing from other
-  origins, so it works offline.
+  `--no-open` it starts the platform opener (`open`, `xdg-open`, `cmd /c start ""`) with a one-time
+  launch URL, `/launch?c=<code>`, as one argument, never through a shell string, so the token stays
+  out of every process's arguments. The code is a second OS-random value, never the token. The first
+  request naming it gets a 303 to `/?t=<token>` and spends it; an unknown or spent code gets 403.
+  `--brief` refuses `REQUEST_INVALID`, since it would hold the URL back. Connection threads run with
+  the invoking thread's options and tool timeout, as daemon requests do. The page
+  (`src/arch/view/index.html`, `app.js`, `style.css`) is embedded with `include_str!`, uses no
+  framework and loads nothing from other origins, so it works offline.
 - T11: the API answers with the command outputs through the same functions the CLI prints:
-  `/api/model?proposal=&checkpoint=` is `model read`, `/api/render?view=&flow=&scope=&depth=&proposal=&checkpoint=&against=`
-  is `model render` as `image/svg+xml`, `/api/check?proposal=` is `model check` with its skips,
-  `/api/proposals`, `/api/checkpoints`, `/api/compare?proposal=&against=` and
-  `/api/inspect?subject=&proposal=` are their commands. A refusal is its JSON output with 404 for
-  `*_NOT_FOUND` codes and 400 otherwise; any other error is a 500. An empty parameter counts as
-  absent. `/api/events` is a Server-Sent Events stream that sends `event: changed` with
-  `{"revision": ..., "parts": [...]}` once the watched files have been quiet for 200 ms (only a
-  relevant event restarts the wait), and a keepalive comment every 15 s so a closed page ends its
-  thread. The revision is the current state's, or null when it does not load, computed once by the
-  watcher for every stream. The parts say what changed: `model` (the current state's files),
-  `proposals`, `state` (this worktree's `<git dir>/boundrail`: claims, journal) and `history`
-  (`refs/boundrail` and `packed-refs` in the common Git directory, so checkpoints retained from any
-  worktree show); a stream that slept through several changes gets every part. The watcher
-  follows no symbolic links, ignores read access, and watches only those folders, deeply, plus
-  their parents shallowly so it sees them appear. The page reloads everything for `proposals`,
-  `history` or a moved revision, only claims and checks for `state`, and nothing when the revision
-  did not move; `/api/model` answers are kept per state until the next change.
-- T11: security. The server binds the loopback interface only. Each run's 128-bit token is a
-  SHA-256 over keys of the standard library's hasher, seeded once per thread from the operating
-  system (128 bits of OS entropy), with the time and process ID; every `/api/` request carries it as
+  `/api/model?proposal=&checkpoint=` is `model read` (both at once refuse `REQUEST_INVALID`, 400),
+  `/api/render?view=&flow=&scope=&depth=&proposal=&checkpoint=&against=` is `model render` as
+  `image/svg+xml`, `/api/check?proposal=` is `model check` with its skips, `/api/proposals`,
+  `/api/checkpoints`, `/api/compare?proposal=&against=` and `/api/inspect?subject=&proposal=` are
+  their commands. A refusal is its JSON output with 404 for `*_NOT_FOUND` codes and 400 otherwise;
+  any other error is a 500. An empty parameter counts as absent. `/api/events` is a Server-Sent
+  Events stream that sends `event: changed` with `{"revision": ..., "parts": [...]}` once the
+  watched files have been quiet for 200 ms (only a relevant event restarts the wait), and a
+  keepalive comment every 15 s so a closed page ends its thread. The revision is the current
+  state's, or null when it does not load, computed once by the watcher for every stream. The parts
+  say what changed: `model` (the current state's files), `proposals`, `state` (this worktree's `<git
+  dir>/boundrail`: claims, journal) and `history` (`refs/boundrail` and `packed-refs` in the common
+  Git directory, so checkpoints retained from any worktree show); a stream that slept through
+  several changes gets every part. The watcher follows no symbolic links, ignores read access, and
+  watches only those folders, deeply, plus their parents shallowly so it sees them appear. The page
+  reloads everything for `proposals` or `history`, for a revision other than the last event's (null
+  included; the first load's until an event comes) or after a failed load of the current state, only
+  claims and checks for `state`, and nothing otherwise; `/api/model` answers are kept per state
+  until the next change.
+- T11: security. The server binds the loopback interface only. Each run's token is 256 bits from the
+  operating system's random source (`/dev/urandom`, or the system RNG on Windows), the helper the
+  daemon's token uses; a target with neither refuses to start. Every `/api/` request carries it as
   `t` or the `X-Boundrail-Token` header, compared in constant time, or gets 403. The page drops the
-  token from the address bar once read and keeps it in the tab's session storage, so a reload
-  works. The page and its two assets carry no data and need no token. Every request must name
-  exactly one Host, `127.0.0.1:<port>` or `localhost:<port>`, else 403, which stops DNS rebinding.
-  Only GET is served (405 with `Allow: GET` otherwise). A request head is capped at 16 KiB (431) and
-  must arrive whole within 10 s (408), however slowly it drips. At most 64 connections are served at
-  once besides 16 event streams; more get 503, and a failed thread start or accept never stops the
+  token from the address bar once read and keeps it in the tab's session storage, so a reload works.
+  The page and its two assets carry no data and need no token. Every request must name exactly one
+  Host, `127.0.0.1:<port>` or `localhost:<port>`, else 403, which stops DNS rebinding. Only GET is
+  served (405 with `Allow: GET` otherwise). A request head is capped at 16 KiB (431) and must arrive
+  whole within 10 s (408), however slowly it drips. At most 64 connections are served at once
+  besides 16 event streams; more get 503, and a failed thread start or accept never stops the
   server. Every response sends `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`,
   `Referrer-Policy: no-referrer` and `Connection: close`. The page's Content-Security-Policy allows
   only its own script, style and connections; SVG is parsed with `DOMParser` and imported, never
   run, and `/api/render` opened on its own carries `default-src 'none'; style-src 'unsafe-inline'`.
-  The server writes nothing: every endpoint is a read the CLI already does.
+  The server writes nothing: every endpoint is a read the CLI already does. The hardening exception
+  of T7 covers its reads too: a clean or process filter driver repository config defines may run
+  when Git content-checks a working-tree entry.
 - T11: limits. ponytail: a thread per connection under the caps, fine for one person's pages; a
   pool if many share a server. The vault watch is set at start: a vault folder deleted and made
   again is not followed. Checks and interfaces scan the checkout on each request, as the commands

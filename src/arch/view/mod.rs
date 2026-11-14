@@ -2,12 +2,9 @@
 //! request to `boundrail model view` passes. The server itself lives with the CLI, which owns
 //! the command outputs it answers with.
 
-use std::collections::hash_map::RandomState;
-use std::hash::{BuildHasher, Hasher};
 use std::io::{self, Read};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
-use sha2::{Digest, Sha256};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 pub const INDEX_HTML: &str = include_str!("index.html");
 pub const APP_JS: &str = include_str!("app.js");
@@ -214,25 +211,31 @@ fn same(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0, |diff, (x, y)| diff | (x ^ y)) == 0
 }
 
-/// 32 hex digits no other page can guess. The standard library seeds each thread's
-/// [`RandomState`] keys once from the operating system's random source and then increments
-/// them, so the four hashes below share that one 128-bit seed; the time and process ID add
-/// little. The token is as unpredictable as that seed, which is enough for a loopback server
-/// that lives as long as one session.
-pub fn new_token() -> String {
-    let mut hasher = Sha256::new();
-    for k in 0u8..4 {
-        let mut keyed = RandomState::new().build_hasher();
-        keyed.write_u8(k);
-        hasher.update(keyed.finish().to_le_bytes());
+/// A one-time code the browser opener gets in place of the token, so the token never appears in
+/// a process's arguments. The first request naming it redeems it; after that it is spent.
+pub struct Launch(Mutex<Option<String>>);
+
+impl Launch {
+    /// A new code from the operating system's random source.
+    pub fn new() -> anyhow::Result<Self> {
+        Ok(Self(Mutex::new(Some(crate::token()?))))
     }
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    hasher.update(nanos.to_le_bytes());
-    hasher.update(std::process::id().to_le_bytes());
-    let digest = hasher.finalize();
-    digest[..16].iter().map(|b| format!("{b:02x}")).collect()
+
+    /// The code while it is unspent.
+    pub fn code(&self) -> Option<String> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Whether `given` is the unspent code, which this spends.
+    pub fn redeem(&self, given: Option<&str>) -> bool {
+        let mut code = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let matches =
+            (code.as_deref().zip(given)).is_some_and(|(c, g)| same(c.as_bytes(), g.as_bytes()));
+        if matches {
+            *code = None;
+        }
+        matches
+    }
 }
 
 /// A complete response that closes the connection. Every response forbids caching and sniffing.
@@ -256,6 +259,7 @@ pub fn response(status: u16, content_type: &str, body: &[u8], extra: &[(&str, &s
 fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        303 => "See Other",
         400 => "Bad Request",
         403 => "Forbidden",
         408 => "Request Timeout",
@@ -386,10 +390,27 @@ mod tests {
     }
 
     #[test]
+    fn a_launch_code_redeems_once_and_is_never_the_token() {
+        let token = crate::token().unwrap();
+        let launch = Launch::new().unwrap();
+        let code = launch.code().unwrap();
+        assert_eq!(code.len(), 64);
+        assert_ne!(code, token);
+        assert!(!launch.redeem(None));
+        assert!(!launch.redeem(Some(&code[1..])));
+        assert!(launch.redeem(Some(&code)));
+        assert!(
+            !launch.redeem(Some(&code)),
+            "a spent code does not redeem again"
+        );
+        assert_eq!(launch.code(), None);
+    }
+
+    #[test]
     fn the_token_passes_in_the_query_or_the_header_only_when_equal() {
-        let token = new_token();
-        assert_eq!(token.len(), 32);
-        assert_ne!(token, new_token());
+        let token = crate::token().unwrap();
+        assert_eq!(token.len(), 64);
+        assert_ne!(token, crate::token().unwrap());
         let query = request(&format!("GET /api/model?t={token} HTTP/1.1\r\n"));
         assert!(token_matches(&query, &token));
         let header = request(&format!(

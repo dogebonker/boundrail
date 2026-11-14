@@ -57,6 +57,36 @@ use anyhow::{Result, bail};
 use model::{Cochange, Config, Document, Edge, File, SCHEMA, Source, Summary, Tool};
 use rules::Compiled;
 
+/// 64 hex digits (256 bits) from the operating system's random source: `/dev/urandom` on Unix,
+/// the system RNG on Windows. Fails on a target with neither, rather than return a guessable
+/// value.
+#[cfg(any(unix, windows))]
+pub fn token() -> Result<String> {
+    let mut bytes = [0u8; 32];
+    #[cfg(unix)]
+    {
+        use std::io::Read as _;
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    }
+    #[cfg(windows)]
+    {
+        #[link(name = "bcrypt")]
+        unsafe extern "system" {
+            fn BCryptGenRandom(h: *mut std::ffi::c_void, p: *mut u8, n: u32, flags: u32) -> i32;
+        } // System RNG, with no algorithm handle.
+        if unsafe { BCryptGenRandom(std::ptr::null_mut(), bytes.as_mut_ptr(), 32, 2) } < 0 {
+            bail!("the system random number generator failed")
+        };
+    }
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Always fails: this target has no operating system random source.
+#[cfg(not(any(unix, windows)))]
+pub fn token() -> Result<String> {
+    bail!("no operating system random source on this target")
+}
+
 /// Rebuild a persisted scan, retaining its optional historical context.
 pub fn restore_scan(mut input: model::ScanInput) -> Result<Document> {
     validate_scan(&input)?;

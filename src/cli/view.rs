@@ -47,6 +47,8 @@ pub(super) struct ViewArgs {
 struct Server {
     root: PathBuf,
     token: String,
+    /// The code the opener's URL carries instead of the token.
+    launch: page::Launch,
     port: u16,
     connections: AtomicUsize,
     streams: AtomicUsize,
@@ -68,14 +70,26 @@ struct News {
 }
 
 /// Serves until the process is stopped. The URL, with its token, is the first line on stdout.
+/// The browser opener gets a one-time launch URL instead, so the token stays out of its
+/// arguments.
 pub(super) fn run(root: &Path, args: &ViewArgs) -> Result<()> {
+    // Options and the tool timeout belong to the calling thread; connections take them along.
+    let options = globals();
+    // The URL goes to stdout, which `--brief` would capture until the server stops.
+    if options.brief {
+        return Err(invalid(
+            "--brief does not apply to model view, which serves a page",
+        ));
+    }
+    let timeout = (options.tool_timeout > 0).then(|| Duration::from_secs(options.tool_timeout));
     let vault = vault::locate(root)?;
     let listener = TcpListener::bind(("127.0.0.1", args.port))
         .with_context(|| format!("binding 127.0.0.1:{}", args.port))?;
     let port = listener.local_addr()?.port();
     let server = Arc::new(Server {
         root: root.to_path_buf(),
-        token: page::new_token(),
+        token: boundrail::token()?,
+        launch: page::Launch::new()?,
         port,
         connections: AtomicUsize::new(0),
         streams: AtomicUsize::new(0),
@@ -87,8 +101,10 @@ pub(super) fn run(root: &Path, args: &ViewArgs) -> Result<()> {
     println!("{url}");
     std::io::stdout().flush()?;
     eprintln!("Serving a read-only view of the model; stop with Ctrl-C");
-    if !args.no_open {
-        open(&url);
+    if !args.no_open
+        && let Some(code) = server.launch.code()
+    {
+        open(&format!("http://127.0.0.1:{port}/launch?c={code}"));
     }
     for stream in listener.incoming() {
         let stream = match stream {
@@ -103,9 +119,12 @@ pub(super) fn run(root: &Path, args: &ViewArgs) -> Result<()> {
             continue;
         }
         let worker = Arc::clone(&server);
+        let options = options.clone();
         let spawned = thread::Builder::new()
             .name("view-connection".into())
             .spawn(move || {
+                GLOBALS.with(|g| *g.borrow_mut() = options);
+                collect::request_timeout(timeout);
                 let connection = Release(&worker.connections);
                 if let Some(stream) = worker.serve(stream) {
                     // An event stream counts against its own cap, claimed in `serve`.
@@ -359,6 +378,16 @@ impl Server {
             "/" => asset("text/html; charset=utf-8", page::INDEX_HTML),
             "/app.js" => asset("text/javascript; charset=utf-8", page::APP_JS),
             "/style.css" => asset("text/css; charset=utf-8", page::STYLE_CSS),
+            "/launch" if self.launch.redeem(request.param("c")) => {
+                let location = format!("/?t={}", self.token);
+                page::response(
+                    303,
+                    "text/plain; charset=utf-8",
+                    b"",
+                    &[("Location", &location)],
+                )
+            }
+            "/launch" => text(403, "Unknown or used launch code"),
             "/api/render" => match self.render(request) {
                 Ok(svg) => {
                     let csp = [("Content-Security-Policy", page::RENDER_CSP)];
@@ -379,7 +408,12 @@ impl Server {
         let root = &self.root;
         let param = |name| request.param(name);
         Ok(Some(match path {
-            "/api/model" => model_cli::read_output(root, param("checkpoint"), param("proposal"))?,
+            "/api/model" => {
+                if param("checkpoint").is_some() && param("proposal").is_some() {
+                    return Err(invalid("read a checkpoint or a proposal, not both"));
+                }
+                model_cli::read_output(root, param("checkpoint"), param("proposal"))?
+            }
             "/api/check" => model_cli::run_check(root, None, param("proposal"))?.output()?,
             "/api/proposals" => model_cli::proposals_output(root)?,
             "/api/checkpoints" => model_cli::checkpoints_output(root, None)?,
@@ -498,6 +532,40 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), 2);
         drop(Release(&counter));
         assert!(claim(&counter, 2), "a released place is free again");
+    }
+
+    #[test]
+    fn the_launch_url_redirects_to_the_token_once() {
+        let server = Server {
+            root: PathBuf::new(),
+            token: boundrail::token().unwrap(),
+            launch: page::Launch::new().unwrap(),
+            port: 4000,
+            connections: AtomicUsize::new(0),
+            streams: AtomicUsize::new(0),
+            news: Mutex::default(),
+            changed: Condvar::new(),
+        };
+        let code = server.launch.code().unwrap();
+        assert_ne!(code, server.token);
+        let launch = |code: &str| {
+            let head = format!("GET /launch?c={code} HTTP/1.1\r\nHost: 127.0.0.1:4000\r\n");
+            let request = page::parse(head.as_bytes()).unwrap();
+            assert!(server.refusal(&request).is_none());
+            String::from_utf8(server.answer(&request)).unwrap()
+        };
+        assert!(launch("wrong").starts_with("HTTP/1.1 403 "));
+        let redirect = launch(&code);
+        assert!(
+            redirect.starts_with("HTTP/1.1 303 See Other\r\n"),
+            "{redirect}"
+        );
+        let location = format!("\r\nLocation: /?t={}\r\n", server.token);
+        assert!(redirect.contains(&location), "{redirect}");
+        assert!(
+            launch(&code).starts_with("HTTP/1.1 403 "),
+            "a used code is refused"
+        );
     }
 
     #[test]

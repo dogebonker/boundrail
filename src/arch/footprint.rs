@@ -4,9 +4,10 @@
 //! crosses, and the vault's own changes compare the branch's model with its base's.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Serialize;
 
 use super::code::{self, PathOwners};
@@ -14,6 +15,7 @@ use super::compare::{self, Comparison};
 use super::index::Index;
 use super::types::{Collection, Module};
 use super::{Code, Refusal, vault};
+use crate::collect::TempDir;
 use crate::git;
 use crate::model::Document;
 
@@ -149,7 +151,9 @@ pub fn range(root: &Path, base: Option<&str>, head: Option<&str>) -> Result<Rang
 
 /// The paths changed from `base` to `head`, or to the working tree with its untracked files
 /// when `head` is `None`, in the checkout `root`, less the vault's own files. Both are commit
-/// hashes; renames count as a deletion and an addition.
+/// hashes; renames count as a deletion and an addition. The working tree is compared through a
+/// disposable copy of the index with Git's stat refresh on, so a file whose stat changed but
+/// whose content did not is content-checked and left out, and the user's index is never written.
 pub fn changed(root: &Path, base: &str, head: Option<&str>) -> Result<Vec<String>> {
     let mut args = vec![
         "diff",
@@ -162,15 +166,39 @@ pub fn changed(root: &Path, base: &str, head: Option<&str>) -> Result<Vec<String
     ];
     args.extend(head);
     args.push("--");
-    let mut files = split(&git::run(root, &args)?);
-    if head.is_none() {
+    let mut files = if head.is_some() {
+        split(&git::run(root, &args)?)
+    } else {
+        let temp = TempDir::new("footprint-index")?;
+        let index = temp.path().join("index");
+        let actual = ["rev-parse", "--path-format=absolute", "--git-path", "index"];
+        let actual = PathBuf::from(git::text(root, &actual)?.trim_end_matches(['\n', '\r']));
+        if actual.is_file() {
+            copy_index(&actual, &index)?;
+        }
+        let mut files = split(&git::run_with_index(root, &args, Some(&index))?);
         let untracked = ["ls-files", "--others", "--exclude-standard", "-z"];
         files.extend(split(&git::run(root, &untracked)?));
-    }
+        files
+    };
     files.retain(|f| !vault::in_vault(f));
     files.sort_unstable();
     files.dedup();
     Ok(files)
+}
+
+/// Copies the index at `from` to `to` with its modification time. Git content-checks an entry
+/// whose file is not older than the index (racily clean), so a copy newer than the original
+/// would pass files edited in the same second as unchanged.
+fn copy_index(from: &Path, to: &Path) -> Result<()> {
+    fs::copy(from, to).context("copying the Git index")?;
+    let modified = fs::metadata(from)?.modified()?;
+    fs::File::options()
+        .write(true)
+        .open(to)?
+        .set_modified(modified)
+        .context("dating the Git index copy")?;
+    Ok(())
 }
 
 fn split(out: &[u8]) -> Vec<String> {
@@ -300,6 +328,22 @@ mod tests {
             ]
         );
         assert!(report.model.is_none());
+    }
+
+    #[test]
+    fn an_index_copy_keeps_the_original_modification_time() {
+        let temp = TempDir::new("index-copy-test").unwrap();
+        let (from, to) = (temp.path().join("index"), temp.path().join("copy"));
+        fs::write(&from, b"DIRC").unwrap();
+        let old =
+            std::time::UNIX_EPOCH + std::time::Duration::from_nanos(1_000_000_000_123_456_789);
+        (fs::File::options().write(true).open(&from).unwrap())
+            .set_modified(old)
+            .unwrap();
+        copy_index(&from, &to).unwrap();
+        let modified = |p: &Path| fs::metadata(p).unwrap().modified().unwrap();
+        assert_eq!(modified(&to), modified(&from));
+        assert_eq!(fs::read(&to).unwrap(), b"DIRC");
     }
 
     #[test]

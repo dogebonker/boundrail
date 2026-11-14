@@ -1,6 +1,9 @@
 //! Every Git subprocess boundrail runs, hardened so a repository's config never names a program
-//! Git would run on our behalf (fsmonitor, hooks). The one exception is the signing program:
-//! when the user opts into `commit.gpgSign`, `model retain` signs its checkpoints with it.
+//! Git would run on our behalf (fsmonitor, hooks). The exceptions are the signing program, which
+//! signs `model retain`'s checkpoints when the user opts into `commit.gpgSign`, and the clean and
+//! process filter drivers repository config defines, which run when Git content-checks a
+//! working-tree entry, for example in `model footprint`. Writing `.git/config` already allows
+//! running code, so neither widens what a repository can do.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -18,7 +21,8 @@ fn subcommand<'a>(args: &[&'a str]) -> &'a str {
 pub fn run(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
     run_with_index(root, args, None)
 }
-/// A disposable index permits Git's own stat cache without changing the user's staging index.
+/// A disposable index permits Git's own stat cache without changing the user's staging index,
+/// so `git diff` refreshes it: an entry whose stat changed is content-checked, not listed.
 pub fn run_with_index(root: &Path, args: &[&str], index: Option<&Path>) -> Result<Vec<u8>> {
     let mut command = Command::new("git");
     if let Some(index) = index {
@@ -43,7 +47,11 @@ pub fn run_with_index(root: &Path, args: &[&str], index: Option<&Path>) -> Resul
             "-c",
             "core.hooksPath=/dev/null",
             "-c",
-            "diff.autoRefreshIndex=false",
+            if index.is_some() {
+                "diff.autoRefreshIndex=true"
+            } else {
+                "diff.autoRefreshIndex=false"
+            },
         ])
         .args(args)
         .output()

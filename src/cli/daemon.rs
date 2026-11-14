@@ -487,22 +487,6 @@ pub(super) fn status(args: Status) -> Result<()> {
     };
     write(None, &value)
 }
-pub(super) fn token() -> Result<String> {
-    let mut bytes = [0u8; 32];
-    #[cfg(unix)]
-    fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-    #[cfg(windows)]
-    {
-        #[link(name = "bcrypt")]
-        unsafe extern "system" {
-            fn BCryptGenRandom(h: *mut std::ffi::c_void, p: *mut u8, n: u32, flags: u32) -> i32;
-        } // System RNG, with no algorithm handle.
-        if unsafe { BCryptGenRandom(std::ptr::null_mut(), bytes.as_mut_ptr(), 32, 2) } < 0 {
-            bail!("cannot create daemon authentication token; retry or use --no-daemon")
-        };
-    }
-    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
-}
 fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::fs::OpenOptions;
     history::refuse_symlink(path)?;
@@ -900,7 +884,8 @@ pub(super) fn serve(mut args: Serve) -> Result<ExitCode> {
             .as_ref()
             .map(|s| s.local_addr().map(|a| a.port()))
             .transpose()?,
-        token: token()?,
+        token: boundrail::token()
+            .context("cannot create daemon authentication token; retry or use --no-daemon")?,
     };
     let cleanup = Cleanup {
         descriptor: path.clone(),

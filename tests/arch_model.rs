@@ -4720,7 +4720,34 @@ fn footprint_shows_the_touched_modules_and_the_model_change() {
     let first = git(&checkout, &["rev-list", "--max-parents=0", "HEAD"]);
     let out = checkout.ok(&["footprint", "--base", first.trim()]);
     assert_eq!(out["model"], Value::Null);
-    assert!(out.get("model_error").is_none(), "{out:#}");
+    assert_eq!(out.get("model_error"), Some(&Value::Null), "{out:#}");
+    assert_eq!(out.get("scan_error"), Some(&Value::Null), "{out:#}");
+}
+
+#[test]
+fn footprint_content_checks_a_working_tree_file_whose_stat_changed() {
+    let (checkout, model) = measured();
+    let index = checkout.path().join(".git/index");
+    let before = fs::read(&index).unwrap();
+    // A touch changes the file's stat, not its content.
+    let fee = checkout.path().join("src/billing/fee.ts");
+    let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+    (fs::File::options().write(true).open(&fee).unwrap())
+        .set_modified(old)
+        .unwrap();
+    let out = checkout.ok(&["footprint"]);
+    assert_eq!(out["modules"], json!([]), "{out:#}");
+    assert_eq!(out["outside"], json!([]), "{out:#}");
+    assert_eq!(
+        fs::read(&index).unwrap(),
+        before,
+        "the user's index is not written"
+    );
+
+    fs::write(&fee, "export const fee = 2;\n").unwrap();
+    let out = checkout.ok(&["footprint"]);
+    assert_eq!(out["modules"][0]["module"], format!("{model}#Billing1"));
+    assert_eq!(out["modules"][0]["files"], json!(["src/billing/fee.ts"]));
 }
 
 #[test]
@@ -4912,6 +4939,11 @@ fn view_serves_the_page_and_the_model_to_its_token_only() {
     assert_eq!(refused["error"]["code"], "REQUEST_INVALID");
     let (status, _) = view.get(&format!("/api/model?t={t}&checkpoint=ffff"));
     assert_eq!(status, 404);
+    // One state at a time, as `model read` takes.
+    let (status, refused) = view.get(&format!("/api/model?t={t}&checkpoint=ffff&proposal=P"));
+    assert_eq!(status, 400, "{refused}");
+    let refused: Value = serde_json::from_str(View::body(&refused)).unwrap();
+    assert_eq!(refused["error"]["code"], "REQUEST_INVALID");
 
     for path in ["proposals", "checkpoints", "check"] {
         let (status, out) = view.get(&format!("/api/{path}?t={t}"));
@@ -4927,6 +4959,19 @@ fn view_serves_the_page_and_the_model_to_its_token_only() {
     );
     assert_eq!(status, 405, "{response}");
     assert!(response.contains("Allow: GET"));
+
+    // `--brief` would hold the URL back until the server stops.
+    let brief = Command::new(env!("CARGO_BIN_EXE_boundrail"))
+        .args(["--no-daemon", "--brief", "model", "view", "--no-open"])
+        .current_dir(checkout.path())
+        .output()
+        .unwrap();
+    assert_eq!(brief.status.code(), Some(2));
+    let brief: Value = serde_json::from_slice(&brief.stdout).unwrap();
+    assert_eq!(
+        brief["result"]["error"]["code"], "REQUEST_INVALID",
+        "{brief:#}"
+    );
 }
 
 #[test]

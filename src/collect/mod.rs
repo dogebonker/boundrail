@@ -114,7 +114,11 @@ impl TempDir {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir(&path).with_context(|| format!("creating {}", path.display()))?;
+        let mut builder = fs::DirBuilder::new();
+        // Only the user may read what goes in, such as a copy of the Git index.
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        (builder.create(&path)).with_context(|| format!("creating {}", path.display()))?;
         Ok(Self(path))
     }
 
@@ -384,6 +388,12 @@ mod tests {
     fn temp_dirs_created_together_are_distinct_and_removed_on_drop() {
         let (first, second) = (TempDir::new("test").unwrap(), TempDir::new("test").unwrap());
         assert_ne!(first.path(), second.path());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(first.path()).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "only the user may read it");
+        }
         let path = first.path().to_owned();
         fs::write(path.join("file"), "").unwrap();
         drop(first);

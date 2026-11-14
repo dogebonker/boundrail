@@ -1371,11 +1371,8 @@ fn model_footprint(
     output["crossings"] = json!(report.crossings);
     output["crossings_skipped"] = json!(report.crossings_skipped);
     output["model"] = json!(report.model);
-    for (key, error) in [("model_error", model_error), ("scan_error", scan_error)] {
-        if let Some(error) = error {
-            output[key] = json!(error);
-        }
-    }
+    output["model_error"] = json!(model_error);
+    output["scan_error"] = json!(scan_error);
     write(None, &output)
 }
 

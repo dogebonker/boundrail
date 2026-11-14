@@ -483,7 +483,7 @@ fn scan(setup: &Setup) -> Result<(Document, BTreeMap<String, String>)> {
         let before = manifest(&setup.root, &outputs)?;
         let graph_relative = format!(
             ".archgraph/hooks/snapshots/{}.scan.json",
-            daemon_cli::token()?
+            boundrail::token()?
         );
         let graph_path = checked(&setup.root, &graph_relative)?;
         let mut args = vec![
@@ -564,7 +564,7 @@ fn capture(setup: &Setup, agent: Agent, session: &str) -> Result<(String, Docume
         "policy changed during capture"
     );
     let bytes = serde_json::to_vec(&doc)?;
-    let id = daemon_cli::token()?;
+    let id = boundrail::token()?;
     let state = Snapshot {
         schema: "archgraph/edit-snapshot/v1".into(),
         root: setup.root.clone(),
@@ -1069,7 +1069,7 @@ mod tests {
         fn new() -> Self {
             let root = std::env::temp_dir().join(format!(
                 "archgraph-edit-runtime-{}",
-                daemon_cli::token().unwrap()
+                boundrail::token().unwrap()
             ));
             fs::create_dir_all(root.join("src/domain")).unwrap();
             fs::create_dir_all(root.join("src/adapters")).unwrap();
@@ -1364,7 +1364,7 @@ mod tests {
     fn directory_alias_non_regular_link_target_is_refused() {
         let root = PathBuf::from("/tmp").join(format!(
             "ag-hook-socket-{}",
-            &daemon_cli::token().unwrap()[..16]
+            &boundrail::token().unwrap()[..16]
         ));
         fs::create_dir(&root).unwrap();
         let fixture = Fixture(root.canonicalize().unwrap());

@@ -33,7 +33,10 @@ const app = {
   checkpoints: [],
   models: new Map(), // state key -> promise of a pane model
   interfaces: new Map(), // state key | module ID -> `model inspect`
-  revision: null, // the current state's revision as last seen
+  // The revision the last change event named, null when the current state did not load; the
+  // first load's until an event comes. Kept apart from later loads, which may race the events.
+  eventRevision: undefined,
+  currentFailed: false, // whether the last load of the current state failed
   selected: null, // qualified module ID
   hits: [], // subjects a warning pointed at
   focus: false,
@@ -193,10 +196,15 @@ function comparePair(pane) {
 function loadModel(state) {
   const key = stateKey(state);
   if (!app.models.has(key)) {
-    app.models.set(key, attempt(api('model', stateParams(state))).then(([data, error]) => {
-      if (state.kind === 'current' && data) app.revision = data.revision.digest;
+    const loading = attempt(api('model', stateParams(state))).then(([data, error]) => {
+      // A load a later change replaced says nothing about the current state any more.
+      if (state.kind === 'current' && app.models.get(key) === loading) {
+        app.currentFailed = !data;
+        if (app.eventRevision === undefined) app.eventRevision = data?.revision?.digest ?? null;
+      }
       return paneModel(data, error);
-    }));
+    });
+    app.models.set(key, loading);
   }
   return app.models.get(key);
 }
@@ -228,6 +236,7 @@ async function loadPane(pane) {
 /** Loads everything again, as on opening the page. */
 async function loadAll() {
   forget();
+  app.currentFailed = false;
   await Promise.all([loadLists(), ...app.panes.map(loadPane)]);
   showActive();
 }
@@ -938,8 +947,9 @@ function toggleSplit() {
 
 // ---------------------------------------------------------------- live updates
 
-/** Follows a `changed` event: everything when proposals or history changed or the current
- * state's revision moved, only claims and checks when the Boundrail state alone changed. */
+/** Follows a `changed` event: everything when proposals or history changed, the revision differs
+ * from the last event's or the last load of the current state failed, only claims and checks
+ * when the Boundrail state alone changed. */
 async function onChanged(event) {
   let news;
   try {
@@ -948,7 +958,9 @@ async function onChanged(event) {
     news = { revision: null, parts: ALL_PARTS };
   }
   const parts = new Set(news.parts ?? ALL_PARTS);
-  const moved = parts.has('model') && news.revision !== app.revision;
+  const revision = news.revision ?? null;
+  const moved = revision !== app.eventRevision || app.currentFailed;
+  app.eventRevision = revision;
   if (parts.has('proposals') || parts.has('history') || moved) {
     await loadAll();
   } else if (parts.has('state')) {
