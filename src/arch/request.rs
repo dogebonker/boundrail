@@ -12,6 +12,9 @@ use super::{Code, Refusal, one_line};
 /// The largest request a model command reads, and the largest state file it reads, in bytes.
 pub const INPUT_MAX: u64 = 4 * 1024 * 1024;
 pub const WRITER_MAX: usize = 64;
+pub const OPERATION_MAX: usize = 64;
+/// The characters an operation ID may use; [`check_operation`] enforces the same rule.
+pub const OPERATION_PATTERN: &str = "^[A-Za-z0-9._-]+$";
 const DOING_MAX: usize = 140;
 
 /// The model and state a request is written against.
@@ -48,6 +51,22 @@ pub(super) fn check_doing(doing: &str) -> Result<()> {
         .into());
     }
     Ok(())
+}
+
+/// Refuses an operation ID that is not 1 to [`OPERATION_MAX`] characters from `A-Za-z0-9._-`;
+/// the ID names a journal file.
+pub(super) fn check_operation(operation: &str) -> Result<()> {
+    if !operation.is_empty()
+        && operation.len() <= OPERATION_MAX
+        && operation
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return Ok(());
+    }
+    Err(invalid(format!(
+        "operation_id needs 1 to {OPERATION_MAX} characters from A-Z, a-z, 0-9, `.`, `_`, `-`"
+    )))
 }
 
 pub(super) fn check_writer(writer: &str) -> Result<()> {

@@ -15,8 +15,9 @@ use super::types::{
     Anchor, Binding, DESCRIPTION_MAX, Emphasis, LABEL_MAX, Manifest, Module, RESPONSIBILITY_MAX,
     Relationship, SCHEMA_VERSION, State, VaultConfig,
 };
-use super::{Code, Refusal, ids, one_line};
+use super::{Code, Refusal, ids, one_line, state};
 use crate::history::{refuse_symlink, write_atomic};
+use crate::sync_rules::hash;
 
 /// Boundrail's state folder at the checkout root, and the vault folder inside it.
 const STATE: &str = ".boundrail";
@@ -448,7 +449,50 @@ pub(super) fn apply_writes(dir: &Path, writes: &[FileWrite]) -> Result<()> {
             },
         }
     }
+    // The renames and removals must reach the disk before the journal records the edit done.
+    state::sync_dir(dir)?;
+    let modules = dir.join(MODULES);
+    if modules.is_dir() {
+        state::sync_dir(&modules)?;
+    }
     Ok(())
+}
+
+/// The SHA-256 of each recognized vault file by vault-relative path, read without validating the
+/// model, which a partly applied edit may leave invalid. A linked or special file gets a marker
+/// that no content hashes to.
+pub(super) fn file_digests(dir: &Path) -> Result<BTreeMap<String, String>> {
+    let mut paths = vec![MANIFEST.to_owned(), CONFIG.to_owned()];
+    match fs::read_dir(dir.join(MODULES)) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry?;
+                // As in `load_dir`, a folder named like a module file is not a vault file.
+                if let Some(name) = entry.file_name().to_str()
+                    && name.ends_with(MODULE_SUFFIX)
+                    && !entry.file_type()?.is_dir()
+                {
+                    paths.push(format!("{MODULES}/{name}"));
+                }
+            }
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("reading {MODULES}")),
+    }
+    let mut digests = BTreeMap::new();
+    for path in paths {
+        let file = dir.join(&path);
+        let digest = match fs::symlink_metadata(&file) {
+            Ok(meta) if meta.is_file() => {
+                hash(&fs::read(&file).with_context(|| format!("reading {path}"))?)
+            }
+            Ok(_) => "not a regular file".to_owned(),
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| format!("reading {path}")),
+        };
+        digests.insert(path, digest);
+    }
+    Ok(digests)
 }
 
 fn file_subject(path: &str) -> &str {

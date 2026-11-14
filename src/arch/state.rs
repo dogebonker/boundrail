@@ -6,18 +6,21 @@ use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
-use serde::Deserialize;
+use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::request::INPUT_MAX;
 use super::{Code, Refusal};
 use crate::history::{refuse_symlink, write_atomic};
+use crate::sync_rules::hash;
 
 const STATE: &str = "boundrail";
 const LOCK: &str = "model.lock";
-/// The journal folder: one record per edit operation.
-pub(super) const OPERATIONS: &str = "operations";
+/// The journal folder: one record per operation, and the `pending` folder of edits that have
+/// not finished. Records differ by their `kind`: `edit`, `claim` or `release`.
+const OPERATIONS: &str = "operations";
+const PENDING: &str = "pending";
 
 /// `<git dir>/boundrail` for the vault folder `vault`, which may not exist yet.
 pub(super) fn dir(vault: &Path) -> Result<PathBuf> {
@@ -86,7 +89,7 @@ pub(super) fn read<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
 }
 
 /// Replaces a state file with `value` as pretty JSON, refusing one that [`read`] could not read.
-pub(super) fn write(path: &Path, value: &impl serde::Serialize) -> Result<()> {
+pub(super) fn write(path: &Path, value: &impl Serialize) -> Result<()> {
     let text = serde_json::to_string_pretty(value)? + "\n";
     ensure!(
         text.len() as u64 <= INPUT_MAX,
@@ -96,48 +99,144 @@ pub(super) fn write(path: &Path, value: &impl serde::Serialize) -> Result<()> {
     write_atomic(path, text.as_bytes()).with_context(|| format!("writing {}", path.display()))
 }
 
-/// The journal record paths in `dir`, in operation ID order.
-pub(super) fn operations(dir: &Path) -> Result<Vec<PathBuf>> {
-    let journal = dir.join(OPERATIONS);
-    let mut paths: Vec<PathBuf> = match fs::read_dir(&journal) {
-        Ok(entries) => entries
-            .filter_map(|entry| {
-                let path = entry.ok()?.path();
-                (path.extension()? == "json").then_some(path)
-            })
-            .collect(),
-        Err(e) if e.kind() == ErrorKind::NotFound => Vec::new(),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", journal.display())),
+/// The IDs of the operations waiting in the journal of `dir`, in order: records in the pending
+/// folder whose operation has no done record. A pending record left beside a done one (a crash
+/// between writing one and removing the other) counts as done.
+pub(super) fn pending(dir: &Path) -> Result<Vec<String>> {
+    let folder = dir.join(OPERATIONS).join(PENDING);
+    let mut operations = Vec::new();
+    match fs::read_dir(&folder) {
+        Ok(entries) => {
+            for entry in entries {
+                let path = entry?.path();
+                if path.extension().is_some_and(|e| e == "json")
+                    && let Some(operation) = path.file_stem().and_then(|s| s.to_str())
+                    && fs::symlink_metadata(done_path(dir, operation)).is_err()
+                {
+                    operations.push(operation.to_owned());
+                }
+            }
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("reading {}", folder.display())),
+    }
+    operations.sort();
+    Ok(operations)
+}
+
+/// `operations/pending/<operation>.json`: an edit planned but not yet finished.
+pub(super) fn pending_path(dir: &Path, operation: &str) -> PathBuf {
+    dir.join(OPERATIONS)
+        .join(PENDING)
+        .join(format!("{operation}.json"))
+}
+
+/// `operations/<operation>.json`: a finished or abandoned operation.
+fn done_path(dir: &Path, operation: &str) -> PathBuf {
+    dir.join(OPERATIONS).join(format!("{operation}.json"))
+}
+
+/// The SHA-256 of `request` and the journal record of `operation` as JSON: the record in
+/// `operations/` when there is one, else the pending one. Refuses `OPERATION_REUSED` when the
+/// record was written for another request.
+pub(super) fn recorded(
+    dir: &Path,
+    operation: &str,
+    request: &impl Serialize,
+) -> Result<(String, Option<Value>)> {
+    let fingerprint = hash(&serde_json::to_vec(request)?);
+    let record = match read::<Value>(&done_path(dir, operation))? {
+        Some(record) => Some(record),
+        None => read::<Value>(&pending_path(dir, operation))?,
     };
-    paths.sort();
-    Ok(paths)
+    match record {
+        Some(record) if record["request_sha256"] != fingerprint => Err(Refusal::new(
+            Code::OperationReused,
+            "this operation_id already applied a different request; use a new operation_id",
+        )
+        .with_details(json!({ "operation_id": operation }))
+        .into()),
+        record => Ok((fingerprint, record)),
+    }
+}
+
+/// Writes the pending record of `operation` and makes it durable before any vault file changes.
+pub(super) fn write_pending(dir: &Path, operation: &str, record: &impl Serialize) -> Result<()> {
+    let folder = dir.join(OPERATIONS).join(PENDING);
+    for path in [&dir.join(OPERATIONS), &folder] {
+        refuse_symlink(path)?;
+    }
+    fs::create_dir_all(&folder).with_context(|| format!("creating {}", folder.display()))?;
+    write(&pending_path(dir, operation), record)?;
+    // The folders may be new, so their entries in the parents are flushed too.
+    for path in [&folder, &dir.join(OPERATIONS), dir] {
+        sync_dir(path)?;
+    }
+    Ok(())
+}
+
+/// Writes the record of `operation` in `operations/` durably.
+pub(super) fn write_record(dir: &Path, operation: &str, record: &impl Serialize) -> Result<()> {
+    let folder = dir.join(OPERATIONS);
+    refuse_symlink(&folder)?;
+    fs::create_dir_all(&folder).with_context(|| format!("creating {}", folder.display()))?;
+    write(&done_path(dir, operation), record)?;
+    sync_dir(&folder)?;
+    sync_dir(dir)
+}
+
+/// Writes the done record of `operation`, then removes its pending record if it has one.
+pub(super) fn finish(dir: &Path, operation: &str, record: &impl Serialize) -> Result<()> {
+    write_record(dir, operation, record)?;
+    let path = pending_path(dir, operation);
+    match fs::remove_file(&path) {
+        Err(e) if e.kind() != ErrorKind::NotFound => {
+            Err(e).with_context(|| format!("removing {}", path.display()))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Whether a writer holds the vault lock of the state folder `dir` now. It never creates the
+/// lock file, and the shared probe it takes is released at once.
+pub(super) fn locked(dir: &Path) -> Result<bool> {
+    let path = dir.join(LOCK);
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
+    };
+    match file.try_lock_shared() {
+        Ok(()) => Ok(false),
+        Err(TryLockError::WouldBlock) => Ok(true),
+        Err(TryLockError::Error(e)) => {
+            Err(e).with_context(|| format!("locking {}", path.display()))
+        }
+    }
+}
+
+/// Flushes a folder's entries to disk, so a file renamed into or removed from it survives a crash.
+pub(super) fn sync_dir(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    File::open(path)
+        .and_then(|folder| folder.sync_all())
+        .with_context(|| format!("syncing {}", path.display()))?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 /// `RECOVERY_REQUIRED` while an interrupted edit waits in the journal of `dir`.
 pub(super) fn refuse_interrupted(dir: &Path) -> Result<()> {
-    #[derive(Deserialize)]
-    struct Record {
-        status: String,
-        output: Output,
-    }
-    #[derive(Deserialize)]
-    struct Output {
-        operation_id: String,
-    }
-    for path in operations(dir)? {
-        if let Some(record) = read::<Record>(&path)?
-            && record.status == "pending"
-        {
-            let operation = record.output.operation_id;
-            return Err(Refusal::new(
-                Code::RecoveryRequired,
-                format!(
-                    "operation {operation} was interrupted; run `boundrail model recover` to finish it"
-                ),
-            )
-            .with_details(json!({ "operation_id": operation }))
-            .into());
-        }
+    if let Some(operation) = pending(dir)?.into_iter().next() {
+        return Err(Refusal::new(
+            Code::RecoveryRequired,
+            format!(
+                "operation {operation} was interrupted; run `boundrail model recover` to finish it"
+            ),
+        )
+        .with_details(json!({ "operation_id": operation }))
+        .into());
     }
     Ok(())
 }

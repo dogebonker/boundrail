@@ -49,3 +49,7 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 | T16 | Agent integration: `init`, skills for authoring/planning/PRs, CI action with PR annotations and footprint comment | open |
 | T17 | Reconcile drafts after current changes, export/import bundles, history publication | open |
 | T18 | Remove scan-era code that the model does not use | open |
+
+## Notes
+
+- T16: scoped agent hooks treat .boundrail/model changes as out of scope; decide whether the vault is always in scope.

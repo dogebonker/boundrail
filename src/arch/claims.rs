@@ -16,12 +16,15 @@ use std::iter;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::request::{Target, WRITER_MAX, check_doing, check_model, check_writer, invalid, parse};
+use super::request::{
+    OPERATION_MAX, OPERATION_PATTERN, Target, WRITER_MAX, check_doing, check_model,
+    check_operation, check_writer, invalid, parse,
+};
 use super::types::Relationship;
 use super::vault::{self, Model};
 use super::{Code, Refusal, ids, one_line, state};
@@ -68,6 +71,10 @@ pub struct ClaimRequest {
     /// qualified or local.
     #[schemars(length(min = 1, max = SUBJECTS_MAX))]
     pub subjects: Vec<String>,
+    /// Repeating an operation ID with the same request returns the claim it recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = OPERATION_MAX), pattern(OPERATION_PATTERN))]
+    pub operation_id: Option<String>,
 }
 
 /// The `model release` request: a writer gives up its own claim, or anyone clears a revoked one.
@@ -77,6 +84,10 @@ pub struct ReleaseRequest {
     pub claim: String,
     #[schemars(length(min = 1, max = WRITER_MAX))]
     pub writer: String,
+    /// Repeating an operation ID with the same request returns the claim it released.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = OPERATION_MAX), pattern(OPERATION_PATTERN))]
+    pub operation_id: Option<String>,
 }
 
 /// `claims.json`.
@@ -96,7 +107,24 @@ pub fn claim(vault: &Path, input: &[u8], doing: &str) -> Result<Claim> {
             "subjects needs 1 to {SUBJECTS_MAX} entries"
         )));
     }
+    request
+        .operation_id
+        .as_deref()
+        .map(check_operation)
+        .transpose()?;
     let state = state::lock(vault)?;
+    let mut ledger = read(&state.dir)?;
+    // A claim recorded pending took effect when the ledger holds it.
+    let operation = Operation::start(
+        &state.dir,
+        request.operation_id.as_deref(),
+        "claim",
+        &request,
+        |claim| ledger.claims.iter().any(|c| c.id == claim.id),
+    )?;
+    if let Operation::Done(claim) = operation {
+        return Ok(claim);
+    }
     state::refuse_interrupted(&state.dir)?;
     let model = vault::load_dir(vault.to_path_buf())?;
     check_model(&model, &request.target)?;
@@ -106,7 +134,6 @@ pub fn claim(vault: &Path, input: &[u8], doing: &str) -> Result<Claim> {
         .iter()
         .map(|subject| resolve(&model, &relationships, subject))
         .collect::<Result<BTreeSet<String>>>()?;
-    let mut ledger = read(&state.dir)?;
     let up = containers(&model);
     // Holding a module holds what is inside it, so claims on either side of a containment clash.
     refuse_conflicts(
@@ -130,8 +157,10 @@ pub fn claim(vault: &Path, input: &[u8], doing: &str) -> Result<Claim> {
         created: now(),
         revoked: None,
     };
+    operation.record(&state.dir, "pending", &claim)?;
     ledger.claims.push(claim.clone());
     write(&state.dir, &ledger)?;
+    operation.record(&state.dir, "done", &claim)?;
     Ok(claim)
 }
 
@@ -140,16 +169,106 @@ pub fn claim(vault: &Path, input: &[u8], doing: &str) -> Result<Claim> {
 pub fn release(vault: &Path, input: &[u8]) -> Result<Claim> {
     let request: ReleaseRequest = parse(input, "release")?;
     check_writer(&request.writer)?;
+    request
+        .operation_id
+        .as_deref()
+        .map(check_operation)
+        .transpose()?;
     let state = state::lock(vault)?;
-    state::refuse_interrupted(&state.dir)?;
     let mut ledger = read(&state.dir)?;
+    // A release recorded pending took effect when the ledger no longer holds the claim.
+    let operation = Operation::start(
+        &state.dir,
+        request.operation_id.as_deref(),
+        "release",
+        &request,
+        |claim| !ledger.claims.iter().any(|c| c.id == claim.id),
+    )?;
+    if let Operation::Done(claim) = operation {
+        return Ok(claim);
+    }
+    state::refuse_interrupted(&state.dir)?;
     let at = find(&ledger.claims, &request.claim)?;
     if ledger.claims[at].revoked.is_none() {
         check_holder(&ledger.claims[at], &request.writer)?;
     }
     let claim = ledger.claims.remove(at);
+    operation.record(&state.dir, "pending", &claim)?;
     write(&state.dir, &ledger)?;
+    operation.record(&state.dir, "done", &claim)?;
     Ok(claim)
+}
+
+/// A claim or release request's record in the journal, `operations/<operation_id>.json`, so a
+/// retry returns the claim instead of acting twice. The record is written `pending` with the claim
+/// before the ledger changes and `done` after; it never blocks edits.
+enum Operation {
+    /// No operation ID: nothing is recorded.
+    Untracked,
+    /// A first attempt, or a retry of one that never reached the ledger.
+    New {
+        operation: String,
+        kind: &'static str,
+        fingerprint: String,
+    },
+    /// Already done: the recorded claim.
+    Done(Claim),
+}
+
+#[derive(Deserialize)]
+struct Record {
+    status: String,
+    output: Claim,
+}
+
+impl Operation {
+    /// The operation `operation` of `request`, a `kind` request. A pending record counts as done
+    /// when `landed` says its claim reached the ledger.
+    fn start(
+        dir: &Path,
+        operation: Option<&str>,
+        kind: &'static str,
+        request: &impl Serialize,
+        landed: impl Fn(&Claim) -> bool,
+    ) -> Result<Self> {
+        let Some(operation) = operation else {
+            return Ok(Self::Untracked);
+        };
+        let (fingerprint, record) = state::recorded(dir, operation, request)?;
+        if let Some(record) = record {
+            let record: Record = serde_json::from_value(record)
+                .with_context(|| format!("parsing the journal record of {operation}"))?;
+            match record.status.as_str() {
+                "done" => return Ok(Self::Done(record.output)),
+                "pending" if landed(&record.output) => return Ok(Self::Done(record.output)),
+                "pending" => {}
+                status => {
+                    bail!("the journal record of {operation} has the unknown status {status}")
+                }
+            }
+        }
+        Ok(Self::New {
+            operation: operation.to_owned(),
+            kind,
+            fingerprint,
+        })
+    }
+
+    fn record(&self, dir: &Path, status: &str, claim: &Claim) -> Result<()> {
+        let Self::New {
+            operation,
+            kind,
+            fingerprint,
+        } = self
+        else {
+            return Ok(());
+        };
+        state::write_record(
+            dir,
+            operation,
+            &json!({"request_sha256": fingerprint, "kind": kind, "status": status, "output": claim}),
+        )
+    }
 }
 
 /// Marks a claim revoked, so it stops blocking anyone; the first revocation stays.
@@ -176,9 +295,10 @@ pub fn list(vault: &Path) -> Result<Vec<Claim>> {
     Ok(read(&state::dir(vault)?)?.claims)
 }
 
-/// The claims that block other writers.
-pub fn active(vault: &Path) -> Result<Vec<Claim>> {
-    let mut claims = list(vault)?;
+/// The claims that block other writers, from the state folder `state` (see
+/// [`super::state_dir`]).
+pub fn active(state: &Path) -> Result<Vec<Claim>> {
+    let mut claims = read(state)?.claims;
     claims.retain(|c| c.revoked.is_none());
     Ok(claims)
 }
@@ -196,19 +316,30 @@ pub fn holding(model: &Model, claims: Vec<Claim>, subjects: &[&str]) -> Vec<Clai
         .collect()
 }
 
+/// A module an edit moves to another parent.
+pub(super) struct Move {
+    /// Its qualified ID.
+    pub(super) module: String,
+    /// The qualified IDs of its containers after the edit, nearest first.
+    pub(super) above: Vec<String>,
+}
+
 /// Refuses an edit by `writer` of `model` touching `affected` while another writer's active
 /// claim holds any of it, and, when the edit names `claim`, unless that is the writer's live
-/// claim holding all of it. `dir` is the state folder, held under the vault lock.
+/// claim holding all of it. It also refuses a move in `moves` that would put one writer's claim
+/// inside another's. `dir` is the state folder, held under the vault lock.
 pub(super) fn check_edit(
     dir: &Path,
     model: &Model,
     writer: &str,
     claim: Option<&str>,
     affected: &BTreeSet<String>,
+    moves: &[Move],
 ) -> Result<()> {
     let ledger = read(dir)?;
     let up = containers(model);
     let held_by = |held: &str, subject: &str| covers(&up, held, subject);
+    refuse_nesting(&ledger.claims, &up, moves)?;
     let Some(id) = claim else {
         return refuse_conflicts(&ledger.claims, writer, affected, held_by);
     };
@@ -323,6 +454,49 @@ fn refuse_conflicts(
             "{} claim(s) of other writers hold these subjects; wait for their release or ask a person to revoke them",
             conflicts.len()
         ),
+    )
+    .with_details(json!({ "conflicts": conflicts }))
+    .into())
+}
+
+/// `CLAIM_CONFLICT` when a move takes a subject one writer's active claim holds (the module, a
+/// module inside it, or a relationship they own) under a module another writer's active claim
+/// holds. Claims never overlap across writers when recorded; this keeps a move from making them.
+fn refuse_nesting(claims: &[Claim], up: &BTreeMap<String, String>, moves: &[Move]) -> Result<()> {
+    let active: Vec<&Claim> = claims.iter().filter(|c| c.revoked.is_none()).collect();
+    let mut conflicts = Vec::new();
+    for moved in moves {
+        for inner in &active {
+            let inside: Vec<&String> = inner
+                .subjects
+                .iter()
+                .filter(|s| covers(up, &moved.module, s))
+                .collect();
+            if inside.is_empty() {
+                continue;
+            }
+            for outer in active.iter().filter(|c| c.writer != inner.writer) {
+                let above: Vec<&String> = outer
+                    .subjects
+                    .iter()
+                    .filter(|s| moved.above.contains(s))
+                    .collect();
+                if !above.is_empty() {
+                    conflicts.push(json!({
+                        "module": moved.module,
+                        "inside": {"id": inner.id, "writer": inner.writer, "subjects": inside},
+                        "above": {"id": outer.id, "writer": outer.writer, "subjects": above},
+                    }));
+                }
+            }
+        }
+    }
+    if conflicts.is_empty() {
+        return Ok(());
+    }
+    Err(Refusal::new(
+        Code::ClaimConflict,
+        "the move would put one writer's claim inside another writer's claim; release one of them first",
     )
     .with_details(json!({ "conflicts": conflicts }))
     .into())

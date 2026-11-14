@@ -11,9 +11,16 @@ pub mod types;
 pub mod vault;
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 use serde::{Serialize, Serializer};
 use serde_json::Value;
+
+/// `<git dir>/boundrail`, the machine-local state folder of the vault folder `vault`. Reading it
+/// creates nothing.
+pub fn state_dir(vault: &Path) -> anyhow::Result<PathBuf> {
+    state::dir(vault)
+}
 
 /// Whether `text` is one line of 1 to `max` characters: not blank and free of control characters.
 pub fn one_line(text: &str, max: usize) -> bool {
@@ -46,6 +53,8 @@ pub enum Code {
     VaultLocked,
     OperationReused,
     RecoveryRequired,
+    RecoveryConflict,
+    OperationAbandoned,
     ClaimNotFound,
     ClaimConflict,
     ClaimNotHeld,
@@ -72,6 +81,8 @@ impl Code {
             Code::VaultLocked => "VAULT_LOCKED",
             Code::OperationReused => "OPERATION_REUSED",
             Code::RecoveryRequired => "RECOVERY_REQUIRED",
+            Code::RecoveryConflict => "RECOVERY_CONFLICT",
+            Code::OperationAbandoned => "OPERATION_ABANDONED",
             Code::ClaimNotFound => "CLAIM_NOT_FOUND",
             Code::ClaimConflict => "CLAIM_CONFLICT",
             Code::ClaimNotHeld => "CLAIM_NOT_HELD",

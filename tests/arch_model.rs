@@ -1208,7 +1208,6 @@ fn a_held_edit_lock_refuses() {
 
 #[test]
 fn an_interrupted_edit_blocks_others_until_recovered() {
-    const STOP: (&str, &str) = ("BOUNDRAIL_TEST_STOP_AFTER_JOURNAL", "1");
     let checkout = Checkout::new();
     let model = shop(&checkout);
     let request = checkout.request(json!([
@@ -1221,12 +1220,13 @@ fn an_interrupted_edit_blocks_others_until_recovered() {
     assert_eq!((code, stdout.as_str()), (2, ""));
     assert_eq!(checkout.digest(), before);
     let operation = request["operation_id"].as_str().unwrap();
-    let record_path = checkout
-        .path()
-        .join(format!(".git/boundrail/operations/{operation}.json"));
+    let journal = checkout.path().join(".git/boundrail/operations");
+    let pending_path = journal.join(format!("pending/{operation}.json"));
+    let record_path = journal.join(format!("{operation}.json"));
     let read_record =
         || -> Value { serde_json::from_str(&fs::read_to_string(&record_path).unwrap()).unwrap() };
-    let record = read_record();
+    let record: Value = serde_json::from_str(&fs::read_to_string(&pending_path).unwrap()).unwrap();
+    assert!(!record_path.exists());
     assert_eq!(record["status"], "pending");
     assert_eq!(record["before"], before);
     let after = record["after"].clone();
@@ -1260,6 +1260,7 @@ fn an_interrupted_edit_blocks_others_until_recovered() {
     let record = read_record();
     assert_eq!(record["status"], "done");
     assert!(record.get("writes").is_none());
+    assert!(!pending_path.exists());
     assert_eq!(checkout.ok(&["recover"])["completed"], json!([]));
 
     let (code, replayed) = checkout.edit(&request);
@@ -1709,4 +1710,320 @@ fn a_relationship_transfer_needs_its_old_and_new_source() {
             .contains(&json!(q("BankApi1")))
     }));
     checkout.claim_refused("bob", json!(["Bank"]), "SUBJECT_NOT_FOUND");
+}
+
+const STOP: (&str, &str) = ("BOUNDRAIL_TEST_STOP_AFTER_JOURNAL", "1");
+
+/// Runs `request` as an edit that stops after writing its pending journal record, and returns that
+/// record.
+fn interrupt(checkout: &Checkout, request: &Value) -> Value {
+    let (code, stdout) = checkout.edit_with(request, "interrupted", &[STOP]);
+    assert_eq!((code, stdout.as_str()), (2, ""));
+    let path = checkout.path().join(format!(
+        ".git/boundrail/operations/pending/{}.json",
+        request["operation_id"].as_str().unwrap()
+    ));
+    serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+}
+
+#[test]
+fn recovery_refuses_a_vault_changed_since_the_plan() {
+    // A hand change inside the edit's writes, then outside them.
+    for path in [
+        "modules/BankApi1.module.json",
+        "modules/WebApp01.module.json",
+    ] {
+        let checkout = Checkout::new();
+        shop(&checkout);
+        let request = checkout
+            .request(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 7}}]));
+        interrupt(&checkout, &request);
+        let operation = request["operation_id"].as_str().unwrap();
+        let file = checkout.vault().join(path);
+        let hand = fs::read_to_string(&file).unwrap() + "\n";
+        fs::write(&file, &hand).unwrap();
+
+        let error = checkout.refused(&["recover"], "RECOVERY_CONFLICT");
+        assert_eq!(
+            error["details"],
+            json!({"operation_id": operation, "paths": [path]})
+        );
+        let (code, out) = checkout.edit(&request);
+        assert_eq!(code, 2, "{out:#}");
+        assert_eq!(out["error"]["code"], "RECOVERY_CONFLICT");
+        assert_eq!(fs::read_to_string(&file).unwrap(), hand);
+
+        let out = checkout.ok(&["recover", "--abandon", operation]);
+        assert_eq!(out["kind"], "abandon");
+        assert_eq!(out["operation_id"], operation);
+        assert_eq!(out["landed"], json!([]));
+        assert_eq!(fs::read_to_string(&file).unwrap(), hand);
+        assert_eq!(checkout.read_module("BankApi1")["order"], 1);
+
+        checkout.edited(json!([{"type": "edit-module", "subject": "Web", "set": {"order": 3}}]));
+        let (code, out) = checkout.edit(&request);
+        assert_eq!(code, 2, "{out:#}");
+        assert_eq!(out["error"]["code"], "OPERATION_ABANDONED");
+        checkout.refused(&["recover", "--abandon", operation], "REQUEST_INVALID");
+        checkout.refused(&["recover", "--abandon", "../x"], "REQUEST_INVALID");
+    }
+}
+
+#[test]
+fn recovery_rolls_a_partly_applied_edit_forward() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let request = checkout.request(json!([
+        {"type": "edit-module", "subject": "Bank", "set": {"order": 7}},
+        {"type": "remove-module", "subject": "Web"},
+    ]));
+    let record = interrupt(&checkout, &request);
+    // The manifest and the deletion landed before the crash; the Bank file did not.
+    for write in record["writes"].as_array().unwrap() {
+        let file = checkout.vault().join(write["path"].as_str().unwrap());
+        match write["content"].as_str() {
+            Some(content) if write["path"] == "model.json" => fs::write(file, content).unwrap(),
+            None => fs::remove_file(file).unwrap(),
+            Some(_) => {}
+        }
+    }
+    let recovered = checkout.ok(&["recover"]);
+    assert_eq!(
+        recovered["completed"][0]["operation_id"],
+        request["operation_id"]
+    );
+    assert_eq!(checkout.digest(), record["after"]);
+    assert_eq!(checkout.read_module("BankApi1")["order"], 7);
+
+    // Abandoning reports what had already landed, and refuses once every write has.
+    let request = checkout.request(json!([
+        {"type": "edit-module", "subject": "Bank", "set": {"order": 8}},
+        {"type": "edit-module", "subject": "Billing", "set": {"order": 8}},
+    ]));
+    let operation = request["operation_id"].as_str().unwrap();
+    let record = interrupt(&checkout, &request);
+    let land = |write: &Value| {
+        fs::write(
+            checkout.vault().join(write["path"].as_str().unwrap()),
+            write["content"].as_str().unwrap(),
+        )
+        .unwrap()
+    };
+    land(&record["writes"][1]);
+    land(&record["writes"][0]);
+    checkout.refused(&["recover", "--abandon", operation], "REQUEST_INVALID");
+    let recovered = checkout.ok(&["recover"]);
+    assert_eq!(recovered["completed"][0]["operation_id"], operation);
+
+    let request = checkout.request(json!([
+        {"type": "edit-module", "subject": "Bank", "set": {"order": 9}},
+        {"type": "edit-module", "subject": "Billing", "set": {"order": 9}},
+    ]));
+    let record = interrupt(&checkout, &request);
+    land(&record["writes"][0]);
+    let out = checkout.ok(&[
+        "recover",
+        "--abandon",
+        request["operation_id"].as_str().unwrap(),
+    ]);
+    assert_eq!(out["landed"], json!([record["writes"][0]["path"]]));
+    assert_eq!(checkout.ok(&["recover"])["completed"], json!([]));
+}
+
+#[test]
+fn reads_point_to_an_interrupted_edit() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let read = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_boundrail"))
+            .args(["--no-daemon", "model"])
+            .args(args)
+            .current_dir(checkout.path())
+            .output()
+            .unwrap();
+        let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+        (value, String::from_utf8(out.stderr).unwrap())
+    };
+    // Reading creates no state folder and warns about nothing.
+    let (value, stderr) = read(&["read"]);
+    assert!(value.get("pending_operation").is_none());
+    assert_eq!(stderr, "");
+    assert!(!checkout.path().join(".git/boundrail").exists());
+
+    let request =
+        checkout.request(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 7}}]));
+    interrupt(&checkout, &request);
+    let operation = &request["operation_id"];
+    for args in [&["read"][..], &["read", "Bank"]] {
+        let (value, stderr) = read(args);
+        assert_eq!(value["success"], true);
+        assert_eq!(value["pending_operation"]["operation_id"], *operation);
+        assert!(stderr.contains("boundrail model recover"), "{stderr}");
+        assert!(stderr.contains("--abandon"), "{stderr}");
+    }
+    // While a writer holds the lock, the edit is still running rather than interrupted.
+    let lock = fs::File::open(checkout.path().join(".git/boundrail/model.lock")).unwrap();
+    lock.try_lock().unwrap();
+    let (value, stderr) = read(&["read"]);
+    assert_eq!(value["pending_operation"]["in_progress"], true);
+    assert!(stderr.contains("in progress"), "{stderr}");
+    assert!(!stderr.contains("recover"), "{stderr}");
+    drop(lock);
+    let (value, _) = read(&["read"]);
+    assert_eq!(value["pending_operation"]["in_progress"], false);
+
+    checkout.write("modules/BankApi1.module.json", "{ broken");
+    let (value, _) = read(&["read"]);
+    assert_eq!(value["error"]["code"], "MODEL_INVALID");
+    assert_eq!(
+        value["error"]["details"]["pending_operation"]["operation_id"],
+        *operation
+    );
+}
+
+#[test]
+fn a_move_cannot_nest_one_writers_claim_inside_anothers() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let q = |id: &str| format!("{model}#{id}");
+    let bank = checkout.claim("carol", json!(["Bank"]));
+    let billing = checkout.claim("bob", json!(["Billing"]));
+    let into = |parent: &str| json!([{"type": "edit-module", "subject": "Platform", "set": {"parent": parent}}]);
+    let error = checkout.edit_refused(
+        &checkout.request_by("carol", None, into("Bank")),
+        "CLAIM_CONFLICT",
+    );
+    assert_eq!(
+        error["details"]["conflicts"],
+        json!([{
+            "module": q("Platfrm1"),
+            "inside": {"id": billing["id"], "writer": "bob", "subjects": [q("Billing1")]},
+            "above": {"id": bank["id"], "writer": "carol", "subjects": [q("BankApi1")]},
+        }])
+    );
+
+    // A writer without claims may move Platform under a module nobody holds.
+    checkout.edited(json!([
+        {"type": "add-module", "module": {"name": "Hub", "kind": "system", "order": 2}},
+        {"type": "edit-module", "subject": "Platform", "set": {"parent": "Hub"}},
+    ]));
+
+    // A writer may move its own claimed modules into each other.
+    let (code, out) = checkout.release(&bank, "carol");
+    assert_eq!(code, 0, "{out:#}");
+    checkout.claim("bob", json!(["Bank"]));
+    let (code, out) = checkout.edit(&checkout.request_by("bob", None, into("Bank")));
+    assert_eq!(code, 0, "{out:#}");
+}
+
+#[test]
+fn claim_and_release_retries_return_the_recorded_output() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let read = checkout.ok(&["read"]);
+    let claim = json!({
+        "target": {"model": read["manifest"]["id"], "state": read["manifest"]["current"]["id"]},
+        "writer": "alice",
+        "reason": "alice works here",
+        "subjects": ["Bank"],
+        "operation_id": "claim-1",
+    });
+    let args = ["claim", "--doing", "reserve the bank"];
+    let (code, first) = checkout.pipe(&args, &claim);
+    assert_eq!(code, 0, "{first:#}");
+    let (code, again) = checkout.pipe(&args, &claim);
+    assert_eq!(code, 0, "{again:#}");
+    assert_eq!(again, first);
+    assert_eq!(checkout.claims().as_array().unwrap().len(), 1);
+    let mut other = claim.clone();
+    other["subjects"] = json!(["Web"]);
+    let (code, out) = checkout.pipe(&args, &other);
+    assert_eq!(
+        (code, &out["error"]["code"]),
+        (2, &json!("OPERATION_REUSED"))
+    );
+    let mut bad = claim.clone();
+    bad["operation_id"] = "a/b".into();
+    let (code, out) = checkout.pipe(&args, &bad);
+    assert_eq!(
+        (code, &out["error"]["code"]),
+        (2, &json!("REQUEST_INVALID"))
+    );
+
+    let release =
+        json!({"claim": first["claim"]["id"], "writer": "alice", "operation_id": "release-1"});
+    let (code, released) = checkout.pipe(&["release"], &release);
+    assert_eq!(code, 0, "{released:#}");
+    let (code, again) = checkout.pipe(&["release"], &release);
+    assert_eq!(code, 0, "{again:#}");
+    assert_eq!(again, released);
+    assert_eq!(checkout.claims(), json!([]));
+    let mut other = release.clone();
+    other["writer"] = "bob".into();
+    let (code, out) = checkout.pipe(&["release"], &other);
+    assert_eq!(
+        (code, &out["error"]["code"]),
+        (2, &json!("OPERATION_REUSED"))
+    );
+
+    // A record left pending by a crash counts once the ledger shows its effect, and is redone
+    // when the ledger does not.
+    let path = checkout
+        .path()
+        .join(".git/boundrail/operations/release-1.json");
+    let mut record: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        (&record["kind"], &record["status"]),
+        (&json!("release"), &json!("done"))
+    );
+    record["status"] = "pending".into();
+    fs::write(&path, record.to_string()).unwrap();
+    let (code, again) = checkout.pipe(&["release"], &release);
+    assert_eq!(code, 0, "{again:#}");
+    assert_eq!(again, released);
+    let path = checkout
+        .path()
+        .join(".git/boundrail/operations/claim-1.json");
+    let mut record: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(record["kind"], "claim");
+    record["status"] = "pending".into();
+    fs::write(&path, record.to_string()).unwrap();
+    let (code, redone) = checkout.pipe(&args, &claim);
+    assert_eq!(code, 0, "{redone:#}");
+    assert_ne!(redone["claim"]["id"], first["claim"]["id"]);
+    assert_eq!(checkout.claims(), json!([redone["claim"]]));
+
+    // Claims and edits share the operation IDs.
+    let mut edit =
+        checkout.request(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 4}}]));
+    edit["operation_id"] = "claim-1".into();
+    checkout.edit_refused(&edit, "OPERATION_REUSED");
+}
+
+#[test]
+fn an_edit_refuses_a_file_written_while_it_was_planned() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let request =
+        checkout.request(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 7}}]));
+    let path = "modules/WebApp01.module.json";
+    let (code, stdout) = checkout.edit_with(
+        &request,
+        "reorder",
+        &[("BOUNDRAIL_TEST_TOUCH_BEFORE_PLAN_CHECK", path)],
+    );
+    assert_eq!(code, 2, "{stdout}");
+    let value: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(value["error"]["code"], "STALE_REVISION");
+    assert_eq!(value["error"]["details"]["paths"], json!([path]));
+    assert_eq!(checkout.read_module("BankApi1")["order"], 1);
+    let operations = checkout.path().join(".git/boundrail/operations");
+    let operation = request["operation_id"].as_str().unwrap();
+    assert!(!operations.join(format!("{operation}.json")).exists());
+    assert!(
+        !operations
+            .join(format!("pending/{operation}.json"))
+            .exists()
+    );
+    checkout.edited(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 7}}]));
 }

@@ -3,9 +3,10 @@
 //! write can be completed and every operation replays its receipt.
 
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(debug_assertions)]
 use std::fs;
 use std::iter;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, ensure};
 use schemars::JsonSchema;
@@ -13,20 +14,24 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::claims;
-use super::request::{Target, WRITER_MAX, check_doing, check_model, check_writer, invalid, parse};
+use super::request::{
+    OPERATION_MAX, OPERATION_PATTERN, Target, WRITER_MAX, check_doing, check_model,
+    check_operation, check_writer, invalid, parse,
+};
 use super::revision::Revision;
-use super::state::{self, Locked, OPERATIONS};
+use super::state::{self, Locked};
 use super::types::{Anchor, Binding, Emphasis, Module, Relationship, SCHEMA_VERSION};
 use super::vault::{self, FileWrite, Model, relationships};
 use super::{Code, Refusal, ids};
-use crate::history::refuse_symlink;
-use crate::sync_rules::hash;
 
 const CHANGES_MAX: usize = 1000;
-const OPERATION_MAX: usize = 64;
 /// Debug builds stop after writing the journal when this is set, so tests can simulate a crash.
 #[cfg(debug_assertions)]
 const STOP_AFTER_JOURNAL: &str = "BOUNDRAIL_TEST_STOP_AFTER_JOURNAL";
+/// Debug builds append a newline to this vault-relative file after planning, so tests can
+/// simulate a write from outside the lock while an edit is planned.
+#[cfg(debug_assertions)]
+const TOUCH_BEFORE_PLAN_CHECK: &str = "BOUNDRAIL_TEST_TOUCH_BEFORE_PLAN_CHECK";
 
 /// The `model edit` request: changes to the current state, applied in order as one batch.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -36,7 +41,7 @@ pub struct EditRequest {
     /// The revision digest the changes were written against.
     pub expected_revision: String,
     /// Repeating an operation ID with the same request replays its receipt.
-    #[schemars(length(min = 1, max = OPERATION_MAX), pattern("^[A-Za-z0-9._-]+$"))]
+    #[schemars(length(min = 1, max = OPERATION_MAX), pattern(OPERATION_PATTERN))]
     pub operation_id: String,
     #[schemars(length(min = 1, max = WRITER_MAX))]
     pub writer: String,
@@ -208,13 +213,16 @@ pub struct Allocation {
     pub id: String,
 }
 
-/// A journal record, `<git dir>/boundrail/operations/<operation_id>.json`. A pending record
-/// holds every vault write, so a replay or `model recover` can finish an interrupted edit; a
-/// done record keeps only the receipt.
+/// A journal record under `<git dir>/boundrail/operations/`: `pending/<operation_id>.json` until
+/// the edit finishes, then `<operation_id>.json`. A pending record holds every vault write, so a
+/// replay or `model recover` can finish an interrupted edit; a done or abandoned record keeps
+/// only the receipt.
 #[derive(Serialize, Deserialize)]
 struct Record {
     /// SHA-256 of the canonical request; `--doing` is not part of it.
     request_sha256: String,
+    /// Always `edit`; claim and release records share the journal folder.
+    kind: String,
     status: Status,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     before: Option<String>,
@@ -230,6 +238,24 @@ struct Record {
 enum Status {
     Pending,
     Done,
+    /// `model recover --abandon` dropped it unfinished; replaying it refuses.
+    Abandoned,
+}
+
+/// What `model recover --abandon` dropped.
+#[derive(Debug)]
+pub struct Abandoned {
+    pub operation_id: String,
+    /// Vault files the operation had already written: they hold its planned content.
+    pub landed: Vec<String>,
+}
+
+/// An edit waiting in the journal.
+#[derive(Debug)]
+pub struct Interrupted {
+    pub operation_id: String,
+    /// A writer holds the vault lock: the edit is still running rather than interrupted.
+    pub in_progress: bool,
 }
 
 /// Applies `input`, an [`EditRequest`] as JSON, to the vault folder `vault`. A repeated
@@ -238,43 +264,62 @@ pub fn run(vault: &Path, input: &[u8], doing: &str) -> Result<Receipt> {
     check_doing(doing)?;
     let request: EditRequest = parse(input, "edit")?;
     check_request(&request)?;
-    let fingerprint = hash(&serde_json::to_vec(&request)?);
     let journal = Journal::open(vault)?;
-    if let Some(record) = journal.read(&request.operation_id)? {
-        if record.request_sha256 != fingerprint {
-            return Err(Refusal::new(
-                Code::OperationReused,
-                "this operation_id already applied a different request; use a new operation_id",
-            )
-            .with_details(json!({ "operation_id": request.operation_id }))
-            .into());
-        }
+    let (fingerprint, record) = journal.read(&request.operation_id, &request)?;
+    if let Some(record) = record {
         return match record.status {
             Status::Done => Ok(record.output),
             Status::Pending => complete(vault, &journal, record),
+            Status::Abandoned => Err(Refusal::new(
+                Code::OperationAbandoned,
+                "this operation was abandoned; plan the change again with a new operation_id",
+            )
+            .with_details(json!({ "operation_id": request.operation_id }))
+            .into()),
         };
     }
     state::refuse_interrupted(&journal.state.dir)?;
     let model = vault::load_dir(vault.to_path_buf())?;
     check_target(&model, &request)?;
     let claim = request.claim.clone();
-    let (record, affected) = plan(&model, request, doing, fingerprint)?;
+    let (record, affected, moves) = plan(&model, request, doing, fingerprint)?;
     claims::check_edit(
         &journal.state.dir,
         &model,
         &record.output.writer,
         claim.as_deref(),
         &affected,
+        &moves,
     )?;
-    journal.write(&record)?;
+    #[cfg(debug_assertions)]
+    if let Some(path) = std::env::var_os(TOUCH_BEFORE_PLAN_CHECK) {
+        use std::io::Write;
+        fs::OpenOptions::new()
+            .append(true)
+            .open(vault.join(path))?
+            .write_all(b"\n")?;
+    }
+    // A file written outside the lock since the model was read: the plan is stale.
+    let changed = changed(vault, &record)?;
+    if !changed.is_empty() {
+        return Err(Refusal::new(
+            Code::StaleRevision,
+            "vault files changed while the edit was planned; read the model again and rebase the changes",
+        )
+        .with_details(json!({ "paths": changed }))
+        .into());
+    }
+    journal.write_pending(&record)?;
     #[cfg(debug_assertions)]
     if std::env::var_os(STOP_AFTER_JOURNAL).is_some() {
         anyhow::bail!("stopped after writing the journal because {STOP_AFTER_JOURNAL} is set");
     }
-    complete(vault, &journal, record)
+    apply(vault, &journal, record)
 }
 
-/// Finishes every interrupted edit of the vault folder `vault` and returns their receipts.
+/// Finishes every interrupted edit of the vault folder `vault` and returns their receipts. At
+/// most one can be pending, since `refuse_interrupted` stops new edits while one waits, so no
+/// record's `changed` check ever sees another record's writes.
 pub fn recover(vault: &Path) -> Result<Vec<Receipt>> {
     let journal = Journal::open(vault)?;
     journal
@@ -284,23 +329,68 @@ pub fn recover(vault: &Path) -> Result<Vec<Receipt>> {
         .collect()
 }
 
-fn check_request(request: &EditRequest) -> Result<()> {
-    let operation = &request.operation_id;
-    let problem = if operation.is_empty()
-        || operation.len() > OPERATION_MAX
-        || !operation
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-    {
-        format!(
-            "operation_id needs 1 to {OPERATION_MAX} characters from A-Z, a-z, 0-9, `.`, `_`, `-`"
-        )
-    } else if request.changes.is_empty() || request.changes.len() > CHANGES_MAX {
-        format!("changes needs 1 to {CHANGES_MAX} entries")
+/// Drops the interrupted edit `operation` without writing the vault, so other writes can go on.
+pub fn abandon(vault: &Path, operation: &str) -> Result<Abandoned> {
+    check_operation(operation)?;
+    let journal = Journal::open(vault)?;
+    let dir = &journal.state.dir;
+    let record = if state::pending(dir)?.iter().any(|p| p == operation) {
+        state::read::<Record>(&state::pending_path(dir, operation))?
     } else {
-        return check_writer(&request.writer);
+        None
     };
-    Err(invalid(problem))
+    let Some(mut record) = record else {
+        return Err(invalid(format!(
+            "no interrupted operation has the ID `{operation}`"
+        )));
+    };
+    let (before, after, current) = snapshot(vault, &record)?;
+    let now = |path: &str| current.get(path).map(String::as_str);
+    if current.len() == after.len() && after.iter().all(|(path, d)| now(path) == Some(*d)) {
+        return Err(invalid(format!(
+            "operation {operation} already wrote every file; run `boundrail model recover` to finish it"
+        )));
+    }
+    let landed = record
+        .writes
+        .iter()
+        .flatten()
+        .map(|w| w.path.as_str())
+        .filter(|path| {
+            let planned = after.get(path).copied();
+            planned != before.get(path).copied() && now(path) == planned
+        })
+        .map(str::to_owned)
+        .collect();
+    record.status = Status::Abandoned;
+    record.before = None;
+    record.after = None;
+    record.writes = None;
+    journal.finish(&record)?;
+    Ok(Abandoned {
+        operation_id: operation.to_owned(),
+        landed,
+    })
+}
+
+/// The edit waiting in the journal of the state folder `state` (see [`super::state_dir`]), if
+/// any. It creates nothing and holds no lock.
+pub fn interrupted(state: &Path) -> Result<Option<Interrupted>> {
+    let Some(operation_id) = state::pending(state)?.into_iter().next() else {
+        return Ok(None);
+    };
+    Ok(Some(Interrupted {
+        operation_id,
+        in_progress: state::locked(state)?,
+    }))
+}
+
+fn check_request(request: &EditRequest) -> Result<()> {
+    check_operation(&request.operation_id)?;
+    if request.changes.is_empty() || request.changes.len() > CHANGES_MAX {
+        return Err(invalid(format!("changes needs 1 to {CHANGES_MAX} entries")));
+    }
+    check_writer(&request.writer)
 }
 
 fn check_target(model: &Model, request: &EditRequest) -> Result<()> {
@@ -317,13 +407,13 @@ fn check_target(model: &Model, request: &EditRequest) -> Result<()> {
 }
 
 /// Applies the batch in memory, validates the result and plans its writes as a pending record,
-/// returned with the subjects a claim must cover.
+/// returned with the subjects a claim must cover and the modules that move.
 fn plan(
     model: &Model,
     request: EditRequest,
     doing: &str,
     fingerprint: String,
-) -> Result<(Record, BTreeSet<String>)> {
+) -> Result<(Record, BTreeSet<String>, Vec<claims::Move>)> {
     let EditRequest {
         operation_id,
         writer,
@@ -356,6 +446,7 @@ fn plan(
     );
     let record = Record {
         request_sha256: fingerprint,
+        kind: "edit".to_owned(),
         status: Status::Pending,
         before: Some(model.revision.digest.clone()),
         after: Some(after.digest.clone()),
@@ -370,12 +461,73 @@ fn plan(
             allocated: batch.allocated,
         },
     };
-    Ok((record, diff.affected))
+    Ok((record, diff.affected, diff.moves))
 }
+
+/// Finishes a pending record, refusing `RECOVERY_CONFLICT` without writing when a vault file
+/// changed since the edit was planned: applying the plan then would overwrite that change.
+fn complete(vault: &Path, journal: &Journal, record: Record) -> Result<Receipt> {
+    let changed = changed(vault, &record)?;
+    if !changed.is_empty() {
+        let operation = &record.output.operation_id;
+        return Err(Refusal::new(
+            Code::RecoveryConflict,
+            format!(
+                "vault files changed since operation {operation} was planned; restore them, or run `boundrail model recover --abandon {operation}` to drop it"
+            ),
+        )
+        .with_details(json!({ "operation_id": operation, "paths": changed }))
+        .into());
+    }
+    apply(vault, journal, record)
+}
+
+/// The vault paths whose current content is neither what `record` found before planning nor what
+/// it plans. Outside its writes the two agree, so any change there counts.
+fn changed(vault: &Path, record: &Record) -> Result<Vec<String>> {
+    let (before, after, current) = snapshot(vault, record)?;
+    let paths: BTreeSet<&str> = current
+        .keys()
+        .map(String::as_str)
+        .chain(before.keys().copied())
+        .chain(after.keys().copied())
+        .collect();
+    Ok(paths
+        .into_iter()
+        .filter(|path| {
+            let now = current.get(*path).map(String::as_str);
+            now != before.get(path).copied() && now != after.get(path).copied()
+        })
+        .map(str::to_owned)
+        .collect())
+}
+
+/// File digests by path: what `record` found before planning, what it plans, and what the vault
+/// holds now.
+fn snapshot<'a>(vault: &Path, record: &'a Record) -> Result<Digests<'a>> {
+    let digests = |revision: &'a Revision| {
+        revision
+            .files
+            .iter()
+            .map(|f| (f.path.as_str(), f.sha256.as_str()))
+            .collect()
+    };
+    Ok((
+        digests(&record.output.before),
+        digests(&record.output.after),
+        vault::file_digests(vault)?,
+    ))
+}
+
+type Digests<'a> = (
+    BTreeMap<&'a str, &'a str>,
+    BTreeMap<&'a str, &'a str>,
+    BTreeMap<String, String>,
+);
 
 /// Applies a pending record's writes, checks the vault reached its revision and marks it done.
 /// Every failure here may follow a vault write, so it is an error rather than a refusal.
-fn complete(vault: &Path, journal: &Journal, mut record: Record) -> Result<Receipt> {
+fn apply(vault: &Path, journal: &Journal, mut record: Record) -> Result<Receipt> {
     let operation = record.output.operation_id.clone();
     let finished = (|| -> Result<()> {
         vault::apply_writes(vault, record.writes.as_deref().unwrap_or_default())?;
@@ -389,7 +541,7 @@ fn complete(vault: &Path, journal: &Journal, mut record: Record) -> Result<Recei
         record.before = None;
         record.after = None;
         record.writes = None;
-        journal.write(&record)
+        journal.finish(&record)
     })();
     finished.map_err(|e| {
         anyhow!("{e:#}").context(format!(
@@ -410,6 +562,8 @@ struct Diff<'a> {
     subjects: Subjects,
     /// The pre-existing subjects a claim must cover, and the model ID for the root level.
     affected: BTreeSet<String>,
+    /// Pre-existing modules that change parent.
+    moves: Vec<claims::Move>,
 }
 
 fn diff<'a>(model: &'a Model, new: &'a [Module], fresh: &[String]) -> Diff<'a> {
@@ -423,6 +577,7 @@ fn diff<'a>(model: &'a Model, new: &'a [Module], fresh: &[String]) -> Diff<'a> {
         retired: Vec::new(),
         subjects: Subjects::default(),
         affected: BTreeSet::new(),
+        moves: Vec::new(),
     };
     for (id, module) in &new_modules {
         match old_modules.get(id) {
@@ -481,6 +636,12 @@ fn diff<'a>(model: &'a Model, new: &'a [Module], fresh: &[String]) -> Diff<'a> {
         let parent = |module: Option<&&Module>| module.map(|m| m.parent.clone());
         if parent(before) != parent(after) {
             touched.extend(parent(before).into_iter().chain(parent(after)));
+            if let (Some(_), Some(after)) = (before, after) {
+                diff.moves.push(claims::Move {
+                    module: model.qualify(id),
+                    above: above(&model.manifest.id, &new_modules, after),
+                });
+            }
         }
         if let Some(named) = after.filter(|a| before.is_none_or(|b| b.name != a.name)) {
             touched.extend(
@@ -524,6 +685,19 @@ fn diff<'a>(model: &'a Model, new: &'a [Module], fresh: &[String]) -> Diff<'a> {
         diff.affected.insert(model.manifest.id.clone());
     }
     diff
+}
+
+/// The qualified IDs of `module`'s containers among `modules`, nearest first. The batch is not
+/// validated yet, so a containment cycle must not loop forever.
+fn above(model: &str, modules: &BTreeMap<&str, &Module>, module: &Module) -> Vec<String> {
+    iter::successors(module.parent.as_deref(), |up| {
+        modules
+            .get(ids::local(model, up))
+            .and_then(|m| m.parent.as_deref())
+    })
+    .take(modules.len())
+    .map(str::to_owned)
+    .collect()
 }
 
 fn by_id(modules: &[Module]) -> BTreeMap<&str, &Module> {
@@ -912,40 +1086,42 @@ struct Journal {
 
 impl Journal {
     fn open(vault: &Path) -> Result<Self> {
-        let state = state::lock(vault)?;
-        let dir = state.dir.join(OPERATIONS);
-        refuse_symlink(&dir)?;
-        fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        Ok(Self { state })
+        Ok(Self {
+            state: state::lock(vault)?,
+        })
     }
 
-    fn path(&self, operation: &str) -> PathBuf {
-        self.state
-            .dir
-            .join(OPERATIONS)
-            .join(format!("{operation}.json"))
-    }
-
-    fn read(&self, operation: &str) -> Result<Option<Record>> {
-        state::read(&self.path(operation))
+    /// The SHA-256 of `request` and the record of `operation`, refusing `OPERATION_REUSED` when
+    /// the record holds another request.
+    fn read(&self, operation: &str, request: &EditRequest) -> Result<(String, Option<Record>)> {
+        let (fingerprint, record) = state::recorded(&self.state.dir, operation, request)?;
+        let record = record
+            .map(|record| {
+                serde_json::from_value(record)
+                    .with_context(|| format!("parsing the journal record of {operation}"))
+            })
+            .transpose()?;
+        Ok((fingerprint, record))
     }
 
     /// Every pending record, in operation ID order.
-    // ponytail: reads every record per edit; keep pending records apart if journals grow large.
     fn pending(&self) -> Result<Vec<Record>> {
+        let dir = &self.state.dir;
         let mut pending = Vec::new();
-        for path in state::operations(&self.state.dir)? {
-            if let Some(record) = state::read::<Record>(&path)?
-                && record.status == Status::Pending
-            {
+        for operation in state::pending(dir)? {
+            if let Some(record) = state::read(&state::pending_path(dir, &operation))? {
                 pending.push(record);
             }
         }
         Ok(pending)
     }
 
-    /// Fails, before any vault write for a pending record, when the record is too large to read.
-    fn write(&self, record: &Record) -> Result<()> {
-        state::write(&self.path(&record.output.operation_id), record)
+    /// Fails, before any vault write, when the record is too large to read back.
+    fn write_pending(&self, record: &Record) -> Result<()> {
+        state::write_pending(&self.state.dir, &record.output.operation_id, record)
+    }
+
+    fn finish(&self, record: &Record) -> Result<()> {
+        state::finish(&self.state.dir, &record.output.operation_id, record)
     }
 }

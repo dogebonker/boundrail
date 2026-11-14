@@ -47,7 +47,11 @@ enum ModelCmd {
         doing: String,
     },
     /// Finish edits that a crash or failed write left partly applied
-    Recover,
+    Recover {
+        /// Drop this interrupted operation instead, writing nothing to the vault
+        #[arg(long, value_name = "OPERATION_ID")]
+        abandon: Option<String>,
+    },
     /// Reserve modules, relationships or the model's structure for one writer (schema `model-claim`)
     Claim {
         /// Request file; `-` or absent reads standard input
@@ -119,9 +123,11 @@ fn execute(args: ModelArgs) -> Result<()> {
             )
         }
         ModelCmd::Read { subject: None } => {
-            let model = vault::load(&args.root)?;
+            let state = state_dir(&args.root);
+            let pending = state.as_deref().and_then(pending_operation);
+            let model = load_for_read(&args.root, pending.as_ref())?;
             let reading = model.read();
-            let active = active_claims(&model.dir);
+            let active = state.as_deref().and_then(active_claims);
             if markdown {
                 print_reading(&model, &reading);
                 print_claims(active.as_deref());
@@ -142,12 +148,17 @@ fn execute(args: ModelArgs) -> Result<()> {
             if let Some(active) = active {
                 output["claims"] = json!(active);
             }
+            if let Some(pending) = pending {
+                output["pending_operation"] = pending;
+            }
             write(None, &output)
         }
         ModelCmd::Read {
             subject: Some(subject),
         } => {
-            let model = vault::load(&args.root)?;
+            let state = state_dir(&args.root);
+            let pending = state.as_deref().and_then(pending_operation);
+            let model = load_for_read(&args.root, pending.as_ref())?;
             let selection = model.select(&subject)?;
             let subjects: Vec<&str> = iter::once(&selection.module.id)
                 .chain(selection.parts.iter().map(|m| &m.id))
@@ -155,8 +166,10 @@ fn execute(args: ModelArgs) -> Result<()> {
                 .chain(selection.outgoing.iter().map(|r| &r.id))
                 .map(String::as_str)
                 .collect();
-            let active =
-                active_claims(&model.dir).map(|active| claims::holding(&model, active, &subjects));
+            let active = state
+                .as_deref()
+                .and_then(active_claims)
+                .map(|active| claims::holding(&model, active, &subjects));
             if markdown {
                 let names = names(&model);
                 print_module(&selection.module, 0);
@@ -192,6 +205,9 @@ fn execute(args: ModelArgs) -> Result<()> {
             });
             if let Some(active) = active {
                 output["claims"] = json!(active);
+            }
+            if let Some(pending) = pending {
+                output["pending_operation"] = pending;
             }
             write(None, &output)
         }
@@ -239,7 +255,31 @@ fn execute(args: ModelArgs) -> Result<()> {
             }
             write(None, &output)
         }
-        ModelCmd::Recover => {
+        ModelCmd::Recover {
+            abandon: Some(operation),
+        } => {
+            let dir = vault::locate(&args.root)?;
+            let abandoned = edit::abandon(&dir, &operation)?;
+            if markdown {
+                println!("Abandoned operation {}", abandoned.operation_id);
+                if !abandoned.landed.is_empty() {
+                    println!("already written: {}", abandoned.landed.join(", "));
+                }
+                return Ok(());
+            }
+            write(
+                None,
+                &json!({
+                    "schema": MODEL_SCHEMA,
+                    "kind": "abandon",
+                    "success": true,
+                    "vault": dir,
+                    "operation_id": abandoned.operation_id,
+                    "landed": abandoned.landed,
+                }),
+            )
+        }
+        ModelCmd::Recover { abandon: None } => {
             let dir = vault::locate(&args.root)?;
             let completed = edit::recover(&dir)?;
             if markdown {
@@ -339,10 +379,55 @@ fn print_claim_output(markdown: bool, kind: &str, dir: &Path, claim: &Claim) -> 
     )
 }
 
+/// The machine-local state folder for a reading, or `None` with a warning on stderr. Without a
+/// vault there is none, and `load_for_read` reports the missing vault.
+fn state_dir(root: &Path) -> Option<PathBuf> {
+    let dir = vault::locate(root).ok()?;
+    boundrail::arch::state_dir(&dir)
+        .inspect_err(|error| eprintln!("warning: claims and pending edits omitted: {error:#}"))
+        .ok()
+}
+
+/// The edit waiting in the journal of `state`, as `{operation_id, in_progress, hint}`, with a
+/// warning on stderr. Reading the journal never makes a reading fail, and never creates it.
+fn pending_operation(state: &Path) -> Option<Value> {
+    let edit::Interrupted {
+        operation_id,
+        in_progress,
+    } = edit::interrupted(state)
+        .inspect_err(|error| eprintln!("warning: pending edits not checked: {error:#}"))
+        .ok()??;
+    let (status, hint) = if in_progress {
+        ("is in progress", "read again when it finishes".to_owned())
+    } else {
+        (
+            "was interrupted",
+            format!(
+                "run `boundrail model recover` to finish it, or `boundrail model recover --abandon {operation_id}` to drop it"
+            ),
+        )
+    };
+    eprintln!("warning: operation {operation_id} {status}; {hint}");
+    Some(json!({ "operation_id": operation_id, "in_progress": in_progress, "hint": hint }))
+}
+
+/// The model for `model read`; a `MODEL_INVALID` refusal also names the interrupted edit.
+fn load_for_read(root: &Path, pending: Option<&Value>) -> Result<Model> {
+    vault::load(root).map_err(|mut error| {
+        if let (Some(pending), Some(refusal)) = (pending, error.downcast_mut::<Refusal>())
+            && refusal.code == Code::ModelInvalid
+            && let Some(details) = refusal.details.as_mut()
+        {
+            details["pending_operation"] = pending.clone();
+        }
+        error
+    })
+}
+
 /// The active claims, or `None` with a warning on stderr when the claims file cannot be read:
 /// machine-local coordination state never makes a reading fail.
-fn active_claims(vault: &Path) -> Option<Vec<Claim>> {
-    claims::active(vault)
+fn active_claims(state: &Path) -> Option<Vec<Claim>> {
+    claims::active(state)
         .inspect_err(|error| eprintln!("warning: claims omitted: {error:#}"))
         .ok()
 }
