@@ -8,7 +8,7 @@ mod kubernetes;
 mod manifests;
 mod terraform;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -98,6 +98,10 @@ pub struct Infra {
     pub hops: Vec<Hop>,
     /// The folders of the workspace packages read.
     pub packages: Vec<String>,
+    /// The compose, Kubernetes and Terraform files read and parsed.
+    pub files: HashSet<String>,
+    /// Why the files could not be read; nothing else is set then.
+    pub error: Option<String>,
     /// Each unit's index by kind, folder and name.
     keys: HashMap<(UnitKind, String, String), usize>,
 }
@@ -179,13 +183,21 @@ impl Infra {
             units,
             hops,
             packages,
-            keys: HashMap::new(),
+            ..Self::default()
         };
         for (at, unit) in infra.units.iter().enumerate() {
             let key = (unit.kind, dir_of(&unit.file).to_owned(), unit.name.clone());
             infra.keys.entry(key).or_insert(at);
         }
         infra
+    }
+
+    /// No infrastructure, because reading it failed with `error`.
+    pub fn failed(error: String) -> Self {
+        Self {
+            error: Some(error),
+            ..Self::default()
+        }
     }
 
     /// The unit a unit binding names: one of the binding file's kind, declared in its folder
@@ -282,15 +294,18 @@ pub fn read(root: &Path) -> Result<Infra> {
     files.sort_by_cached_key(|path| (override_file(path), path.clone()));
     let mut declared = Declared::default();
     let mut env_files = HashMap::new();
+    let mut parsed = HashSet::new();
     for path in &files {
         let Some(text) = read_file(root, path) else {
             continue;
         };
         match classify(path) {
             Some(FileKind::Compose) => {
-                let services = compose::parse(path, &text);
-                let services = services.map(|s| compose::with_env_files(root, s, &mut env_files));
-                declared.compose.extend(services.map(|s| (path.clone(), s)));
+                let Some(services) = compose::parse(path, &text) else {
+                    continue;
+                };
+                let services = compose::with_env_files(root, services, &mut env_files);
+                declared.compose.push((path.clone(), services));
             }
             Some(FileKind::Kubernetes) => {
                 declared.kubernetes.extend(kubernetes::parse(path, &text))
@@ -299,12 +314,18 @@ pub fn read(root: &Path) -> Result<Infra> {
                 let resources = terraform::parse(path, &text).into_iter();
                 (declared.terraform).extend(resources.map(|r| (path.clone(), r)));
             }
-            Some(FileKind::Manifest) => declared.manifests.extend(manifests::parse(path, &text)),
-            None => {}
+            Some(FileKind::Manifest) => {
+                declared.manifests.extend(manifests::parse(path, &text));
+                continue;
+            }
+            None => continue,
         }
+        parsed.insert(path.clone());
     }
     declared.manifests.extend(manifests::npm(root));
-    Ok(declared.link())
+    let mut infra = declared.link();
+    infra.files = parsed;
+    Ok(infra)
 }
 
 /// Whether `path` is a compose override rather than a base file.

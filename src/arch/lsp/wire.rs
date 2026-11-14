@@ -100,31 +100,45 @@ impl Text {
             .map_or(self.text.len(), |&next| next - 1);
         Some(self.text[start..end].trim_end_matches('\r'))
     }
+
+    /// Whether `name` is written anywhere in the text as a whole word.
+    pub(super) fn has_word(&self, name: &str) -> bool {
+        whole_word(&self.text, name, 0).is_some()
+    }
+}
+
+/// The byte offset of the first whole-word occurrence of `name` in `text` from byte `from`: one
+/// neither preceded nor followed by a letter, digit, `_` or `$`.
+fn whole_word(text: &str, name: &str, mut from: usize) -> Option<usize> {
+    if name.is_empty() {
+        return None;
+    }
+    let word = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    while let Some(found) = text[from..].find(name) {
+        let start = from + found;
+        let end = start + name.len();
+        let before = text[..start].chars().next_back().is_none_or(|c| !word(c));
+        let after = text[end..].chars().next().is_none_or(|c| !word(c));
+        if before && after {
+            return Some(start);
+        }
+        from = end;
+    }
+    None
 }
 
 /// Where `name` is written in `text` within `range`: its first whole-word occurrence from the
 /// range's start, as 0-based line and UTF-16 column; else the range's start. A declaration's
 /// range may begin at a keyword, and references are asked at the name.
 pub(super) fn name_position(text: &Text, name: &str, (line, column, end): Range) -> (u64, u64) {
-    if name.is_empty() {
-        return (line, column);
-    }
-    let word = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
     for at in line..=end {
         let Some(text) = text.line(at) else {
             break;
         };
-        let mut search = if at == line { byte_at(text, column) } else { 0 };
-        while let Some(found) = text[search..].find(name) {
-            let start = search + found;
-            let end = start + name.len();
-            let before = text[..start].chars().next_back().is_none_or(|c| !word(c));
-            let after = text[end..].chars().next().is_none_or(|c| !word(c));
-            if before && after {
-                let units = text[..start].encode_utf16().count();
-                return (at, u64::try_from(units).unwrap_or(u64::MAX));
-            }
-            search = end;
+        let search = if at == line { byte_at(text, column) } else { 0 };
+        if let Some(start) = whole_word(text, name, search) {
+            let units = text[..start].encode_utf16().count();
+            return (at, u64::try_from(units).unwrap_or(u64::MAX));
         }
     }
     (line, column)
@@ -283,5 +297,7 @@ mod tests {
         );
         assert_eq!(text.line(0), Some("// charge"));
         assert_eq!(text.line(4), None);
+        assert!(text.has_word("charge") && text.has_word("é"));
+        assert!(!text.has_word("charg") && !text.has_word("rech") && !text.has_word(""));
     }
 }

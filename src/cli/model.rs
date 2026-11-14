@@ -54,7 +54,9 @@ enum Command {
         /// Run the language servers .boundrail/language-servers.json names, for call references and symbols.
         /// They run code from the checkout (a workspace tsserver.js under node_modules,
         /// rust-analyzer build scripts and proc macros, jdtls Gradle and Maven imports): use it on
-        /// trusted checkouts only, never on untrusted pull request heads in CI
+        /// trusted checkouts only, never on untrusted pull request heads in CI. The servers may
+        /// leave build output and project metadata in the checkout (rust-analyzer target/, jdtls
+        /// .project, .classpath and .settings), while Boundrail itself writes nothing there
         #[arg(long)]
         language_servers: bool,
     },
@@ -273,7 +275,9 @@ enum ModelCmd {
         /// Run the language servers .boundrail/language-servers.json names, for references to each interface symbol.
         /// They run code from the checkout (a workspace tsserver.js under node_modules,
         /// rust-analyzer build scripts and proc macros, jdtls Gradle and Maven imports): use it on
-        /// trusted checkouts only, never on untrusted pull request heads in CI
+        /// trusted checkouts only, never on untrusted pull request heads in CI. The servers may
+        /// leave build output and project metadata in the checkout (rust-analyzer target/, jdtls
+        /// .project, .classpath and .settings), while Boundrail itself writes nothing there
         #[arg(long)]
         language_servers: bool,
     },
@@ -1152,12 +1156,23 @@ fn scan_error(doc: &Result<Document, NoScan>) -> Option<&str> {
     }
 }
 
+/// The infrastructure of the checkout. A read that fails warns and leaves it empty with the
+/// error, so the modules bound to units go unjudged as after a failed scan.
+fn read_infra(checkout: &Path) -> Infra {
+    infra::read(checkout).unwrap_or_else(|error| {
+        let error = format!("{error:#}");
+        eprintln!("warning: reading the checkout's infrastructure failed: {error}");
+        Infra::failed(error)
+    })
+}
+
 /// The code check against the model's checkout and its infrastructure, scanning it once when a
-/// binding or anchor names code there. A failed scan becomes a `SCAN_FAILED` warning.
+/// binding or anchor names code there. A failed scan or infrastructure read becomes a
+/// `SCAN_FAILED` warning.
 fn code_check(model: &Model, language_servers: bool) -> Result<CodeReport> {
     let (checkout, doc) = scan_checkout(model)?;
     let checkout = checkout.as_path();
-    let infra = infra::read(checkout)?;
+    let infra = read_infra(checkout);
     let lsp = language_server_facts(model, checkout, &doc, &infra, language_servers)?;
     Ok(code::check(
         &model.manifest.id,
@@ -1260,11 +1275,11 @@ fn inspected(
         .transpose()?;
     let (checkout, doc) = scan_checkout(&model)?;
     let scan = doc.as_ref().map_err(Clone::clone);
-    let infra = infra::read(&checkout)?;
+    let infra = read_infra(&checkout);
     let lsp = language_server_facts(&model, &checkout, &doc, &infra, language_servers)?;
     let (modules, subject) = (&model.modules, subject.as_deref());
     let report = inspect::inspect(id, modules, &checkout, scan, &infra, subject, &lsp);
-    let scan_error = scan_error(&doc).map(str::to_owned);
+    let scan_error = (scan_error(&doc).or(infra.error.as_deref())).map(str::to_owned);
     Ok(Inspected {
         model,
         report,
@@ -1445,14 +1460,18 @@ fn model_footprint(
         Err(error) => (None, Some(format!("{error:#}"))),
     };
     let files = footprint::changed(&checkout, &range.base.commit, range.head.as_deref())?;
-    let (doc, scan_error) = footprint_scan(&model, &range, &files)?;
+    let (mut doc, mut scan_error) = footprint_scan(&model, &range, &files)?;
     // The infrastructure is read from the checkout, so it serves only a head that is checked out,
-    // and only changed files cross anything.
+    // and only changed files cross anything. A failed read skips the crossings as a scan does.
     let infra = if range.checked_out && !files.is_empty() {
-        infra::read(&checkout)?
+        read_infra(&checkout)
     } else {
         Infra::default()
     };
+    if let Some(error) = &infra.error {
+        doc = Err(CrossingsSkipped::ScanFailed);
+        scan_error.get_or_insert_with(|| error.clone());
+    }
     let head_state = (&model.modules[..], &model.collections[..]);
     let base_state = (before.as_ref()).map(|m| (&m.modules[..], &m.collections[..]));
     let (id, scan) = (&model.manifest.id, doc.as_ref().map_err(|s| *s));

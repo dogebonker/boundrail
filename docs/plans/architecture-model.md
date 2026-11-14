@@ -374,7 +374,13 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   another member, a name two members share left out; `Cargo.toml` path dependencies in the
   dependency tables, the workspace's and each target's; and `go.mod` `replace` directives to a
   `./` or `../` path. `depends_on`, `image`, `ports` and `expose` are not read: none names an
-  address. A file that does not read or parse is left out.
+  address. A file that does not read or parse is left out, and a compose file without `services`
+  counts as not read. A unit binding to a file that exists but was not read (a hidden, dependency,
+  test or ignored folder, too deep, or past a symbolic link) is skipped as `not-scanned`, and its
+  relationships with it. When the read itself fails, as when the exclusion policy refuses, the
+  command warns on stderr and goes on without infrastructure: unit-bound modules are skipped as
+  `scan-failed` under a `SCAN_FAILED` warning naming them, inspect and footprint set `scan_error`,
+  and footprint skips its crossings as `scan-failed`.
 - T12: address rules. Parts of a value split at whitespace, commas and semicolons. A part names a
   host as the host of a URL (after `://`, past any user info, before the port and path); as
   `host:port` with a numeric port, only when the value is that one part or holds a URL, so
@@ -397,10 +403,16 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   when both ends hold a unit (the unit's owner or a module containing it), and build-dependency
   evidence only when both ends hold a workspace package folder; otherwise the relationship keeps
   the T5 `evidence-unavailable` skip, so an unbound database or a stray `.tf` file changes
-  nothing. Code evidence (call, import) never applies to a relationship with an end bound to a
-  unit: a `call` between two workloads is `evidence-not-code`, and a `queue` from code to a
-  unit-bound broker is judged on configured paths alone. Units map to modules by binding, else by
-  `build.context`; package folders map through the deepest binding as files do. A hop of an
+  nothing. Binding any module to a unit opts the model into infrastructure judging, build-context
+  mapping included: without one, configured-path evidence is never collected and configured hops
+  report no `RELATIONSHIP_UNDRAWN`, though they still support relationships and are still listed
+  in `units`, inspect hops and footprint hops; build-dependency evidence needs no opt-in. A custom
+  kind accepting only build-dependency evidence therefore becomes strict between modules that
+  hold workspace packages. Code evidence (call, import) never applies to a relationship with an
+  end bound to a unit: a `call` between two workloads is `evidence-not-code`, and a `queue` from
+  code to a unit-bound broker is judged on configured paths alone. Units map to modules by
+  binding, else by `build.context`; package folders map through the deepest binding as files do.
+  A hop of an
   evidence kind that applies, from the source or a part of it to the target or a part of it,
   supports the relationship. With every applicable kind collected, a hop only the other way is
   `RELATIONSHIP_BACKWARDS` (`only Api names the address of Rabbit`, or `depends on`), and none is
@@ -464,7 +476,10 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   node` launcher, say) finds a program a relative entry would reach in the checkout. `boundrail:
   starting language server <name>: <program> <args>` goes to stderr before it starts, with the
   resolved program path and shell-quoted arguments. It runs in the checkout root. This is the
-  third stated exception in `src/git.rs`'s hardening header, gated by the flag.
+  third stated exception in `src/git.rs`'s hardening header, gated by the flag. The servers may
+  leave build output and project metadata in the checkout (rust-analyzer `target/`, jdtls
+  `.project`, `.classpath` and `.settings`), while Boundrail itself writes nothing there; the
+  flag's help says so too.
 - T13: client (`src/arch/lsp/`: `config.rs`, `wire.rs` for URIs and result mapping, `framing.rs`,
   `client.rs`, and `mod.rs` for the evidence). JSON-RPC 2.0 over stdio with `Content-Length`
   framing; a body over 16 MiB or a header line over 1 KiB is an error, and the reader holds at
@@ -488,10 +503,15 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   it owns), asked about at their definition (the export's target): `workspace/symbol` finds the
   declaration of that name in that file, and references are asked at the name's first whole-word
   occurrence from the declaration's start, since a range may begin at a keyword. A reference from
-  a scanned file of one module to a definition owned by another is a call hop. A module is served
+  a scanned file of one module into another, as credited below, is a call hop. A module is served
   when every file it owns is covered by one server that answered, no file it owns is named by a
   symbol limitation, it has at most 64 interface symbols, and the server found every one of them;
-  a container is served only when every judged part below it is. Between two served modules,
+  a container is served only when every judged part below it is. A served module counts as a
+  call target only when it, or a judged part below it, has an interface symbol a server located;
+  into any other module imports stand in. A reference belongs to the module of the file its use
+  site imports the symbol through (the written target of an import edge from the use-site file
+  to the definition file, or to a file exporting the symbol), and to the defining module only
+  without such an edge, as import edges are credited. Between two served modules,
   call evidence is the references, replacing the import approximation: a hop from the source or a
   part of it into the target or a part of it supports a kind accepting `call`; under the T5
   strictness rules a hop only the other way is `RELATIONSHIP_BACKWARDS` (`only Web calls Bank`)
@@ -503,7 +523,8 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   of that name in one of the files, from `workspace/symbol` or a symbol list, confirms it; a
   binding or anchor of one file whose `textDocument/documentSymbol` list is not empty and lacks
   the name refutes it, `BINDING_SYMBOL_MISSING`/`ANCHOR_SYMBOL_MISSING` (`no file there declares
-  refund`). An empty answer refutes nothing, since a server may not have indexed the file, so
+  refund`), but only when the name is not `default` (a default export lists under its own name),
+  the file's text does not hold it as a whole word, and no server found it declared anywhere. An empty answer refutes nothing, since a server may not have indexed the file, so
   such a symbol, and any symbol of a folder the servers do not find, keeps its
   `symbols-incomplete` or `language-unsupported` skip. A complete scan's verdict stands. `model
   inspect` counts `used` from references for served modules, lists `unused` even when the scan's

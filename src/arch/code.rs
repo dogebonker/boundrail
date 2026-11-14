@@ -139,7 +139,8 @@ impl CodeReport {
 
 /// Which evidence is collected for which modules.
 struct Collected<'i> {
-    /// The modules holding an infrastructure unit, and the modules containing them.
+    /// The modules holding an infrastructure unit, and the modules containing them; empty
+    /// unless a module is bound to a unit, which opts the model into infrastructure judging.
     configured: HashSet<&'i str>,
     /// The modules holding a workspace package folder, and the modules containing them.
     build: HashSet<&'i str>,
@@ -154,14 +155,19 @@ impl<'i> Collected<'i> {
                 .flat_map(|&owner| index.chain(owner))
                 .collect()
         };
-        let units: Vec<&str> = joined.owners.iter().flatten().copied().collect();
+        let units: HashSet<&str> = (index.by_id.iter())
+            .filter(|(_, m)| m.binding.as_ref().is_some_and(infra::is_unit_binding))
+            .map(|(id, _)| id.as_str())
+            .collect();
+        let owners: Vec<&str> = joined.owners.iter().flatten().copied().collect();
         Self {
-            configured: held(&units),
+            configured: if units.is_empty() {
+                HashSet::new()
+            } else {
+                held(&owners)
+            },
             build: held(&joined.packages),
-            units: (index.by_id.iter())
-                .filter(|(_, m)| m.binding.as_ref().is_some_and(infra::is_unit_binding))
-                .map(|(id, _)| id.as_str())
-                .collect(),
+            units,
         }
     }
 
@@ -220,8 +226,8 @@ pub fn needs_scan(modules: &[Module], root: &Path) -> bool {
 /// Every code diagnostic of model `model` against the checkout at `root`, its scan, its
 /// infrastructure and what language servers found, sorted, with what was not judged. Without a
 /// scan, existing paths are skipped as `not-scanned`, or as `scan-failed` with a `SCAN_FAILED`
-/// warning. The modules must have loaded, so parents and targets exist and containment has no
-/// cycle.
+/// warning; infrastructure that failed to read does the same to modules bound to units. The
+/// modules must have loaded, so parents and targets exist and containment has no cycle.
 pub fn check(
     model: &str,
     modules: &[Module],
@@ -241,22 +247,33 @@ pub fn check(
     let joined = joined(&index, &status, infra, &paths);
     let owners = owners(&status, &paths);
     let served = served(&index, &status, lsp);
-    let pairs = Pairs::new(
+    let targets = targets(&index, &status, &served, lsp);
+    let mut pairs = Pairs::new(
         &index,
         &scan,
         &owners,
         &joined.hops,
         &lsp.references,
-        served,
+        (served, targets),
     );
     let collected = Collected::new(&index, &joined);
+    // Without a unit binding, configured hops only support relationships: they reveal none.
+    if collected.units.is_empty() {
+        pairs.configured.clear();
+    }
     report.units = unit_statuses(infra, &joined.owners);
     let judged = (&status, &pairs, &collected);
     let backwards = relationships(&index, config, judged, &mut report);
     undrawn(&index, &pairs, &backwards, &mut report);
     entry_points(&index, &scan, &status, &mut report);
+    let unit = |subject: &str| collected.units.contains(subject);
     if let Some(error) = failure {
-        scan_failed(&error, &mut report);
+        let what = "the scan of the checkout failed";
+        scan_failed(what, &error, |s| !unit(s), &mut report);
+    }
+    if let Some(error) = &infra.error {
+        let what = "reading the checkout's infrastructure failed";
+        scan_failed(what, error, unit, &mut report);
     }
     report.diagnostics.sort();
     report.skips.sort();
@@ -442,20 +459,21 @@ pub(super) fn written(edge: &Edge) -> &str {
     edge.original_to.as_deref().unwrap_or(&edge.to)
 }
 
-/// `SCAN_FAILED`: the scan the check needed failed. Its subjects are what went unjudged; with
-/// none, every path it was needed for turned out missing and already warns.
-fn scan_failed(error: &str, report: &mut CodeReport) {
+/// `SCAN_FAILED`: a read the check needed failed, as `what` says. Its subjects are the
+/// `scan-failed` skips `left` accepts; with none, every path it was needed for turned out
+/// missing and already warns.
+fn scan_failed(what: &str, error: &str, left: impl Fn(&str) -> bool, report: &mut CodeReport) {
     let subjects: BTreeSet<&str> = report
         .skips
         .iter()
-        .filter(|s| s.reason == SkipReason::ScanFailed)
+        .filter(|s| s.reason == SkipReason::ScanFailed && left(&s.subject))
         .map(|s| s.subject.as_str())
         .collect();
     if subjects.is_empty() {
         return;
     }
     let subjects = subjects.into_iter().map(str::to_owned).collect();
-    let message = format!("the scan of the checkout failed: {}", parse_message(&error));
+    let message = format!("{what}: {}", parse_message(&error));
     report.warn(DiagnosticCode::ScanFailed, subjects, message);
 }
 
@@ -741,7 +759,9 @@ fn bindings<'i, 's, 'd>(
 }
 
 /// `BINDING_PATH_MISSING` and `BINDING_SYMBOL_MISSING` of a module bound to an infrastructure
-/// unit: the file must exist and its folder declare the unit. The module owns no scanned file.
+/// unit: the file must exist and its folder declare the unit. A file that exists but was not
+/// read is `not-scanned`, and every file is `scan-failed` when reading failed. The module owns
+/// no scanned file.
 fn unit_binding<'s, 'd>(
     subject: &str,
     name: &str,
@@ -761,6 +781,16 @@ fn unit_binding<'s, 'd>(
         report.skip(SkipSite::Binding, subject, SkipReason::PathMissing);
         return Err(SkipReason::PathMissing);
     }
+    let normalized = segments(path).join("/");
+    let unread = if infra.error.is_some() {
+        Some(SkipReason::ScanFailed)
+    } else {
+        (!infra.files.contains(&normalized)).then_some(SkipReason::NotScanned)
+    };
+    if let Some(reason) = unread {
+        report.skip(SkipSite::Binding, subject, reason);
+        return Err(reason);
+    }
     if infra.bound(binding).is_none() {
         let symbol = binding.symbol.as_deref().unwrap_or_default();
         let message =
@@ -774,7 +804,7 @@ fn unit_binding<'s, 'd>(
     Ok(Found {
         files: &[],
         dir: false,
-        path: segments(path).join("/"),
+        path: normalized,
     })
 }
 
@@ -889,6 +919,38 @@ fn served<'i>(index: &'i Index<'_>, status: &Status<'i, '_, '_>, lsp: &Facts) ->
     served
 }
 
+/// The `served` modules language servers judge calls into: those that, or a judged part below
+/// them, have an interface symbol a server located. Into the others imports stand in.
+fn targets<'i>(
+    index: &'i Index<'_>,
+    status: &Status<'i, '_, '_>,
+    served: &HashSet<&'i str>,
+    lsp: &Facts,
+) -> HashSet<&'i str> {
+    (status.iter())
+        .filter(|(id, found)| found.is_ok() && lsp.located.contains(**id))
+        .flat_map(|(&id, _)| index.chain(id))
+        .filter(|id| served.contains(id))
+        .collect()
+}
+
+/// The file through which the use site of `r` reaches its definition: the written target of an
+/// import edge of `imports` from the use site to the definition file or to a file exporting the
+/// symbol, else the definition file itself.
+fn through<'a>(
+    r: &'a Reference,
+    imports: &HashMap<&str, Vec<&'a Edge>>,
+    scan: &Scan<'a>,
+) -> &'a str {
+    let exports = |file: &str| {
+        (scan.exports_of.get(file).into_iter().flatten())
+            .any(|e| e.name == r.name || (e.target.file == r.file && e.target.name == r.name))
+    };
+    (imports.get(r.from.as_str()).into_iter().flatten())
+        .find(|e| e.to == r.file || written(e) == r.file || exports(written(e)))
+        .map_or(r.file.as_str(), |e| written(e))
+}
+
 /// The modules code edges, language-server references and infrastructure hops join, through
 /// the written target of each edge.
 struct Pairs<'i, 'd, 'x> {
@@ -903,8 +965,10 @@ struct Pairs<'i, 'd, 'x> {
     reach: HashSet<(Evidence, &'i str, &'i str)>,
     /// Pairs of those owners or their ancestors that a reference joins.
     called: HashSet<(&'i str, &'i str)>,
-    /// The modules whose call evidence is the references rather than runtime edges.
+    /// The modules whose calls out are judged by the references rather than runtime edges.
     served: HashSet<&'i str>,
+    /// The served modules whose calls in are judged by the references.
+    targets: HashSet<&'i str>,
 }
 
 impl<'i, 'd, 'x> Pairs<'i, 'd, 'x> {
@@ -914,7 +978,7 @@ impl<'i, 'd, 'x> Pairs<'i, 'd, 'x> {
         owners: &HashMap<&'d str, &'i str>,
         hops: &[(&'i str, &'i str, &'x Hop)],
         references: &'x [Reference],
-        served: HashSet<&'i str>,
+        (served, targets): (HashSet<&'i str>, HashSet<&'i str>),
     ) -> Self {
         let mut joined = HashSet::new();
         let mut pairs = Self {
@@ -924,10 +988,17 @@ impl<'i, 'd, 'x> Pairs<'i, 'd, 'x> {
             reach: HashSet::new(),
             called: HashSet::new(),
             served,
+            targets,
         };
         let owner = |file: &str| owners.get(file).copied();
+        let mut imports: HashMap<&str, Vec<&Edge>> = HashMap::new();
+        for edge in scan.edges {
+            imports.entry(edge.from.as_str()).or_default().push(edge);
+        }
+        // A reference belongs to the module its use site imports the symbol through, as an
+        // import edge does.
         for r in references {
-            if let (Some(from), Some(to)) = (owner(&r.from), owner(&r.file))
+            if let (Some(from), Some(to)) = (owner(&r.from), owner(through(r, &imports, scan)))
                 && from != to
             {
                 pairs.calls.entry((from, to)).or_insert(r);
@@ -968,9 +1039,9 @@ impl<'i, 'd, 'x> Pairs<'i, 'd, 'x> {
         })
     }
 
-    /// Whether language servers judge the calls between `a` and `b`.
-    fn served(&self, a: &str, b: &str) -> bool {
-        self.served.contains(a) && self.served.contains(b)
+    /// Whether language servers judge the calls from `from` to `to`.
+    fn served(&self, from: &str, to: &str) -> bool {
+        self.served.contains(from) && self.targets.contains(to)
     }
 
     /// Each pair's evidence as it reads, the first kind found: a runtime edge, else a

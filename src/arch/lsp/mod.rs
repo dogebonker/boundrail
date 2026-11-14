@@ -9,7 +9,7 @@ mod config;
 mod framing;
 mod wire;
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -37,27 +37,34 @@ const SESSION_BUDGET_DEFAULT: Duration = Duration::from_secs(600);
 pub struct Facts {
     /// Declarations found, as (file, name).
     pub(super) declared: HashSet<(String, String)>,
-    /// Files whose `textDocument/documentSymbol` answer listed at least one symbol.
-    pub(super) listed: HashSet<String>,
+    /// Names a file's non-empty `textDocument/documentSymbol` answer lacks, as (file, name),
+    /// that are not `default` and not written in the file as a whole word.
+    pub(super) unlisted: HashSet<(String, String)>,
     /// References to interface symbols.
     pub(super) references: Vec<Reference>,
     /// The modules whose every interface symbol a server found and was asked about.
     pub(super) queried: HashSet<String>,
+    /// The modules with at least one interface symbol a server found.
+    pub(super) located: HashSet<String>,
     /// Servers that failed, or the config when language servers are not enabled.
     pub skips: Vec<Skip>,
 }
 
 impl Facts {
     /// Whether `name` is declared in one of `files`: yes when a server found it there, no when
-    /// `files` is one file whose symbol list a server gave without it, else unknown. An empty
-    /// answer refutes nothing, since a server may not have indexed the file.
+    /// `files` is one file whose symbol list lacks it (see [`Facts::unlisted`]) and no server
+    /// found it declared anywhere, else unknown. An empty answer refutes nothing, since a server
+    /// may not have indexed the file.
     pub(super) fn symbol(&self, files: &[&str], name: &str) -> Option<bool> {
         let declared = |f: &&str| self.declared.contains(&((*f).to_owned(), name.to_owned()));
         if files.iter().any(declared) {
             return Some(true);
         }
+        let unlisted = |file: &str| self.unlisted.contains(&(file.to_owned(), name.to_owned()));
         match files {
-            [file] if self.listed.contains(*file) => Some(false),
+            [file] if unlisted(file) && !self.declared.iter().any(|(_, n)| n == name) => {
+                Some(false)
+            }
             _ => None,
         }
     }
@@ -155,23 +162,26 @@ fn plan<'a>(
         asks.names.insert(lookup.name);
         asks.files.insert(first);
         if lookup.files.len() == 1 {
-            asks.documents.insert(first);
+            asks.documents.entry(first).or_default().insert(lookup.name);
         }
     }
     (served, asks)
 }
 
 /// Adds what one server found to `facts`: its modules count as queried when it found every
-/// interface symbol of theirs.
+/// interface symbol of theirs, and as located when it found any.
 fn merge(facts: &mut Facts, served: &[&Interface], found: Found<'_>) {
-    let located = |i: &&&Interface| {
-        let mut definitions = i.definitions.iter();
-        definitions.all(|(f, n)| found.located.contains(&(f.as_str(), n.as_str())))
-    };
-    let queried = served.iter().filter(located).map(|i| i.id.clone());
-    facts.queried.extend(queried);
+    let located = |(f, n): &(String, String)| found.located.contains(&(f.as_str(), n.as_str()));
+    for i in served {
+        if i.definitions.iter().all(located) {
+            facts.queried.insert(i.id.clone());
+        }
+        if i.definitions.iter().any(located) {
+            facts.located.insert(i.id.clone());
+        }
+    }
     facts.declared.extend(found.declared);
-    facts.listed.extend(found.listed);
+    facts.unlisted.extend(found.unlisted);
     facts.references.extend(found.references);
 }
 
@@ -243,15 +253,15 @@ struct Asks<'a> {
     names: BTreeSet<&'a str>,
     /// Files to open first.
     files: BTreeSet<&'a str>,
-    /// Opened files to ask for their symbol list.
-    documents: BTreeSet<&'a str>,
+    /// Opened files to ask for their symbol list, with the names looked up in each.
+    documents: BTreeMap<&'a str, BTreeSet<&'a str>>,
 }
 
 /// What one server answered.
 #[derive(Default)]
 struct Found<'a> {
     declared: HashSet<(String, String)>,
-    listed: HashSet<String>,
+    unlisted: HashSet<(String, String)>,
     /// The definitions whose declaration the server found.
     located: HashSet<(&'a str, &'a str)>,
     references: Vec<Reference>,
@@ -313,7 +323,13 @@ fn questions<'a>(
     let at = find_declarations(session, roots, &asks.names, &mut found)?;
     let lists = &capabilities["documentSymbolProvider"];
     if !(lists.is_null() || *lists == Value::Bool(false)) {
-        list_symbols(session, roots.canonical, &asks.documents, &mut found)?;
+        list_symbols(
+            session,
+            roots.canonical,
+            &asks.documents,
+            &texts,
+            &mut found,
+        )?;
     }
     for &(file, name) in &asks.definitions {
         let Some(&range) = at.get(&(file.to_owned(), name.to_owned())) else {
@@ -374,20 +390,28 @@ fn find_declarations(
     Ok(at)
 }
 
-/// Asks for the symbol list of each of `files`, recording the names declared at the top of each
-/// and the files whose list is not empty.
+/// Asks for the symbol list of each of `documents`, recording the names declared at the top of
+/// each, and, when the list is not empty, the names looked up that it lacks: those other than
+/// `default` (a default export lists under its own name) that the file's text in `texts` does
+/// not hold as a whole word.
 fn list_symbols(
     session: &mut Session,
     root: &Path,
-    files: &BTreeSet<&str>,
+    documents: &BTreeMap<&str, BTreeSet<&str>>,
+    texts: &HashMap<&str, Text>,
     found: &mut Found<'_>,
 ) -> Result<()> {
-    for &file in files {
+    for (&file, looked_up) in documents {
         let params = json!({ "textDocument": {"uri": file_uri(&root.join(file))} });
         let result = session.request("textDocument/documentSymbol", params)?;
         let names = wire::top_level_names(&result);
-        if !names.is_empty() {
-            found.listed.insert(file.to_owned());
+        if !names.is_empty()
+            && let Some(text) = texts.get(file)
+        {
+            let lacks = (looked_up.iter())
+                .filter(|&&n| n != "default" && !names.contains(&n) && !text.has_word(n))
+                .map(|n| (file.to_owned(), (*n).to_owned()));
+            found.unlisted.extend(lacks);
         }
         let declared = names.into_iter().map(|n| (file.to_owned(), n.to_owned()));
         found.declared.extend(declared);

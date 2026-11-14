@@ -5246,6 +5246,132 @@ fn check_supports_a_dependency_with_a_workspace_manifest() {
     );
 }
 
+/// A compose checkout of a web, an api and a worker built from TypeScript folders bound to Web,
+/// Api and Worker, and an unbound database. The worker names the api's address.
+const BUILT: &str = "services:
+  web:
+    build: ./web
+  api:
+    build: ./api
+  worker:
+    build: ./worker
+    env_file: worker.env
+  db:
+    image: postgres:16
+";
+
+#[test]
+fn infrastructure_is_judged_only_once_a_module_binds_a_unit() {
+    let checkout = Checkout::new();
+    source(
+        &checkout,
+        &[
+            ("package.json", r#"{"name": "shop"}"#),
+            ("web/index.ts", "export const web = 1;\n"),
+            ("api/index.ts", "export const api = 1;\n"),
+            ("worker/index.ts", "export const worker = 1;\n"),
+            ("docker-compose.yml", BUILT),
+            ("worker.env", "API_URL=http://api:8080\n"),
+        ],
+    );
+    let model = checkout.init();
+    let services = [
+        ("WebApp01", "Web", "web"),
+        ("ApiSvc01", "Api", "api"),
+        ("Worker01", "Worker", "worker"),
+    ];
+    for (order, (id, name, path)) in services.into_iter().enumerate() {
+        let mut module = module(id, name, "service", order as u32);
+        module["binding"] = json!({"path": path});
+        checkout.module(module);
+    }
+    draw(
+        &checkout,
+        &model,
+        "WebApp01",
+        &[("WebApi01", "ApiSvc01", "http")],
+    );
+
+    // Build contexts alone opt nothing in: Web -> Api keeps its skip, and the worker naming the
+    // api's address reveals no undrawn relationship.
+    let out = checkout.ok(&["check", "--only", "code"]);
+    assert_eq!(out["diagnostics"], json!([]), "{out:#}");
+    let skip = json!({"subject": format!("{model}#WebApi01"), "site": "relationship", "reason": "evidence-unavailable"});
+    assert_eq!(out["skips"], json!([skip]));
+    let owned = |out: &Value| {
+        (out["units"].as_array().unwrap().iter())
+            .filter(|u| u["owner"].is_string())
+            .count()
+    };
+    assert_eq!(owned(&out), 3);
+
+    // Binding the database opts the model in.
+    let mut db = module("DbStore1", "Db", "datastore", 3);
+    db["binding"] = json!({"path": "docker-compose.yml", "symbol": "db"});
+    checkout.module(db);
+    let (code, out) = checkout.run(&["check", "--only", "code"]);
+    assert_eq!(code, 1, "{out:#}");
+    assert_eq!(
+        found(&out),
+        [
+            "RELATIONSHIP_UNDRAWN Worker01, ApiSvc01",
+            "RELATIONSHIP_UNSUPPORTED WebApi01"
+        ]
+    );
+    assert_eq!(owned(&out), 4);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_infrastructure_read_skips_unit_bindings_as_a_failed_scan_does() {
+    let checkout = committed();
+    source(&checkout, &[("docker-compose.yml", COMPOSE)]);
+    let model = checkout.init();
+    let mut rabbit = module("Rabbit01", "Rabbit", "queue", 0);
+    rabbit["binding"] = json!({"path": "docker-compose.yml", "symbol": "rabbit"});
+    checkout.module(rabbit);
+    checkout.module(module("Cache001", "Cache", "datastore", 1));
+    // The exclusion policy refuses an ignore file outside the checkout.
+    let outside = TempDir::new("arch-model-outside").unwrap();
+    fs::write(outside.path().join("ignore"), "").unwrap();
+    let ignore = checkout.path().join(".archgraphignore");
+    std::os::unix::fs::symlink(outside.path().join("ignore"), ignore).unwrap();
+    let user = TempDir::new("arch-model-user").unwrap();
+    let error = ".archgraphignore must stay inside the scan root";
+
+    let (code, out, stderr) = checkout.run_served(user.path(), &["check"]);
+    assert_eq!(code, 1, "{out:#}");
+    let warning = format!("warning: reading the checkout's infrastructure failed: {error}");
+    assert!(stderr.contains(&warning), "{stderr}");
+    let codes = found(&out);
+    assert!(
+        codes.contains(&"SCAN_FAILED Rabbit01".to_owned()),
+        "{out:#}"
+    );
+    assert!(
+        codes.iter().any(|c| c.starts_with("ROOT_UNCONNECTED")),
+        "{out:#}"
+    );
+    let failed = (out["diagnostics"].as_array().unwrap().iter())
+        .find(|d| d["code"] == "SCAN_FAILED")
+        .unwrap();
+    let message = format!("reading the checkout's infrastructure failed: {error}");
+    assert_eq!(failed["message"], message);
+    let skip =
+        json!({"subject": format!("{model}#Rabbit01"), "site": "binding", "reason": "scan-failed"});
+    assert!(out["skips"].as_array().unwrap().contains(&skip), "{out:#}");
+
+    let out = checkout.ok(&["inspect"]);
+    assert_eq!(out["scan_error"], error);
+    let skip = json!({"module": format!("{model}#Rabbit01"), "reason": "scan-failed"});
+    assert!(out["skips"].as_array().unwrap().contains(&skip), "{out:#}");
+
+    let out = checkout.ok(&["footprint"]);
+    assert_eq!(out["crossings"], Value::Null, "{out:#}");
+    assert_eq!(out["crossings_skipped"], "scan-failed");
+    assert_eq!(out["scan_error"], error);
+}
+
 const K8S: &str = "kind: Deployment
 metadata:
   name: web
@@ -5344,6 +5470,26 @@ fn kubernetes_service_names_support_http_and_show_in_inspect() {
         out["diagnostics"][0]["message"],
         "Ghost is bound to k8s/app.yaml ghost, but no unit there is named ghost"
     );
+
+    // A unit file the walk never reads, in a hidden folder, is not scanned, and neither are the
+    // relationships of the module bound to it.
+    let devcontainer = "services:\n  app:\n    image: node:22\n";
+    source(
+        &checkout,
+        &[(".devcontainer/docker-compose.yml", devcontainer)],
+    );
+    let mut dev = module("DevBox01", "Dev", "app", 3);
+    dev["binding"] = json!({"path": ".devcontainer/docker-compose.yml", "symbol": "app"});
+    dev["outgoing"] = json!([{"id": "DevWeb01", "to": q("WebApp01"), "kind": "http", "order": 0}]);
+    checkout.module(dev);
+    let (code, out) = checkout.run(&["check", "--only", "code"]);
+    assert_eq!(code, 1, "{out:#}");
+    assert_eq!(found(&out), ["BINDING_SYMBOL_MISSING Ghost001"]);
+    let skips = out["skips"].as_array().unwrap();
+    for (subject, site) in [("DevBox01", "binding"), ("DevWeb01", "relationship")] {
+        let skip = json!({"subject": q(subject), "site": site, "reason": "not-scanned"});
+        assert!(skips.contains(&skip), "{skip} in {out:#}");
+    }
 }
 
 /// The fake language server's program name.
@@ -5650,6 +5796,112 @@ fn language_server_references_run_backwards_and_find_undrawn_calls() {
 }
 
 #[test]
+fn imports_stand_in_for_calls_into_a_module_with_no_symbol_a_server_found() {
+    let checkout = Checkout::new();
+    let (model, user) = served_shop(&checkout);
+    // Web imports Shared for its side effects; Shared exports nothing.
+    let web = "import { charge } from \"../billing\";\nexport const page = () => charge(1);\nimport \"../shared\";\n";
+    source(
+        &checkout,
+        &[
+            ("src/web/index.ts", web),
+            ("src/shared/index.ts", "console.log(\"ready\");\n"),
+        ],
+    );
+    let mut shared = module("Shared01", "Shared", "service", 3);
+    shared["binding"] = json!({"path": "src/shared"});
+    checkout.module(shared);
+    let lines = [
+        ("WebBil01", "Billing1", "call"),
+        ("WebBnk01", "BankApi1", "call"),
+        ("WebShr01", "Shared01", "call"),
+    ];
+    draw(&checkout, &model, "WebApp01", &lines);
+
+    let (code, out, stderr) = checkout.run_served(user.path(), &CHECK_SERVED);
+    assert_eq!(code, 0, "{out:#} {stderr}");
+    assert_eq!(out["diagnostics"], json!([]));
+}
+
+#[test]
+fn a_reference_belongs_to_the_module_its_use_site_imports_the_symbol_through() {
+    let checkout = Checkout::new();
+    source(
+        &checkout,
+        &[
+            ("package.json", r#"{"name": "fixture"}"#),
+            (
+                "src/shop/cart.ts",
+                "import { charge } from \"../shared\";\nexport const buy = () => charge(1);\n",
+            ),
+            (
+                "src/shared/index.ts",
+                "export { charge } from \"../billing\";\n",
+            ),
+            (
+                "src/billing/index.ts",
+                "export const charge = (n: number) => n;\n",
+            ),
+        ],
+    );
+    let model = checkout.init();
+    for (order, (id, name, path)) in [
+        ("ShopApp1", "Shop", "src/shop"),
+        ("Shared01", "Shared", "src/shared"),
+        ("Billing1", "Billing", "src/billing"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut module = module(id, name, "service", order as u32);
+        module["binding"] = json!({"path": path});
+        checkout.module(module);
+    }
+    draw(
+        &checkout,
+        &model,
+        "ShopApp1",
+        &[("ShpShr01", "Shared01", "call")],
+    );
+    draw(
+        &checkout,
+        &model,
+        "Shared01",
+        &[("ShrBil01", "Billing1", "call")],
+    );
+    let (cart, shared, billing) = (
+        "src/shop/cart.ts",
+        "src/shared/index.ts",
+        "src/billing/index.ts",
+    );
+    let rules = [
+        ("initialize", "", json!({"capabilities": {}}).to_string()),
+        (
+            "workspace/symbol",
+            r#""query":"charge""#,
+            declared(&checkout, "charge", billing, 0),
+        ),
+        (
+            "workspace/symbol",
+            r#""query":"buy""#,
+            declared(&checkout, "buy", cart, 1),
+        ),
+        (
+            "textDocument/references",
+            billing,
+            uses(&checkout, &[(cart, 1), (shared, 0)]),
+        ),
+        ("textDocument/references", cart, "[]".to_owned()),
+    ];
+    let user = serve(&checkout, &rules, &[]);
+
+    // The cart calls `charge` through the shared barrel: the call is Shop's to Shared.
+    let (code, out, stderr) = checkout.run_served(user.path(), &CHECK_SERVED);
+    assert_eq!(code, 0, "{out:#} {stderr}");
+    assert_eq!(out["diagnostics"], json!([]));
+}
+
+#[test]
 fn language_servers_confirm_or_refute_symbols_the_scan_cannot_index() {
     let checkout = Checkout::new();
     typescript(&checkout);
@@ -5722,6 +5974,16 @@ fn language_servers_confirm_or_refute_symbols_the_scan_cannot_index() {
         out["diagnostics"][0]["message"],
         "Web -> Billing is anchored at src/bank/pay.js refund, but no file there declares refund"
     );
+
+    // A default export lists under its own name, so a list without `default` refutes nothing:
+    // the CommonJS file's `module.exports` is its default export.
+    let mut billing = checkout.read_module("Billing1");
+    billing["binding"] = json!({"path": pay, "symbol": "default"});
+    checkout.module(billing);
+    let (code, out, _) = checkout.run_served(user.path(), &CHECK_SERVED);
+    assert_eq!(code, 1, "{out:#}");
+    assert_eq!(incomplete(&out), ["Billing1"]);
+    assert_eq!(found(&out), ["ANCHOR_SYMBOL_MISSING WebBil01"]);
 }
 
 #[test]
