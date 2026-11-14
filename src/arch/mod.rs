@@ -10,6 +10,7 @@ pub mod edit;
 pub mod ids;
 mod index;
 pub mod proposal;
+pub mod render;
 pub mod request;
 pub mod revision;
 pub mod semantic;

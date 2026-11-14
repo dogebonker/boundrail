@@ -3939,3 +3939,304 @@ fn an_interrupted_adoption_is_one_journaled_write_that_recovery_finishes() {
         "adopted"
     );
 }
+
+/// Asserts `svg` is well-formed XML as far as a render can break it: every tag closes in order,
+/// quotes pair inside tags, and every `&` starts an entity. The crate has no XML parser.
+fn assert_xml(svg: &str) {
+    let entities = |text: &str| {
+        for (at, _) in text.match_indices('&') {
+            let tail = &text[at..];
+            let known = ["&amp;", "&lt;", "&gt;", "&quot;", "&apos;"];
+            assert!(
+                known.iter().any(|e| tail.starts_with(e)),
+                "bare & in {text}"
+            );
+        }
+    };
+    assert!(
+        svg.starts_with("<svg xmlns=\"http://www.w3.org/2000/svg\""),
+        "{svg}"
+    );
+    let mut open: Vec<&str> = Vec::new();
+    let mut rest = svg;
+    while let Some(start) = rest.find('<') {
+        entities(&rest[..start]);
+        let end = start + rest[start..].find('>').expect("a tag closes");
+        let tag = &rest[start + 1..end];
+        assert!(
+            !tag.contains('<') && tag.matches('"').count().is_multiple_of(2),
+            "{tag}"
+        );
+        entities(tag);
+        if let Some(name) = tag.strip_prefix('/') {
+            assert_eq!(open.pop(), Some(name), "closing {name}");
+        } else if !tag.ends_with('/') {
+            open.push(tag.split_whitespace().next().unwrap());
+        }
+        rest = &rest[end + 1..];
+    }
+    assert!(open.is_empty(), "unclosed {open:?}");
+    assert_eq!(rest.trim(), "");
+}
+
+impl Checkout {
+    /// `model render` with `args`: the SVG it prints, checked to be well-formed.
+    fn render(&self, args: &[&str]) -> String {
+        let mut all = vec!["render"];
+        all.extend(args);
+        let (code, svg) = self.run_raw(&all);
+        assert_eq!(code, 0, "{svg}");
+        assert_xml(&svg);
+        svg
+    }
+}
+
+/// The first `<g>` element with class `class` that holds `text`, up to its first `</g>`.
+fn group_holding<'a>(svg: &'a str, class: &str, text: &str) -> Option<&'a str> {
+    let opening = format!("<g class=\"{class}\"");
+    svg.match_indices(&opening).find_map(|(at, _)| {
+        let body = &svg[at..at + svg[at..].find("</g>")?];
+        body.contains(text).then_some(body)
+    })
+}
+
+#[test]
+fn render_draws_every_module_and_an_arrow_per_relationship() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let svg = checkout.render(&[]);
+    for name in ["Platform", "Web", "Billing", "Bank"] {
+        assert!(svg.contains(&format!(">{name}</text>")), "{name}: {svg}");
+    }
+    assert_eq!(svg.matches("<g class=\"relationship\"").count(), 2, "{svg}");
+    assert!(svg.contains(">charges</text>") && svg.contains(">Call</text>"));
+    // Bank is external: a dashed border.
+    let bank = group_holding(&svg, "module", ">Bank<").unwrap();
+    assert!(
+        bank.contains("BankApi1") && bank.contains("stroke-dasharray=\"5 3\""),
+        "{bank}"
+    );
+    assert!(svg.contains(r#" viewBox="0 0 "#) && svg.contains("font-family=\"sans-serif\""));
+    // The same input draws the same bytes.
+    assert_eq!(checkout.render(&[]), svg);
+
+    // Depth 1 collapses Platform's parts; their relationship to Bank lifts to Platform.
+    let collapsed = checkout.render(&["--depth", "1"]);
+    assert!(!collapsed.contains(">Web</text>"));
+    assert!(collapsed.contains("[System] +2 parts"), "{collapsed}");
+    assert_eq!(collapsed.matches("<g class=\"relationship\"").count(), 1);
+
+    // A scope draws its parts; relationships leaving it are left out.
+    let scoped = checkout.render(&["--scope", "Platform"]);
+    assert!(scoped.contains(">Web</text>") && !scoped.contains(">Bank</text>"));
+    assert_eq!(scoped.matches("<g class=\"relationship\"").count(), 1);
+    checkout.refused(&["render", "--scope", "Nowhere"], "SUBJECT_NOT_FOUND");
+}
+
+#[test]
+fn render_a_sequence_with_its_decision_and_loop_frames() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    add_checkout(&checkout);
+    let svg = checkout.render(&["--flow", "Checkout"]);
+    assert_eq!(svg.matches("<g class=\"lifeline\"").count(), 3, "{svg}");
+    for text in [
+        ">alt</text>",
+        ">card valid?</text>",
+        ">[yes]</text>",
+        ">[no]</text>",
+        ">loop</text>",
+        ">[each item]</text>",
+        ">charge x3</text>",
+        ">place order</text>",
+    ] {
+        assert!(svg.contains(text), "{text}: {svg}");
+    }
+    assert!(svg.contains("<g class=\"frame alt\"") && svg.contains("<g class=\"frame loop\""));
+    // A reply is dashed.
+    let decline = group_holding(&svg, "message", ">decline<").unwrap();
+    assert!(decline.contains("stroke-dasharray=\"6 4\""), "{decline}");
+    assert_eq!(
+        checkout.render(&["--flow", "Checkout", "--view", "sequence"]),
+        svg
+    );
+}
+
+#[test]
+fn render_a_flowchart_of_a_flow() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    add_checkout(&checkout);
+    let svg = checkout.render(&["--flow", "Checkout", "--view", "flowchart"]);
+    for text in [
+        ">Web -&gt; Billing: place order</text>",
+        ">Billing -&gt; Bank: charge x3</text>",
+        ">card valid?</text>",
+        ">yes</text>",
+        ">no</text>",
+        ">loop: each item</text>",
+        ">repeat</text>",
+    ] {
+        assert!(svg.contains(text), "{text}: {svg}");
+    }
+    assert_eq!(svg.matches("<g class=\"step message\"").count(), 4);
+    assert_eq!(svg.matches("<g class=\"step decision\"").count(), 1);
+    // The branches rejoin at one point.
+    assert_eq!(svg.matches("<circle").count(), 1);
+}
+
+#[test]
+fn render_marks_what_a_proposal_changes() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let ids = add_checkout(&checkout);
+    let id = propose(&checkout, "Fraud", "current");
+    edited_proposal(
+        &checkout,
+        &id,
+        json!([
+            {"type": "add-module", "module": {"name": "Fraud", "kind": "service", "order": 2}},
+            {"type": "add-relationship", "source": "Billing", "relationship": {"to": "Fraud", "kind": "rpc", "order": 1, "label": "score"}},
+            {"type": "edit-module", "subject": "Billing", "set": {"name": "Payments"}},
+            {"type": "remove-step", "subject": ids[7]},
+        ]),
+    );
+    let svg = checkout.render(&["--proposal", &id, "--against", "current"]);
+    let fraud = group_holding(&svg, "module added", ">Fraud<").unwrap();
+    assert!(fraud.contains("stroke=\"#2f9e44\""), "{fraud}");
+    assert!(
+        group_holding(&svg, "module changed", ">Payments<").is_some(),
+        "{svg}"
+    );
+    assert!(group_holding(&svg, "relationship added", ">score<").is_some());
+    let legend = group_holding(&svg, "legend", ">added<").unwrap();
+    assert!(
+        legend.contains(">removed<") && legend.contains(">changed<"),
+        "{legend}"
+    );
+    assert!(svg.contains(">Shop, proposal Fraud, compared with the current state</text>"));
+    // A proposal alone, or named by --against, is drawn against the current state the same way.
+    assert_eq!(checkout.render(&["--proposal", &id]), svg);
+    assert_eq!(checkout.render(&["--against", &id]), svg);
+    // Unmarked when nothing is compared.
+    let plain = checkout.render(&[]);
+    assert!(!plain.contains("class=\"legend\"") && !plain.contains(" added\""));
+    checkout.refused(&["render", "--against", "current"], "REQUEST_INVALID");
+    checkout.refused(
+        &["render", "--proposal", &id, "--against", &id],
+        "REQUEST_INVALID",
+    );
+
+    // Of two proposals, --proposal is drawn against --against: what the first lacks is removed,
+    // faded and struck.
+    let copy = propose(&checkout, "Plain", "current");
+    let back = checkout.render(&["--proposal", &copy, "--against", &id]);
+    assert!(back.contains(">Shop, proposal Plain, compared with proposal Fraud</text>"));
+    let gone = group_holding(&back, "module removed", ">Fraud<").unwrap();
+    assert!(gone.contains("text-decoration=\"line-through\""), "{gone}");
+    assert!(gone.contains("stroke=\"#e03131\"") && gone.contains("opacity=\"0.4\""));
+    assert!(group_holding(&back, "relationship removed", ">score<").is_some());
+
+    // In a flow, the removed step is drawn where it stood.
+    let sequence = checkout.render(&[
+        "--proposal",
+        &id,
+        "--against",
+        "current",
+        "--flow",
+        "Checkout",
+    ]);
+    assert!(
+        group_holding(&sequence, "message removed", ">decline<").is_some(),
+        "{sequence}"
+    );
+    assert!(group_holding(&sequence, "lifeline changed", ">Payments<").is_some());
+    let flowchart = checkout.render(&[
+        "--proposal",
+        &id,
+        "--against",
+        "current",
+        "--flow",
+        "Checkout",
+        "--view",
+        "flowchart",
+    ]);
+    assert!(group_holding(&flowchart, "step message removed", "decline<").is_some());
+    assert!(flowchart.contains("class=\"legend\""));
+}
+
+#[test]
+fn render_draws_the_current_state_against_an_older_checkpoint() {
+    let checkout = committed();
+    shop(&checkout);
+    let first = checkout.ok(&["retain", "--doing", "the shop as built"])["checkpoint"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    checkout.edited(json!([
+        {"type": "add-module", "module": {"name": "Ledger", "kind": "service", "order": 3}},
+    ]));
+    let svg = checkout.render(&["--checkpoint", &first, "--against", "current"]);
+    let title = format!(">Shop, the current state, compared with checkpoint {first}</text>");
+    assert!(svg.contains(&title), "{svg}");
+    assert!(
+        group_holding(&svg, "module added", ">Ledger<").is_some(),
+        "{svg}"
+    );
+    // The checkpoint alone is drawn unmarked.
+    let old = checkout.render(&["--checkpoint", &first]);
+    assert!(!old.contains(">Ledger<") && !old.contains("class=\"legend\""));
+    assert!(old.contains(&format!(">Shop, checkpoint {first}</text>")));
+}
+
+#[test]
+fn render_writes_an_output_file_or_json() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let svg = checkout.render(&[]);
+    let (code, stdout) = checkout.run_raw(&["render", "--output", "out/model.svg"]);
+    assert_eq!(code, 2, "a missing folder refuses: {stdout}");
+    assert!(stdout.contains("REQUEST_INVALID"));
+    fs::create_dir(checkout.path().join("out")).unwrap();
+    let (code, stdout) = checkout.run_raw(&["render", "--output", "out/model.svg"]);
+    assert_eq!((code, stdout.as_str()), (0, ""));
+    let written = fs::read_to_string(checkout.path().join("out/model.svg")).unwrap();
+    assert_eq!(written, svg);
+    let error = checkout.refused(
+        &["render", "--output", ".boundrail/model/x.svg"],
+        "REQUEST_INVALID",
+    );
+    assert!(
+        error["message"].as_str().unwrap().contains("vault"),
+        "{error}"
+    );
+    assert!(!checkout.vault().join("x.svg").exists());
+
+    let out = checkout.ok(&["render", "--format", "json"]);
+    assert_eq!(out["kind"], "render");
+    assert_eq!(out["view"], "architecture");
+    assert_eq!(out["svg"], svg);
+}
+
+#[test]
+fn render_refuses_flags_that_do_not_go_together() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    add_checkout(&checkout);
+    for args in [
+        vec!["render", "--view", "sequence"],
+        vec!["render", "--view", "flowchart"],
+        vec!["render", "--view", "architecture", "--flow", "Checkout"],
+        vec!["render", "--flow", "Checkout", "--scope", "Platform"],
+        vec!["render", "--flow", "Checkout", "--depth", "3"],
+        vec!["render", "--depth", "0"],
+        vec!["render", "--proposal", "Abcdefgh", "--checkpoint", "abcd"],
+    ] {
+        checkout.refused(&args, "REQUEST_INVALID");
+    }
+    // Render has no Markdown form; the refusal itself prints as Markdown.
+    let (code, stdout) = checkout.run_raw(&["render", "--format", "markdown"]);
+    assert_eq!(code, 2);
+    assert!(stdout.starts_with("REQUEST_INVALID: "), "{stdout}");
+    checkout.refused(&["render", "--flow", "Nowhere"], "SUBJECT_NOT_FOUND");
+}

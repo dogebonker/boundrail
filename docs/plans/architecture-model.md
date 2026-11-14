@@ -39,7 +39,7 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 | T6 | Flows: collections of flows in `collections/<id>.collection.json`, message/decision/loop steps, collection/flow/step/branch edits with flow and step moves, `REFERENCED_BY_FLOW`, collection and flow claims, `model read --flow`, `FLOW_SUMMARY_MISSING` and `MESSAGE_UNDRAWN` in the semantic check | done |
 | T7 | Checkpoints: history branch, `model retain`, `model checkpoints`, `model read --checkpoint` | done |
 | T8 | Proposals: create/edit drafts against a predecessor, `model compare`, adopt, shelve, planning models without a current state | done |
-| T9 | Render: SVG architecture view with automatic layout, sequence and flowchart views of a flow, comparison marks | open |
+| T9 | Render: SVG architecture view with automatic layout, sequence and flowchart views of a flow, comparison marks | done |
 | T10 | Measures: module interface counts (`model inspect`), co-change locality (`model locality`), branch footprint (`model footprint`) | open |
 | T11 | Live browser view: model canvas, drill-down, focus and filters, detail panel, warnings, comparison, history, split panes | open |
 | T12 | Infrastructure evidence: docker-compose, Kubernetes, Terraform bindings and configured-address hops between modules | open |
@@ -170,3 +170,45 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   flows, flows without their steps and steps without the steps inside them; a relationship's
   `from`, a flow's `collection` and a step's `flow` and `parent` count as fields, so a move shows
   as a change. A step's index is not compared.
+- T9: `model render` draws the loaded model as SVG, purely and deterministically (sorted maps,
+  numbers to one decimal). The view is `architecture`, or `sequence` by default when `--flow` is
+  given, or `flowchart`. It prints the SVG on stdout; `--format json` wraps it as
+  `{kind: "render", view, svg}`, `--format markdown` refuses `REQUEST_INVALID`, and `--output`
+  writes the same bytes to a file. The global `--format` has no default any more: absent means JSON
+  for every other command and SVG for `render`. A refusal still prints as JSON on stdout, so
+  `render > a.svg` can capture a refusal instead of a picture; scripts should use `--output`, which
+  writes nothing when the command refuses. `REQUEST_INVALID` refuses a sequence or flowchart
+  without `--flow`, `--flow` with the architecture view, `--scope` or `--depth` with a flow,
+  `--depth 0`, `--proposal` with `--checkpoint`, `--against` naming the state being drawn, and an
+  `--output` whose folder is missing or inside the vault. The picture and its viewBox are sized to
+  the bounds of everything drawn, text included at its estimated width.
+- T9: the architecture view lays out the parts of each container, and the top level, as layers over
+  the relationships lifted to them: ranks by longest path after dropping the back edges of a
+  depth-first search in module order, four barycenter sweeps down and up, rows centered, box widths
+  from 7 units per character. Containers size to their parts plus padding and a label band, from
+  the inside out. Edges leave and enter by facing sides, spread along a side by where the other end
+  is; a vertical edge turns in its own lane of the gap beside its source, the shortest run nearest,
+  so labels sit in free space. `--depth N` (default 2) collapses deeper parts into their box at
+  level N, which shows `+N parts`; relationships lift to the drawn ancestor, one arrow per box pair
+  and kind, labelled `Kind xN` when it stands for several. Relationships inside one box or with an
+  end outside `--scope` are not drawn, except that a relationship of a drawn module to itself loops
+  back to its box. External modules have a dashed border and, without a configured color, a gray
+  fill. A kind's configured color fills its boxes when it is `#rgb` or `#rrggbb`; otherwise a
+  palette color picked by a hash of the kind's key, so adding a kind recolors no other, and no
+  palette color reads as an added, removed or changed mark. A module's first valid group color is a
+  stripe on its left edge.
+- T9: ponytail: no dummy nodes and no crossing count, so an edge that skips ranks can cross the
+  boxes between its ends, and a relationship from a container to its own part loops out of the
+  right side; add dummy nodes and crossing reduction when real models show it. Text width is a
+  fixed estimate, so wide glyphs can overflow a box; measure the font if that shows.
+- T9: a render compares two states when `--against current|<proposal>` names one or `--proposal`
+  is given alone (then against the current state). The newer state is drawn and the older is the
+  base, in the order checkpoint, current state, proposal; of two proposals, `--proposal` is drawn
+  and `--against` is the base. So `--against P` draws P against the current state, and
+  `--checkpoint C --against current` draws the current state against C. The title names the drawn
+  state and its base. Marks come from `model compare`: added green, changed amber, removed red,
+  faded and struck through, with a legend. Removed modules and relationships are drawn from the
+  base; a removed step goes back at its old index in its old list when that list still exists,
+  else it is not drawn. The flow resolves in the drawn state, so a flow it lacks
+  refuses `SUBJECT_NOT_FOUND`. Notes appear beside their message in the sequence view only, and an
+  empty flow draws `no steps`.

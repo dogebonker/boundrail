@@ -9,6 +9,7 @@ use boundrail::arch::compare::{self, Comparison};
 use boundrail::arch::diagnostic::{Diagnostic, Severity};
 use boundrail::arch::edit::{self, Receipt};
 use boundrail::arch::proposal::{self, CURRENT, Writing};
+use boundrail::arch::render::{self, View};
 use boundrail::arch::request::INPUT_MAX;
 use boundrail::arch::semantic;
 use boundrail::arch::types::{self, Collection, Flow, SCHEMAS, Step};
@@ -23,8 +24,9 @@ pub(super) struct ModelArgs {
     /// Directory inside the Git checkout that holds the model
     #[arg(long, global = true, default_value = ".")]
     root: PathBuf,
-    #[arg(long, global = true, value_enum, default_value_t = Format::Json)]
-    format: Format,
+    /// Output format; JSON when absent, except `model render`, which then prints the SVG
+    #[arg(long, global = true, value_enum)]
+    format: Option<Format>,
     #[command(subcommand)]
     command: Command,
 }
@@ -43,6 +45,47 @@ enum Command {
         #[arg(long)]
         proposal: Option<String>,
     },
+    /// Draw the model as SVG: the architecture, or a flow as a sequence diagram or flowchart,
+    /// optionally marked with what it changes against another state
+    Render(RenderArgs),
+}
+
+#[derive(Args)]
+struct RenderArgs {
+    /// Draw this proposal, marked against the current state unless --against names another
+    #[arg(long)]
+    proposal: Option<String>,
+    /// Draw the model a checkpoint holds, or with --against compare it: its ID or a unique
+    /// commit prefix
+    #[arg(long)]
+    checkpoint: Option<String>,
+    /// What to draw; a flow's sequence diagram when --flow is given, else the architecture
+    #[arg(long, value_enum)]
+    view: Option<RenderView>,
+    /// The flow a sequence or flowchart view draws: its qualified or local ID, or its unique name
+    #[arg(long)]
+    flow: Option<String>,
+    /// Draw only this module's parts: its ID or unique current or former name
+    #[arg(long)]
+    scope: Option<String>,
+    /// How many levels of containers the architecture view opens; deeper parts collapse
+    /// into their container [default: 2]
+    #[arg(long)]
+    depth: Option<usize>,
+    /// Compare with the current state or this proposal; the newer state (checkpoint, then
+    /// current, then proposal) is drawn with what it adds, removes and changes marked
+    #[arg(long)]
+    against: Option<String>,
+    /// Write to this file instead of standard output; its folder must exist
+    #[arg(long)]
+    output: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum RenderView {
+    Architecture,
+    Sequence,
+    Flowchart,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -223,9 +266,12 @@ impl WritingArgs {
 
 /// A refusal is printed on stdout and exits with code 2; other errors go to main's handler.
 pub(super) fn run(args: ModelArgs) -> Result<ExitCode> {
-    let markdown = matches!(args.format, Format::Markdown);
+    let markdown = matches!(args.format, Some(Format::Markdown));
     let result = match args.command {
         Command::Check { only, proposal } => check(&args.root, markdown, only, proposal.as_deref()),
+        Command::Render(render) => {
+            render_model(&args.root, args.format, &render).map(|()| ExitCode::SUCCESS)
+        }
         Command::Model(command) => {
             execute(&args.root, markdown, command).map(|()| ExitCode::SUCCESS)
         }
@@ -704,6 +750,164 @@ impl GroupingRead<'_> {
         }
         write(None, &output)
     }
+}
+
+/// `model render`: the SVG on stdout or in `--output`; with `--format json`, inside the output
+/// envelope.
+fn render_model(root: &Path, format: Option<Format>, args: &RenderArgs) -> Result<()> {
+    if matches!(format, Some(Format::Markdown)) {
+        let message = "model render prints SVG, or JSON with --format json";
+        return Err(Refusal::new(Code::RequestInvalid, message).into());
+    }
+    let view = args.view()?;
+    let (drawn, base) = args.states()?;
+    let (model, name) = load_state(root, drawn)?;
+    let base = base.map(|b| load_state(root, b)).transpose()?;
+    if let Some(output) = &args.output {
+        check_output(root, output)?;
+    }
+    let drawn = render::Side {
+        model: &model,
+        name,
+    };
+    let base = (base.as_ref()).map(|(model, name)| render::Side {
+        model,
+        name: name.clone(),
+    });
+    let svg = render::render(&drawn, base.as_ref(), &view)?;
+    let output = args.output.as_deref();
+    if matches!(format, Some(Format::Json)) {
+        let envelope = json!({
+            "schema": MODEL_SCHEMA,
+            "kind": "render",
+            "success": true,
+            "view": view.name(),
+            "svg": svg,
+        });
+        return write(output, &envelope);
+    }
+    match output {
+        Some(path) => write_file(path, svg.as_bytes()),
+        None => {
+            print!("{svg}");
+            Ok(())
+        }
+    }
+}
+
+/// A state `model render` draws or compares with, oldest first.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum RenderState<'a> {
+    Checkpoint(&'a str),
+    Current,
+    Proposal(&'a str),
+}
+
+/// The model `state` holds, and how a title names it: `None` for the current state.
+fn load_state(root: &Path, state: RenderState<'_>) -> Result<(Model, Option<String>)> {
+    let (checkpoint, proposal) = match state {
+        RenderState::Checkpoint(c) => (Some(c), None),
+        RenderState::Current => (None, None),
+        RenderState::Proposal(p) => (None, Some(p)),
+    };
+    let Loaded {
+        model, checkpoint, ..
+    } = load_reading(root, checkpoint, proposal)?;
+    let name = match (&checkpoint, &model.proposal) {
+        (Some(c), _) => Some(format!("checkpoint {}", c.id)),
+        (None, Some(p)) => Some(format!("proposal {}", p.name)),
+        (None, None) => None,
+    };
+    Ok((model, name))
+}
+
+impl RenderArgs {
+    /// The state to draw and the one to compare it with. The newer of the two is drawn; of two
+    /// proposals, the one `--proposal` names. A proposal alone is compared with the current state.
+    fn states(&self) -> Result<(RenderState<'_>, Option<RenderState<'_>>)> {
+        let invalid = |message: &str| Refusal::new(Code::RequestInvalid, message);
+        let named = match (self.proposal.as_deref(), self.checkpoint.as_deref()) {
+            (Some(_), Some(_)) => {
+                let message = "--proposal and --checkpoint each name a state; give one";
+                return Err(invalid(message).into());
+            }
+            (Some(p), None) => RenderState::Proposal(p),
+            (None, Some(c)) => RenderState::Checkpoint(c),
+            (None, None) => RenderState::Current,
+        };
+        let other = match self.against.as_deref() {
+            Some(CURRENT) => Some(RenderState::Current),
+            Some(p) => Some(RenderState::Proposal(p)),
+            None => matches!(named, RenderState::Proposal(_)).then_some(RenderState::Current),
+        };
+        let Some(other) = other else {
+            return Ok((named, None));
+        };
+        if other == named {
+            return Err(invalid("--against names the state being drawn").into());
+        }
+        Ok(match (named, other) {
+            (RenderState::Proposal(_), RenderState::Proposal(_)) => (named, Some(other)),
+            _ if other > named => (other, Some(named)),
+            _ => (named, Some(other)),
+        })
+    }
+
+    /// The view the flags ask for, refusing `REQUEST_INVALID` for flags that do not go together.
+    fn view(&self) -> Result<View<'_>> {
+        let invalid = |message: &str| Refusal::new(Code::RequestInvalid, message);
+        let flow = self.flow.as_deref();
+        let kind = self.view.unwrap_or(match flow {
+            Some(_) => RenderView::Sequence,
+            None => RenderView::Architecture,
+        });
+        let architecture_only = self.scope.is_some() || self.depth.is_some();
+        match (kind, flow) {
+            (RenderView::Architecture, None) => Ok(View::Architecture {
+                scope: self.scope.as_deref(),
+                depth: self.depth.unwrap_or(render::DEFAULT_DEPTH),
+            }),
+            (RenderView::Architecture, Some(_)) => Err(invalid(
+                "--flow draws a sequence or flowchart view, not the architecture",
+            )
+            .into()),
+            (_, None) => Err(invalid("the sequence and flowchart views need --flow").into()),
+            (_, Some(_)) if architecture_only => {
+                Err(invalid("--scope and --depth apply to the architecture view only").into())
+            }
+            (RenderView::Sequence, Some(flow)) => Ok(View::Sequence(flow)),
+            (RenderView::Flowchart, Some(flow)) => Ok(View::Flowchart(flow)),
+        }
+    }
+}
+
+/// Refuses an `--output` whose folder is missing or lies inside the model vault.
+fn check_output(root: &Path, output: &Path) -> Result<()> {
+    let parent = match output.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let folder = fs::canonicalize(parent).map_err(|error| {
+        Refusal::new(
+            Code::RequestInvalid,
+            format!(
+                "--output {}: its folder cannot be read: {error}",
+                output.display()
+            ),
+        )
+    })?;
+    let vault = vault::path(root).and_then(|dir| Ok(fs::canonicalize(dir)?));
+    if vault.is_ok_and(|vault| folder.starts_with(vault)) {
+        return Err(Refusal::new(
+            Code::RequestInvalid,
+            format!(
+                "--output {} is inside the model vault; write it elsewhere",
+                output.display()
+            ),
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// `model check`: exit 0 without warnings, 1 with any. Like `model read`, it names a pending edit.
