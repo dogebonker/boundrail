@@ -196,7 +196,7 @@ fn locations(start: &Path) -> Result<(PathBuf, PathBuf)> {
 }
 
 /// The checkout of a vault folder, `<checkout>/.boundrail/model`.
-fn checkout(vault: &Path) -> Result<PathBuf> {
+pub(super) fn checkout(vault: &Path) -> Result<PathBuf> {
     vault
         .parent()
         .and_then(Path::parent)
@@ -323,7 +323,7 @@ fn files(root: &Path, checkpoint: &Checkpoint) -> Result<Vec<(String, String, us
 }
 
 /// The name of the Git author identity, which `commit-tree` needs anyway.
-fn author(root: &Path) -> Result<String> {
+pub(super) fn author(root: &Path) -> Result<String> {
     let ident = git::text(root, &["var", "GIT_AUTHOR_IDENT"])?;
     let name = ident.split(" <").next().unwrap_or_default().trim();
     ensure!(!name.is_empty(), "the Git author identity has no name");
@@ -432,7 +432,7 @@ fn write_tree(root: &Path, model: &Model) -> Result<String> {
     let mut args = vec!["hash-object", "-w", "--no-filters", "--"];
     args.extend(&paths);
     let objects = git::text(&model.dir, &args)?;
-    let now = revision::of_digests(vault::file_digests(&model.dir)?);
+    let now = revision::of_digests(vault::file_digests(&model.dir, &vault::Scope::Current)?);
     if now.digest != model.revision.digest {
         return Err(Refusal::new(
             Code::StaleRevision,

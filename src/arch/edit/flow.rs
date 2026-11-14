@@ -818,6 +818,7 @@ mod tests {
             ],
             collections,
             revision: revision::of(std::iter::empty()),
+            proposal: None,
         }
     }
 

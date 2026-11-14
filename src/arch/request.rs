@@ -23,7 +23,7 @@ const DOING_MAX: usize = 140;
 pub struct Target {
     /// The model's local ID.
     pub model: String,
-    /// The current state's local ID.
+    /// The current state's local ID, or the proposal's for a request inside a proposal.
     pub state: String,
 }
 
@@ -78,18 +78,31 @@ pub(super) fn check_writer(writer: &str) -> Result<()> {
     )))
 }
 
-/// Refuses a request whose target is not the vault's model and current state.
+/// Refuses a request whose target is not the vault's model and the state `model` holds: the
+/// current state, or the proposal it was loaded as. A planning model has no current state.
 pub(super) fn check_model(model: &Model, target: &Target) -> Result<()> {
     let manifest = &model.manifest;
-    if target.model != manifest.id || target.state != manifest.current.id {
+    let state = match &model.proposal {
+        Some(proposal) => Some(proposal.id.as_str()),
+        None => manifest.current.as_ref().map(|c| c.id.as_str()),
+    };
+    if target.model == manifest.id && state.is_none() {
+        return Err(Refusal::new(
+            Code::NoCurrentState,
+            "the model has no current state yet; draw a proposal with `boundrail model propose`, work in it with --proposal and adopt it",
+        )
+        .into());
+    }
+    if target.model != manifest.id || Some(target.state.as_str()) != state {
+        let state = state.unwrap_or("none");
         return Err(Refusal::new(
             Code::TargetMismatch,
             format!(
-                "the request targets model {} state {}, but the vault holds model {} state {}",
-                target.model, target.state, manifest.id, manifest.current.id
+                "the request targets model {} state {}, but the vault holds model {} state {state}",
+                target.model, target.state, manifest.id
             ),
         )
-        .with_details(json!({ "model": manifest.id, "state": manifest.current.id }))
+        .with_details(json!({ "model": manifest.id, "state": state }))
         .into());
     }
     Ok(())

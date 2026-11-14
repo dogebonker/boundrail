@@ -3,7 +3,10 @@
 //! relationship IDs, qualified collection and flow IDs, and the model ID, which holds the root
 //! level (adding, removing or moving a root module, adding or removing a collection). A module
 //! claim also holds everything inside the module: its parts, their parts, and the relationships
-//! they own. A collection claim holds its flows, and a flow claim holds its steps.
+//! they own. A collection claim holds its flows, and a flow claim holds its steps. A proposal
+//! claim holds everything inside the proposal. IDs are model-wide, so a claim on a module holds
+//! it in the current state and in every proposal; inside a proposal, the proposal's ID holds the
+//! root level in place of the model ID.
 //!
 //! Claims are cooperative coordination, not authorization: writers name themselves, and anyone
 //! may revoke a claim. They live in `<git dir>/boundrail/claims.json`, so they are never committed
@@ -70,7 +73,9 @@ pub struct ClaimRequest {
     pub reason: String,
     /// The model ID, which holds the root level; module IDs or unique current or former names,
     /// each holding the module and everything inside it; relationship IDs; and collection and
-    /// flow IDs, each holding what is inside it. IDs may be qualified or local.
+    /// flow IDs, each holding what is inside it; and proposal IDs, each holding the whole
+    /// proposal. IDs may be qualified or local. Names resolve in the state `target` names: the
+    /// current state, or a proposal by its ID.
     #[schemars(length(min = 1, max = SUBJECTS_MAX))]
     pub subjects: Vec<String>,
     /// Repeating an operation ID with the same request returns the claim it recorded.
@@ -128,7 +133,7 @@ pub fn claim(vault: &Path, input: &[u8], doing: &str) -> Result<Claim> {
         return Ok(claim);
     }
     state::refuse_interrupted(&state.dir)?;
-    let model = vault::load_dir(vault.to_path_buf())?;
+    let model = vault::load_state(vault.to_path_buf(), &request.target.state)?;
     check_model(&model, &request.target)?;
     let relationships = vault::relationships(&model.modules);
     let subjects = request
@@ -136,14 +141,17 @@ pub fn claim(vault: &Path, input: &[u8], doing: &str) -> Result<Claim> {
         .iter()
         .map(|subject| resolve(&model, &relationships, subject))
         .collect::<Result<BTreeSet<String>>>()?;
-    let up = containers(&model);
-    // Holding a module holds what is inside it, so claims on either side of a containment clash.
-    refuse_conflicts(
-        &ledger.claims,
-        &request.writer,
-        &subjects,
-        |held: &str, wanted: &str| covers(&up, held, wanted) || covers(&up, wanted, held),
-    )?;
+    // Holding a module holds what is inside it, so claims on either side of a containment clash,
+    // in the target and inside every other proposal the new or existing claims hold.
+    for scope in iter::once(model).chain(involved(vault, &ledger.claims, &subjects)) {
+        let up = containers(&scope);
+        refuse_conflicts(
+            &ledger.claims,
+            &request.writer,
+            &subjects,
+            |held: &str, wanted: &str| covers(&up, held, wanted) || covers(&up, wanted, held),
+        )?;
+    }
     let id = ids::allocate(|candidate| {
         ledger
             .claims
@@ -319,7 +327,7 @@ fn resolve(
         return Ok(subject.to_owned());
     }
     let local = ids::local(id, subject);
-    if model.find_grouping(local).is_some() {
+    if model.find_grouping(local).is_some() || vault::is_proposal(&model.dir, local) {
         return Ok(model.qualify(local));
     }
     match vault::find(id, &model.modules, subject) {
@@ -331,7 +339,7 @@ fn resolve(
             Err(Refusal::new(
                 Code::SubjectNotFound,
                 format!(
-                    "no model, module, relationship, collection or flow has the ID or name `{subject}`"
+                    "no model, proposal, module, relationship, collection or flow has the ID or name `{subject}`"
                 ),
             )
             .into())
@@ -340,13 +348,34 @@ fn resolve(
     }
 }
 
+/// The proposals that `subjects` or an active claim hold, loaded, so
+/// a claim on a proposal and a claim on what it contains clash in any target. A proposal that
+/// does not load contains nothing to clash with.
+fn involved(vault: &Path, claims: &[Claim], subjects: &BTreeSet<String>) -> Vec<Model> {
+    let held = claims.iter().filter(|c| c.revoked.is_none());
+    let named: BTreeSet<&str> = (held.flat_map(|c| &c.subjects).chain(subjects))
+        .filter_map(|s| s.split_once('#').map(|(_, local)| local))
+        .filter(|local| vault::is_proposal(vault, local))
+        .collect();
+    named
+        .into_iter()
+        .filter_map(|id| vault::load_proposal(vault.to_path_buf(), id).ok())
+        .collect()
+}
+
 /// The container of each module, relationship and flow, by qualified ID: a module's parent, a
-/// relationship's owning module, a flow's collection.
+/// relationship's owning module, a flow's collection. In a proposal, the proposal contains its
+/// root modules and its collections.
 fn containers(model: &Model) -> BTreeMap<String, String> {
-    let parents = model
-        .modules
+    let root = model.proposal.as_ref().map(|_| model.root());
+    let parents = model.modules.iter().filter_map(|m| {
+        let parent = m.parent.clone().or_else(|| root.clone())?;
+        Some((model.qualify(&m.id), parent))
+    });
+    let held = model
+        .collections
         .iter()
-        .filter_map(|m| Some((model.qualify(&m.id), m.parent.clone()?)));
+        .filter_map(|c| Some((model.qualify(&c.id), root.clone()?)));
     let owners = vault::relationships(&model.modules)
         .into_iter()
         .map(|(id, (owner, _))| (model.qualify(id), model.qualify(owner)));
@@ -355,7 +384,11 @@ fn containers(model: &Model) -> BTreeMap<String, String> {
             .iter()
             .map(|f| (model.qualify(&f.id), model.qualify(&c.id)))
     });
-    parents.chain(owners).chain(collections).collect()
+    parents
+        .chain(owners)
+        .chain(collections)
+        .chain(held)
+        .collect()
 }
 
 /// Whether holding `held` holds `subject`: it is the subject or one of its containers.
@@ -475,7 +508,7 @@ fn check_reason(reason: &str) -> Result<()> {
     )))
 }
 
-fn now() -> u64 {
+pub(super) fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())

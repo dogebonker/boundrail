@@ -38,7 +38,7 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 | T5 | Code check: binding and anchor paths and symbols, relationships undrawn / unsupported / backwards from the scanned graph, module interface exposure | done |
 | T6 | Flows: collections of flows in `collections/<id>.collection.json`, message/decision/loop steps, collection/flow/step/branch edits with flow and step moves, `REFERENCED_BY_FLOW`, collection and flow claims, `model read --flow`, `FLOW_SUMMARY_MISSING` and `MESSAGE_UNDRAWN` in the semantic check | done |
 | T7 | Checkpoints: history branch, `model retain`, `model checkpoints`, `model read --checkpoint` | done |
-| T8 | Proposals: create/edit drafts against a predecessor, `model compare`, adopt, shelve, planning models without a current state | open |
+| T8 | Proposals: create/edit drafts against a predecessor, `model compare`, adopt, shelve, planning models without a current state | done |
 | T9 | Render: SVG architecture view with automatic layout, sequence and flowchart views of a flow, comparison marks | open |
 | T10 | Measures: module interface counts (`model inspect`), co-change locality (`model locality`), branch footprint (`model footprint`) | open |
 | T11 | Live browser view: model canvas, drill-down, focus and filters, detail panel, warnings, comparison, history, split panes | open |
@@ -110,3 +110,63 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   `git show` of their blobs, which applies no attributes or filters. A checkpoint reading shows
   no claims or pending edit, which belong to the checkout. Listing without `--limit` walks the
   whole ref.
+- T8: a proposal is `proposals/<id>/` in the vault: `proposal.json` (schema `model-proposal`) beside
+  its own `modules/` and `collections/` in the current state's formats. Each load is one target:
+  the current state, or one proposal with the vault's manifest and config. The current state's
+  revision covers what it did before, so existing digests hold; a proposal's covers its
+  `proposal.json` and folders. A proposal edit names the proposal's ID as `target.state`, its
+  revision as `expected_revision`, and `--proposal <id>` on the command line; the request names
+  the proposal, so its operation fingerprint differs from a current-state edit. Proposal IDs are
+  local or qualified, never names.
+- T8: proposal loads validate like current-state loads (limits, references inside the proposal,
+  links, file and folder names) with one exception: an ID the current state retired after the
+  proposal was drawn does not stop it loading, since such a proposal refuses adoption anyway
+  (`PREDECESSOR_MOVED`). A planning model's manifest has `current: null`; a planning model with
+  module or collection files is `MODEL_INVALID`.
+- T8: drawing, editing, adopting and shelving are journaled writes through the edit journal. The
+  journal record names its `scope` (current, a proposal, or an adoption covering both); older
+  records default to the current state. `model propose`, `adopt` and `shelve` take flags like
+  `model retain`: `--writer` defaults to the Git author name, and without `--operation-id` a fresh
+  one is generated. Their fingerprints cover the kind, writer and arguments, not `--doing`. Every
+  write's paths are checked for linked folders before its record is journaled, so such a write
+  refuses without leaving a pending record. A proposal's `created` is Unix seconds, as a claim's.
+- T8: a draft drawn from the current state has the current state and revision as predecessor; a
+  copy of another proposal (`--from <id>`) inherits that proposal's predecessor, since adopting
+  the copy would otherwise revert whatever the current state gained since its source was drawn.
+  A copy of an adopted proposal is drawn only while that proposal still is the current state,
+  unchanged (its `adopted_as` is the current state and their modules and collections are equal);
+  otherwise it refuses `PREDECESSOR_MOVED`.
+- T8: `model proposals` reads only each `proposal.json` and lists its ID, name, status and
+  predecessor, or the folder's ID with an `error` when it does not read, so one broken proposal
+  hides no other. `model read --proposal` shows a proposal's revision.
+- T8: new IDs are random 8-character base62, collision-checked against the state being edited
+  (the current state or the proposal), the retired list, and the proposal folder names; drawing a
+  proposal or adopting one also checks the current state's IDs, and adoption the proposal's. IDs
+  two proposals allocate are not checked against each other: adopting a state that clashes with
+  the model (a retired or duplicate ID) refuses `MODEL_INVALID`. Removing something inside a
+  proposal retires nothing.
+  Adoption writes the proposal's files over the current state's (unchanged files are left alone),
+  gives the state a fresh ID and the proposal's name, and retires every ID the old state held that
+  the new one drops, the old state's ID included. The adopted proposal keeps its folder, reading
+  only; its `adopted_as` names the new state. `model adopt` prints the current state's new
+  `revision` beside the receipt, whose revisions cover both the state and the proposal.
+- T8: `model adopt` refuses `STALE_REVISION` when `--expected-revision` is not the current revision,
+  then `PREDECESSOR_MOVED` when the proposal was drawn against another; reconcile is T17. With
+  `--expected-proposal-revision` it also refuses `STALE_REVISION` when the proposal is at another
+  revision; agents should pass the proposal revision they compared, so a proposal edited after the
+  comparison is never adopted unseen. The flag is part of the fingerprint only when given. Edits,
+  shelving and adoption of an adopted or shelved proposal refuse `PROPOSAL_CLOSED`. A
+  current-state edit or claim in a planning model refuses `NO_CURRENT_STATE`.
+- T8: IDs are model-wide, so a claim on a module holds it in the current state and in every
+  proposal. Inside a proposal the proposal's qualified ID takes the model ID's place as the root
+  level and contains the root modules and collections, so a claim on the proposal holds all of it.
+  A claim request's `target.state` may name a proposal, and its subjects then resolve there.
+  Claims never overlap across targets: a new claim is checked against the containment of its
+  target and of every proposal it or another active claim holds, so a claim on a proposal and a
+  claim on a module it contains clash either way round. Adoption touches what an edit making the
+  same change would (the modules, relationships, collections and flows it adds, changes or
+  removes, with their moves), plus the model ID and the proposal; shelving touches the proposal.
+- T8: `model compare` compares modules without their relationships, collections without their
+  flows, flows without their steps and steps without the steps inside them; a relationship's
+  `from`, a flow's `collection` and a step's `flow` and `parent` count as fields, so a move shows
+  as a change. A step's index is not compared.

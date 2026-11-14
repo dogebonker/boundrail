@@ -4,15 +4,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::ErrorKind;
+use std::iter;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::revision::{self, Revision};
 use super::types::{
-    Anchor, Binding, Collection, DESCRIPTION_MAX, Emphasis, LABEL_MAX, Manifest, Module,
+    Anchor, Binding, Collection, DESCRIPTION_MAX, Emphasis, LABEL_MAX, Manifest, Module, Proposal,
     RESPONSIBILITY_MAX, Relationship, SCHEMA_VERSION, State, VaultConfig,
 };
 use super::{Code, Refusal, ids, one_line, state};
@@ -20,9 +22,15 @@ use crate::history::{refuse_symlink, write_atomic};
 use crate::sync_rules::hash;
 
 mod flows;
+mod proposals;
 
 pub use flows::{CollectionView, FlowEntry, FlowView, Found};
 pub(super) use flows::{Ends, collection_position, flow_position, holds_name, message_problems};
+use proposals::{PROPOSAL, PROPOSALS, check_proposal, prefix, split_proposal, unprefixed};
+pub(super) use proposals::{
+    Scope, in_proposal, is_proposal, is_proposal_path, proposal_file, proposal_write, read_proposal,
+};
+pub use proposals::{load_proposal, load_state, proposals};
 
 /// Boundrail's state folder at the checkout root, and the vault folder inside it.
 const STATE: &str = ".boundrail";
@@ -35,7 +43,8 @@ const COLLECTIONS: &str = "collections";
 const COLLECTION_SUFFIX: &str = ".collection.json";
 /// The folders of per-ID vault files, each with the suffix its files end in.
 const FOLDERS: [(&str, &str); 2] = [(MODULES, MODULE_SUFFIX), (COLLECTIONS, COLLECTION_SUFFIX)];
-const CURRENT: &str = "Current";
+/// The name of a new model's current state.
+const DEFAULT_STATE_NAME: &str = "Current";
 /// The longest model, module, collection or flow name.
 const NAME_MAX: usize = 120;
 
@@ -48,7 +57,10 @@ pub struct Model {
     pub modules: Vec<Module>,
     /// Sorted by local ID.
     pub collections: Vec<Collection>,
+    /// The revision of what was loaded: the current state's files, or the proposal's.
     pub revision: Revision,
+    /// The proposal this model holds the modules and collections of; `None` for the current state.
+    pub proposal: Option<Proposal>,
 }
 
 /// One reason a vault does not load: the vault-relative file and the ID or key it concerns.
@@ -91,25 +103,27 @@ fn checkout_root(start: &Path) -> Result<PathBuf> {
 }
 
 /// Pretty JSON with a trailing newline, the form every vault JSON file is written in.
-fn file_json(value: &impl Serialize) -> Result<String> {
+pub(super) fn file_json(value: &impl Serialize) -> Result<String> {
     Ok(serde_json::to_string_pretty(value)? + "\n")
 }
 
-/// A model name trimmed of surrounding space: non-empty, at most 120 characters, no controls.
-fn valid_name(name: &str) -> Result<&str> {
+/// A model or proposal name trimmed of surrounding space: non-empty, at most 120 characters, no
+/// controls.
+pub(super) fn valid_name(name: &str) -> Result<&str> {
     let name = name.trim();
     if !one_line(name, NAME_MAX) {
         return Err(Refusal::new(
             Code::NameInvalid,
-            format!("a model name needs 1 to {NAME_MAX} characters and no control characters"),
+            format!("a name needs 1 to {NAME_MAX} characters and no control characters"),
         )
         .into());
     }
     Ok(name)
 }
 
-/// Creates the vault with a manifest, its current state and the default vocabulary.
-pub fn init(start: &Path, name: &str) -> Result<Model> {
+/// Creates the vault with a manifest, its current state and the default vocabulary. A `planning`
+/// model has no current state until a proposal is adopted.
+pub fn init(start: &Path, name: &str, planning: bool) -> Result<Model> {
     let name = valid_name(name)?;
     let state = checkout_root(start)?.join(STATE);
     let dir = state.join(VAULT);
@@ -128,14 +142,14 @@ pub fn init(start: &Path, name: &str) -> Result<Model> {
         }
         Err(e) => return Err(e).with_context(|| format!("creating {}", dir.display())),
     }
-    let created = populate(&dir, name).and_then(|()| load_dir(dir.clone()));
+    let created = populate(&dir, name, planning).and_then(|()| load_dir(dir.clone()));
     if created.is_err() {
         let _ = fs::remove_dir_all(&dir);
     }
     created
 }
 
-fn populate(dir: &Path, name: &str) -> Result<()> {
+fn populate(dir: &Path, name: &str, planning: bool) -> Result<()> {
     fs::create_dir(dir.join(MODULES)).with_context(|| format!("creating {MODULES}"))?;
     let id = ids::allocate(|_| false)?;
     let current = ids::allocate(|candidate| candidate == id.to_ascii_lowercase())?;
@@ -143,10 +157,10 @@ fn populate(dir: &Path, name: &str) -> Result<()> {
         schema_version: SCHEMA_VERSION,
         id,
         name: name.to_owned(),
-        current: State {
+        current: (!planning).then(|| State {
             id: current,
-            name: CURRENT.to_owned(),
-        },
+            name: DEFAULT_STATE_NAME.to_owned(),
+        }),
         retired_ids: Vec::new(),
     };
     let config = serde_yaml_ng::to_string(&VaultConfig::default())?;
@@ -187,14 +201,29 @@ pub fn load(start: &Path) -> Result<Model> {
 
 const LINKED: &str = "is a symbolic link";
 
-/// The state, vault, modules and collections folders by their vault-relative paths.
-fn folders(dir: &Path) -> [(&'static str, PathBuf); 4] {
-    [
-        ("..", dir.parent().unwrap_or(dir).to_path_buf()),
-        (".", dir.to_path_buf()),
-        (MODULES, dir.join(MODULES)),
-        (COLLECTIONS, dir.join(COLLECTIONS)),
-    ]
+/// The folders a load reads through, by their vault-relative paths: the state, vault, modules and
+/// collections folders, and for a proposal its folder, the folder holding it and its own modules
+/// and collections folders.
+fn folders(dir: &Path, proposal: Option<&str>) -> Vec<(String, PathBuf)> {
+    let mut folders = vec![
+        ("..".to_owned(), dir.parent().unwrap_or(dir).to_path_buf()),
+        (".".to_owned(), dir.to_path_buf()),
+    ];
+    let mut inside = |prefix: &str| {
+        for folder in [MODULES, COLLECTIONS] {
+            let path = format!("{prefix}{folder}");
+            folders.push((path.clone(), dir.join(path)));
+        }
+    };
+    inside("");
+    if let Some(id) = proposal {
+        let prefix = prefix(id);
+        inside(&prefix);
+        for path in [PROPOSALS.to_owned(), format!("{PROPOSALS}/{id}")] {
+            folders.push((path.clone(), dir.join(path)));
+        }
+    }
+    folders
 }
 
 fn is_link(path: &Path) -> bool {
@@ -203,94 +232,65 @@ fn is_link(path: &Path) -> bool {
 
 /// Refuses to write through a linked state, vault, modules or collections folder.
 fn refuse_links(dir: &Path) -> Result<()> {
-    folders(dir)
+    folders(dir, None)
         .iter()
         .try_for_each(|(_, path)| refuse_symlink(path))
 }
 
-/// Loads the vault folder `dir`, refusing a model with any problem.
+/// Loads the current state of the vault folder `dir`, refusing a model with any problem.
 pub fn load_dir(dir: PathBuf) -> Result<Model> {
+    load_scope(dir, None)
+}
+
+/// [`load_proposal`] for `proposal`, else [`load_dir`].
+pub fn load_target(dir: PathBuf, proposal: Option<&str>) -> Result<Model> {
+    match proposal {
+        Some(proposal) => load_proposal(dir, proposal),
+        None => load_dir(dir),
+    }
+}
+
+/// Loads the current state, or the proposal with local ID `proposal`, of the vault folder `dir`.
+fn load_scope(dir: PathBuf, proposal: Option<&str>) -> Result<Model> {
     // A linked folder could point reads outside the checkout, so nothing is read through it.
     let mut problems = Problems::default();
-    for (path, folder) in folders(&dir) {
+    for (path, folder) in folders(&dir, proposal) {
         if is_link(&folder) {
-            problems.push(path, path, LINKED);
+            problems.push(&path, &path, LINKED);
         }
     }
     if !problems.0.is_empty() {
         return Err(invalid(&dir, problems.0));
     }
     // Each file is read once: the revision and the parsed model come from the same bytes.
-    let mut inputs: Vec<(String, Vec<u8>)> = Vec::new();
-    for path in [MANIFEST, CONFIG] {
-        let file = dir.join(path);
-        match fs::symlink_metadata(&file) {
-            Ok(meta) if meta.is_file() => {
-                let bytes = fs::read(&file).with_context(|| format!("reading {path}"))?;
-                inputs.push((path.to_owned(), bytes));
-            }
-            Ok(meta) if meta.file_type().is_symlink() => problems.push(path, path, LINKED),
-            Ok(_) => problems.push(path, path, "is not a regular file"),
-            Err(e) if e.kind() == ErrorKind::NotFound && path == MANIFEST => {
-                return Err(not_found(&dir));
-            }
-            Err(e) if e.kind() == ErrorKind::NotFound => {
-                problems.push(path, path, "file is missing");
-            }
-            Err(e) => return Err(e).with_context(|| format!("reading {path}")),
-        }
-    }
-    for (folder, suffix) in FOLDERS {
-        for path in listed(&dir, folder, suffix, &mut problems)? {
-            let bytes = fs::read(dir.join(&path)).with_context(|| format!("reading {path}"))?;
-            inputs.push((path, bytes));
-        }
-    }
-    let revision = revision::of(inputs.iter().map(|(p, b)| (p.as_str(), b.as_slice())));
-
-    let mut manifest = None;
-    let mut config = None;
-    let mut modules = Vec::new();
-    let mut collections = Vec::new();
-    for (path, bytes) in &inputs {
-        let parsed = match (path.as_str(), vault_file(path)) {
-            (MANIFEST, _) => serde_json::from_slice(bytes)
-                .map(|m| manifest = Some(m))
-                .map_err(|e| parse_message(&e)),
-            (CONFIG, _) => serde_yaml_ng::from_slice(bytes)
-                .map(|c| config = Some(c))
-                .map_err(|e| parse_message(&e)),
-            (_, Some((MODULES, _))) => serde_json::from_slice::<Module>(bytes)
-                .map(|m| modules.push((path.as_str(), m)))
-                .map_err(|e| parse_message(&e)),
-            _ => serde_json::from_slice::<Collection>(bytes)
-                .map(|c| collections.push((path.as_str(), c)))
-                .map_err(|e| parse_message(&e)),
-        };
-        if let Err(message) = parsed {
-            problems.push(
-                path,
-                file_subject(path),
-                format!("does not parse: {message}"),
-            );
-        }
-    }
-    let pairs: Vec<(&str, &Module)> = modules.iter().map(|(f, m)| (*f, m)).collect();
-    let groups: Vec<(&str, &Collection)> = collections.iter().map(|(f, c)| (*f, c)).collect();
+    let inputs = read_inputs(&dir, proposal, &mut problems)?;
+    let prefix = proposal.map(prefix).unwrap_or_default();
+    let revision = revision::of(
+        inputs
+            .iter()
+            .filter(|(path, _)| path.starts_with(&prefix))
+            .map(|(p, b)| (p.as_str(), b.as_slice())),
+    );
+    let parsed = parse_inputs(&inputs, &mut problems);
+    let pairs: Vec<(&str, &Module)> = parsed.modules.iter().map(|(f, m)| (*f, m)).collect();
+    let groups: Vec<(&str, &Collection)> =
+        parsed.collections.iter().map(|(f, c)| (*f, c)).collect();
+    let file = proposal.map(proposal_file);
     check(
-        manifest.as_ref(),
-        config.as_ref(),
+        parsed.manifest.as_ref(),
+        parsed.config.as_ref(),
+        file.as_deref().zip(parsed.proposal.as_ref()),
         &pairs,
         &groups,
         &mut problems,
     );
     let problems = problems.0;
-    match (manifest, config) {
+    match (parsed.manifest, parsed.config) {
         (Some(manifest), Some(config)) if problems.is_empty() => {
-            let mut modules: Vec<Module> = modules.into_iter().map(|(_, m)| m).collect();
+            let mut modules: Vec<Module> = parsed.modules.into_iter().map(|(_, m)| m).collect();
             modules.sort_by(|a, b| a.id.cmp(&b.id));
             let mut collections: Vec<Collection> =
-                collections.into_iter().map(|(_, c)| c).collect();
+                parsed.collections.into_iter().map(|(_, c)| c).collect();
             collections.sort_by(|a, b| a.id.cmp(&b.id));
             Ok(Model {
                 dir,
@@ -299,17 +299,104 @@ pub fn load_dir(dir: PathBuf) -> Result<Model> {
                 modules,
                 collections,
                 revision,
+                proposal: parsed.proposal,
             })
         }
         _ => Err(invalid(&dir, problems)),
     }
 }
 
-/// The vault-relative paths of the regular files in `folder` whose names end in `suffix`,
-/// sorted. A linked or special file is a problem and is not read.
-fn listed(dir: &Path, folder: &str, suffix: &str, problems: &mut Problems) -> Result<Vec<String>> {
+/// The bytes of every file a load of the current state or of `proposal` reads, by vault-relative
+/// path: the manifest and config, the proposal's `proposal.json`, and the module and collection
+/// files of the state or proposal.
+fn read_inputs(
+    dir: &Path,
+    proposal: Option<&str>,
+    problems: &mut Problems,
+) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut inputs: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut files = vec![MANIFEST.to_owned(), CONFIG.to_owned()];
+    files.extend(proposal.map(proposal_file));
+    for path in files {
+        let file = dir.join(&path);
+        match fs::symlink_metadata(&file) {
+            Ok(meta) if meta.is_file() => {
+                let bytes = fs::read(&file).with_context(|| format!("reading {path}"))?;
+                inputs.push((path, bytes));
+            }
+            Ok(meta) if meta.file_type().is_symlink() => problems.push(&path, &path, LINKED),
+            Ok(_) => problems.push(&path, &path, "is not a regular file"),
+            Err(e) if e.kind() == ErrorKind::NotFound && path == MANIFEST => {
+                return Err(not_found(dir));
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                problems.push(&path, &path, "file is missing");
+            }
+            Err(e) => return Err(e).with_context(|| format!("reading {path}")),
+        }
+    }
+    let prefix = proposal.map(prefix).unwrap_or_default();
+    for (folder, suffix) in FOLDERS {
+        for path in listed(dir, &prefix, folder, suffix, problems)? {
+            let bytes = fs::read(dir.join(&path)).with_context(|| format!("reading {path}"))?;
+            inputs.push((path, bytes));
+        }
+    }
+    Ok(inputs)
+}
+
+/// The vault files of one load, parsed; each module and collection with its vault-relative path.
+#[derive(Default)]
+struct Parsed<'a> {
+    manifest: Option<Manifest>,
+    config: Option<VaultConfig>,
+    proposal: Option<Proposal>,
+    modules: Vec<(&'a str, Module)>,
+    collections: Vec<(&'a str, Collection)>,
+}
+
+fn parse_inputs<'a>(inputs: &'a [(String, Vec<u8>)], problems: &mut Problems) -> Parsed<'a> {
+    fn json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
+        serde_json::from_slice(bytes).map_err(|e| parse_message(&e))
+    }
+    let mut parsed = Parsed::default();
+    for (path, bytes) in inputs {
+        let path = path.as_str();
+        let local = unprefixed(path);
+        let result = match path {
+            MANIFEST => json(bytes).map(|m| parsed.manifest = Some(m)),
+            CONFIG => serde_yaml_ng::from_slice(bytes)
+                .map(|c| parsed.config = Some(c))
+                .map_err(|e| parse_message(&e)),
+            _ if local == PROPOSAL => json(bytes).map(|p| parsed.proposal = Some(p)),
+            _ if vault_file(local).is_some_and(|(folder, _)| folder == MODULES) => {
+                json(bytes).map(|m| parsed.modules.push((path, m)))
+            }
+            _ => json(bytes).map(|c| parsed.collections.push((path, c))),
+        };
+        if let Err(message) = result {
+            problems.push(
+                path,
+                file_subject(path),
+                format!("does not parse: {message}"),
+            );
+        }
+    }
+    parsed
+}
+
+/// The vault-relative paths of the regular files in `folder` of the state or proposal folder
+/// `prefix` names whose names end in `suffix`, sorted. A linked or special file is a problem and
+/// is not read.
+fn listed(
+    dir: &Path,
+    prefix: &str,
+    folder: &str,
+    suffix: &str,
+    problems: &mut Problems,
+) -> Result<Vec<String>> {
     let mut paths = Vec::new();
-    match fs::read_dir(dir.join(folder)) {
+    match fs::read_dir(dir.join(prefix).join(folder)) {
         Ok(entries) => {
             for entry in entries {
                 let entry = entry?;
@@ -321,7 +408,7 @@ fn listed(dir: &Path, folder: &str, suffix: &str, problems: &mut Problems) -> Re
                 }
                 // `file_type` does not follow links: a linked vault file is reported, not read.
                 let kind = entry.file_type()?;
-                let path = format!("{folder}/{name}");
+                let path = format!("{prefix}{folder}/{name}");
                 if kind.is_symlink() {
                     problems.push(&path, file_subject(&path), LINKED);
                 } else if kind.is_file() {
@@ -333,7 +420,7 @@ fn listed(dir: &Path, folder: &str, suffix: &str, problems: &mut Problems) -> Re
             }
         }
         Err(e) if e.kind() == ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("reading {folder}")),
+        Err(e) => return Err(e).with_context(|| format!("reading {prefix}{folder}")),
     }
     paths.sort();
     Ok(paths)
@@ -372,31 +459,52 @@ pub(super) fn parse_message(error: &impl std::fmt::Display) -> String {
         })
 }
 
-/// Every problem of an in-memory model, as `load` would report it after writing the model.
+/// Every problem of an in-memory current state, or of `proposal`'s modules and collections, as
+/// `load` would report it after writing them.
 pub(super) fn problems(
     manifest: &Manifest,
     config: &VaultConfig,
+    proposal: Option<&Proposal>,
     modules: &[Module],
     collections: &[Collection],
 ) -> Vec<Problem> {
-    let files: Vec<String> = modules.iter().map(|m| module_file(&m.id)).collect();
+    let prefix = proposal.map(|p| prefix(&p.id)).unwrap_or_default();
+    let files: Vec<String> = (modules.iter())
+        .map(|m| format!("{prefix}{}", module_file(&m.id)))
+        .collect();
     let pairs: Vec<(&str, &Module)> = files.iter().map(String::as_str).zip(modules).collect();
-    let files: Vec<String> = collections.iter().map(|c| collection_file(&c.id)).collect();
+    let files: Vec<String> = (collections.iter())
+        .map(|c| format!("{prefix}{}", collection_file(&c.id)))
+        .collect();
     let groups: Vec<(&str, &Collection)> =
         files.iter().map(String::as_str).zip(collections).collect();
+    let file = proposal.map(|p| proposal_file(&p.id));
     let mut problems = Problems::default();
-    check(Some(manifest), Some(config), &pairs, &groups, &mut problems);
+    check(
+        Some(manifest),
+        Some(config),
+        file.as_deref().zip(proposal),
+        &pairs,
+        &groups,
+        &mut problems,
+    );
     problems.0
 }
 
+/// Every problem of the current state, or with `proposal` (its file and contents) of that
+/// proposal's modules and collections.
 fn check(
     manifest: Option<&Manifest>,
     config: Option<&VaultConfig>,
+    proposal: Option<(&str, &Proposal)>,
     modules: &[(&str, &Module)],
     collections: &[(&str, &Collection)],
     problems: &mut Problems,
 ) {
-    check_ids(manifest, modules, collections, problems);
+    check_ids(manifest, proposal, modules, collections, problems);
+    if let Some((file, proposal)) = proposal {
+        check_proposal(file, proposal, problems);
+    }
     flows::check(
         manifest.map(|m| m.id.as_str()),
         modules,
@@ -416,15 +524,25 @@ fn check(
             None,
             false,
         );
-        check_text(
-            problems,
-            MANIFEST,
-            &m.current.id,
-            "state name",
-            Some(&m.current.name),
-            None,
-            false,
-        );
+        match &m.current {
+            Some(current) => check_text(
+                problems,
+                MANIFEST,
+                &current.id,
+                "state name",
+                Some(&current.name),
+                None,
+                false,
+            ),
+            None if proposal.is_none() && !(modules.is_empty() && collections.is_empty()) => {
+                problems.push(
+                    MANIFEST,
+                    &m.id,
+                    "a planning model holds no modules or collections until a proposal is adopted",
+                );
+            }
+            None => {}
+        }
         check_containment(&m.id, modules, problems);
     }
 }
@@ -489,20 +607,42 @@ pub(super) fn plan_writes(
     Ok(writes)
 }
 
-/// Applies `writes` in order. Each one sets a file's whole contents or deletes it, so a journal
-/// can apply the same writes again after an interruption.
-pub(super) fn apply_writes(dir: &Path, writes: &[FileWrite]) -> Result<()> {
+/// Refuses `writes` that a journaled write may not make: a path that is not a vault file it
+/// writes, or one reached through a linked folder. Returns the vault folder and every folder
+/// between it and the files, which are synced after writing.
+pub(super) fn check_writes(dir: &Path, writes: &[FileWrite]) -> Result<BTreeSet<PathBuf>> {
     refuse_links(dir)?;
+    let mut folders = BTreeSet::from([dir.to_path_buf()]);
     for write in writes {
         let path = write.path.as_str();
         ensure!(
-            path == MANIFEST || vault_file(path).is_some_and(|(_, id)| ids::is_local(id)),
+            is_written(path),
             "`{path}` is not a vault file an edit writes"
         );
         let file = dir.join(path);
+        folders.extend(
+            (file.ancestors().skip(1))
+                .take_while(|folder| *folder != dir)
+                .map(Path::to_path_buf),
+        );
+    }
+    // Sorted paths put each folder before the folders inside it.
+    folders
+        .iter()
+        .try_for_each(|folder| refuse_symlink(folder))?;
+    Ok(folders)
+}
+
+/// Applies `writes` in order. Each one sets a file's whole contents or deletes it, so a journal
+/// can apply the same writes again after an interruption.
+pub(super) fn apply_writes(dir: &Path, writes: &[FileWrite]) -> Result<()> {
+    let folders = check_writes(dir, writes)?;
+    for write in writes {
+        let path = write.path.as_str();
+        let file = dir.join(path);
         match &write.content {
             Some(content) => {
-                // The collections folder appears with the first collection.
+                // The collections and proposal folders appear with their first file.
                 if let Some(folder) = file.parent() {
                     fs::create_dir_all(folder).with_context(|| format!("creating {path}"))?;
                 }
@@ -517,9 +657,7 @@ pub(super) fn apply_writes(dir: &Path, writes: &[FileWrite]) -> Result<()> {
         }
     }
     // The renames and removals must reach the disk before the journal records the edit done.
-    state::sync_dir(dir)?;
-    for (folder, _) in FOLDERS {
-        let folder = dir.join(folder);
+    for folder in folders {
         if folder.is_dir() {
             state::sync_dir(&folder)?;
         }
@@ -527,28 +665,18 @@ pub(super) fn apply_writes(dir: &Path, writes: &[FileWrite]) -> Result<()> {
     Ok(())
 }
 
-/// The SHA-256 of each recognized vault file by vault-relative path, read without validating the
-/// model, which a partly applied edit may leave invalid. A linked or special file gets a marker
-/// that no content hashes to.
-pub(super) fn file_digests(dir: &Path) -> Result<BTreeMap<String, String>> {
-    let mut paths = vec![MANIFEST.to_owned(), CONFIG.to_owned()];
-    for (folder, suffix) in FOLDERS {
-        match fs::read_dir(dir.join(folder)) {
-            Ok(entries) => {
-                for entry in entries {
-                    let entry = entry?;
-                    // As in `load_dir`, a folder named like a vault file is not one.
-                    if let Some(name) = entry.file_name().to_str()
-                        && name.ends_with(suffix)
-                        && !entry.file_type()?.is_dir()
-                    {
-                        paths.push(format!("{folder}/{name}"));
-                    }
-                }
-            }
-            Err(e) if e.kind() == ErrorKind::NotFound => {}
-            Err(e) => return Err(e).with_context(|| format!("reading {folder}")),
-        }
+/// The SHA-256 of each recognized vault file of `scope` by vault-relative path, read without
+/// validating the model, which a partly applied edit may leave invalid. A linked or special file
+/// gets a marker that no content hashes to.
+pub(super) fn file_digests(dir: &Path, scope: &Scope) -> Result<BTreeMap<String, String>> {
+    let mut paths = Vec::new();
+    if scope.current() {
+        paths.extend([MANIFEST.to_owned(), CONFIG.to_owned()]);
+        paths.extend(named(dir, "")?);
+    }
+    if let Some(id) = scope.proposal() {
+        paths.push(proposal_file(id));
+        paths.extend(named(dir, &prefix(id))?);
     }
     let mut digests = BTreeMap::new();
     for path in paths {
@@ -564,6 +692,31 @@ pub(super) fn file_digests(dir: &Path) -> Result<BTreeMap<String, String>> {
         digests.insert(path, digest);
     }
     Ok(digests)
+}
+
+/// The vault-relative paths named like module and collection files in the state or proposal
+/// folder `prefix` names.
+fn named(dir: &Path, prefix: &str) -> Result<Vec<String>> {
+    let mut paths = Vec::new();
+    for (folder, suffix) in FOLDERS {
+        match fs::read_dir(dir.join(prefix).join(folder)) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry?;
+                    // As in `load_dir`, a folder named like a vault file is not one.
+                    if let Some(name) = entry.file_name().to_str()
+                        && name.ends_with(suffix)
+                        && !entry.file_type()?.is_dir()
+                    {
+                        paths.push(format!("{prefix}{folder}/{name}"));
+                    }
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("reading {prefix}{folder}")),
+        }
+    }
+    Ok(paths)
 }
 
 /// The folder and local ID of a module or collection file, by its vault-relative path.
@@ -584,18 +737,38 @@ pub(super) fn is_vault_file(path: &str) -> bool {
 }
 
 fn file_subject(path: &str) -> &str {
-    vault_file(path).map_or(path, |(_, id)| id)
+    vault_file(unprefixed(path)).map_or(path, |(_, id)| id)
 }
 
-/// Every allocated ID (model, state, module, relationship, collection, flow, step, branch)
-/// shares one namespace: each must be well formed, unique and not retired.
+/// Whether a journaled write may write or delete `path`: the manifest, a module or collection
+/// file of the current state or of a proposal, or a proposal's `proposal.json`.
+fn is_written(path: &str) -> bool {
+    let local = match split_proposal(path) {
+        Some((id, rest)) if ids::is_local(id) => {
+            if rest == PROPOSAL {
+                return true;
+            }
+            rest
+        }
+        Some(_) => return false,
+        None if path == MANIFEST => return true,
+        None => path,
+    };
+    vault_file(local).is_some_and(|(_, id)| ids::is_local(id))
+}
+
+/// Every allocated ID (model, state, proposal, module, relationship, collection, flow, step,
+/// branch) shares one namespace: each must be well formed, unique and not retired. A proposal may
+/// hold IDs the current state retired after it was drawn: it cannot be adopted until reconciled.
 fn check_ids(
     manifest: Option<&Manifest>,
+    proposal: Option<(&str, &Proposal)>,
     modules: &[(&str, &Module)],
     collections: &[(&str, &Collection)],
     problems: &mut Problems,
 ) {
     let retired: BTreeSet<&str> = manifest
+        .filter(|_| proposal.is_none())
         .map(|m| m.retired_ids.iter().map(String::as_str).collect())
         .unwrap_or_default();
     let mut ids: Vec<(&str, &str)> = Vec::new();
@@ -611,13 +784,14 @@ fn check_ids(
             );
         }
         ids.push((MANIFEST, &m.id));
-        ids.push((MANIFEST, &m.current.id));
+        ids.extend(m.current.iter().map(|c| (MANIFEST, c.id.as_str())));
         for id in &m.retired_ids {
             if !ids::is_local(id) {
                 problems.push(MANIFEST, id, "retired ID is not 8 base62 characters");
             }
         }
     }
+    ids.extend(proposal.map(|(file, p)| (file, p.id.as_str())));
     for (file, module) in modules {
         ids.push((file, &module.id));
         ids.extend(module.outgoing.iter().map(|r| (*file, r.id.as_str())));
@@ -955,6 +1129,36 @@ pub(super) fn find_keyed<'a, K: Copy>(
 impl Model {
     pub fn qualify(&self, local: &str) -> String {
         ids::qualify(&self.manifest.id, local)
+    }
+
+    /// The subject a claim holds the root level by: the model ID for the current state, the
+    /// qualified proposal ID for a proposal.
+    pub(super) fn root(&self) -> String {
+        match &self.proposal {
+            Some(proposal) => self.qualify(&proposal.id),
+            None => self.manifest.id.clone(),
+        }
+    }
+
+    /// Every ID this model holds or reserves: the model's, its current state's, the retired
+    /// ones, the proposal's and the state it became, and every module, relationship, collection,
+    /// flow, step and branch.
+    pub(super) fn ids(&self) -> impl Iterator<Item = &str> {
+        let manifest = &self.manifest;
+        let proposal = self
+            .proposal
+            .iter()
+            .flat_map(|p| iter::once(&p.id).chain(&p.adopted_as));
+        iter::once(&manifest.id)
+            .chain(manifest.current.iter().map(|c| &c.id))
+            .chain(&manifest.retired_ids)
+            .chain(proposal)
+            .chain(
+                (self.modules.iter())
+                    .flat_map(|m| iter::once(&m.id).chain(m.outgoing.iter().map(|r| &r.id))),
+            )
+            .map(String::as_str)
+            .chain(self.collections.iter().flat_map(Collection::ids))
     }
 
     /// Modules keyed by their parent's qualified ID (`None` for roots), each list in order.

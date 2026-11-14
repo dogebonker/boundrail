@@ -447,6 +447,7 @@ mod tests {
         super::super::problems(
             &manifest(),
             &VaultConfig::default(),
+            None,
             &modules(),
             &[collection],
         )
@@ -553,6 +554,7 @@ mod tests {
         let found: Vec<(String, String)> = super::super::problems(
             &manifest(),
             &VaultConfig::default(),
+            None,
             &modules(),
             &[collection],
         )

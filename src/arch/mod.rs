@@ -4,10 +4,12 @@
 pub mod checkpoint;
 pub mod claims;
 pub mod code;
+pub mod compare;
 pub mod diagnostic;
 pub mod edit;
 pub mod ids;
 mod index;
+pub mod proposal;
 pub mod request;
 pub mod revision;
 pub mod semantic;
@@ -77,6 +79,9 @@ pub enum Code {
     HistoryMoved,
     CheckpointNotFound,
     SigningFailed,
+    NoCurrentState,
+    ProposalClosed,
+    PredecessorMoved,
 }
 
 impl Code {
@@ -110,6 +115,9 @@ impl Code {
             Code::HistoryMoved => "HISTORY_MOVED",
             Code::CheckpointNotFound => "CHECKPOINT_NOT_FOUND",
             Code::SigningFailed => "SIGNING_FAILED",
+            Code::NoCurrentState => "NO_CURRENT_STATE",
+            Code::ProposalClosed => "PROPOSAL_CLOSED",
+            Code::PredecessorMoved => "PREDECESSOR_MOVED",
         }
     }
 }

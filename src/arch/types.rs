@@ -28,7 +28,9 @@ pub struct Manifest {
     #[schemars(pattern(LOCAL_ID))]
     pub id: String,
     pub name: String,
-    pub current: State,
+    /// `null` in a planning model, which has no current state until a proposal is adopted.
+    #[serde(default)]
+    pub current: Option<State>,
     /// Local IDs that were removed and may never be allocated again.
     #[serde(default)]
     #[schemars(inner(pattern(LOCAL_ID)))]
@@ -41,6 +43,48 @@ pub struct State {
     #[schemars(pattern(LOCAL_ID))]
     pub id: String,
     pub name: String,
+}
+
+/// `proposals/<id>/proposal.json`: a draft of a future architecture, drawn against the current
+/// state it would replace. Its modules and collections sit beside it in the current state's formats.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Proposal {
+    #[schemars(range(min = 1, max = 1))]
+    pub schema_version: u32,
+    #[schemars(pattern(LOCAL_ID))]
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = DESCRIPTION_MAX))]
+    pub description: Option<String>,
+    pub status: ProposalStatus,
+    pub predecessor: Predecessor,
+    /// When it was drawn, in Unix seconds.
+    pub created: u64,
+    /// The local ID of the current state its adoption made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(pattern(LOCAL_ID))]
+    pub adopted_as: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ProposalStatus {
+    Draft,
+    Adopted,
+    Shelved,
+}
+
+/// The current state a proposal was drawn against.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Predecessor {
+    /// The current state's local ID; `null` when drawn in a planning model.
+    #[schemars(pattern(LOCAL_ID))]
+    pub state: Option<String>,
+    /// The current state's revision digest when the proposal was drawn.
+    pub revision: String,
 }
 
 /// `config.yaml`: the vocabulary modules and relationships draw their kinds from.
@@ -465,11 +509,12 @@ impl Default for VaultConfig {
 pub type SchemaFn = fn() -> Schema;
 
 /// Every vault file format and request, by its `model schema` name.
-pub const SCHEMAS: [(&str, SchemaFn); 7] = [
+pub const SCHEMAS: [(&str, SchemaFn); 8] = [
     ("model-claim", root::<super::claims::ClaimRequest>),
     ("model-collection", root::<Collection>),
     ("model-edit", root::<super::edit::EditRequest>),
     ("model-manifest", root::<Manifest>),
+    ("model-proposal", root::<Proposal>),
     ("model-release", root::<super::claims::ReleaseRequest>),
     ("module", root::<Module>),
     ("vault-config", root::<VaultConfig>),

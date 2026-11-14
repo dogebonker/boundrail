@@ -23,8 +23,8 @@ use super::state::{self, Locked};
 use super::types::{
     Anchor, Binding, Collection, Emphasis, Module, Relationship, SCHEMA_VERSION, Step, walk,
 };
-use super::vault::{self, FileWrite, Model, relationships};
-use super::{Code, Refusal, ids};
+use super::vault::{self, FileWrite, Model, Scope, relationships};
+use super::{Code, Refusal, ids, proposal};
 
 mod flow;
 
@@ -42,7 +42,8 @@ const STOP_AFTER_JOURNAL: &str = "BOUNDRAIL_TEST_STOP_AFTER_JOURNAL";
 #[cfg(debug_assertions)]
 const TOUCH_BEFORE_PLAN_CHECK: &str = "BOUNDRAIL_TEST_TOUCH_BEFORE_PLAN_CHECK";
 
-/// The `model edit` request: changes to the current state, applied in order as one batch.
+/// The `model edit` request: changes to the current state, or with `--proposal` to a proposal,
+/// applied in order as one batch.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EditRequest {
@@ -302,11 +303,15 @@ pub struct Allocation {
 /// replay or `model recover` can finish an interrupted edit; a done or abandoned record keeps
 /// only the receipt.
 #[derive(Serialize, Deserialize)]
-struct Record {
+pub(super) struct Record {
     /// SHA-256 of the canonical request; `--doing` is not part of it.
     request_sha256: String,
-    /// Always `edit`; claim and release records share the journal folder.
+    /// `edit`, `propose`, `adopt` or `shelve`; claim and release records share the journal folder.
     kind: String,
+    /// The vault files the revisions cover; records written before proposals cover the current
+    /// state.
+    #[serde(default)]
+    scope: Scope,
     status: Status,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     before: Option<String>,
@@ -342,15 +347,85 @@ pub struct Interrupted {
     pub in_progress: bool,
 }
 
-/// Applies `input`, an [`EditRequest`] as JSON, to the vault folder `vault`. A repeated
-/// operation returns its stored receipt, finishing it first when it was interrupted. The flag
-/// says whether this call finished an interrupted edit.
-pub fn run(vault: &Path, input: &[u8], doing: &str) -> Result<(Receipt, bool)> {
+/// Applies `input`, an [`EditRequest`] as JSON, to the current state of the vault folder `vault`,
+/// or to the proposal with local or qualified ID `proposal`. A repeated operation returns its
+/// stored receipt, finishing it first when it was interrupted. The flag says whether this call
+/// finished an interrupted edit.
+pub fn run(
+    vault: &Path,
+    input: &[u8],
+    doing: &str,
+    proposal: Option<&str>,
+) -> Result<(Receipt, bool)> {
     check_doing(doing)?;
     let request: EditRequest = parse(input, "edit")?;
     check_request(&request)?;
+    let operation = request.operation_id.clone();
+    journaled(vault, &operation, request, |request, dir, fingerprint| {
+        let model = vault::load_target(vault.to_path_buf(), proposal)?;
+        check_target(&model, &request)?;
+        let claim = request.claim.clone();
+        let (record, affected, moves) = plan(&model, request, doing, fingerprint)?;
+        let writer = &record.output.writer;
+        claims::check_edit(dir, &model, writer, claim.as_deref(), &affected, &moves)?;
+        Ok(record)
+    })
+}
+
+/// A write planned under the vault lock: an edit, or drawing, adopting or shelving a proposal.
+pub(super) struct Plan {
+    pub(super) kind: &'static str,
+    pub(super) scope: Scope,
+    pub(super) operation_id: String,
+    pub(super) writer: String,
+    pub(super) doing: String,
+    /// The revision of the files `scope` covers that the plan was made from.
+    pub(super) before: Revision,
+    pub(super) writes: Vec<FileWrite>,
+    pub(super) subjects: Subjects,
+    pub(super) allocated: Vec<Allocation>,
+}
+
+impl Plan {
+    /// The pending journal record of this plan, for a request with SHA-256 `fingerprint`.
+    pub(super) fn record(self, fingerprint: String) -> Record {
+        let after = self.before.updated(
+            (self.writes.iter())
+                .map(|w| (w.path.as_str(), w.content.as_deref().map(str::as_bytes))),
+        );
+        Record {
+            request_sha256: fingerprint,
+            kind: self.kind.to_owned(),
+            scope: self.scope,
+            status: Status::Pending,
+            before: Some(self.before.digest.clone()),
+            after: Some(after.digest.clone()),
+            writes: Some(self.writes),
+            output: Receipt {
+                operation_id: self.operation_id,
+                writer: self.writer,
+                doing: self.doing,
+                before: self.before,
+                after,
+                subjects: self.subjects,
+                allocated: self.allocated,
+            },
+        }
+    }
+}
+
+/// Runs the journaled write `operation` of `request`. A repeated operation returns its stored
+/// receipt, finishing it first when it was interrupted; otherwise `plan` plans it under the vault
+/// lock, given the request, the state folder and the request's SHA-256, and the plan is written
+/// through the journal. The flag says whether this call finished an interrupted write.
+pub(super) fn journaled<R: Serialize>(
+    vault: &Path,
+    operation: &str,
+    request: R,
+    plan: impl FnOnce(R, &Path, String) -> Result<Record>,
+) -> Result<(Receipt, bool)> {
     let journal = Journal::open(vault)?;
-    let (fingerprint, record) = journal.read(&request.operation_id, &request)?;
+    let (fingerprint, record) = journal.read(operation, &request)?;
     if let Some(record) = record {
         return match record.status {
             Status::Done => Ok((record.output, false)),
@@ -359,23 +434,12 @@ pub fn run(vault: &Path, input: &[u8], doing: &str) -> Result<(Receipt, bool)> {
                 Code::OperationAbandoned,
                 "this operation was abandoned; plan the change again with a new operation_id",
             )
-            .with_details(json!({ "operation_id": request.operation_id }))
+            .with_details(json!({ "operation_id": operation }))
             .into()),
         };
     }
     state::refuse_interrupted(&journal.state.dir)?;
-    let model = vault::load_dir(vault.to_path_buf())?;
-    check_target(&model, &request)?;
-    let claim = request.claim.clone();
-    let (record, affected, moves) = plan(&model, request, doing, fingerprint)?;
-    claims::check_edit(
-        &journal.state.dir,
-        &model,
-        &record.output.writer,
-        claim.as_deref(),
-        &affected,
-        &moves,
-    )?;
+    let record = plan(request, &journal.state.dir, fingerprint)?;
     #[cfg(debug_assertions)]
     if let Some(path) = std::env::var_os(TOUCH_BEFORE_PLAN_CHECK) {
         use std::io::Write;
@@ -395,6 +459,8 @@ pub fn run(vault: &Path, input: &[u8], doing: &str) -> Result<(Receipt, bool)> {
         .with_details(json!({ "paths": changed, "current": current }))
         .into());
     }
+    // A write the journal could never apply refuses before it is recorded.
+    vault::check_writes(vault, record.writes.as_deref().unwrap_or_default())?;
     journal.write_pending(&record)?;
     #[cfg(debug_assertions)]
     if std::env::var_os(STOP_AFTER_JOURNAL).is_some() {
@@ -482,6 +548,9 @@ fn check_request(request: &EditRequest) -> Result<()> {
 
 fn check_target(model: &Model, request: &EditRequest) -> Result<()> {
     check_model(model, &request.target)?;
+    if let Some(drawn) = &model.proposal {
+        proposal::refuse_closed(drawn)?;
+    }
     if request.expected_revision != model.revision.digest {
         return Err(Refusal::new(
             Code::StaleRevision,
@@ -494,7 +563,8 @@ fn check_target(model: &Model, request: &EditRequest) -> Result<()> {
 }
 
 /// Applies the batch in memory, validates the result and plans its writes as a pending record,
-/// returned with the subjects a claim must cover and the modules that move.
+/// returned with the subjects a claim must cover and the modules that move. A proposal retires
+/// nothing: what it drops is retired when it is adopted.
 fn plan(
     model: &Model,
     request: EditRequest,
@@ -514,10 +584,21 @@ fn plan(
     batch.finish()?;
     let diff = diff(model, &batch.modules, &batch.collections, &batch.fresh);
 
+    let drawn = model.proposal.as_ref();
+    let retired = if drawn.is_none() {
+        diff.retired.as_slice()
+    } else {
+        &[]
+    };
     let mut manifest = model.manifest.clone();
-    manifest.retired_ids.extend(diff.retired.iter().cloned());
-    let mut problems =
-        vault::problems(&manifest, &model.config, &batch.modules, &batch.collections);
+    manifest.retired_ids.extend(retired.iter().cloned());
+    let mut problems = vault::problems(
+        &manifest,
+        &model.config,
+        drawn,
+        &batch.modules,
+        &batch.collections,
+    );
     if !problems.is_empty() {
         for problem in &mut problems {
             problem.change = batch.touched.get(&problem.subject).copied();
@@ -525,31 +606,27 @@ fn plan(
         return Err(vault::invalid(&model.dir, problems));
     }
 
-    let manifest = (!diff.retired.is_empty()).then_some(&manifest);
+    let manifest = (!retired.is_empty()).then_some(&manifest);
     let writes = vault::plan_writes(manifest, &diff.write, &diff.write_collections, &diff.remove)?;
-    let after = model.revision.updated(
-        writes
-            .iter()
-            .map(|w| (w.path.as_str(), w.content.as_deref().map(str::as_bytes))),
-    );
-    let record = Record {
-        request_sha256: fingerprint,
-        kind: "edit".to_owned(),
-        status: Status::Pending,
-        before: Some(model.revision.digest.clone()),
-        after: Some(after.digest.clone()),
-        writes: Some(writes),
-        output: Receipt {
-            operation_id,
-            writer,
-            doing: doing.to_owned(),
-            before: model.revision.clone(),
-            after,
-            subjects: diff.subjects,
-            allocated: batch.allocated,
-        },
+    let (scope, writes) = match drawn {
+        Some(p) => (
+            Scope::Proposal(p.id.clone()),
+            vault::in_proposal(&p.id, writes),
+        ),
+        None => (Scope::Current, writes),
     };
-    Ok((record, diff.affected, diff.moves))
+    let plan = Plan {
+        kind: "edit",
+        scope,
+        operation_id,
+        writer,
+        doing: doing.to_owned(),
+        before: model.revision.clone(),
+        writes,
+        subjects: diff.subjects,
+        allocated: batch.allocated,
+    };
+    Ok((plan.record(fingerprint), diff.affected, diff.moves))
 }
 
 /// Finishes a pending record, refusing `RECOVERY_CONFLICT` without writing when a vault file
@@ -605,7 +682,7 @@ fn snapshot<'a>(vault: &Path, record: &'a Record) -> Result<Digests<'a>> {
     Ok((
         digests(&record.output.before),
         digests(&record.output.after),
-        vault::file_digests(vault)?,
+        vault::file_digests(vault, &record.scope)?,
     ))
 }
 
@@ -623,7 +700,7 @@ fn apply(vault: &Path, journal: &Journal, mut record: Record) -> Result<Receipt>
     let operation = record.output.operation_id.clone();
     let finished = (|| -> Result<()> {
         vault::apply_writes(vault, record.writes.as_deref().unwrap_or_default())?;
-        let reached = revision::of_digests(vault::file_digests(vault)?);
+        let reached = revision::of_digests(vault::file_digests(vault, &record.scope)?);
         let planned = &record.output.after;
         ensure!(
             reached == *planned,
@@ -645,24 +722,25 @@ fn apply(vault: &Path, journal: &Journal, mut record: Record) -> Result<Receipt>
     Ok(record.output)
 }
 
-/// What the batch changed against the loaded model.
-struct Diff<'a> {
+/// What the batch, or an adopted proposal, changed against the loaded model.
+pub(super) struct Diff<'a> {
     /// Module files to write: added and changed modules.
-    write: Vec<&'a Module>,
+    pub(super) write: Vec<&'a Module>,
     /// Collection files to write: added and changed collections.
-    write_collections: Vec<&'a Collection>,
+    pub(super) write_collections: Vec<&'a Collection>,
     /// Vault-relative paths of module and collection files to delete.
-    remove: Vec<String>,
+    pub(super) remove: Vec<String>,
     /// IDs leaving the model, allocated-then-removed ones included; they stay reserved.
-    retired: Vec<String>,
-    subjects: Subjects,
-    /// The pre-existing subjects a claim must cover, and the model ID for the root level.
-    affected: BTreeSet<String>,
+    pub(super) retired: Vec<String>,
+    pub(super) subjects: Subjects,
+    /// The pre-existing subjects a claim must cover, and the model's root subject for the root
+    /// level.
+    pub(super) affected: BTreeSet<String>,
     /// Pre-existing modules that change parent.
-    moves: Vec<claims::Move>,
+    pub(super) moves: Vec<claims::Move>,
 }
 
-fn diff<'a>(
+pub(super) fn diff<'a>(
     model: &'a Model,
     new: &'a [Module],
     collections: &'a [Collection],
@@ -785,13 +863,13 @@ fn diff<'a>(
     diff.affected = touched
         .into_iter()
         .filter_map(|subject| match subject {
-            None => Some(model.manifest.id.clone()),
+            None => Some(model.root()),
             Some(id) => existed(&id).then_some(id),
         })
         .collect();
     // A batch that only retires IDs, adding and removing a module, still rewrites the manifest.
     if diff.affected.is_empty() && !diff.retired.is_empty() {
-        diff.affected.insert(model.manifest.id.clone());
+        diff.affected.insert(model.root());
     }
     diff
 }
@@ -834,27 +912,9 @@ struct Batch<'a> {
 
 impl<'a> Batch<'a> {
     fn new(model: &'a Model) -> Self {
-        let manifest = &model.manifest;
-        let taken = [&manifest.id, &manifest.current.id]
-            .into_iter()
-            .chain(&manifest.retired_ids)
-            .chain(
-                model
-                    .modules
-                    .iter()
-                    .flat_map(|m| iter::once(&m.id).chain(m.outgoing.iter().map(|r| &r.id))),
-            )
-            .map(|id| id.to_ascii_lowercase())
-            .chain(
-                model
-                    .collections
-                    .iter()
-                    .flat_map(Collection::ids)
-                    .map(str::to_ascii_lowercase),
-            )
-            .collect();
+        let taken = model.ids().map(str::to_ascii_lowercase).collect();
         Self {
-            model: &manifest.id,
+            model: &model.manifest.id,
             modules: model.modules.clone(),
             collections: model.collections.clone(),
             removed: BTreeSet::new(),
@@ -1323,7 +1383,7 @@ impl Journal {
 
     /// The SHA-256 of `request` and the record of `operation`, refusing `OPERATION_REUSED` when
     /// the record holds another request.
-    fn read(&self, operation: &str, request: &EditRequest) -> Result<(String, Option<Record>)> {
+    fn read(&self, operation: &str, request: &impl Serialize) -> Result<(String, Option<Record>)> {
         let (fingerprint, record) = state::recorded(&self.state.dir, operation, request)?;
         let record = record
             .map(|record| {
