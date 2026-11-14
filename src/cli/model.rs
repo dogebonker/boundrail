@@ -13,7 +13,9 @@ use boundrail::arch::render::{self, View};
 use boundrail::arch::request::INPUT_MAX;
 use boundrail::arch::semantic;
 use boundrail::arch::types::{self, Collection, Flow, SCHEMAS, Step};
-use boundrail::arch::vault::{self, CollectionView, Found, Model, ModuleView, RelationshipView};
+use boundrail::arch::vault::{
+    self, CollectionView, Found, Model, ModuleView, RelationshipView, Scope,
+};
 use boundrail::arch::{Code, Refusal};
 use serde_json::{Value, json};
 
@@ -166,7 +168,7 @@ enum ModelCmd {
         expected_revision: String,
         /// The proposal's revision digest you compared; another revision refuses
         #[arg(long)]
-        expected_proposal_revision: Option<String>,
+        expected_proposal_revision: String,
         #[command(flatten)]
         writing: WritingArgs,
         /// Your claim covering what the adoption changes
@@ -177,6 +179,9 @@ enum ModelCmd {
     Shelve {
         /// The proposal's ID
         proposal: String,
+        /// The proposal's revision digest, as `model read --proposal` shows it; another refuses
+        #[arg(long)]
+        expected_revision: String,
         #[command(flatten)]
         writing: WritingArgs,
         /// Your claim covering the proposal
@@ -250,7 +255,7 @@ struct WritingArgs {
     writer: Option<String>,
     /// Repeating an operation ID with the same arguments returns the same receipt
     #[arg(long)]
-    operation_id: Option<String>,
+    operation_id: String,
 }
 
 impl WritingArgs {
@@ -258,7 +263,7 @@ impl WritingArgs {
         Writing {
             doing: &self.doing,
             writer: self.writer.as_deref(),
-            operation_id: self.operation_id.as_deref(),
+            operation_id: &self.operation_id,
             claim,
         }
     }
@@ -487,8 +492,8 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
             let dir = vault::locate(root)?;
             let request = read_request(input.as_deref())?;
             let (receipt, finished) = edit::run(&dir, &request, &doing, proposal.as_deref())?;
-            if finished {
-                warn_unloadable(&dir, &[&receipt]);
+            if let Some(scope) = &finished {
+                warn_unloadable(&dir, &[(scope, &receipt)]);
             }
             print_written(markdown, "edit", &dir, &receipt, None)
         }
@@ -502,8 +507,8 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
             let writing = writing.writing(None);
             let (receipt, finished) =
                 proposal::propose(&dir, &writing, &name, Some(&from), description.as_deref())?;
-            if finished {
-                warn_unloadable(&dir, &[&receipt]);
+            if let Some(scope) = &finished {
+                warn_unloadable(&dir, &[(scope, &receipt)]);
             }
             print_written(markdown, "propose", &dir, &receipt, None)
         }
@@ -516,11 +521,11 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
         } => {
             let dir = vault::locate(root)?;
             let writing = writing.writing(claim.as_deref());
-            let compared = expected_proposal_revision.as_deref();
+            let compared = &expected_proposal_revision;
             let (receipt, finished) =
                 proposal::adopt(&dir, &writing, &proposal, &expected_revision, compared)?;
-            if finished {
-                warn_unloadable(&dir, &[&receipt]);
+            if let Some(scope) = &finished {
+                warn_unloadable(&dir, &[(scope, &receipt)]);
             }
             // The receipt's revisions cover the proposal too.
             let current = proposal::current_revision(&receipt);
@@ -528,14 +533,16 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
         }
         ModelCmd::Shelve {
             proposal,
+            expected_revision,
             writing,
             claim,
         } => {
             let dir = vault::locate(root)?;
             let writing = writing.writing(claim.as_deref());
-            let (receipt, finished) = proposal::shelve(&dir, &writing, &proposal)?;
-            if finished {
-                warn_unloadable(&dir, &[&receipt]);
+            let (receipt, finished) =
+                proposal::shelve(&dir, &writing, &proposal, &expected_revision)?;
+            if let Some(scope) = &finished {
+                warn_unloadable(&dir, &[(scope, &receipt)]);
             }
             print_written(markdown, "shelve", &dir, &receipt, None)
         }
@@ -570,12 +577,15 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
         ModelCmd::Recover { abandon: None } => {
             let dir = vault::locate(root)?;
             let completed = edit::recover(&dir)?;
-            warn_unloadable(&dir, &completed.iter().collect::<Vec<_>>());
+            let finished: Vec<_> = completed.iter().map(|c| (&c.scope, &c.receipt)).collect();
+            warn_unloadable(&dir, &finished);
             if markdown {
                 if completed.is_empty() {
                     println!("No interrupted edits");
                 }
-                completed.iter().for_each(|r| print_receipt("Edit", r));
+                for c in &completed {
+                    print_receipt(&label(&c.kind), &c.receipt);
+                }
                 return Ok(());
             }
             write(
@@ -763,6 +773,15 @@ fn render_model(root: &Path, format: Option<Format>, args: &RenderArgs) -> Resul
     let (drawn, base) = args.states()?;
     let (model, name) = load_state(root, drawn)?;
     let base = base.map(|b| load_state(root, b)).transpose()?;
+    // A proposal's local and qualified IDs name the same state.
+    let id = |model: &Model| model.proposal.as_ref().map(|p| p.id.clone());
+    if let Some((base, _)) = &base
+        && id(&model).is_some()
+        && id(&model) == id(base)
+    {
+        let message = "--against names the state being drawn";
+        return Err(Refusal::new(Code::RequestInvalid, message).into());
+    }
     if let Some(output) = &args.output {
         check_output(root, output)?;
     }
@@ -1026,14 +1045,14 @@ fn print_diagnostics(
     println!("Check {verdict}: warnings: {warning}, information: {information}");
 }
 
-/// Warns on stderr when the model no longer loads after finishing interrupted edits: a newer
-/// build may judge a record an older one planned otherwise. The edits themselves are complete.
-fn warn_unloadable(dir: &Path, finished: &[&Receipt]) {
-    if finished.is_empty() {
-        return;
-    }
-    if let Err(error) = vault::load_dir(dir.to_path_buf()) {
-        for receipt in finished {
+/// Warns on stderr when what an interrupted write covers no longer loads after finishing it: a
+/// newer build may judge a record an older one planned otherwise. The writes themselves are
+/// complete. Each write's own scope is loaded: the current state, its proposal, or both.
+fn warn_unloadable(dir: &Path, finished: &[(&Scope, &Receipt)]) {
+    for (scope, receipt) in finished {
+        let current = (scope.current()).then(|| vault::load_dir(dir.to_path_buf()));
+        let proposal = (scope.proposal()).map(|id| vault::load_proposal(dir.to_path_buf(), id));
+        for error in current.into_iter().chain(proposal).filter_map(Result::err) {
             eprintln!(
                 "warning: operation {} is complete, but the model does not load: {error:#}",
                 receipt.operation_id
@@ -1197,9 +1216,7 @@ fn print_written(
     current: Option<&boundrail::arch::revision::Revision>,
 ) -> Result<()> {
     if markdown {
-        let mut label = kind.to_owned();
-        label[..1].make_ascii_uppercase();
-        print_receipt(&label, receipt);
+        print_receipt(&label(kind), receipt);
         if let Some(current) = current {
             println!("current revision {}", current.digest);
         }
@@ -1225,6 +1242,15 @@ fn extend(output: &mut Value, fields: impl serde::Serialize) -> Result<()> {
         envelope.extend(fields.into_iter().filter(|(_, value)| !value.is_null()));
     }
     Ok(())
+}
+
+/// A write's kind as a Markdown line starts it: `edit` as `Edit`.
+fn label(kind: &str) -> String {
+    let mut label = kind.to_owned();
+    if let Some(first) = label.get_mut(..1) {
+        first.make_ascii_uppercase();
+    }
+    label
 }
 
 fn print_receipt(label: &str, receipt: &Receipt) {

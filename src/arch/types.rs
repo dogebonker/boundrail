@@ -22,14 +22,16 @@ const REPO_PATH: &str = r"^(?:[^/\\.:][^/\\:]*|\.(?:[^/\\.:][^/\\:]*)?|\.\.[^/\\
 /// `model.json`: the model's identity and its current state.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(transform = require_current)]
 pub struct Manifest {
     #[schemars(range(min = 1, max = 1))]
     pub schema_version: u32,
     #[schemars(pattern(LOCAL_ID))]
     pub id: String,
     pub name: String,
-    /// `null` in a planning model, which has no current state until a proposal is adopted.
-    #[serde(default)]
+    /// `null` in a planning model, which has no current state until a proposal is adopted. The
+    /// key is required, so a manifest that lost it never reads as a planning model.
+    #[serde(deserialize_with = "present")]
     pub current: Option<State>,
     /// Local IDs that were removed and may never be allocated again.
     #[serde(default)]
@@ -66,6 +68,11 @@ pub struct Proposal {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(pattern(LOCAL_ID))]
     pub adopted_as: Option<String>,
+    /// Local IDs this proposal removed that it did not add in the same edit, sorted. Edits
+    /// inside it never allocate them again; adoption retires what the adopted state drops.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(inner(pattern(LOCAL_ID)))]
+    pub dropped: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -74,6 +81,23 @@ pub enum ProposalStatus {
     Draft,
     Adopted,
     Shelved,
+}
+
+/// Lists `current` as required in the manifest's schema, as [`present`] reads it.
+fn require_current(schema: &mut Schema) {
+    if let Some(Value::Array(required)) = schema.get_mut("required") {
+        required.push("current".into());
+    }
+}
+
+/// An `Option` whose key must be present, `null` allowed: a plain `Option` field reads a missing
+/// key as `None`, and `deserialize_with` turns that off.
+fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(deserializer)
 }
 
 /// The current state a proposal was drawn against.

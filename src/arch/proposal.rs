@@ -33,7 +33,7 @@ pub struct Writing<'a> {
     /// Who writes; defaults to the Git author name.
     pub writer: Option<&'a str>,
     /// Repeating an operation ID with the same arguments returns the same receipt.
-    pub operation_id: Option<&'a str>,
+    pub operation_id: &'a str,
     /// The writer's claim covering what the write touches.
     pub claim: Option<&'a str>,
 }
@@ -41,17 +41,19 @@ pub struct Writing<'a> {
 /// Draws a draft named `name` from the current state, or from the proposal `from` names, in the
 /// vault folder `vault`. Drawn from the current state, its predecessor is the current state and
 /// revision; in a planning model the predecessor state is `None` and the draft starts empty. A
-/// copy of a proposal inherits that proposal's predecessor, since it holds what that proposal
-/// drew; a copy of an adopted proposal needs it to still be the current state, unchanged.
+/// copy of a proposal inherits that proposal's predecessor and dropped IDs, since it holds what
+/// that proposal drew; a copy of an adopted proposal needs it to still be the current state,
+/// unchanged. It takes no revision: the draft records the predecessor it copied, which adoption
+/// checks again.
 pub fn propose(
     vault: &Path,
     writing: &Writing<'_>,
     name: &str,
     from: Option<&str>,
     description: Option<&str>,
-) -> Result<(Receipt, bool)> {
+) -> Result<(Receipt, Option<Scope>)> {
     let name = vault::valid_name(name)?.to_owned();
-    let (writer, operation) = start(vault, writing, "propose")?;
+    let (writer, operation) = start(vault, writing)?;
     let from = from.filter(|from| *from != CURRENT);
     let request = json!({"kind": "propose", "writer": writer, "name": name, "from": from, "description": description});
     edit::journaled(vault, &operation, request, |_, _, fingerprint| {
@@ -59,7 +61,7 @@ pub fn propose(
         let source = from
             .map(|from| vault::load_proposal(vault.to_path_buf(), from))
             .transpose()?;
-        let predecessor = inherited(&current, source.as_ref())?;
+        let (predecessor, dropped) = inherited(&current, source.as_ref())?;
         let taken = taken(vault, &[&current])?;
         let proposal = Proposal {
             schema_version: SCHEMA_VERSION,
@@ -70,6 +72,7 @@ pub fn propose(
             predecessor,
             created: claims::now(),
             adopted_as: None,
+            dropped,
         };
         let source = source.as_ref().unwrap_or(&current);
         let plan = drawing(source, proposal, writer.clone(), operation.clone(), writing)?;
@@ -77,25 +80,26 @@ pub fn propose(
     })
 }
 
-/// The predecessor of a draft copied from `source`, or drawn from `current` without one.
-fn inherited(current: &Model, source: Option<&Model>) -> Result<Predecessor> {
+/// The predecessor of a draft copied from `source`, or drawn from `current` without one, and the
+/// IDs the draft has dropped from it.
+fn inherited(current: &Model, source: Option<&Model>) -> Result<(Predecessor, Vec<String>)> {
     let state = current.manifest.current.as_ref().map(|c| c.id.clone());
     let of_current = Predecessor {
         state: state.clone(),
         revision: current.revision.digest.clone(),
     };
     let Some((source, drawn)) = source.and_then(|s| Some((s, s.proposal.as_ref()?))) else {
-        return Ok(of_current);
+        return Ok((of_current, Vec::new()));
     };
     if drawn.status != ProposalStatus::Adopted {
-        return Ok(drawn.predecessor.clone());
+        return Ok((drawn.predecessor.clone(), drawn.dropped.clone()));
     }
     // An adopted proposal stands for the current state only while nothing has changed it since.
     if drawn.adopted_as == state
         && source.modules == current.modules
         && source.collections == current.collections
     {
-        return Ok(of_current);
+        return Ok((of_current, Vec::new()));
     }
     Err(Refusal::new(
         Code::PredecessorMoved,
@@ -111,7 +115,7 @@ fn inherited(current: &Model, source: Option<&Model>) -> Result<Predecessor> {
 /// The IDs a new proposal or state must not take, in ASCII lowercase: those `models` hold or
 /// reserve and every proposal folder's. IDs are random, so this guards the names that matter
 /// most; adopting a state that clashes with the current one refuses `MODEL_INVALID`.
-fn taken(vault: &Path, models: &[&Model]) -> Result<BTreeSet<String>> {
+pub(super) fn taken(vault: &Path, models: &[&Model]) -> Result<BTreeSet<String>> {
     let held = models.iter().flat_map(|m| m.ids()).map(str::to_owned);
     Ok(held
         .chain(vault::proposals(vault)?)
@@ -165,21 +169,18 @@ fn drawing(
 /// Makes the draft `subject` names the current state: its files replace the current state's,
 /// the new state gets a fresh ID and the proposal's name, the IDs it drops are retired, and the
 /// proposal is marked adopted, all in one journaled write. `expected` is the current revision the
-/// caller read, and `compared`, when given, the proposal revision. Refuses `STALE_REVISION` when
-/// either is at another revision, and `PREDECESSOR_MOVED` when the current state moved since the
-/// proposal was drawn. Claims on what the adoption changes apply as to an edit.
+/// caller read, and `compared` the proposal revision. Refuses `STALE_REVISION` when either is at
+/// another revision, and `PREDECESSOR_MOVED` when the current state moved since the proposal was
+/// drawn. Claims on what the adoption changes apply as to an edit.
 pub fn adopt(
     vault: &Path,
     writing: &Writing<'_>,
     subject: &str,
     expected: &str,
-    compared: Option<&str>,
-) -> Result<(Receipt, bool)> {
-    let (writer, operation) = start(vault, writing, "adopt")?;
-    let mut request = json!({"kind": "adopt", "writer": writer, "proposal": subject, "expected_revision": expected, "claim": writing.claim});
-    if let Some(compared) = compared {
-        request["expected_proposal_revision"] = compared.into();
-    }
+    compared: &str,
+) -> Result<(Receipt, Option<Scope>)> {
+    let (writer, operation) = start(vault, writing)?;
+    let request = json!({"kind": "adopt", "writer": writer, "proposal": subject, "expected_revision": expected, "expected_proposal_revision": compared, "claim": writing.claim});
     edit::journaled(vault, &operation, request, |_, dir, fingerprint| {
         let current = vault::load_dir(vault.to_path_buf())?;
         let (drawn, proposal) = open(vault, subject)?;
@@ -263,7 +264,7 @@ impl Adoption<'_> {
 
 /// The manifest after adopting `drawn` as the state `state` named `name`, refusing
 /// `MODEL_INVALID` when the adopted state would not load. The state it replaces leaves the model
-/// with the IDs it drops, `retired`, and all stay reserved.
+/// with the IDs it drops, `retired`, and all stay reserved, as do the IDs the proposal dropped.
 fn adopted_manifest(
     current: &Model,
     drawn: &Model,
@@ -276,7 +277,20 @@ fn adopted_manifest(
         id: state.to_owned(),
         name: name.to_owned(),
     });
-    (manifest.retired_ids).extend(retired.iter().cloned().chain(old.map(|s| s.id)));
+    let dropped = drawn
+        .proposal
+        .iter()
+        .flat_map(|p| p.dropped.iter().cloned());
+    for id in retired
+        .iter()
+        .cloned()
+        .chain(old.map(|s| s.id))
+        .chain(dropped)
+    {
+        if !manifest.retired_ids.contains(&id) {
+            manifest.retired_ids.push(id);
+        }
+    }
     let problems = vault::problems(
         &manifest,
         &current.config,
@@ -290,13 +304,19 @@ fn adopted_manifest(
     Ok(manifest)
 }
 
-/// Sets the draft `subject` names aside: it stays, reading only.
-pub fn shelve(vault: &Path, writing: &Writing<'_>, subject: &str) -> Result<(Receipt, bool)> {
-    let (writer, operation) = start(vault, writing, "shelve")?;
-    let request =
-        json!({"kind": "shelve", "writer": writer, "proposal": subject, "claim": writing.claim});
+/// Sets the draft `subject` names aside: it stays, reading only. `expected` is the proposal
+/// revision the caller read; another revision refuses `STALE_REVISION`.
+pub fn shelve(
+    vault: &Path,
+    writing: &Writing<'_>,
+    subject: &str,
+    expected: &str,
+) -> Result<(Receipt, Option<Scope>)> {
+    let (writer, operation) = start(vault, writing)?;
+    let request = json!({"kind": "shelve", "writer": writer, "proposal": subject, "expected_revision": expected, "claim": writing.claim});
     edit::journaled(vault, &operation, request, |_, dir, fingerprint| {
         let (drawn, mut proposal) = open(vault, subject)?;
+        refuse_compared(&drawn, expected)?;
         let id = drawn.qualify(&proposal.id);
         let touched = BTreeSet::from([id.clone()]);
         claims::check_edit(dir, &drawn, &writer, writing.claim, &touched, &[])?;
@@ -369,18 +389,18 @@ pub(super) fn refuse_closed(proposal: &Proposal) -> Result<()> {
     .into())
 }
 
-/// `STALE_REVISION` when the caller compared another revision of the proposal than `drawn`.
-fn refuse_compared(drawn: &Model, compared: Option<&str>) -> Result<()> {
+/// `STALE_REVISION` when the caller read another revision of the proposal than `drawn`.
+fn refuse_compared(drawn: &Model, expected: &str) -> Result<()> {
     let now = &drawn.revision.digest;
-    match compared {
-        Some(compared) if compared != now => Err(Refusal::new(
-            Code::StaleRevision,
-            "the proposal changed since the expected proposal revision; compare it again before adopting",
-        )
-        .with_details(json!({ "current": now }))
-        .into()),
-        _ => Ok(()),
+    if expected == now {
+        return Ok(());
     }
+    Err(Refusal::new(
+        Code::StaleRevision,
+        "the proposal is not at the expected revision; read it again first",
+    )
+    .with_details(json!({ "current": now }))
+    .into())
 }
 
 /// The draft `subject` names, loaded, with its `proposal.json`; a closed one refuses.
@@ -424,21 +444,15 @@ fn refuse_moved(current: &Model, proposal: &Proposal, expected: &str) -> Result<
     Ok(())
 }
 
-/// The writer, `writing.writer` or the Git author name, and the operation ID, `writing`'s or a
-/// fresh one named after `kind`, after checking `--doing`.
-fn start(vault: &Path, writing: &Writing<'_>, kind: &str) -> Result<(String, String)> {
+/// The writer, `writing.writer` or the Git author name, and the operation ID, after checking
+/// them and `--doing`.
+fn start(vault: &Path, writing: &Writing<'_>) -> Result<(String, String)> {
     check_doing(writing.doing)?;
+    check_operation(writing.operation_id)?;
     let writer = match writing.writer {
         Some(writer) => writer.to_owned(),
         None => checkpoint::author(&checkpoint::checkout(vault)?)?,
     };
     check_writer(&writer)?;
-    let operation = match writing.operation_id {
-        Some(operation) => {
-            check_operation(operation)?;
-            operation.to_owned()
-        }
-        None => format!("{kind}-{}", ids::allocate(|_| false)?),
-    };
-    Ok((writer, operation))
+    Ok((writer, writing.operation_id.to_owned()))
 }

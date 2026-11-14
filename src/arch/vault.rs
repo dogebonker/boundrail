@@ -27,10 +27,10 @@ mod proposals;
 pub use flows::{CollectionView, FlowEntry, FlowView, Found};
 pub(super) use flows::{Ends, collection_position, flow_position, holds_name, message_problems};
 use proposals::{PROPOSAL, PROPOSALS, check_proposal, prefix, split_proposal, unprefixed};
+pub use proposals::{Scope, load_proposal, load_state, proposals};
 pub(super) use proposals::{
-    Scope, in_proposal, is_proposal, is_proposal_path, proposal_file, proposal_write, read_proposal,
+    in_proposal, is_proposal, is_proposal_path, proposal_file, proposal_write, read_proposal,
 };
-pub use proposals::{load_proposal, load_state, proposals};
 
 /// Boundrail's state folder at the checkout root, and the vault folder inside it.
 const STATE: &str = ".boundrail";
@@ -230,11 +230,14 @@ fn is_link(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
 }
 
-/// Refuses to write through a linked state, vault, modules or collections folder.
-fn refuse_links(dir: &Path) -> Result<()> {
-    folders(dir, None)
-        .iter()
-        .try_for_each(|(_, path)| refuse_symlink(path))
+/// `MODEL_INVALID` for the linked folder at the vault-relative `path`.
+fn linked(path: &str) -> anyhow::Error {
+    Refusal::new(
+        Code::ModelInvalid,
+        format!("`{path}` is a symbolic link; refusing to read or write through it"),
+    )
+    .with_details(json!({ "path": path }))
+    .into()
 }
 
 /// Loads the current state of the vault folder `dir`, refusing a model with any problem.
@@ -608,11 +611,14 @@ pub(super) fn plan_writes(
 }
 
 /// Refuses `writes` that a journaled write may not make: a path that is not a vault file it
-/// writes, or one reached through a linked folder. Returns the vault folder and every folder
-/// between it and the files, which are synced after writing.
+/// writes, or one reached through a linked folder (`MODEL_INVALID` naming it). Returns the vault
+/// folder and every folder between it and the files, which are synced after writing.
 pub(super) fn check_writes(dir: &Path, writes: &[FileWrite]) -> Result<BTreeSet<PathBuf>> {
-    refuse_links(dir)?;
-    let mut folders = BTreeSet::from([dir.to_path_buf()]);
+    let mut checked: BTreeMap<PathBuf, String> = folders(dir, None)
+        .into_iter()
+        .map(|(path, folder)| (folder, path))
+        .collect();
+    let mut synced = BTreeSet::from([dir.to_path_buf()]);
     for write in writes {
         let path = write.path.as_str();
         ensure!(
@@ -620,17 +626,17 @@ pub(super) fn check_writes(dir: &Path, writes: &[FileWrite]) -> Result<BTreeSet<
             "`{path}` is not a vault file an edit writes"
         );
         let file = dir.join(path);
-        folders.extend(
-            (file.ancestors().skip(1))
-                .take_while(|folder| *folder != dir)
-                .map(Path::to_path_buf),
-        );
+        for folder in file.ancestors().skip(1).take_while(|folder| *folder != dir) {
+            let relative = folder.strip_prefix(dir).unwrap_or(folder);
+            checked.insert(folder.to_path_buf(), relative.display().to_string());
+            synced.insert(folder.to_path_buf());
+        }
     }
     // Sorted paths put each folder before the folders inside it.
-    folders
-        .iter()
-        .try_for_each(|folder| refuse_symlink(folder))?;
-    Ok(folders)
+    if let Some((_, path)) = checked.iter().find(|(folder, _)| is_link(folder)) {
+        return Err(linked(path));
+    }
+    Ok(synced)
 }
 
 /// Applies `writes` in order. Each one sets a file's whole contents or deletes it, so a journal
@@ -1141,14 +1147,14 @@ impl Model {
     }
 
     /// Every ID this model holds or reserves: the model's, its current state's, the retired
-    /// ones, the proposal's and the state it became, and every module, relationship, collection,
-    /// flow, step and branch.
+    /// ones, the proposal's, the state it became and the IDs it dropped, and every module,
+    /// relationship, collection, flow, step and branch.
     pub(super) fn ids(&self) -> impl Iterator<Item = &str> {
         let manifest = &self.manifest;
         let proposal = self
             .proposal
             .iter()
-            .flat_map(|p| iter::once(&p.id).chain(&p.adopted_as));
+            .flat_map(|p| iter::once(&p.id).chain(&p.adopted_as).chain(&p.dropped));
         iter::once(&manifest.id)
             .chain(manifest.current.iter().map(|c| &c.id))
             .chain(&manifest.retired_ids)

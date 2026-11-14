@@ -9,8 +9,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    FileWrite, Model, Problems, SCHEMA_VERSION, check_name, check_text, file_json, load_dir,
-    load_scope,
+    FileWrite, Model, Problems, SCHEMA_VERSION, check_name, check_text, file_json, is_link, linked,
+    load_dir, load_scope,
 };
 use crate::arch::types::{DESCRIPTION_MAX, Proposal, ProposalStatus};
 use crate::arch::{Code, Refusal, ids, state};
@@ -23,7 +23,7 @@ pub(super) const PROPOSAL: &str = "proposal.json";
 /// The vault files a revision covers and a journaled write may change.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub(crate) enum Scope {
+pub enum Scope {
     /// The manifest, the config, and the current state's modules and collections.
     #[default]
     Current,
@@ -34,11 +34,13 @@ pub(crate) enum Scope {
 }
 
 impl Scope {
-    pub(super) fn current(&self) -> bool {
+    /// Whether it covers the current state's files.
+    pub fn current(&self) -> bool {
         !matches!(self, Self::Proposal(_))
     }
 
-    pub(super) fn proposal(&self) -> Option<&str> {
+    /// The proposal whose folder it covers.
+    pub fn proposal(&self) -> Option<&str> {
         match self {
             Self::Current => None,
             Self::Proposal(id) | Self::Adoption(id) => Some(id),
@@ -78,7 +80,7 @@ pub(super) fn unprefixed(path: &str) -> &str {
 /// proposal's own files.
 pub fn load_proposal(dir: PathBuf, subject: &str) -> Result<Model> {
     let id = subject.split_once('#').map_or(subject, |(_, local)| local);
-    if !is_proposal(&dir, id) {
+    if !is_proposal(&dir, id)? {
         return Err(proposal_not_found(subject));
     }
     let model = load_scope(dir, Some(id))?;
@@ -90,7 +92,7 @@ pub fn load_proposal(dir: PathBuf, subject: &str) -> Result<Model> {
 
 /// The proposal `state` names, when a proposal has that local ID, else the current state.
 pub fn load_state(dir: PathBuf, state: &str) -> Result<Model> {
-    if is_proposal(&dir, state) {
+    if is_proposal(&dir, state)? {
         load_proposal(dir, state)
     } else {
         load_dir(dir)
@@ -116,13 +118,26 @@ pub(crate) fn read_proposal(dir: &Path, id: &str) -> Result<Proposal> {
         .with_context(|| format!("{} is missing", proposal_file(id)))
 }
 
-/// Whether the vault folder `dir` holds a proposal folder, linked or not, named `id`.
-pub(crate) fn is_proposal(dir: &Path, id: &str) -> bool {
-    ids::is_local(id) && fs::symlink_metadata(dir.join(PROPOSALS).join(id)).is_ok()
+/// Whether the vault folder `dir` holds a proposal folder, linked or not, named `id`. A linked
+/// `proposals` folder refuses `MODEL_INVALID`.
+pub(crate) fn is_proposal(dir: &Path, id: &str) -> Result<bool> {
+    refuse_linked(dir)?;
+    Ok(ids::is_local(id) && fs::symlink_metadata(dir.join(PROPOSALS).join(id)).is_ok())
 }
 
-/// The local IDs of the proposal folders in the vault folder `dir`, sorted.
+/// `MODEL_INVALID` when the `proposals` folder of the vault folder `dir` is a symbolic link,
+/// which could point reads outside the checkout.
+fn refuse_linked(dir: &Path) -> Result<()> {
+    if is_link(&dir.join(PROPOSALS)) {
+        return Err(linked(PROPOSALS));
+    }
+    Ok(())
+}
+
+/// The local IDs of the proposal folders in the vault folder `dir`, sorted. A linked
+/// `proposals` folder refuses `MODEL_INVALID`.
 pub fn proposals(dir: &Path) -> Result<Vec<String>> {
+    refuse_linked(dir)?;
     let mut found = Vec::new();
     match fs::read_dir(dir.join(PROPOSALS)) {
         Ok(entries) => {
@@ -192,6 +207,11 @@ pub(super) fn check_proposal(file: &str, proposal: &Proposal, problems: &mut Pro
     {
         if !ids::is_local(named) {
             problems.push(file, named, "state ID is not 8 base62 characters");
+        }
+    }
+    for dropped in &proposal.dropped {
+        if !ids::is_local(dropped) {
+            problems.push(file, dropped, "dropped ID is not 8 base62 characters");
         }
     }
     if (proposal.status == ProposalStatus::Adopted) != proposal.adopted_as.is_some() {

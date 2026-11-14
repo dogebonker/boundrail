@@ -3267,6 +3267,18 @@ fn checkpoints_follow_the_users_signing_config() {
     assert_eq!(checkout_state(&checkout), before);
 }
 
+/// A fresh operation ID for a proposal write.
+fn operation() -> String {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    format!("write-{}", NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+/// The revision digest of the proposal `id`.
+fn proposal_digest(checkout: &Checkout, id: &str) -> String {
+    let read = checkout.ok(&["read", "--proposal", id]);
+    read["revision"]["digest"].as_str().unwrap().to_owned()
+}
+
 /// `model propose` named `name` by tester: the new proposal's local ID.
 fn propose(checkout: &Checkout, name: &str, from: &str) -> String {
     let out = checkout.ok(&[
@@ -3279,6 +3291,8 @@ fn propose(checkout: &Checkout, name: &str, from: &str) -> String {
         "draw a plan",
         "--writer",
         "tester",
+        "--operation-id",
+        &operation(),
     ]);
     assert_eq!(out["kind"], "propose");
     local(out["allocated"][0]["id"].as_str().unwrap()).to_owned()
@@ -3312,16 +3326,21 @@ fn edited_proposal(checkout: &Checkout, id: &str, changes: Value) -> Value {
     out
 }
 
+/// `model adopt` of the proposal `id` at its present revision, by tester.
 fn adopt(checkout: &Checkout, id: &str, expected: &Value) -> (i32, Value) {
     checkout.run(&[
         "adopt",
         id,
         "--expected-revision",
         expected.as_str().unwrap(),
+        "--expected-proposal-revision",
+        &proposal_digest(checkout, id),
         "--doing",
         "adopt the plan",
         "--writer",
         "tester",
+        "--operation-id",
+        &operation(),
     ])
 }
 
@@ -3400,6 +3419,11 @@ fn a_proposal_is_drawn_edited_and_compared_apart_from_the_current_state() {
         json!([q("BankApi1"), q("RelBil01")])
     );
     let ledger = local(out["allocated"][0]["id"].as_str().unwrap()).to_owned();
+    // What the proposal removes it keeps aside, so its edits never allocate those IDs again.
+    assert_eq!(
+        checkout.ok(&["read", "--proposal", &id])["proposal"]["dropped"],
+        json!(["BankApi1", "RelBil01"])
+    );
     let after = checkout.ok(&["read"]);
     assert_eq!(after["revision"], before["revision"]);
     assert_eq!(names(&after), ["Bank", "Billing", "Platform", "Web"]);
@@ -3457,6 +3481,8 @@ fn adopting_a_proposal_replaces_the_current_state_and_retires_what_it_drops() {
         id.as_str(),
         "--expected-revision",
         expected,
+        "--expected-proposal-revision",
+        drawn["revision"]["digest"].as_str().unwrap(),
         "--doing",
         "adopt the plan",
         "--writer",
@@ -3534,6 +3560,50 @@ fn adopting_a_proposal_replaces_the_current_state_and_retires_what_it_drops() {
 }
 
 #[test]
+fn adoption_retires_what_the_proposal_dropped() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let id = propose(&checkout, "Next", "current");
+    let out = edited_proposal(
+        &checkout,
+        &id,
+        json!([{"type": "add-module", "module": {"name": "Ledger", "kind": "datastore", "order": 2}}]),
+    );
+    let ledger = local(out["allocated"][0]["id"].as_str().unwrap()).to_owned();
+    // Ledger never reached the current state, so only the dropped list keeps its ID reserved.
+    edited_proposal(
+        &checkout,
+        &id,
+        json!([{"type": "remove-module", "subject": "Ledger"}]),
+    );
+    let dropped = checkout.ok(&["read", "--proposal", &id])["proposal"]["dropped"].clone();
+    assert_eq!(dropped, json!([ledger]));
+    let (code, out) = adopt(&checkout, &id, &checkout.digest());
+    assert_eq!(code, 0, "{out:#}");
+    let retired = checkout.ok(&["read"])["manifest"]["retired_ids"].clone();
+    let retired = retired.as_array().unwrap();
+    assert!(retired.contains(&json!(ledger)), "{retired:?}");
+    assert_eq!(retired.iter().filter(|r| **r == json!(ledger)).count(), 1);
+}
+
+#[test]
+fn a_dropped_id_must_be_well_formed() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let id = propose(&checkout, "Next", "current");
+    let file = format!("proposals/{id}/proposal.json");
+    let mut proposal: Value =
+        serde_json::from_str(&fs::read_to_string(checkout.vault().join(&file)).unwrap()).unwrap();
+    proposal["dropped"] = json!(["bad"]);
+    checkout.write(&file, &serde_json::to_string_pretty(&proposal).unwrap());
+    let error = checkout.refused(&["read", "--proposal", &id], "MODEL_INVALID");
+    let problem = &error["details"]["problems"][0];
+    assert_eq!(problem["file"], file.as_str());
+    assert_eq!(problem["subject"], "bad");
+    assert_eq!(problem["message"], "dropped ID is not 8 base62 characters");
+}
+
+#[test]
 fn adopting_after_the_current_state_moved_refuses_predecessor_moved() {
     let checkout = Checkout::new();
     shop(&checkout);
@@ -3569,15 +3639,29 @@ fn a_shelved_proposal_reads_only() {
     let checkout = Checkout::new();
     shop(&checkout);
     let (id, _) = next(&checkout);
-    let shelve = [
-        "shelve",
-        id.as_str(),
-        "--doing",
-        "not now",
-        "--writer",
-        "tester",
-    ];
-    assert_eq!(checkout.ok(&shelve)["kind"], "shelve");
+    let digest = proposal_digest(&checkout, &id);
+    let shelve = |expected: &str, operation: &str| {
+        checkout.run(&[
+            "shelve",
+            &id,
+            "--expected-revision",
+            expected,
+            "--doing",
+            "not now",
+            "--writer",
+            "tester",
+            "--operation-id",
+            operation,
+        ])
+    };
+    // Shelving names the proposal revision it read, as an edit inside it does.
+    let (code, out) = shelve(checkout.digest().as_str().unwrap(), "shelve-0");
+    assert_eq!(code, 2, "{out:#}");
+    assert_eq!(out["error"]["code"], "STALE_REVISION");
+    assert_eq!(out["error"]["details"]["current"], digest.as_str());
+    let (code, out) = shelve(&digest, "shelve-1");
+    assert_eq!(code, 0, "{out:#}");
+    assert_eq!(out["kind"], "shelve");
     let read = checkout.ok(&["read", "--proposal", &id]);
     assert_eq!(read["proposal"]["status"], "shelved");
     assert_eq!(names(&read), ["Ledger", "Payments", "Platform", "Web"]);
@@ -3592,7 +3676,9 @@ fn a_shelved_proposal_reads_only() {
     let (code, out) = edit_proposal(&checkout, &id, &request);
     assert_eq!(code, 2, "{out:#}");
     assert_eq!(out["error"]["code"], "PROPOSAL_CLOSED");
-    checkout.refused(&shelve, "PROPOSAL_CLOSED");
+    let (code, out) = shelve(&proposal_digest(&checkout, &id), "shelve-2");
+    assert_eq!(code, 2, "{out:#}");
+    assert_eq!(out["error"]["code"], "PROPOSAL_CLOSED");
     let (code, out) = adopt(&checkout, &id, &checkout.digest());
     assert_eq!(code, 2);
     assert_eq!(out["error"]["code"], "PROPOSAL_CLOSED");
@@ -3704,6 +3790,42 @@ fn proposal_files_are_validated_like_the_current_states() {
 }
 
 #[test]
+fn a_manifest_needs_its_current_key_and_null_reads_as_a_planning_model() {
+    let checkout = Checkout::new();
+    checkout.init();
+    let path = checkout.vault().join("model.json");
+    let mut manifest: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    manifest.as_object_mut().unwrap().remove("current");
+    checkout.write(
+        "model.json",
+        &serde_json::to_string_pretty(&manifest).unwrap(),
+    );
+    let error = checkout.refused(&["read"], "MODEL_INVALID");
+    let problem = &error["details"]["problems"][0];
+    assert_eq!(problem["file"], "model.json");
+    assert!(
+        problem["message"]
+            .as_str()
+            .unwrap()
+            .contains("missing field `current`"),
+        "{problem}"
+    );
+    manifest["current"] = Value::Null;
+    checkout.write(
+        "model.json",
+        &serde_json::to_string_pretty(&manifest).unwrap(),
+    );
+    let read = checkout.ok(&["read"]);
+    assert_eq!(read["manifest"]["current"], Value::Null);
+    let request = json!({
+        "target": {"model": manifest["id"], "state": "State001"}, "expected_revision": read["revision"]["digest"],
+        "operation_id": "planning-1", "writer": "tester",
+        "changes": [{"type": "add-module", "module": {"name": "Web", "kind": "app", "order": 0}}],
+    });
+    checkout.edit_refused(&request, "NO_CURRENT_STATE");
+}
+
+#[test]
 fn adopting_a_proposal_that_holds_a_retired_id_refuses() {
     let checkout = Checkout::new();
     shop(&checkout);
@@ -3757,7 +3879,17 @@ fn a_copy_of_a_proposal_keeps_its_predecessor() {
     checkout.edited(json!([{"type": "edit-module", "subject": "Web", "set": {"order": 4}}]));
     checkout.refused(
         &[
-            "propose", "--name", "Late", "--from", &next, "--doing", "draw", "--writer", "tester",
+            "propose",
+            "--name",
+            "Late",
+            "--from",
+            &next,
+            "--doing",
+            "draw",
+            "--writer",
+            "tester",
+            "--operation-id",
+            "late",
         ],
         "PREDECESSOR_MOVED",
     );
@@ -3798,6 +3930,34 @@ fn claims_never_overlap_across_targets() {
     other.claim_refused("dave", json!(["Billing"]), "CLAIM_CONFLICT");
 }
 
+#[test]
+fn claims_clash_by_the_containment_of_every_draft() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let id = propose(&checkout, "Nested", "current");
+    edited_proposal(
+        &checkout,
+        &id,
+        json!([{"type": "edit-module", "subject": "Web", "set": {"parent": "Billing"}}]),
+    );
+    // Nobody claims the draft, yet inside it Billing holds Web.
+    checkout.claim("alice", json!(["Web"]));
+    let error = checkout.claim_refused("bob", json!(["Billing"]), "CLAIM_CONFLICT");
+    assert_eq!(error["details"]["conflicts"][0]["writer"], "alice");
+}
+
+#[test]
+fn a_claim_on_an_adopted_proposal_blocks_no_other_claim() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let id = propose(&checkout, "Next", "current");
+    let (code, out) = adopt(&checkout, &id, &checkout.digest());
+    assert_eq!(code, 0, "{out:#}");
+    // The adopted proposal reads only, so what it holds is no longer contained by it.
+    checkout.claim("alice", json!([id]));
+    checkout.claim("bob", json!(["Web"]));
+}
+
 #[cfg(unix)]
 #[test]
 fn a_write_through_a_linked_folder_refuses_before_it_is_journaled() {
@@ -3806,13 +3966,32 @@ fn a_write_through_a_linked_folder_refuses_before_it_is_journaled() {
     let elsewhere = checkout.path().join("elsewhere");
     fs::create_dir_all(&elsewhere).unwrap();
     std::os::unix::fs::symlink(&elsewhere, checkout.vault().join("proposals")).unwrap();
-    let (code, _) = checkout.run_raw(&[
-        "propose", "--name", "Next", "--doing", "draw", "--writer", "tester",
-    ]);
-    assert_ne!(code, 0);
+    let error = checkout.refused(
+        &[
+            "propose",
+            "--name",
+            "Next",
+            "--doing",
+            "draw",
+            "--writer",
+            "tester",
+            "--operation-id",
+            "draw-1",
+        ],
+        "MODEL_INVALID",
+    );
+    assert_eq!(error["details"]["path"], "proposals");
     assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
     let pending = checkout.path().join(".git/boundrail/operations/pending");
     assert!(!pending.exists() || fs::read_dir(&pending).unwrap().count() == 0);
+    // Current-state edits list the proposal folders too, so they refuse until the link goes,
+    // and nothing waits in the journal afterwards.
+    let request =
+        checkout.request(json!([{"type": "edit-module", "subject": "Web", "set": {"order": 3}}]));
+    let (code, out) = checkout.edit(&request);
+    assert_eq!(code, 2, "{out:#}");
+    assert_eq!(out["error"]["details"]["path"], "proposals");
+    fs::remove_file(checkout.vault().join("proposals")).unwrap();
     checkout.edited(json!([{"type": "edit-module", "subject": "Web", "set": {"order": 3}}]));
 }
 
@@ -3844,7 +4023,7 @@ fn proposals_list_each_folder_even_when_one_does_not_read() {
 }
 
 #[test]
-fn adopt_checks_the_compared_proposal_revision_when_given() {
+fn adopt_checks_the_compared_proposal_revision() {
     let checkout = Checkout::new();
     shop(&checkout);
     let (id, _) = next(&checkout);
@@ -3867,6 +4046,8 @@ fn adopt_checks_the_compared_proposal_revision_when_given() {
             "adopt the plan",
             "--writer",
             "tester",
+            "--operation-id",
+            &operation(),
         ])
     };
     let (code, out) = with(&compared);
@@ -3885,9 +4066,11 @@ fn an_interrupted_adoption_is_one_journaled_write_that_recovery_finishes() {
     shop(&checkout);
     let expected = checkout.digest();
     let (id, _) = next(&checkout);
+    let compared = proposal_digest(&checkout, &id);
     let out = Command::new(env!("CARGO_BIN_EXE_boundrail"))
         .args(["--no-daemon", "model", "adopt", &id, "--expected-revision"])
         .arg(expected.as_str().unwrap())
+        .args(["--expected-proposal-revision", &compared])
         .args([
             "--doing",
             "adopt the plan",
@@ -3924,12 +4107,22 @@ fn an_interrupted_adoption_is_one_journaled_write_that_recovery_finishes() {
     assert_eq!(checkout.digest(), expected);
     checkout.refused(
         &[
-            "propose", "--name", "Other", "--doing", "draw", "--writer", "tester",
+            "propose",
+            "--name",
+            "Other",
+            "--doing",
+            "draw",
+            "--writer",
+            "tester",
+            "--operation-id",
+            "other",
         ],
         "RECOVERY_REQUIRED",
     );
     let recovered = checkout.ok(&["recover"]);
     assert_eq!(recovered["completed"][0]["operation_id"], "adopt-1");
+    assert_eq!(recovered["completed"][0]["kind"], "adopt");
+    assert_eq!(recovered["completed"][0]["scope"], json!({"adoption": id}));
     assert_eq!(
         names(&checkout.ok(&["read"])),
         ["Ledger", "Payments", "Platform", "Web"]
@@ -4088,7 +4281,7 @@ fn render_a_flowchart_of_a_flow() {
 #[test]
 fn render_marks_what_a_proposal_changes() {
     let checkout = Checkout::new();
-    shop(&checkout);
+    let model = shop(&checkout);
     let ids = add_checkout(&checkout);
     let id = propose(&checkout, "Fraud", "current");
     edited_proposal(
@@ -4126,6 +4319,14 @@ fn render_marks_what_a_proposal_changes() {
         &["render", "--proposal", &id, "--against", &id],
         "REQUEST_INVALID",
     );
+    // The local and qualified IDs name the same proposal.
+    let qualified = format!("{model}#{id}");
+    for (drawn, against) in [(id.as_str(), qualified.as_str()), (&qualified, &id)] {
+        checkout.refused(
+            &["render", "--proposal", drawn, "--against", against],
+            "REQUEST_INVALID",
+        );
+    }
 
     // Of two proposals, --proposal is drawn against --against: what the first lacks is removed,
     // faded and struck.

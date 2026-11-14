@@ -12,8 +12,10 @@
 //! may revoke a claim. They live in `<git dir>/boundrail/claims.json`, so they are never committed
 //! and each worktree has its own; separate worktrees do not see each other's claims. They change
 //! only under the vault lock; readers rely on the atomic replace instead. A subject that an edit
-//! later removes stays in the claim: removed IDs are retired and never allocated again, so it
-//! simply never matches.
+//! later removes stays in the claim. The current state retires the IDs it removes and a proposal
+//! keeps them in its `dropped` list, so neither allocates them again; an ID that only another
+//! state holds, or one a proposal edit both added and removed, can match again only through a
+//! random allocation picking it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::iter;
@@ -30,7 +32,7 @@ use super::request::{
     check_operation, check_writer, invalid, parse,
 };
 use super::state::{self, Operation};
-use super::types::Relationship;
+use super::types::{ProposalStatus, Relationship};
 use super::vault::{self, Model};
 use super::{Code, Refusal, ids, one_line};
 
@@ -142,8 +144,9 @@ pub fn claim(vault: &Path, input: &[u8], doing: &str) -> Result<Claim> {
         .map(|subject| resolve(&model, &relationships, subject))
         .collect::<Result<BTreeSet<String>>>()?;
     // Holding a module holds what is inside it, so claims on either side of a containment clash,
-    // in the target and inside every other proposal the new or existing claims hold.
-    for scope in iter::once(model).chain(involved(vault, &ledger.claims, &subjects)) {
+    // in the target and inside every other draft.
+    let target = model.proposal.as_ref().map(|p| p.id.clone());
+    for scope in iter::once(model).chain(drafts(vault, target.as_deref())?) {
         let up = containers(&scope);
         refuse_conflicts(
             &ledger.claims,
@@ -294,7 +297,8 @@ pub(super) fn check_edit(
         .with_details(json!({ "claim": id, "revoked": revoked }))
         .into());
     }
-    // Claims never overlap across writers when recorded; this guards a hand-edited ledger.
+    // Claims are checked for overlap when recorded, but a draft that did not load then, or a
+    // ledger or vault changed by hand, can leave two overlapping; the edit refuses anyway.
     refuse_conflicts(&ledger.claims, writer, affected, held_by)?;
     let missing: Vec<&String> = affected
         .iter()
@@ -327,7 +331,7 @@ fn resolve(
         return Ok(subject.to_owned());
     }
     let local = ids::local(id, subject);
-    if model.find_grouping(local).is_some() || vault::is_proposal(&model.dir, local) {
+    if model.find_grouping(local).is_some() || vault::is_proposal(&model.dir, local)? {
         return Ok(model.qualify(local));
     }
     match vault::find(id, &model.modules, subject) {
@@ -348,19 +352,32 @@ fn resolve(
     }
 }
 
-/// The proposals that `subjects` or an active claim hold, loaded, so
-/// a claim on a proposal and a claim on what it contains clash in any target. A proposal that
-/// does not load contains nothing to clash with.
-fn involved(vault: &Path, claims: &[Claim], subjects: &BTreeSet<String>) -> Vec<Model> {
-    let held = claims.iter().filter(|c| c.revoked.is_none());
-    let named: BTreeSet<&str> = (held.flat_map(|c| &c.subjects).chain(subjects))
-        .filter_map(|s| s.split_once('#').map(|(_, local)| local))
-        .filter(|local| vault::is_proposal(vault, local))
-        .collect();
-    named
-        .into_iter()
-        .filter_map(|id| vault::load_proposal(vault.to_path_buf(), id).ok())
-        .collect()
+/// Every draft proposal of the vault folder `vault` but the claim's target `skip`, loaded, so
+/// claims clash by the containment of any draft: a module inside another there, or anything
+/// inside the draft itself. Adopted and shelved proposals read only and are skipped, by the
+/// status their `proposal.json` records. A draft that does not load is skipped with a warning;
+/// an edit inside that draft refuses anyway.
+// ponytail: one draft load per draft per claim, under the lock; keep a containment index of
+// the drafts when vaults hold many large ones.
+fn drafts(vault: &Path, skip: Option<&str>) -> Result<Vec<Model>> {
+    let mut drafts = Vec::new();
+    for id in vault::proposals(vault)? {
+        if skip == Some(id.as_str()) {
+            continue;
+        }
+        let loaded = vault::read_proposal(vault, &id).and_then(|proposal| {
+            (proposal.status == ProposalStatus::Draft)
+                .then(|| vault::load_proposal(vault.to_path_buf(), &id))
+                .transpose()
+        });
+        match loaded {
+            Ok(draft) => drafts.extend(draft),
+            Err(error) => eprintln!(
+                "warning: proposal {id} does not load, so claims are not checked against it: {error:#}"
+            ),
+        }
+    }
+    Ok(drafts)
 }
 
 /// The container of each module, relationship and flow, by qualified ID: a module's parent, a

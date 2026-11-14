@@ -90,7 +90,8 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   would break `include.path` and per-repository signing setups. The ref moves by compare-and-swap
   with a reflog entry; a lost race or a held ref lock refuses `HISTORY_MOVED` and a retry builds on
   the new tip. The new commit's parent and the swap's old value are the tip the history was read
-  from, even a commit without checkpoint trailers. A vault file larger than the 4 MiB a checkpoint
+  from, even a commit without checkpoint trailers. Checkpoints restore the current state; drafts
+  travel with the committed vault, and publishing them is T17. A vault file larger than the 4 MiB a checkpoint
   reader accepts refuses `MODEL_INVALID` before anything is written. Retaining an unchanged model
   refuses `NOTHING_TO_RETAIN`. Trailers `Source` and `Operation` appear only when there is a value.
 - T7: `model retain` takes flags, not a request body. `--writer` defaults to the Git author name.
@@ -119,17 +120,27 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   the proposal, so its operation fingerprint differs from a current-state edit. Proposal IDs are
   local or qualified, never names.
 - T8: proposal loads validate like current-state loads (limits, references inside the proposal,
-  links, file and folder names) with one exception: an ID the current state retired after the
-  proposal was drawn does not stop it loading, since such a proposal refuses adoption anyway
-  (`PREDECESSOR_MOVED`). A planning model's manifest has `current: null`; a planning model with
-  module or collection files is `MODEL_INVALID`.
+  links, file and folder names) with one exception: they exempt every retired ID, so a proposal
+  holding one loads, and adoption checks the adopted state against the retired list again
+  (`MODEL_INVALID`). A planning model's manifest has `current: null`; the key is required, so a
+  manifest without it is `MODEL_INVALID`. A planning model with module or collection files is
+  `MODEL_INVALID`.
 - T8: drawing, editing, adopting and shelving are journaled writes through the edit journal. The
   journal record names its `scope` (current, a proposal, or an adoption covering both); older
   records default to the current state. `model propose`, `adopt` and `shelve` take flags like
-  `model retain`: `--writer` defaults to the Git author name, and without `--operation-id` a fresh
-  one is generated. Their fingerprints cover the kind, writer and arguments, not `--doing`. Every
+  `model retain`: `--writer` defaults to the Git author name, and `--operation-id` is required, as
+  for edits. Their fingerprints cover the kind, writer and arguments, not `--doing`. Under D4,
+  adoption names both revisions it read (`--expected-revision` for the current state,
+  `--expected-proposal-revision` for the proposal) and shelving names the proposal's
+  (`--expected-revision`, as `edit --proposal` names it). `model propose` takes no revision: the
+  draft records the predecessor it copied, adoption checks that predecessor again, and the
+  required proposal revision means whoever adopts has read the draft. Every
   write's paths are checked for linked folders before its record is journaled, so such a write
-  refuses without leaving a pending record. A proposal's `created` is Unix seconds, as a claim's.
+  refuses `MODEL_INVALID` with the folder in `details.path` without leaving a pending record; a
+  linked `proposals` folder refuses the same way before it is listed. A journal record may hold up
+  to 256 MiB, since a pending one carries every file its write makes; a larger one refuses
+  `MODEL_INVALID` before anything is written. `model recover` lists each finished write with its
+  `kind` and `scope`. A proposal's `created` is Unix seconds, as a claim's.
 - T8: a draft drawn from the current state has the current state and revision as predecessor; a
   copy of another proposal (`--from <id>`) inherits that proposal's predecessor, since adopting
   the copy would otherwise revert whatever the current state gained since its source was drawn.
@@ -140,21 +151,25 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   predecessor, or the folder's ID with an `error` when it does not read, so one broken proposal
   hides no other. `model read --proposal` shows a proposal's revision.
 - T8: new IDs are random 8-character base62, collision-checked against the state being edited
-  (the current state or the proposal), the retired list, and the proposal folder names; drawing a
-  proposal or adopting one also checks the current state's IDs, and adoption the proposal's. IDs
-  two proposals allocate are not checked against each other: adopting a state that clashes with
-  the model (a retired or duplicate ID) refuses `MODEL_INVALID`. Removing something inside a
-  proposal retires nothing.
+  (the current state or the proposal), the retired list, the proposal folder names, and in a
+  proposal its `dropped` list; drawing a proposal or adopting one also checks the current state's
+  IDs, and adoption the proposal's. A proposal edit reads no other state. IDs two proposals
+  allocate are not checked against each other: adopting a state that clashes with the model (a
+  retired or duplicate ID) refuses `MODEL_INVALID`. Removing something inside a proposal retires
+  nothing; an ID the proposal held before the edit goes on its `dropped` list instead, a copy of
+  a draft inherits the list, and adoption retires it with the rest. A `dropped` entry that is not
+  8 base62 characters is `MODEL_INVALID`.
   Adoption writes the proposal's files over the current state's (unchanged files are left alone),
   gives the state a fresh ID and the proposal's name, and retires every ID the old state held that
   the new one drops, the old state's ID included. The adopted proposal keeps its folder, reading
   only; its `adopted_as` names the new state. `model adopt` prints the current state's new
   `revision` beside the receipt, whose revisions cover both the state and the proposal.
 - T8: `model adopt` refuses `STALE_REVISION` when `--expected-revision` is not the current revision,
-  then `PREDECESSOR_MOVED` when the proposal was drawn against another; reconcile is T17. With
-  `--expected-proposal-revision` it also refuses `STALE_REVISION` when the proposal is at another
-  revision; agents should pass the proposal revision they compared, so a proposal edited after the
-  comparison is never adopted unseen. The flag is part of the fingerprint only when given. Edits,
+  then `PREDECESSOR_MOVED` when the proposal was drawn against another; reconcile is T17. It also
+  refuses `STALE_REVISION` when `--expected-proposal-revision` is not the proposal's revision, so
+  a proposal edited after the comparison is never adopted unseen. `model shelve` refuses
+  `STALE_REVISION` when its `--expected-revision` is not the proposal's. Each refusal names the
+  revision found in `details.current`. Edits,
   shelving and adoption of an adopted or shelved proposal refuse `PROPOSAL_CLOSED`. A
   current-state edit or claim in a planning model refuses `NO_CURRENT_STATE`.
 - T8: IDs are model-wide, so a claim on a module holds it in the current state and in every
@@ -162,8 +177,11 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   level and contains the root modules and collections, so a claim on the proposal holds all of it.
   A claim request's `target.state` may name a proposal, and its subjects then resolve there.
   Claims never overlap across targets: a new claim is checked against the containment of its
-  target and of every proposal it or another active claim holds, so a claim on a proposal and a
-  claim on a module it contains clash either way round. Adoption touches what an edit making the
+  target and of every draft, read by the status in each `proposal.json`, so a claim on a proposal
+  and a claim on a module it contains clash either way round, as do claims on two modules one of
+  which holds the other in any draft. Adopted and shelved proposals read only and contain nothing
+  for this check. A draft that does not load is skipped with a warning on stderr; an edit inside
+  that draft refuses anyway. Adoption touches what an edit making the
   same change would (the modules, relationships, collections and flows it adds, changes or
   removes, with their moves), plus the model ID and the proposal; shelving touches the proposal.
 - T8: `model compare` compares modules without their relationships, collections without their

@@ -29,6 +29,12 @@ const DONE: &str = "done";
 /// brief shared-lock probe, short enough that a held lock refuses promptly.
 const LOCK_WAIT: Duration = Duration::from_millis(250);
 const LOCK_RETRY: Duration = Duration::from_millis(10);
+/// The largest journal record. A pending record holds every file its write makes, so adopting a
+/// large proposal needs far more than a request's [`INPUT_MAX`].
+#[cfg(not(test))]
+const RECORD_MAX: u64 = 256 * 1024 * 1024;
+#[cfg(test)]
+const RECORD_MAX: u64 = 2 * INPUT_MAX;
 
 /// `<git dir>/boundrail` for the vault folder `vault`, which may not exist yet.
 pub(super) fn dir(vault: &Path) -> Result<PathBuf> {
@@ -85,6 +91,15 @@ pub(super) fn lock(vault: &Path) -> Result<Locked> {
 /// A state file parsed from JSON, `None` when it does not exist. A linked file or one larger
 /// than [`INPUT_MAX`] is refused rather than read.
 pub(super) fn read<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+    read_at_most(path, INPUT_MAX)
+}
+
+/// A journal record, as [`read`] reads a state file but up to [`RECORD_MAX`] bytes.
+pub(super) fn read_record<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+    read_at_most(path, RECORD_MAX)
+}
+
+fn read_at_most<T: DeserializeOwned>(path: &Path, max: u64) -> Result<Option<T>> {
     refuse_symlink(path)?;
     let file = match File::open(path) {
         Ok(file) => file,
@@ -92,12 +107,12 @@ pub(super) fn read<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
     let mut bytes = Vec::new();
-    file.take(INPUT_MAX + 1)
+    file.take(max + 1)
         .read_to_end(&mut bytes)
         .with_context(|| format!("reading {}", path.display()))?;
     ensure!(
-        bytes.len() as u64 <= INPUT_MAX,
-        "{} is larger than {INPUT_MAX} bytes",
+        bytes.len() as u64 <= max,
+        "{} is larger than {max} bytes",
         path.display()
     );
     serde_json::from_slice(&bytes)
@@ -107,13 +122,39 @@ pub(super) fn read<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
 
 /// Replaces a state file with `value` as pretty JSON, refusing one that [`read`] could not read.
 pub(super) fn write(path: &Path, value: &impl Serialize) -> Result<()> {
-    let text = serde_json::to_string_pretty(value)? + "\n";
+    let text = text(value)?;
     ensure!(
         text.len() as u64 <= INPUT_MAX,
         "{} would be larger than {INPUT_MAX} bytes",
         path.display()
     );
+    write_text(path, &text)
+}
+
+fn text(value: &impl Serialize) -> Result<String> {
+    Ok(serde_json::to_string_pretty(value)? + "\n")
+}
+
+fn write_text(path: &Path, text: &str) -> Result<()> {
     write_atomic(path, text.as_bytes()).with_context(|| format!("writing {}", path.display()))
+}
+
+/// `value` as a journal record's text, refusing `MODEL_INVALID` for one that [`read_record`]
+/// could not read back.
+fn record_text(value: &impl Serialize) -> Result<String> {
+    let text = text(value)?;
+    let size = text.len() as u64;
+    if size > RECORD_MAX {
+        return Err(Refusal::new(
+            Code::ModelInvalid,
+            format!(
+                "the write's journal record would be {size} bytes, more than the {RECORD_MAX} a record may hold"
+            ),
+        )
+        .with_details(json!({ "bytes": size, "max": RECORD_MAX }))
+        .into());
+    }
+    Ok(text)
 }
 
 /// The IDs of the operations waiting in the journal of `dir`, in order: records in the pending
@@ -162,9 +203,9 @@ pub(super) fn recorded(
     request: &impl Serialize,
 ) -> Result<(String, Option<Value>)> {
     let fingerprint = hash(&serde_json::to_vec(request)?);
-    let record = match read::<Value>(&done_path(dir, operation))? {
+    let record = match read_record::<Value>(&done_path(dir, operation))? {
         Some(record) => Some(record),
-        None => read::<Value>(&pending_path(dir, operation))?,
+        None => read_record::<Value>(&pending_path(dir, operation))?,
     };
     match record {
         Some(record) if record["request_sha256"] != fingerprint => Err(Refusal::new(
@@ -179,12 +220,13 @@ pub(super) fn recorded(
 
 /// Writes the pending record of `operation` and makes it durable before any vault file changes.
 pub(super) fn write_pending(dir: &Path, operation: &str, record: &impl Serialize) -> Result<()> {
+    let text = record_text(record)?;
     let folder = dir.join(OPERATIONS).join(PENDING);
     for path in [&dir.join(OPERATIONS), &folder] {
         refuse_symlink(path)?;
     }
     fs::create_dir_all(&folder).with_context(|| format!("creating {}", folder.display()))?;
-    write(&pending_path(dir, operation), record)?;
+    write_text(&pending_path(dir, operation), &text)?;
     // The folders may be new, so their entries in the parents are flushed too.
     for path in [&folder, &dir.join(OPERATIONS), dir] {
         sync_dir(path)?;
@@ -194,10 +236,11 @@ pub(super) fn write_pending(dir: &Path, operation: &str, record: &impl Serialize
 
 /// Writes the record of `operation` in `operations/` durably.
 pub(super) fn write_record(dir: &Path, operation: &str, record: &impl Serialize) -> Result<()> {
+    let text = record_text(record)?;
     let folder = dir.join(OPERATIONS);
     refuse_symlink(&folder)?;
     fs::create_dir_all(&folder).with_context(|| format!("creating {}", folder.display()))?;
-    write(&done_path(dir, operation), record)?;
+    write_text(&done_path(dir, operation), &text)?;
     sync_dir(&folder)?;
     sync_dir(dir)
 }
@@ -338,4 +381,37 @@ pub(super) fn refuse_interrupted(dir: &Path) -> Result<()> {
         .into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::collect::TempDir;
+
+    fn record(bytes: u64) -> Value {
+        json!({ "writes": "x".repeat(usize::try_from(bytes).unwrap()) })
+    }
+
+    #[test]
+    fn journal_records_hold_more_than_a_request_up_to_their_own_limit() {
+        let temp = TempDir::new("state-record").unwrap();
+        let dir = temp.path();
+        write_pending(dir, "large", &record(INPUT_MAX + 1)).unwrap();
+        let path = pending_path(dir, "large");
+        assert!(read::<Value>(&path).is_err());
+        assert_eq!(
+            read_record::<Value>(&path).unwrap(),
+            Some(record(INPUT_MAX + 1))
+        );
+
+        let error = write_pending(dir, "huge", &record(RECORD_MAX)).unwrap_err();
+        let refusal = error.downcast_ref::<Refusal>().expect("a refusal");
+        assert_eq!(refusal.code, Code::ModelInvalid);
+        let size = text(&record(RECORD_MAX)).unwrap().len();
+        assert!(
+            refusal.message.contains(&format!("{size} bytes")),
+            "{refusal}"
+        );
+        assert!(!pending_path(dir, "huge").exists());
+    }
 }

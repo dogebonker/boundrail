@@ -349,14 +349,14 @@ pub struct Interrupted {
 
 /// Applies `input`, an [`EditRequest`] as JSON, to the current state of the vault folder `vault`,
 /// or to the proposal with local or qualified ID `proposal`. A repeated operation returns its
-/// stored receipt, finishing it first when it was interrupted. The flag says whether this call
-/// finished an interrupted edit.
+/// stored receipt, finishing it first when it was interrupted; the scope is the interrupted
+/// record's when this call finished one.
 pub fn run(
     vault: &Path,
     input: &[u8],
     doing: &str,
     proposal: Option<&str>,
-) -> Result<(Receipt, bool)> {
+) -> Result<(Receipt, Option<Scope>)> {
     check_doing(doing)?;
     let request: EditRequest = parse(input, "edit")?;
     check_request(&request)?;
@@ -417,19 +417,22 @@ impl Plan {
 /// Runs the journaled write `operation` of `request`. A repeated operation returns its stored
 /// receipt, finishing it first when it was interrupted; otherwise `plan` plans it under the vault
 /// lock, given the request, the state folder and the request's SHA-256, and the plan is written
-/// through the journal. The flag says whether this call finished an interrupted write.
+/// through the journal. The scope is the record's when this call finished an interrupted write.
 pub(super) fn journaled<R: Serialize>(
     vault: &Path,
     operation: &str,
     request: R,
     plan: impl FnOnce(R, &Path, String) -> Result<Record>,
-) -> Result<(Receipt, bool)> {
+) -> Result<(Receipt, Option<Scope>)> {
     let journal = Journal::open(vault)?;
     let (fingerprint, record) = journal.read(operation, &request)?;
     if let Some(record) = record {
         return match record.status {
-            Status::Done => Ok((record.output, false)),
-            Status::Pending => complete(vault, &journal, record).map(|receipt| (receipt, true)),
+            Status::Done => Ok((record.output, None)),
+            Status::Pending => {
+                let scope = record.scope.clone();
+                complete(vault, &journal, record).map(|receipt| (receipt, Some(scope)))
+            }
             Status::Abandoned => Err(Refusal::new(
                 Code::OperationAbandoned,
                 "this operation was abandoned; plan the change again with a new operation_id",
@@ -466,18 +469,36 @@ pub(super) fn journaled<R: Serialize>(
     if std::env::var_os(STOP_AFTER_JOURNAL).is_some() {
         anyhow::bail!("stopped after writing the journal because {STOP_AFTER_JOURNAL} is set");
     }
-    apply(vault, &journal, record).map(|receipt| (receipt, false))
+    apply(vault, &journal, record).map(|receipt| (receipt, None))
 }
 
-/// Finishes every interrupted edit of the vault folder `vault` and returns their receipts. At
-/// most one can be pending, since `refuse_interrupted` stops new edits while one waits, so no
-/// record's `changed` check ever sees another record's writes.
-pub fn recover(vault: &Path) -> Result<Vec<Receipt>> {
+/// An interrupted write `model recover` finished: its kind, the vault files it covers, and its
+/// receipt.
+#[derive(Debug, Serialize)]
+pub struct Completed {
+    pub kind: String,
+    pub scope: Scope,
+    #[serde(flatten)]
+    pub receipt: Receipt,
+}
+
+/// Finishes every interrupted write of the vault folder `vault`. At most one can be pending,
+/// since `refuse_interrupted` stops new writes while one waits, so no record's `changed` check
+/// ever sees another record's writes.
+pub fn recover(vault: &Path) -> Result<Vec<Completed>> {
     let journal = Journal::open(vault)?;
     journal
         .pending()?
         .into_iter()
-        .map(|record| complete(vault, &journal, record))
+        .map(|record| {
+            let (kind, scope) = (record.kind.clone(), record.scope.clone());
+            let receipt = complete(vault, &journal, record)?;
+            Ok(Completed {
+                kind,
+                scope,
+                receipt,
+            })
+        })
         .collect()
 }
 
@@ -487,7 +508,7 @@ pub fn abandon(vault: &Path, operation: &str) -> Result<Abandoned> {
     let journal = Journal::open(vault)?;
     let dir = &journal.state.dir;
     let record = if state::pending(dir)?.iter().any(|p| p == operation) {
-        state::read::<Record>(&state::pending_path(dir, operation))?
+        state::read_record::<Record>(&state::pending_path(dir, operation))?
     } else {
         None
     };
@@ -564,7 +585,8 @@ fn check_target(model: &Model, request: &EditRequest) -> Result<()> {
 
 /// Applies the batch in memory, validates the result and plans its writes as a pending record,
 /// returned with the subjects a claim must cover and the modules that move. A proposal retires
-/// nothing: what it drops is retired when it is adopted.
+/// nothing: it adds the IDs it removes to its `dropped` list, and adoption retires what the
+/// adopted state drops.
 fn plan(
     model: &Model,
     request: EditRequest,
@@ -577,14 +599,23 @@ fn plan(
         changes,
         ..
     } = request;
-    let mut batch = Batch::new(model);
+    let mut batch = Batch::new(model)?;
     for (index, change) in changes.into_iter().enumerate() {
         batch.apply(index, change)?;
     }
     batch.finish()?;
     let diff = diff(model, &batch.modules, &batch.collections, &batch.fresh);
 
-    let drawn = model.proposal.as_ref();
+    // A proposal keeps the IDs it held before the batch and removes, so it never allocates
+    // them again; IDs the batch both allocates and removes were never written.
+    let drawn = model.proposal.clone().map(|mut drawn| {
+        let removed = diff.retired.iter().filter(|id| !batch.fresh.contains(id));
+        drawn.dropped.extend(removed.cloned());
+        drawn.dropped.sort();
+        drawn.dropped.dedup();
+        drawn
+    });
+    let drawn = drawn.as_ref();
     let retired = if drawn.is_none() {
         diff.retired.as_slice()
     } else {
@@ -609,10 +640,13 @@ fn plan(
     let manifest = (!retired.is_empty()).then_some(&manifest);
     let writes = vault::plan_writes(manifest, &diff.write, &diff.write_collections, &diff.remove)?;
     let (scope, writes) = match drawn {
-        Some(p) => (
-            Scope::Proposal(p.id.clone()),
-            vault::in_proposal(&p.id, writes),
-        ),
+        Some(p) => {
+            let mut writes = vault::in_proposal(&p.id, writes);
+            if model.proposal.as_ref() != Some(p) {
+                writes.push(vault::proposal_write(p)?);
+            }
+            (Scope::Proposal(p.id.clone()), writes)
+        }
         None => (Scope::Current, writes),
     };
     let plan = Plan {
@@ -806,7 +840,9 @@ pub(super) fn diff<'a>(
     // and target of each relationship added, changed, moved or removed. So is every module whose
     // current or former name an added or renamed module takes, since the name would then stop
     // naming it alone. Collections and flows are touched as `flow::diff_collections` says. IDs
-    // this batch allocates are left out: nobody could have claimed them.
+    // this batch allocates are left out: allocation skips every ID the edited state holds or
+    // reserves, so a claim holds one only by a random clash with an ID that only another state
+    // holds (a proposal's, or for a proposal edit the current state's).
     let module_ids: BTreeSet<&str> = old_modules
         .keys()
         .chain(new_modules.keys())
@@ -900,7 +936,8 @@ struct Batch<'a> {
     removed: BTreeSet<String>,
     /// Local IDs of relationships the batch removed or gave another source or target.
     moved: BTreeSet<String>,
-    /// Every ID the model holds or retired, and those allocated so far, in ASCII lowercase.
+    /// Every ID the model holds or reserves, every proposal folder's name, and those allocated
+    /// so far, in ASCII lowercase.
     taken: BTreeSet<String>,
     fresh: Vec<String>,
     allocated: Vec<Allocation>,
@@ -911,9 +948,9 @@ struct Batch<'a> {
 }
 
 impl<'a> Batch<'a> {
-    fn new(model: &'a Model) -> Self {
-        let taken = model.ids().map(str::to_ascii_lowercase).collect();
-        Self {
+    fn new(model: &'a Model) -> Result<Self> {
+        let taken = proposal::taken(&model.dir, &[model])?;
+        Ok(Self {
             model: &model.manifest.id,
             modules: model.modules.clone(),
             collections: model.collections.clone(),
@@ -924,7 +961,7 @@ impl<'a> Batch<'a> {
             allocated: Vec::new(),
             edited: BTreeSet::new(),
             touched: BTreeMap::new(),
-        }
+        })
     }
 
     fn apply(&mut self, index: usize, change: Change) -> Result<()> {
@@ -1399,7 +1436,7 @@ impl Journal {
         let dir = &self.state.dir;
         let mut pending = Vec::new();
         for operation in state::pending(dir)? {
-            if let Some(record) = state::read(&state::pending_path(dir, &operation))? {
+            if let Some(record) = state::read_record(&state::pending_path(dir, &operation))? {
                 pending.push(record);
             }
         }
@@ -1413,5 +1450,54 @@ impl Journal {
 
     fn finish(&self, record: &Record) -> Result<()> {
         state::finish(&self.state.dir, &record.output.operation_id, record)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arch::types::{Manifest, Predecessor, Proposal, ProposalStatus, State, VaultConfig};
+    use crate::collect::TempDir;
+
+    #[test]
+    fn a_proposal_edit_never_allocates_an_id_it_dropped_or_a_proposal_folder_name() {
+        let temp = TempDir::new("edit-taken").unwrap();
+        std::fs::create_dir_all(temp.path().join("proposals/Folder01")).unwrap();
+        let model = Model {
+            dir: temp.path().to_path_buf(),
+            manifest: Manifest {
+                schema_version: SCHEMA_VERSION,
+                id: "ModelId1".to_owned(),
+                name: "Shop".to_owned(),
+                current: Some(State {
+                    id: "State001".to_owned(),
+                    name: "Current".to_owned(),
+                }),
+                retired_ids: vec!["Retired1".to_owned()],
+            },
+            config: VaultConfig::default(),
+            modules: Vec::new(),
+            collections: Vec::new(),
+            revision: revision::of(iter::empty()),
+            // After the proposal removed Billing, which its predecessor holds.
+            proposal: Some(Proposal {
+                schema_version: SCHEMA_VERSION,
+                id: "Propose1".to_owned(),
+                name: "Next".to_owned(),
+                description: None,
+                status: ProposalStatus::Draft,
+                predecessor: Predecessor {
+                    state: Some("State001".to_owned()),
+                    revision: String::new(),
+                },
+                created: 0,
+                adopted_as: None,
+                dropped: vec!["Billing1".to_owned()],
+            }),
+        };
+        let batch = Batch::new(&model).unwrap();
+        for id in ["billing1", "retired1", "folder01", "propose1", "modelid1"] {
+            assert!(batch.taken.contains(id), "{id} is free: {:?}", batch.taken);
+        }
     }
 }
