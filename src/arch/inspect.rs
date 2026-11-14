@@ -10,7 +10,8 @@ use serde::Serialize;
 
 use super::code::{self, NoScan, Ownership, SkipReason};
 use super::index::Index;
-use super::types::Module;
+use super::infra::Infra;
+use super::types::{Evidence, Module};
 use crate::model::Document;
 use crate::surface::{SymbolExport, Symbols as SymbolData};
 
@@ -46,6 +47,22 @@ pub struct Interface {
     pub deep_imports: Vec<DeepImport>,
     pub incoming: Vec<Neighbour>,
     pub outgoing: Vec<Neighbour>,
+    /// Infrastructure hops from other modules into this one.
+    pub hops_in: Vec<HopEntry>,
+    /// Infrastructure hops from this module to others.
+    pub hops_out: Vec<HopEntry>,
+}
+
+/// A configured address or build dependency joining a module with one other module.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct HopEntry {
+    /// The other module.
+    pub module: String,
+    pub evidence: Evidence,
+    pub file: String,
+    pub line: usize,
+    pub variable: String,
+    pub address: String,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -78,17 +95,18 @@ pub struct Neighbour {
 }
 
 /// The interface of every module of `modules`, or of `subject` alone (a qualified ID), against
-/// the checkout at `root` and its scan.
+/// the checkout at `root`, its scan and its infrastructure.
 pub fn inspect(
     model: &str,
     modules: &[Module],
     root: &Path,
     scan: Result<&Document, NoScan>,
+    infra: &Infra,
     subject: Option<&str>,
 ) -> InspectReport {
     let index = Index::new(model, modules);
     let doc = scan.as_ref().ok().copied();
-    let own = code::ownership(&index, root, scan);
+    let own = code::ownership(&index, root, scan, infra);
     let grouped = Grouped::new(&own, doc);
     let uses = doc.and_then(|d| Some(Uses::new(d.symbols.as_ref()?, d)));
     let mut report = InspectReport::default();
@@ -152,7 +170,28 @@ fn interface(
             .collect(),
         incoming: neighbours(&grouped.incoming, false),
         outgoing: neighbours(&grouped.outgoing, true),
+        hops_in: hops(own, id, false),
+        hops_out: hops(own, id, true),
     }
+}
+
+/// The hops from (`outgoing`) or into module `id`, sorted.
+fn hops(own: &Ownership<'_>, id: &str, outgoing: bool) -> Vec<HopEntry> {
+    let mut found: Vec<HopEntry> = (own.hops.iter())
+        .filter_map(|(from, to, hop)| {
+            let (here, other) = if outgoing { (from, to) } else { (to, from) };
+            (here == id).then(|| HopEntry {
+                module: other.clone(),
+                evidence: hop.evidence,
+                file: hop.file.clone(),
+                line: hop.line,
+                variable: hop.variable.clone(),
+                address: hop.address.clone(),
+            })
+        })
+        .collect();
+    found.sort();
+    found
 }
 
 /// The scan's facts grouped by owning module, each built in one pass.
@@ -361,7 +400,7 @@ mod tests {
         let mut modules = shop().to_vec();
         link(&mut modules[1], "WebBill1", "Billing", "call");
         modules.push(module("Loose", None, None));
-        let report = inspect(M, &modules, dir.path(), Ok(&doc), None);
+        let report = inspect(M, &modules, dir.path(), Ok(&doc), &Infra::default(), None);
 
         let billing = of(&report, "Billing");
         assert_eq!(billing.files, 2);
@@ -408,7 +447,14 @@ mod tests {
         let (dir, mut doc) = checkout();
         let modules = shop();
         let only = q("Bank");
-        let report = inspect(M, &modules, dir.path(), Ok(&doc), Some(&only));
+        let report = inspect(
+            M,
+            &modules,
+            dir.path(),
+            Ok(&doc),
+            &Infra::default(),
+            Some(&only),
+        );
         assert_eq!(report.modules.len(), 1);
         // Billing's charge imports Bank's index with no symbol import: a use of all it exports.
         let expected = Symbols {
@@ -421,7 +467,14 @@ mod tests {
         // A limitation naming no file makes coverage incomplete: candidates are withheld.
         let symbols = doc.symbols.as_mut().unwrap();
         symbols.limitations = vec!["CommonJS export surfaces are not indexed.".into()];
-        let report = inspect(M, &modules, dir.path(), Ok(&doc), Some(&only));
+        let report = inspect(
+            M,
+            &modules,
+            dir.path(),
+            Ok(&doc),
+            &Infra::default(),
+            Some(&only),
+        );
         let symbols = report.modules[0].symbols.as_ref().unwrap();
         assert_eq!(
             (symbols.exported, symbols.used, &symbols.unused),
@@ -429,21 +482,42 @@ mod tests {
         );
 
         doc.symbols.as_mut().unwrap().limitations = vec!["bank/index.ts: CommonJS".into()];
-        let report = inspect(M, &modules, dir.path(), Ok(&doc), Some(&only));
+        let report = inspect(
+            M,
+            &modules,
+            dir.path(),
+            Ok(&doc),
+            &Infra::default(),
+            Some(&only),
+        );
         assert_eq!(
             report.modules[0].symbols_skipped,
             Some(SkipReason::SymbolsIncomplete)
         );
 
         doc.symbols = None;
-        let report = inspect(M, &modules, dir.path(), Ok(&doc), Some(&only));
+        let report = inspect(
+            M,
+            &modules,
+            dir.path(),
+            Ok(&doc),
+            &Infra::default(),
+            Some(&only),
+        );
         assert_eq!(report.modules[0].symbols, None);
         assert_eq!(
             report.modules[0].symbols_skipped,
             Some(SkipReason::LanguageUnsupported)
         );
 
-        let report = inspect(M, &modules, dir.path(), Err(NoScan::NotNeeded), None);
+        let report = inspect(
+            M,
+            &modules,
+            dir.path(),
+            Err(NoScan::NotNeeded),
+            &Infra::default(),
+            None,
+        );
         assert!(report.modules.is_empty());
         assert!(
             report

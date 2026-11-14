@@ -11,8 +11,9 @@ use serde::Serialize;
 
 use super::diagnostic::{Diagnostic, DiagnosticCode};
 use super::index::{Index, Line};
+use super::infra::{self, Hop, Infra, Joined, Unit};
 use super::segments;
-use super::types::{EXTERNAL_KIND, Evidence, Module, VaultConfig};
+use super::types::{Binding, EXTERNAL_KIND, Evidence, Module, VaultConfig};
 use super::vault::parse_message;
 use crate::model::{Document, Edge, EdgeKind, Language};
 use crate::modules::dir_of;
@@ -42,6 +43,8 @@ pub enum SkipReason {
     NotScanned,
     /// The path exists but the scan failed.
     ScanFailed,
+    /// No module binds the infrastructure unit.
+    InfraUnbound,
 }
 
 impl SkipReason {
@@ -58,6 +61,7 @@ impl SkipReason {
             Self::SymbolBinding => "symbol-binding",
             Self::NotScanned => "not-scanned",
             Self::ScanFailed => "scan-failed",
+            Self::InfraUnbound => "infra-unbound",
         }
     }
 }
@@ -93,6 +97,19 @@ pub struct Skip {
 pub struct CodeReport {
     pub diagnostics: Vec<Diagnostic>,
     pub skips: Vec<Skip>,
+    /// Every infrastructure unit found, with the module it maps to.
+    pub units: Vec<UnitStatus>,
+}
+
+/// An infrastructure unit and the module it maps to.
+#[derive(Debug, Serialize)]
+pub struct UnitStatus {
+    #[serde(flatten)]
+    pub unit: Unit,
+    /// The module bound to it, else the owner of the directory a compose service builds from.
+    pub owner: Option<String>,
+    /// `infra-unbound` when no module owns it.
+    pub reason: Option<SkipReason>,
 }
 
 impl CodeReport {
@@ -110,10 +127,55 @@ impl CodeReport {
     }
 }
 
-/// Whether evidence of this kind is collected. Import edges stand in for call evidence until
-/// language-server references arrive.
-fn collected(evidence: Evidence) -> bool {
-    matches!(evidence, Evidence::Import | Evidence::Call)
+/// Which evidence is collected for which modules.
+struct Collected<'i> {
+    /// The modules holding an infrastructure unit, and the modules containing them.
+    configured: HashSet<&'i str>,
+    /// The modules holding a workspace package folder, and the modules containing them.
+    build: HashSet<&'i str>,
+    /// The modules bound to a unit, which hold no code.
+    units: HashSet<&'i str>,
+}
+
+impl<'i> Collected<'i> {
+    fn new(index: &'i Index<'_>, joined: &Joined<'i, '_>) -> Self {
+        let held = |owners: &[&'i str]| -> HashSet<&'i str> {
+            (owners.iter())
+                .flat_map(|&owner| index.chain(owner))
+                .collect()
+        };
+        let units: Vec<&str> = joined.owners.iter().flatten().copied().collect();
+        Self {
+            configured: held(&units),
+            build: held(&joined.packages),
+            units: (index.by_id.iter())
+                .filter(|(_, m)| m.binding.as_ref().is_some_and(infra::is_unit_binding))
+                .map(|(id, _)| id.as_str())
+                .collect(),
+        }
+    }
+
+    /// The kinds of `accepted` that apply to `line`: code evidence never applies to a module
+    /// bound to a unit.
+    fn applicable(&self, accepted: &[Evidence], line: &Line<'_>) -> Vec<Evidence> {
+        let unit = self.units.contains(line.from.as_str()) || self.units.contains(line.to);
+        (accepted.iter().copied())
+            .filter(|e| !(unit && matches!(e, Evidence::Call | Evidence::Import)))
+            .collect()
+    }
+
+    /// Whether evidence of this kind is collected for a relationship from `from` to `to`.
+    /// Import edges stand in for call evidence until language-server references arrive;
+    /// configured paths are collected between modules holding units, and build dependencies
+    /// between modules holding workspace packages.
+    fn holds(&self, evidence: Evidence, from: &str, to: &str) -> bool {
+        let both = |set: &HashSet<&str>| set.contains(from) && set.contains(to);
+        match evidence {
+            Evidence::Import | Evidence::Call => true,
+            Evidence::ConfiguredPath => both(&self.configured),
+            Evidence::BuildDependency => both(&self.build),
+        }
+    }
 }
 
 /// Why the check runs without a scan.
@@ -125,13 +187,15 @@ pub enum NoScan {
     Failed(String),
 }
 
-/// Whether a binding of a module that is not external, or any anchor, names an existing path of
-/// this repository under `root`: without one there is no code to compare, so no scan is needed.
+/// Whether a binding of a module that is not external, other than to an infrastructure unit,
+/// or any anchor, names an existing path of this repository under `root`: without one there is
+/// no code to compare, so no scan is needed.
 pub fn needs_scan(modules: &[Module], root: &Path) -> bool {
     let bindings = modules
         .iter()
         .filter(|m| m.kind != EXTERNAL_KIND)
         .filter_map(|m| m.binding.as_ref())
+        .filter(|b| !infra::is_unit_binding(b))
         .map(|b| (&b.repo, &b.path));
     let anchors = modules
         .iter()
@@ -143,24 +207,30 @@ pub fn needs_scan(modules: &[Module], root: &Path) -> bool {
         .any(|(repo, path)| repo.is_none() && root.join(path).exists())
 }
 
-/// Every code diagnostic of model `model` against the checkout at `root` and its scan, sorted,
-/// with what was not judged. Without a scan, existing paths are skipped as `not-scanned`, or as
-/// `scan-failed` with a `SCAN_FAILED` warning. The modules must have loaded, so parents and
-/// targets exist and containment has no cycle.
+/// Every code diagnostic of model `model` against the checkout at `root`, its scan and its
+/// infrastructure, sorted, with what was not judged. Without a scan, existing paths are skipped
+/// as `not-scanned`, or as `scan-failed` with a `SCAN_FAILED` warning. The modules must have
+/// loaded, so parents and targets exist and containment has no cycle.
 pub fn check(
     model: &str,
     modules: &[Module],
     config: &VaultConfig,
     root: &Path,
     scan: Result<&Document, NoScan>,
+    infra: &Infra,
 ) -> CodeReport {
     let index = Index::new(model, modules);
     let (scan, failure) = Scan::of(scan);
     let mut report = CodeReport::default();
-    let status = bindings(&index, root, &scan, &mut report);
+    let status = bindings(&index, root, &scan, infra, &mut report);
     anchors(&index, root, &scan, &mut report);
-    let pairs = Pairs::new(&index, &scan, &owners(&status));
-    let backwards = relationships(&index, config, &status, &pairs, &mut report);
+    let paths = path_owners(&status);
+    let joined = joined(&index, &status, infra, &paths);
+    let pairs = Pairs::new(&index, &scan, &owners(&status, &paths), &joined.hops);
+    let collected = Collected::new(&index, &joined);
+    report.units = unit_statuses(infra, &joined.owners);
+    let judged = (&status, &pairs, &collected);
+    let backwards = relationships(&index, config, judged, &mut report);
     undrawn(&index, &pairs, &backwards, &mut report);
     entry_points(&index, &scan, &status, &mut report);
     if let Some(error) = failure {
@@ -183,6 +253,8 @@ pub(super) struct Ownership<'d> {
     pub(super) deep: Vec<(String, &'d Edge)>,
     /// Files a symbol limitation names.
     pub(super) limited: HashSet<&'d str>,
+    /// Infrastructure hops between two modules, as (source, target, hop).
+    pub(super) hops: Vec<(String, String, &'d Hop)>,
 }
 
 /// The code check's mapping of the modules of `index` to the code under `root`, without judging
@@ -191,10 +263,15 @@ pub(super) fn ownership<'d>(
     index: &Index<'_>,
     root: &Path,
     scan: Result<&'d Document, NoScan>,
+    infra: &'d Infra,
 ) -> Ownership<'d> {
     let (scan, _) = Scan::of(scan);
-    let status = bindings(index, root, &scan, &mut CodeReport::default());
-    let owners = owners(&status)
+    let status = bindings(index, root, &scan, infra, &mut CodeReport::default());
+    let paths = path_owners(&status);
+    let hops = (joined(index, &status, infra, &paths).hops.into_iter())
+        .map(|(from, to, hop)| (from.to_owned(), to.to_owned(), hop))
+        .collect();
+    let owners = owners(&status, &paths)
         .into_iter()
         .map(|(file, id)| (file.to_owned(), id.to_owned()))
         .collect();
@@ -221,18 +298,19 @@ pub(super) fn ownership<'d>(
         entries,
         deep,
         limited: scan.limited.clone(),
+        hops,
     }
 }
 
 /// The modules whose binding alone maps paths to them, without a scan, by qualified ID with
 /// their normalized paths: those bound in this repository that are not external, less those
-/// [`symbol_bound`] leaves out.
+/// bound to an infrastructure unit and those [`symbol_bound`] leaves out.
 pub(super) fn bound_paths(model: &str, modules: &[Module]) -> BTreeMap<String, String> {
     let bound: Vec<(String, String, bool)> = modules
         .iter()
         .filter(|m| m.kind != EXTERNAL_KIND)
         .filter_map(|m| Some((m, m.binding.as_ref()?)))
-        .filter(|(_, b)| b.repo.is_none())
+        .filter(|(_, b)| b.repo.is_none() && !infra::is_unit_binding(b))
         .map(|(m, b)| {
             let id = super::ids::qualify(model, &m.id);
             (id, segments(&b.path).join("/"), b.symbol.is_some())
@@ -549,6 +627,7 @@ fn bindings<'i, 's, 'd>(
     index: &'i Index<'_>,
     root: &Path,
     scan: &'s Scan<'d>,
+    infra: &Infra,
     report: &mut CodeReport,
 ) -> Status<'i, 's, 'd> {
     let mut status = BTreeMap::new();
@@ -557,6 +636,9 @@ fn bindings<'i, 's, 'd>(
         let found = match &module.binding {
             _ if module.kind == EXTERNAL_KIND => Err(SkipReason::External),
             None => Err(SkipReason::Unbound),
+            Some(binding) if infra::is_unit_binding(binding) => {
+                unit_binding(id, &module.name, binding, root, infra, report)
+            }
             Some(binding) => Site {
                 site: SkipSite::Binding,
                 subject: id,
@@ -579,14 +661,55 @@ fn bindings<'i, 's, 'd>(
     status
 }
 
+/// `BINDING_PATH_MISSING` and `BINDING_SYMBOL_MISSING` of a module bound to an infrastructure
+/// unit: the file must exist and its folder declare the unit. The module owns no scanned file.
+fn unit_binding<'s, 'd>(
+    subject: &str,
+    name: &str,
+    binding: &Binding,
+    root: &Path,
+    infra: &Infra,
+    report: &mut CodeReport,
+) -> Result<Found<'s, 'd>, SkipReason> {
+    let path = &binding.path;
+    if !root.join(path).is_file() {
+        let message = format!("{name} is bound to {path}, which does not exist");
+        report.warn(
+            DiagnosticCode::BindingPathMissing,
+            vec![subject.to_owned()],
+            message,
+        );
+        report.skip(SkipSite::Binding, subject, SkipReason::PathMissing);
+        return Err(SkipReason::PathMissing);
+    }
+    if infra.bound(binding).is_none() {
+        let symbol = binding.symbol.as_deref().unwrap_or_default();
+        let message =
+            format!("{name} is bound to {path} {symbol}, but no unit there is named {symbol}");
+        report.warn(
+            DiagnosticCode::BindingSymbolMissing,
+            vec![subject.to_owned()],
+            message,
+        );
+    }
+    Ok(Found {
+        files: &[],
+        dir: false,
+        path: segments(path).join("/"),
+    })
+}
+
 /// Marks `symbol-binding` the modules bound with a symbol to a path another bound module holds:
-/// they stand for part of that code, so they own no file of it.
+/// they stand for part of that code, so they own no file of it. Units are not code: modules
+/// bound to units of one file stay judged.
 fn symbol_bindings(index: &Index<'_>, status: &mut Status<'_, '_, '_>) {
     let bound: Vec<(&str, &str, bool)> = (status.iter())
         .filter_map(|(&id, found)| {
-            let symbol = (index.by_id.get(id))
-                .and_then(|m| m.binding.as_ref())
-                .is_some_and(|b| b.symbol.is_some());
+            let binding = index.by_id.get(id).and_then(|m| m.binding.as_ref());
+            if binding.is_some_and(infra::is_unit_binding) {
+                return None;
+            }
+            let symbol = binding.is_some_and(|b| b.symbol.is_some());
             Some((id, found.as_ref().ok()?.path.as_str(), symbol))
         })
         .collect();
@@ -623,69 +746,119 @@ fn anchors(index: &Index<'_>, root: &Path, scan: &Scan<'_>, report: &mut CodeRep
     }
 }
 
+/// The judged modules as owners of the paths their bindings hold.
+fn path_owners<'i, 'p>(status: &'p Status<'i, '_, '_>) -> PathOwners<'i, 'p> {
+    PathOwners::new(
+        (status.iter()).filter_map(|(&id, found)| Some((id, found.as_ref().ok()?.path.as_str()))),
+    )
+}
+
 /// Each scanned file's owner: the deepest judged module whose binding encloses it. Modules
 /// bound to one path without a symbol share its files with the first by ID; the semantic check
 /// reports them as `BINDING_SHARED`.
-fn owners<'i, 'd>(status: &Status<'i, '_, 'd>) -> HashMap<&'d str, &'i str> {
-    let paths = PathOwners::new(
-        (status.iter()).filter_map(|(&id, found)| Some((id, found.as_ref().ok()?.path.as_str()))),
-    );
+fn owners<'i, 'd>(
+    status: &Status<'i, '_, 'd>,
+    paths: &PathOwners<'i, '_>,
+) -> HashMap<&'d str, &'i str> {
     (status.values().flatten())
         .flat_map(|found| found.files.iter().copied())
         .filter_map(|file| Some((file, paths.owner(file)?)))
         .collect()
 }
 
-/// The modules code edges join, through the written target of each edge.
-struct Pairs<'i, 'd> {
-    /// Ordered pairs of different owners joined by a runtime edge, with the first one.
-    runtime: BTreeMap<(&'i str, &'i str), &'d Edge>,
-    /// Pairs of those owners or their ancestors joined by a runtime edge, and by any edge.
-    runtime_reach: HashSet<(&'i str, &'i str)>,
-    any_reach: HashSet<(&'i str, &'i str)>,
+/// The infrastructure as judged modules: units belong to the modules bound to them, else to
+/// the owner of the directory a compose service builds from; folders to their owners.
+fn joined<'i, 'x>(
+    index: &Index<'_>,
+    status: &Status<'i, '_, '_>,
+    infra: &'x Infra,
+    paths: &PathOwners<'i, '_>,
+) -> Joined<'i, 'x> {
+    let bound = (status.iter())
+        .filter(|(_, found)| found.is_ok())
+        .filter_map(|(&id, _)| Some((id, index.by_id.get(id)?.binding.as_ref()?)));
+    infra.join(bound, |dir| paths.owner(dir))
 }
 
-impl<'i, 'd> Pairs<'i, 'd> {
-    fn new(index: &'i Index<'_>, scan: &Scan<'d>, owners: &HashMap<&'d str, &'i str>) -> Self {
-        let mut joined: HashMap<(&str, &str), bool> = HashMap::new();
+/// Every unit with its owner, or `infra-unbound`.
+fn unit_statuses(infra: &Infra, owners: &[Option<&str>]) -> Vec<UnitStatus> {
+    (infra.units.iter().zip(owners))
+        .map(|(unit, owner)| UnitStatus {
+            unit: unit.clone(),
+            owner: owner.map(str::to_owned),
+            reason: owner.is_none().then_some(SkipReason::InfraUnbound),
+        })
+        .collect()
+}
+
+/// The modules code edges and infrastructure hops join, through the written target of each
+/// edge.
+struct Pairs<'i, 'd, 'x> {
+    /// Ordered pairs of different owners joined by a runtime edge, with the first one.
+    runtime: BTreeMap<(&'i str, &'i str), &'d Edge>,
+    /// Ordered pairs of different owners joined by a configured hop, with the first one.
+    configured: BTreeMap<(&'i str, &'i str), &'x Hop>,
+    /// Pairs of those owners or their ancestors with the evidence joining them: `import` for
+    /// any edge, `call` for a runtime edge, and each hop's own evidence.
+    reach: HashSet<(Evidence, &'i str, &'i str)>,
+}
+
+impl<'i, 'd, 'x> Pairs<'i, 'd, 'x> {
+    fn new(
+        index: &'i Index<'_>,
+        scan: &Scan<'d>,
+        owners: &HashMap<&'d str, &'i str>,
+        hops: &[(&'i str, &'i str, &'x Hop)],
+    ) -> Self {
+        let mut joined = HashSet::new();
         let mut pairs = Self {
             runtime: BTreeMap::new(),
-            runtime_reach: HashSet::new(),
-            any_reach: HashSet::new(),
+            configured: BTreeMap::new(),
+            reach: HashSet::new(),
         };
         for (from, to, edge) in owner_pairs(scan.edges, |f| owners.get(f).copied()) {
-            *joined.entry((from, to)).or_default() |= runtime(edge);
+            joined.insert((Evidence::Import, from, to));
             if runtime(edge) {
+                joined.insert((Evidence::Call, from, to));
                 pairs.runtime.entry((from, to)).or_insert(edge);
             }
         }
-        for ((from, to), runtime) in joined {
+        for &(from, to, hop) in hops {
+            joined.insert((hop.evidence, from, to));
+            if hop.evidence == Evidence::ConfiguredPath {
+                pairs.configured.entry((from, to)).or_insert(hop);
+            }
+        }
+        for (evidence, from, to) in joined {
             let targets = index.chain(to);
             for above in index.chain(from) {
-                for &below in &targets {
-                    pairs.any_reach.insert((above, below));
-                    if runtime {
-                        pairs.runtime_reach.insert((above, below));
-                    }
-                }
+                (pairs.reach).extend(targets.iter().map(|&below| (evidence, above, below)));
             }
         }
         pairs
     }
+
+    /// Whether evidence of a kind in `accepted` joins `from` or a part of it to `to` or a part
+    /// of it.
+    fn holds(&self, accepted: &[Evidence], from: &str, to: &str) -> bool {
+        (accepted.iter()).any(|&evidence| self.reach.contains(&(evidence, from, to)))
+    }
 }
 
-/// `RELATIONSHIP_UNSUPPORTED`, or `RELATIONSHIP_BACKWARDS` when the code only runs the other
-/// way, for relationships whose kind's evidence is all collected. Returns the backwards lines.
+/// `RELATIONSHIP_UNSUPPORTED`, or `RELATIONSHIP_BACKWARDS` when the evidence only runs the
+/// other way, for relationships whose kind's evidence is all collected. Returns the backwards
+/// lines.
 fn relationships<'i>(
     index: &'i Index<'_>,
     config: &VaultConfig,
-    status: &Status<'_, '_, '_>,
-    pairs: &Pairs<'_, '_>,
+    judged: Judged<'_, '_>,
     report: &mut CodeReport,
 ) -> HashSet<(&'i str, &'i str)> {
+    let (_, pairs, collected) = judged;
     let mut backwards = HashSet::new();
     for line in &index.lines {
-        let code = match verdict(line, config, status, pairs) {
+        let evidence = collected.applicable(accepted(config, line.kind), line);
+        let code = match verdict(line, &evidence, judged) {
             Ok(Some(code)) => code,
             Ok(None) => continue,
             Err(reason) => {
@@ -693,62 +866,108 @@ fn relationships<'i>(
                 continue;
             }
         };
-        let (from, to, kind) = (index.name(&line.from), index.name(line.to), line.kind);
-        let message = if code == DiagnosticCode::RelationshipBackwards {
+        if code == DiagnosticCode::RelationshipBackwards {
             backwards.insert((line.from.as_str(), line.to));
-            format!("{from} -> {to} [{kind}] runs backwards: only {to} imports {from}")
-        } else {
-            format!("{from} -> {to} [{kind}] has no code evidence: {from} never imports {to}")
-        };
+        }
+        let message = unsupported(index, line, &evidence, code, pairs);
         report.warn(code, vec![line.id.clone()], message);
     }
     backwards
 }
 
-/// The diagnostic a relationship earns, if any, or why it is not judged. Type-only edges count
-/// only for kinds that accept import evidence.
+/// What relationships are judged against: each module's status, the pairs evidence joins and
+/// where evidence is collected.
+type Judged<'s, 'i> = (
+    &'s Status<'i, 's, 's>,
+    &'s Pairs<'i, 's, 's>,
+    &'s Collected<'i>,
+);
+
+/// The evidence kinds that support relationships of `kind`.
+fn accepted<'c>(config: &'c VaultConfig, kind: &str) -> &'c [Evidence] {
+    (config.relationship_kinds.get(kind)).map_or(&[], |k| k.evidence.as_slice())
+}
+
+/// What a relationship the evidence does not support lacks, or the evidence that runs against
+/// it.
+fn unsupported(
+    index: &Index<'_>,
+    line: &Line<'_>,
+    accepted: &[Evidence],
+    code: DiagnosticCode,
+    pairs: &Pairs<'_, '_, '_>,
+) -> String {
+    let (from, to, kind) = (index.name(&line.from), index.name(line.to), line.kind);
+    if code == DiagnosticCode::RelationshipBackwards {
+        let against = (accepted.iter()).find(|&&e| pairs.holds(&[e], line.to, &line.from));
+        let verb = match against {
+            Some(Evidence::ConfiguredPath) => "names the address of",
+            Some(Evidence::BuildDependency) => "depends on",
+            _ => "imports",
+        };
+        return format!("{from} -> {to} [{kind}] runs backwards: only {to} {verb} {from}");
+    }
+    let mut lacks = Vec::new();
+    if accepted
+        .iter()
+        .any(|e| matches!(e, Evidence::Call | Evidence::Import))
+    {
+        lacks.push(format!("never imports {to}"));
+    }
+    if accepted.contains(&Evidence::ConfiguredPath) {
+        lacks.push(format!("names no address of {to}"));
+    }
+    if accepted.contains(&Evidence::BuildDependency) {
+        lacks.push(format!("declares no build dependency on {to}"));
+    }
+    let code_only = (accepted.iter()).all(|e| matches!(e, Evidence::Call | Evidence::Import));
+    let what = if code_only {
+        "code evidence"
+    } else {
+        "evidence"
+    };
+    format!(
+        "{from} -> {to} [{kind}] has no {what}: {from} {}",
+        lacks.join(" and ")
+    )
+}
+
+/// The diagnostic a relationship earns, if any, or why it is not judged, by the `evidence` that
+/// applies to it. Type-only edges count only for kinds that accept import evidence. A
+/// relationship is judged strictly only where all of it is collected.
 fn verdict(
     line: &Line<'_>,
-    config: &VaultConfig,
-    status: &Status<'_, '_, '_>,
-    pairs: &Pairs<'_, '_>,
+    evidence: &[Evidence],
+    (status, pairs, collected): Judged<'_, '_>,
 ) -> Result<Option<DiagnosticCode>, SkipReason> {
     for end in [line.from.as_str(), line.to] {
         if let Some(Err(reason)) = status.get(end) {
             return Err(*reason);
         }
     }
-    let evidence = config
-        .relationship_kinds
-        .get(line.kind)
-        .map_or(&[][..], |k| k.evidence.as_slice());
-    if !evidence.iter().any(|&e| collected(e)) {
+    if evidence.is_empty() {
         return Err(SkipReason::EvidenceNotCode);
     }
-    let reach = if evidence.contains(&Evidence::Import) {
-        &pairs.any_reach
-    } else {
-        &pairs.runtime_reach
-    };
-    if reach.contains(&(line.from.as_str(), line.to)) {
+    let (from, to) = (line.from.as_str(), line.to);
+    if pairs.holds(evidence, from, to) {
         return Ok(None);
     }
-    if !evidence.iter().all(|&e| collected(e)) {
+    if !evidence.iter().all(|&e| collected.holds(e, from, to)) {
         return Err(SkipReason::EvidenceUnavailable);
     }
-    Ok(Some(if reach.contains(&(line.to, line.from.as_str())) {
+    Ok(Some(if pairs.holds(evidence, to, from) {
         DiagnosticCode::RelationshipBackwards
     } else {
         DiagnosticCode::RelationshipUnsupported
     }))
 }
 
-/// `RELATIONSHIP_UNDRAWN`: runtime edges between two modules, neither containing the other,
-/// that no relationship from the source or an ancestor to the target or an ancestor covers.
-/// A backwards relationship already reports the edges that run against it.
+/// `RELATIONSHIP_UNDRAWN`: runtime edges, or else configured hops, between two modules, neither
+/// containing the other, that no relationship from the source or an ancestor to the target or an
+/// ancestor covers. A backwards relationship already reports the evidence against it.
 fn undrawn(
     index: &Index<'_>,
-    pairs: &Pairs<'_, '_>,
+    pairs: &Pairs<'_, '_, '_>,
     backwards: &HashSet<(&str, &str)>,
     report: &mut CodeReport,
 ) {
@@ -761,7 +980,22 @@ fn undrawn(
         from.iter()
             .any(|a| to.iter().any(|b| set.contains(&(*a, *b))))
     };
-    for (&(from, to), edge) in &pairs.runtime {
+    let edges = (pairs.runtime.iter()).map(|(&pair, edge)| {
+        (
+            pair,
+            format!("{} imports {}", location(edge), written(edge)),
+        )
+    });
+    let hops = (pairs.configured.iter())
+        .filter(|(pair, _)| !pairs.runtime.contains_key(*pair))
+        .map(|(&pair, hop)| {
+            let (file, line) = (&hop.file, hop.line);
+            (
+                pair,
+                format!("{file}:{line} {} names {}", hop.variable, hop.address),
+            )
+        });
+    for ((from, to), evidence) in edges.chain(hops) {
         if index.is_below(from, to) || index.is_below(to, from) {
             continue;
         }
@@ -770,11 +1004,9 @@ fn undrawn(
             continue;
         }
         let message = format!(
-            "{} uses {} but no relationship is drawn: {} imports {}",
+            "{} uses {} but no relationship is drawn: {evidence}",
             index.name(from),
             index.name(to),
-            location(edge),
-            written(edge)
         );
         report.warn(
             DiagnosticCode::RelationshipUndrawn,
@@ -1048,7 +1280,14 @@ pub(super) mod tests {
     }
 
     fn run(modules: &[Module], doc: &Document, root: &Path) -> CodeReport {
-        check(M, modules, &VaultConfig::default(), root, Ok(doc))
+        check(
+            M,
+            modules,
+            &VaultConfig::default(),
+            root,
+            Ok(doc),
+            &Infra::default(),
+        )
     }
 
     fn of(report: &CodeReport, code: DiagnosticCode) -> Vec<&Diagnostic> {
@@ -1142,7 +1381,14 @@ pub(super) mod tests {
         link(&mut web, "TypeKind", "Bank", "types");
         link(&mut bank, "Unproven", "Web", "dependency");
         let modules = [app, web, billing, bank];
-        let report = check(M, &modules, &config, dir.path(), Ok(&doc));
+        let report = check(
+            M,
+            &modules,
+            &config,
+            dir.path(),
+            Ok(&doc),
+            &Infra::default(),
+        );
         assert_eq!(
             subjects(&report, RelationshipUnsupported),
             [vec![q("TypeOnly")]]
@@ -1280,7 +1526,17 @@ pub(super) mod tests {
             [(q("Billing"), "binding", "language-unsupported")]
         );
 
-        let without = |scan| check(M, &modules, &VaultConfig::default(), dir.path(), Err(scan));
+        let none = Infra::default();
+        let without = |scan| {
+            check(
+                M,
+                &modules,
+                &VaultConfig::default(),
+                dir.path(),
+                Err(scan),
+                &none,
+            )
+        };
         let report = without(NoScan::NotNeeded);
         assert_eq!(report.diagnostics, []);
         assert_eq!(skips(&report), [(q("Billing"), "binding", "not-scanned")]);
@@ -1305,7 +1561,14 @@ pub(super) mod tests {
         // Every path turned out missing: nothing went unjudged, so no SCAN_FAILED.
         let ghost = [module("Ghost", None, Some("DOCS"))];
         let failed = NoScan::Failed("no source".to_owned());
-        let report = check(M, &ghost, &VaultConfig::default(), dir.path(), Err(failed));
+        let report = check(
+            M,
+            &ghost,
+            &VaultConfig::default(),
+            dir.path(),
+            Err(failed),
+            &none,
+        );
         assert_eq!(found_codes(&report), [BindingPathMissing]);
     }
 

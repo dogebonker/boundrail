@@ -4,11 +4,12 @@ use std::iter;
 
 use boundrail::arch::checkpoint::{self, Checkpoint};
 use boundrail::arch::claims::{self, Claim};
-use boundrail::arch::code::{self, CodeReport, NoScan, Skip};
+use boundrail::arch::code::{self, CodeReport, NoScan, Skip, SkipReason, UnitStatus};
 use boundrail::arch::compare::{self, Comparison};
 use boundrail::arch::diagnostic::{Diagnostic, Severity};
 use boundrail::arch::edit::{self, Receipt};
 use boundrail::arch::footprint::{self, CrossingsSkipped, FootprintReport, Range};
+use boundrail::arch::infra::{self, Infra};
 use boundrail::arch::inspect::{self, InspectReport};
 use boundrail::arch::locality::{self, History, LocalityReport};
 use boundrail::arch::proposal::{self, CURRENT, Writing};
@@ -1008,12 +1009,17 @@ fn check(
             model,
             diagnostics,
             skips,
+            units,
             warning,
             information,
             ..
         } = &checked;
         print_proposal(model);
-        print_diagnostics(diagnostics, skips.as_deref(), *warning, *information);
+        let skipped = Skipped {
+            skips: skips.as_deref().unwrap_or_default(),
+            units: units.as_deref().unwrap_or_default(),
+        };
+        print_diagnostics(diagnostics, skipped, *warning, *information);
         return Ok(code);
     }
     write(None, &checked.output()?)?;
@@ -1026,6 +1032,8 @@ pub(super) struct Checked {
     diagnostics: Vec<Diagnostic>,
     /// `None` when the code check did not run.
     skips: Option<Vec<Skip>>,
+    /// The infrastructure units with their owners; `None` when the code check did not run.
+    units: Option<Vec<UnitStatus>>,
     pending: Option<Value>,
     warning: usize,
     information: usize,
@@ -1043,11 +1051,12 @@ pub(super) fn run_check(
     } else {
         semantic::check(&model.manifest.id, &model.modules, &model.collections)
     };
-    let mut skips = None;
+    let (mut skips, mut units) = (None, None);
     if only != Some(CheckOnly::Semantic) {
         let report = code_check(&model)?;
         diagnostics.extend(report.diagnostics);
         skips = Some(report.skips);
+        units = Some(report.units);
     }
     diagnostics.sort();
     let warning = diagnostics
@@ -1059,6 +1068,7 @@ pub(super) fn run_check(
         model,
         diagnostics,
         skips,
+        units,
         pending,
         warning,
         information,
@@ -1080,6 +1090,9 @@ impl Checked {
         });
         if let Some(skips) = self.skips {
             output["skips"] = json!(skips);
+        }
+        if let Some(units) = self.units {
+            output["units"] = json!(units);
         }
         extend(&mut output, json!({ "proposal": self.model.proposal }))?;
         if let Some(pending) = self.pending {
@@ -1108,8 +1121,8 @@ fn scan_error(doc: &Result<Document, NoScan>) -> Option<&str> {
     }
 }
 
-/// The code check against the model's checkout, scanning it once when a binding or anchor names
-/// code there. A failed scan becomes a `SCAN_FAILED` warning.
+/// The code check against the model's checkout and its infrastructure, scanning it once when a
+/// binding or anchor names code there. A failed scan becomes a `SCAN_FAILED` warning.
 fn code_check(model: &Model) -> Result<CodeReport> {
     let (checkout, doc) = scan_checkout(model)?;
     let checkout = checkout.as_path();
@@ -1119,6 +1132,7 @@ fn code_check(model: &Model) -> Result<CodeReport> {
         &model.config,
         checkout,
         doc.as_ref().map_err(Clone::clone),
+        &infra::read(checkout)?,
     ))
 }
 
@@ -1180,7 +1194,9 @@ fn inspected(root: &Path, subject: Option<&str>, proposal: Option<&str>) -> Resu
         .transpose()?;
     let (checkout, doc) = scan_checkout(&model)?;
     let scan = doc.as_ref().map_err(Clone::clone);
-    let report = inspect::inspect(id, &model.modules, &checkout, scan, subject.as_deref());
+    let infra = infra::read(&checkout)?;
+    let (modules, subject) = (&model.modules, subject.as_deref());
+    let report = inspect::inspect(id, modules, &checkout, scan, &infra, subject);
     let scan_error = scan_error(&doc).map(str::to_owned);
     Ok(Inspected {
         model,
@@ -1248,6 +1264,13 @@ fn print_inspect(model: &Model, report: &InspectReport) {
                 let edges = count(n.edges, "edge");
                 let drawn = drawn_as(&relationships, &n.relationships);
                 println!("  {arrow} {}: {edges}, {drawn}", name_of(&names, &n.module));
+            }
+        }
+        for (arrow, list) in [("->", &m.hops_out), ("<-", &m.hops_in)] {
+            for h in list {
+                let other = name_of(&names, &h.module);
+                let at = format!("{}:{} {} = {}", h.file, h.line, h.variable, h.address);
+                println!("  {arrow} {other}: {} at {at}", h.evidence.as_str());
             }
         }
     }
@@ -1349,10 +1372,17 @@ fn model_footprint(
     };
     let files = footprint::changed(&checkout, &range.base.commit, range.head.as_deref())?;
     let (doc, scan_error) = footprint_scan(&model, &range, &files)?;
+    // The infrastructure is read from the checkout, so it serves only a head that is checked out,
+    // and only changed files cross anything.
+    let infra = if range.checked_out && !files.is_empty() {
+        infra::read(&checkout)?
+    } else {
+        Infra::default()
+    };
     let head_state = (&model.modules[..], &model.collections[..]);
     let base_state = (before.as_ref()).map(|m| (&m.modules[..], &m.collections[..]));
     let (id, scan) = (&model.manifest.id, doc.as_ref().map_err(|s| *s));
-    let report = footprint::measure(id, head_state, base_state, &files, scan);
+    let report = footprint::measure(id, head_state, base_state, &files, scan, &infra);
     if markdown {
         print_footprint(&model, &range, &report, model_error.as_deref());
         return Ok(());
@@ -1418,8 +1448,12 @@ fn print_footprint(model: &Model, range: &Range, report: &FootprintReport, error
     for c in report.crossings.iter().flatten() {
         let (from, to) = (name_of(&names, &c.from), name_of(&names, &c.to));
         let drawn = drawn_as(&relationships, &c.relationships);
+        let hops = match c.hops {
+            0 => String::new(),
+            n => format!(", {}", count(n, "hop")),
+        };
         println!(
-            "Crosses {from} -> {to}: {}, {drawn}",
+            "Crosses {from} -> {to}: {}{hops}, {drawn}",
             count(c.edges, "edge")
         );
     }
@@ -1438,9 +1472,15 @@ fn print_footprint(model: &Model, range: &Range, report: &FootprintReport, error
     }
 }
 
+/// What the code check left unjudged.
+struct Skipped<'a> {
+    skips: &'a [Skip],
+    units: &'a [UnitStatus],
+}
+
 fn print_diagnostics(
     diagnostics: &[Diagnostic],
-    skips: Option<&[Skip]>,
+    skipped: Skipped<'_>,
     warning: usize,
     information: usize,
 ) {
@@ -1464,15 +1504,19 @@ fn print_diagnostics(
             println!("- {} {}{suggestion}", d.code.as_str(), d.message);
         }
     }
-    let mut skipped = BTreeMap::new();
-    for skip in skips.unwrap_or_default() {
-        *skipped.entry((skip.site, skip.reason)).or_insert(0) += 1;
+    let mut counts = BTreeMap::new();
+    for skip in skipped.skips {
+        *counts.entry((skip.site, skip.reason)).or_insert(0) += 1;
     }
-    if !skipped.is_empty() {
+    let unbound = skipped.units.iter().filter(|u| u.owner.is_none()).count();
+    if !counts.is_empty() || unbound > 0 {
         println!("Skipped:");
     }
-    for ((site, reason), count) in skipped {
+    for ((site, reason), count) in counts {
         println!("- {} {}: {count}", site.as_str(), reason.as_str());
+    }
+    if unbound > 0 {
+        println!("- unit {}: {unbound}", SkipReason::InfraUnbound.as_str());
     }
     let verdict = if warning == 0 { "passed" } else { "failed" };
     println!("Check {verdict}: warnings: {warning}, information: {information}");

@@ -155,13 +155,26 @@ pub enum Dash {
     Dotted,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum Evidence {
     Call,
     Import,
     ConfiguredPath,
     BuildDependency,
+}
+
+impl Evidence {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Call => "call",
+            Self::Import => "import",
+            Self::ConfiguredPath => "configured-path",
+            Self::BuildDependency => "build-dependency",
+        }
+    }
 }
 
 /// `modules/<id>.module.json`: one module and the relationships it owns.

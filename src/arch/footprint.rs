@@ -13,11 +13,12 @@ use serde::Serialize;
 use super::code::{self, PathOwners};
 use super::compare::{self, Comparison};
 use super::index::Index;
-use super::types::{Collection, Module};
+use super::infra::{self, Infra};
+use super::types::{Collection, EXTERNAL_KIND, Module};
 use super::{Code, Refusal, vault};
 use crate::collect::TempDir;
 use crate::git;
-use crate::model::Document;
+use crate::model::{Document, Edge};
 
 #[derive(Debug, Default, Serialize)]
 pub struct FootprintReport {
@@ -49,6 +50,9 @@ pub struct Crossing {
     pub to: String,
     /// Import edges from `from` to `to` with a changed file at either end.
     pub edges: usize,
+    /// Configured addresses and build dependencies from `from` to `to` written in a changed
+    /// file.
+    pub hops: usize,
     /// Relationships drawn from `from` or a module containing it to `to` or one containing it;
     /// empty when the crossing is undrawn.
     pub relationships: Vec<String>,
@@ -211,14 +215,17 @@ fn split(out: &[u8]) -> Vec<String> {
 /// The modules and collections of one state.
 pub type State<'a> = (&'a [Module], &'a [Collection]);
 
-/// The footprint of `files` on the state `head` of model `model`, with the edges of `scan` and
-/// what `head` changes against `base`. Without changed files there are no crossings to check.
+/// The footprint of `files` on the state `head` of model `model`, with the edges of `scan`, the
+/// hops of `infra` and what `head` changes against `base`. Without changed files there are no
+/// crossings to check; without a scan the crossings are the hops alone when a module of `head`
+/// is bound to a unit.
 pub fn measure(
     model: &str,
     head: State<'_>,
     base: Option<State<'_>>,
     files: &[String],
     scan: Result<&Document, CrossingsSkipped>,
+    infra: &Infra,
 ) -> FootprintReport {
     let index = Index::new(model, head.0);
     let bound = code::bound_paths(model, head.0);
@@ -244,9 +251,15 @@ pub fn measure(
         }
     }
     report.modules = touched.into_values().collect();
+    // Without a scan, only modules bound to units hold anything to cross.
+    let units = (head.0.iter())
+        .any(|m| m.kind != EXTERNAL_KIND && m.binding.as_ref().is_some_and(infra::is_unit_binding));
     match scan {
         _ if files.is_empty() => report.crossings = Some(Vec::new()),
-        Ok(doc) => report.crossings = Some(crossings(&index, &owners, files, doc)),
+        Ok(doc) => report.crossings = Some(crossings(&index, &owners, files, &doc.edges, infra)),
+        Err(CrossingsSkipped::NotNeeded) if units => {
+            report.crossings = Some(crossings(&index, &owners, files, &[], infra));
+        }
         Err(skipped) => report.crossings_skipped = Some(skipped),
     }
     report.model = base.map(|base| compare::compare(model, base, head));
@@ -254,28 +267,40 @@ pub fn measure(
 }
 
 /// The module pairs, neither containing the other, that an import edge with a changed file at
-/// either end joins, with the relationships drawn that way between them or modules containing
-/// them.
+/// either end joins, or a hop written in a changed file, with the relationships drawn that way
+/// between them or modules containing them. Units map to the modules bound to them, else to the
+/// owner of the directory a compose service builds from.
 fn crossings(
     index: &Index<'_>,
     owners: &PathOwners<'_, '_>,
     files: &[String],
-    doc: &Document,
+    edges: &[Edge],
+    infra: &Infra,
 ) -> Vec<Crossing> {
     let changed: BTreeSet<&str> = files.iter().map(String::as_str).collect();
-    let touching = (doc.edges.iter())
+    let apart = |from, to| !index.is_below(from, to) && !index.is_below(to, from);
+    let touching = (edges.iter())
         .filter(|e| changed.contains(e.from.as_str()) || changed.contains(code::written(e)));
-    let mut pairs: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+    let mut pairs: BTreeMap<(&str, &str), (usize, usize)> = BTreeMap::new();
     for (from, to, _) in code::owner_pairs(touching, |f| owners.owner(f)) {
-        if !index.is_below(from, to) && !index.is_below(to, from) {
-            *pairs.entry((from, to)).or_default() += 1;
+        if apart(from, to) {
+            pairs.entry((from, to)).or_default().0 += 1;
+        }
+    }
+    let bound = (index.by_id.iter())
+        .filter(|(_, m)| m.kind != EXTERNAL_KIND)
+        .filter_map(|(id, m)| Some((id.as_str(), m.binding.as_ref()?)));
+    for (from, to, hop) in infra.join(bound, |dir| owners.owner(dir)).hops {
+        if changed.contains(hop.file.as_str()) && apart(from, to) {
+            pairs.entry((from, to)).or_default().1 += 1;
         }
     }
     (pairs.into_iter())
-        .map(|((from, to), edges)| Crossing {
+        .map(|((from, to), (edges, hops))| Crossing {
             from: from.to_owned(),
             to: to.to_owned(),
             edges,
+            hops,
             relationships: index.covering(from, to).map(|l| l.id.clone()).collect(),
         })
         .collect()
@@ -305,7 +330,14 @@ mod tests {
             "app/web/page.ts",
             "docs/README.md",
         ]);
-        let report = measure(M, (&modules, &[]), None, &changed, Ok(&doc));
+        let report = measure(
+            M,
+            (&modules, &[]),
+            None,
+            &changed,
+            Ok(&doc),
+            &Infra::default(),
+        );
         let touched: Vec<(&str, usize, usize)> = (report.modules.iter())
             .map(|t| (t.name.as_str(), t.files.len(), t.in_parts))
             .collect();
@@ -315,6 +347,7 @@ mod tests {
             from: q(from),
             to: q(to),
             edges,
+            hops: 0,
             relationships: relationships.iter().map(|r| q(r)).collect(),
         };
         // Billing's charge calls Bank under App's line; Web's page reaches into Billing, undrawn,
@@ -328,6 +361,54 @@ mod tests {
             ]
         );
         assert!(report.model.is_none());
+    }
+
+    #[test]
+    fn hops_written_in_changed_files_cross_without_a_scan() {
+        use crate::arch::infra::{End, Hop, Unit, UnitKind};
+        use crate::arch::types::Evidence;
+        let mut queue = module("Queue", None, Some("docker-compose.yml"));
+        queue.binding.as_mut().unwrap().symbol = Some("rabbit".to_owned());
+        let modules = [module("Api", None, Some("api")), queue];
+        let unit = |name: &str, build: Option<&str>| Unit {
+            kind: UnitKind::ComposeService,
+            name: name.to_owned(),
+            file: "docker-compose.yml".to_owned(),
+            build: build.map(str::to_owned),
+        };
+        let hop = Hop {
+            from: End::Unit(0),
+            to: End::Unit(1),
+            evidence: Evidence::ConfiguredPath,
+            file: "docker-compose.yml".to_owned(),
+            line: 4,
+            variable: "QUEUE_URL".to_owned(),
+            address: "rabbit".to_owned(),
+        };
+        let units = vec![unit("api", Some("api")), unit("rabbit", None)];
+        let infra = Infra::new(units, vec![hop], Vec::new());
+        let skipped = Err(CrossingsSkipped::NotNeeded);
+        let changed = files(&["docker-compose.yml"]);
+        let report = measure(M, (&modules, &[]), None, &changed, skipped, &infra);
+        // The compose file belongs to no module: a unit binding holds no path.
+        assert_eq!(report.outside, ["docker-compose.yml"]);
+        let crossing = Crossing {
+            from: q("Api"),
+            to: q("Queue"),
+            edges: 0,
+            hops: 1,
+            relationships: Vec::new(),
+        };
+        assert_eq!(report.crossings, Some(vec![crossing]));
+        let changed = files(&["api/index.ts"]);
+        let report = measure(M, (&modules, &[]), None, &changed, skipped, &infra);
+        assert_eq!(report.crossings, Some(Vec::new()));
+
+        // Without a module bound to a unit there is nothing to cross without a scan.
+        let code_only = [module("Api", None, Some("api"))];
+        let report = measure(M, (&code_only, &[]), None, &changed, skipped, &infra);
+        assert_eq!(report.crossings, None);
+        assert_eq!(report.crossings_skipped, Some(CrossingsSkipped::NotNeeded));
     }
 
     #[test]
@@ -351,7 +432,14 @@ mod tests {
         let head = shop();
         let base = [module("App", None, Some("app")), module("Gone", None, None)];
         let skipped = Err(CrossingsSkipped::NotNeeded);
-        let report = measure(M, (&head, &[]), Some((&base, &[])), &[], skipped);
+        let report = measure(
+            M,
+            (&head, &[]),
+            Some((&base, &[])),
+            &[],
+            skipped,
+            &Infra::default(),
+        );
         let model = report.model.unwrap();
         let ids = |entries: &[compare::Entry]| -> Vec<String> {
             entries.iter().map(|e| e.id.clone()).collect()
@@ -364,7 +452,7 @@ mod tests {
         assert_eq!(report.crossings, Some(Vec::new()));
         assert!(report.modules.is_empty());
         let changed = files(&["app/web/page.ts"]);
-        let report = measure(M, (&head, &[]), None, &changed, skipped);
+        let report = measure(M, (&head, &[]), None, &changed, skipped, &Infra::default());
         assert_eq!(report.crossings, None);
         assert_eq!(report.crossings_skipped, Some(CrossingsSkipped::NotNeeded));
     }

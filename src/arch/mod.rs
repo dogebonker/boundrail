@@ -10,6 +10,7 @@ pub mod edit;
 pub mod footprint;
 pub mod ids;
 mod index;
+pub mod infra;
 pub mod inspect;
 pub mod locality;
 pub mod proposal;

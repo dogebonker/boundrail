@@ -43,7 +43,7 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 | T9 | Render: SVG architecture view with automatic layout, sequence and flowchart views of a flow, comparison marks | done |
 | T10 | Measures: module interface counts (`model inspect`), co-change locality (`model locality`), branch footprint (`model footprint`) | done |
 | T11 | Live browser view: model canvas, drill-down, focus and filters, detail panel, warnings, comparison, history, split panes | done |
-| T12 | Infrastructure evidence: docker-compose, Kubernetes, Terraform bindings and configured-address hops between modules | open |
+| T12 | Infrastructure evidence: docker-compose, Kubernetes, Terraform bindings and configured-address hops between modules | done |
 | T13 | Language-server evidence: call-level references through configured language servers | open |
 | T14 | Walkthroughs: ordered beats over readings, playback in the browser | open |
 | T15 | Embedded pictures: render recipes in SVG/PNG, `check embeds`, PNG rasterize | open |
@@ -343,3 +343,84 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   checkpoints have neither. Dark mode inverts the rendered SVG with a CSS filter rather than
   drawing it in other colors. `#<qualified module ID>` after the URL selects that module when the
   page opens.
+- T12: a module binds an infrastructure unit with the existing binding fields, no schema change:
+  `path` names a compose, Kubernetes or Terraform file the collector reads and `symbol` names the
+  unit, a compose service, a workload or `TYPE.NAME`. What a binding means is inferred from where
+  its file sits (a compose file name, a YAML file below a Kubernetes folder, a `.tf` file); the
+  upgrade path is a separate `unit` field on the binding, which would also let one module bind
+  code and a unit together. The unit is looked up in the file's folder, which is one compose
+  project or one Terraform module, so a binding to `docker-compose.yml` finds a service an
+  override file declares. A missing file is `BINDING_PATH_MISSING`, a unit the folder does not
+  declare `BINDING_SYMBOL_MISSING`. Such a module owns no scanned file, needs no scan, is never a
+  `symbol-binding`, and holds no path for `model locality` and `model footprint`. Until the
+  `unit` field exists a module binds either code or one unit: a compose service built from a
+  directory maps to that directory's owner without a binding, but Kubernetes workloads and
+  Terraform resources need a module bound to them.
+- T12: files read (`src/arch/infra/`). A walk at most 8 folders deep, skipping hidden folders,
+  `node_modules`, `vendor` and `target`, lists candidates by file name and place; the scan's
+  exclusion policy then drops tests, fixtures, examples, stories and gitignored files, but not
+  generated folders such as `build/` or `dist/`. No file or env file is read through a symbolic
+  link. Compose files (`compose.y(a)ml`, `docker-compose*.y(a)ml`) at the root and up to 2 folders
+  below, base names before overrides, an override's `build` replacing the base's: each service's
+  `environment` (map or `KEY=value` list), `env_file` (string, list, or entries with `path`, each
+  file read once), `links` aliases and `build` or `build.context`; `${NAME:-default}` and
+  `${NAME-default}` read as their default. Kubernetes YAML anywhere below a `k8s`, `kubernetes`,
+  `deploy` or `manifests` folder and not below `charts`, multi-document, with Deployment,
+  StatefulSet, DaemonSet, Job and CronJob pod templates (labels, container and init container
+  `env` with `value` or `valueFrom.configMapKeyRef`), Services with their selectors, and ConfigMap
+  `data`. Terraform `*.tf` `resource "TYPE" "NAME"` blocks. Workspace manifests: the npm members
+  of the workspace inventory (`package_splits::workspaces::discover`) when the root declares a
+  workspace (`workspaces` or `pnpm-workspace.yaml`), with dependencies of all four kinds naming
+  another member, a name two members share left out; `Cargo.toml` path dependencies in the
+  dependency tables, the workspace's and each target's; and `go.mod` `replace` directives to a
+  `./` or `../` path. `depends_on`, `image`, `ports` and `expose` are not read: none names an
+  address. A file that does not read or parse is left out.
+- T12: address rules. Parts of a value split at whitespace, commas and semicolons. A part names a
+  host as the host of a URL (after `://`, past any user info, before the port and path); as
+  `host:port` with a numeric port, only when the value is that one part or holds a URL, so
+  `mongodb://a:1,b:2` names both but `billing:3,search:1` none; or, when the variable name ends
+  with `HOST`, `HOSTNAME`, `ADDR` or `ADDRESS`, as a host alone. A part with `@` but no scheme,
+  such as an email address, names none. A host matches only as a whole name, so `b` never matches
+  inside `abc` or `b.example.com`. A compose host matches a service of the same project by name or
+  by a link alias. A Kubernetes host `svc` names a Service of the workload's namespace, and
+  `svc.ns`, `svc.ns.svc` or `svc.ns.svc.cluster.local` one of `ns`; the hop goes to every workload
+  of the Service's namespace whose pod labels hold its non-empty selector. An object whose
+  manifest names no namespace is in any namespace of its own folder, and else in `default`.
+  ConfigMap keys resolve the same way. A Terraform reference is a `TYPE.NAME` token in another
+  resource's body of the same folder, outside comments and string text, inside `${...}` included
+  (strings inside it hide their braces); `var`, `local`, `module`, `data` and the other
+  non-resource roots are not followed. Each hop records the file and line where the address is
+  written (for a ConfigMap key, the ConfigMap's line; a line is the one setting the variable as a
+  key, `name:` or `name=` at its start), the variable, attribute or dependency name, and the
+  address.
+- T12: judging. Evidence is collected per relationship. Configured-path evidence counts only
+  when both ends hold a unit (the unit's owner or a module containing it), and build-dependency
+  evidence only when both ends hold a workspace package folder; otherwise the relationship keeps
+  the T5 `evidence-unavailable` skip, so an unbound database or a stray `.tf` file changes
+  nothing. Code evidence (call, import) never applies to a relationship with an end bound to a
+  unit: a `call` between two workloads is `evidence-not-code`, and a `queue` from code to a
+  unit-bound broker is judged on configured paths alone. Units map to modules by binding, else by
+  `build.context`; package folders map through the deepest binding as files do. A hop of an
+  evidence kind that applies, from the source or a part of it to the target or a part of it,
+  supports the relationship. With every applicable kind collected, a hop only the other way is
+  `RELATIONSHIP_BACKWARDS` (`only Api names the address of Rabbit`, or `depends on`), and none is
+  `RELATIONSHIP_UNSUPPORTED`, naming what is missing. A configured hop between two modules,
+  neither containing the other, that no relationship covers is `RELATIONSHIP_UNDRAWN`
+  (`worker.env:2 API_URL names api`), once per pair and not when an import edge already reports
+  it. Build-dependency hops only support. `model check` lists `units` beside `skips` when the code
+  check runs: each unit with `kind`, `name`, `file`, `build`, `owner` and `reason`
+  (`infra-unbound` when `owner` is null); Markdown counts `unit infra-unbound`. `model inspect`
+  lists each module's `hops_in` and `hops_out`; `model footprint` crossings gain `hops`, the hops
+  written in a changed file, and without a scan the crossings are the hops alone when a module is
+  bound to a unit. The new keys are always present, null or empty when unset, as footprint keeps
+  its keys, rather than skipped. The infrastructure is read from the checkout, only when a
+  footprint has changed files and its head is checked out.
+- T12: limits. ponytail: a hand reader of Terraform blocks over masked text, not an HCL parser:
+  heredoc interpolation is ignored and modules and variables are not followed; YAML merge keys
+  (`<<`) are not applied; `envFrom`, Helm templates and Kustomize overlays are not read; compose
+  files of one folder are one project, so two projects need two folders; Kubernetes Services and
+  ConfigMaps are indexed by name and filtered by namespace, since an object may name none. Env
+  files are read even when gitignored, as compose reads them. A module whose code is not scanned
+  (the T5 polyglot gap) keeps its `not-scanned` skips, and a compose service built from its folder
+  shows as `infra-unbound`. The scan-era service inference reads code facts, not infrastructure,
+  so it is not reused.

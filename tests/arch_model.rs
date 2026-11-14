@@ -4662,7 +4662,7 @@ fn footprint_shows_the_touched_modules_and_the_model_change() {
     // Web imports the fee past Billing's index: the crossing lifts to Web -> Billing's line.
     assert_eq!(
         out["crossings"],
-        json!([{"from": q("WebApp01"), "to": q("Fees0001"), "edges": 1, "relationships": [q("RelWeb01")]}])
+        json!([{"from": q("WebApp01"), "to": q("Fees0001"), "edges": 1, "hops": 0, "relationships": [q("RelWeb01")]}])
     );
     assert_eq!(out["crossings_skipped"], Value::Null);
     assert_eq!(
@@ -5038,4 +5038,284 @@ fn proposals_lists_its_keys_in_the_order_they_always_had() {
     let keys = ["schema", "kind", "success", "vault", "proposals"];
     let positions: Vec<usize> = keys.iter().map(|k| at(k)).collect();
     assert!(positions.is_sorted(), "{out}");
+}
+
+/// Writes `files` into the checkout.
+fn source(checkout: &Checkout, files: &[(&str, &str)]) {
+    for (path, text) in files {
+        let file = checkout.path().join(path);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, text).unwrap();
+    }
+}
+
+const COMPOSE: &str = "services:
+  api:
+    build: ./api
+    environment:
+      - QUEUE_URL=amqp://rabbit:5672
+  worker:
+    build:
+      context: ./worker
+    env_file: worker.env
+  rabbit:
+    image: rabbitmq:3
+  cache:
+    image: redis:7
+";
+
+/// A compose checkout: an api and a worker built from TypeScript folders, RabbitMQ and an unbound
+/// cache. The api names Rabbit's address and the worker the api's. The model holds Api, Worker
+/// and Rabbit, bound to the folders and the compose service, with Api -> Rabbit [queue].
+fn composed(checkout: &Checkout) -> String {
+    source(
+        checkout,
+        &[
+            ("package.json", r#"{"name": "shop"}"#),
+            ("api/index.ts", "export const api = 1;\n"),
+            ("worker/index.ts", "export const worker = 1;\n"),
+            ("docker-compose.yml", COMPOSE),
+            ("worker.env", "# results\nAPI_URL=http://api:8080\n"),
+        ],
+    );
+    let model = checkout.init();
+    let mut api = module("ApiSvc01", "Api", "service", 0);
+    api["binding"] = json!({"path": "api"});
+    api["outgoing"] =
+        json!([{"id": "RelQue01", "to": format!("{model}#Rabbit01"), "kind": "queue", "order": 0}]);
+    checkout.module(api);
+    let mut worker = module("Worker01", "Worker", "service", 1);
+    worker["binding"] = json!({"path": "worker"});
+    checkout.module(worker);
+    let mut rabbit = module("Rabbit01", "Rabbit", "queue", 2);
+    rabbit["binding"] = json!({"path": "docker-compose.yml", "symbol": "rabbit"});
+    checkout.module(rabbit);
+    model
+}
+
+#[test]
+fn check_judges_relationships_by_configured_addresses_in_compose() {
+    let checkout = Checkout::new();
+    let model = composed(&checkout);
+    let q = |id: &str| format!("{model}#{id}");
+
+    // Api names Rabbit's address: supported. The worker names the api's, undrawn.
+    let (code, out) = checkout.run(&["check", "--only", "code"]);
+    assert_eq!(code, 1, "{out:#}");
+    assert_eq!(found(&out), ["RELATIONSHIP_UNDRAWN Worker01, ApiSvc01"]);
+    assert_eq!(
+        out["diagnostics"][0]["message"],
+        "Worker uses Api but no relationship is drawn: worker.env:2 API_URL names api"
+    );
+    assert_eq!(out["skips"], json!([]));
+    let unit = |name: &str, build: Value, owner: Value, reason: Value| {
+        json!({"kind": "compose-service", "name": name, "file": "docker-compose.yml",
+               "build": build, "owner": owner, "reason": reason})
+    };
+    assert_eq!(
+        out["units"],
+        json!([
+            unit("api", "api".into(), q("ApiSvc01").into(), Value::Null),
+            unit("cache", Value::Null, Value::Null, "infra-unbound".into()),
+            unit("rabbit", Value::Null, q("Rabbit01").into(), Value::Null),
+            unit("worker", "worker".into(), q("Worker01").into(), Value::Null),
+        ])
+    );
+    let (_, text) = checkout.run_raw(&["check", "--only", "code", "--format", "markdown"]);
+    assert!(
+        text.ends_with(
+            "Skipped:\n- unit infra-unbound: 1\nCheck failed: warnings: 1, information: 0\n"
+        ),
+        "{text}"
+    );
+
+    let mut worker = checkout.read_module("Worker01");
+    worker["outgoing"] =
+        json!([{"id": "RelApi01", "to": q("ApiSvc01"), "kind": "http", "order": 0}]);
+    checkout.module(worker);
+    let out = checkout.ok(&["check", "--only", "code"]);
+    assert_eq!(out["diagnostics"], json!([]), "{out:#}");
+
+    // Without the address the queue has no evidence.
+    let compose = COMPOSE.replace(
+        "    environment:\n      - QUEUE_URL=amqp://rabbit:5672\n",
+        "",
+    );
+    source(&checkout, &[("docker-compose.yml", &compose)]);
+    let (code, out) = checkout.run(&["check", "--only", "code"]);
+    assert_eq!(code, 1, "{out:#}");
+    assert_eq!(found(&out), ["RELATIONSHIP_UNSUPPORTED RelQue01"]);
+    assert_eq!(
+        out["diagnostics"][0]["message"],
+        "Api -> Rabbit [queue] has no evidence: Api names no address of Rabbit"
+    );
+
+    // Drawn the other way, the address runs against the line.
+    source(&checkout, &[("docker-compose.yml", COMPOSE)]);
+    let mut api = checkout.read_module("ApiSvc01");
+    api["outgoing"] = json!([]);
+    checkout.module(api);
+    let mut rabbit = checkout.read_module("Rabbit01");
+    rabbit["outgoing"] =
+        json!([{"id": "RelBack1", "to": q("ApiSvc01"), "kind": "queue", "order": 0}]);
+    checkout.module(rabbit);
+    let (code, out) = checkout.run(&["check", "--only", "code"]);
+    assert_eq!(code, 1, "{out:#}");
+    assert_eq!(found(&out), ["RELATIONSHIP_BACKWARDS RelBack1"]);
+    assert_eq!(
+        out["diagnostics"][0]["message"],
+        "Rabbit -> Api [queue] runs backwards: only Api names the address of Rabbit"
+    );
+}
+
+#[test]
+fn check_supports_a_dependency_with_a_workspace_manifest() {
+    let checkout = Checkout::new();
+    let app = r#"{"name": "@mono/app", "dependencies": {"@mono/lib": "*"}}"#;
+    source(
+        &checkout,
+        &[
+            (
+                "package.json",
+                r#"{"name": "mono", "workspaces": ["packages/*"]}"#,
+            ),
+            ("packages/app/package.json", app),
+            ("packages/app/index.ts", "export const app = 1;\n"),
+            ("packages/lib/package.json", r#"{"name": "@mono/lib"}"#),
+            ("packages/lib/index.ts", "export const lib = 1;\n"),
+        ],
+    );
+    let model = checkout.init();
+    let mut app = module("AppPkg01", "App", "package", 0);
+    app["binding"] = json!({"path": "packages/app"});
+    app["outgoing"] = json!([
+        {"id": "RelDep01", "to": format!("{model}#LibPkg01"), "kind": "dependency", "order": 0}
+    ]);
+    checkout.module(app);
+    let mut lib = module("LibPkg01", "Lib", "package", 1);
+    lib["binding"] = json!({"path": "packages/lib"});
+    checkout.module(lib);
+
+    let out = checkout.ok(&["check", "--only", "code"]);
+    assert_eq!(out["diagnostics"], json!([]), "{out:#}");
+    assert_eq!(out["skips"], json!([]));
+    assert_eq!(out["units"], json!([]));
+
+    // Without the dependency nothing supports it, and with no unit held by App or Lib the
+    // configured-path evidence a dependency also accepts is not collected: an unbound database
+    // elsewhere in the checkout changes nothing.
+    let app = r#"{"name": "@mono/app"}"#;
+    let compose = "services:\n  postgres:\n    image: postgres:16\n";
+    source(
+        &checkout,
+        &[
+            ("packages/app/package.json", app),
+            ("docker-compose.yml", compose),
+        ],
+    );
+    let out = checkout.ok(&["check", "--only", "code"]);
+    assert_eq!(
+        out["skips"],
+        json!([{"subject": format!("{model}#RelDep01"), "site": "relationship", "reason": "evidence-unavailable"}])
+    );
+}
+
+const K8S: &str = "kind: Deployment
+metadata:
+  name: web
+  namespace: shop
+spec:
+  template:
+    metadata:
+      labels: {app: web}
+    spec:
+      containers:
+        - name: web
+          env:
+            - name: API_URL
+              valueFrom:
+                configMapKeyRef: {name: web-config, key: api}
+---
+kind: ConfigMap
+metadata: {name: web-config, namespace: shop}
+data:
+  api: http://api.shop:8080
+---
+kind: Service
+metadata: {name: api, namespace: shop}
+spec:
+  selector: {app: api}
+---
+kind: Deployment
+metadata: {name: api, namespace: shop}
+spec:
+  template:
+    metadata:
+      labels: {app: api}
+    spec:
+      containers: [{name: api}]
+";
+
+#[test]
+fn kubernetes_service_names_support_http_and_show_in_inspect() {
+    let checkout = Checkout::new();
+    source(&checkout, &[("k8s/app.yaml", K8S)]);
+    let model = checkout.init();
+    let q = |id: &str| format!("{model}#{id}");
+    let mut web = module("WebApp01", "Web", "app", 0);
+    web["binding"] = json!({"path": "k8s/app.yaml", "symbol": "web"});
+    web["outgoing"] = json!([{"id": "RelHtp01", "to": q("ApiSvc01"), "kind": "http", "order": 0}]);
+    checkout.module(web);
+    let mut api = module("ApiSvc01", "Api", "service", 1);
+    api["binding"] = json!({"path": "k8s/app.yaml", "symbol": "api"});
+    checkout.module(api);
+
+    // No code is bound, so nothing is scanned.
+    let out = checkout.ok(&["check", "--only", "code"]);
+    assert_eq!(out["diagnostics"], json!([]), "{out:#}");
+    assert_eq!(out["skips"], json!([]));
+    let owners: Vec<(&str, &str)> = (out["units"].as_array().unwrap().iter())
+        .map(|u| (u["name"].as_str().unwrap(), u["owner"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        owners,
+        [
+            ("web", q("WebApp01").as_str()),
+            ("api", q("ApiSvc01").as_str())
+        ]
+    );
+
+    let out = checkout.ok(&["inspect", "Web"]);
+    let hop = json!({"module": q("ApiSvc01"), "evidence": "configured-path", "file": "k8s/app.yaml",
+                     "line": 20, "variable": "API_URL", "address": "api.shop"});
+    assert_eq!(out["modules"][0]["hops_out"], json!([hop]));
+    assert_eq!(out["modules"][0]["hops_in"], json!([]));
+    let text = checkout
+        .run_raw(&["inspect", "Api", "--format", "markdown"])
+        .1;
+    assert!(
+        text.contains("  <- Web: configured-path at k8s/app.yaml:20 API_URL = api.shop\n"),
+        "{text}"
+    );
+
+    // Code evidence never applies between modules bound to units.
+    let mut api = checkout.read_module("ApiSvc01");
+    api["outgoing"] = json!([{"id": "RelCal01", "to": q("WebApp01"), "kind": "call", "order": 0}]);
+    checkout.module(api);
+    let out = checkout.ok(&["check", "--only", "code"]);
+    let skip =
+        json!({"subject": q("RelCal01"), "site": "relationship", "reason": "evidence-not-code"});
+    assert_eq!(out["skips"], json!([skip]));
+
+    // A unit binding must name a unit its file's folder declares.
+    let mut ghost = module("Ghost001", "Ghost", "app", 2);
+    ghost["binding"] = json!({"path": "k8s/app.yaml", "symbol": "ghost"});
+    checkout.module(ghost);
+    let (code, out) = checkout.run(&["check", "--only", "code"]);
+    assert_eq!(code, 1, "{out:#}");
+    assert_eq!(found(&out), ["BINDING_SYMBOL_MISSING Ghost001"]);
+    assert_eq!(
+        out["diagnostics"][0]["message"],
+        "Ghost is bound to k8s/app.yaml ghost, but no unit there is named ghost"
+    );
 }
