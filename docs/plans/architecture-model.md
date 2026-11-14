@@ -44,7 +44,7 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 | T10 | Measures: module interface counts (`model inspect`), co-change locality (`model locality`), branch footprint (`model footprint`) | done |
 | T11 | Live browser view: model canvas, drill-down, focus and filters, detail panel, warnings, comparison, history, split panes | done |
 | T12 | Infrastructure evidence: docker-compose, Kubernetes, Terraform bindings and configured-address hops between modules | done |
-| T13 | Language-server evidence: call-level references through configured language servers | open |
+| T13 | Language-server evidence: call-level references through configured language servers | done |
 | T14 | Walkthroughs: ordered beats over readings, playback in the browser | open |
 | T15 | Embedded pictures: render recipes in SVG/PNG, `check embeds`, PNG rasterize | open |
 | T16 | Agent integration: `init`, skills for authoring/planning/PRs, CI action with PR annotations and footprint comment | open |
@@ -424,3 +424,115 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   (the T5 polyglot gap) keeps its `not-scanned` skips, and a compose service built from its folder
   shows as `infra-unbound`. The scan-era service inference reads code facts, not infrastructure,
   so it is not reused.
+- T13: config. Two files, each read only when it is a regular file under 1 MiB (else
+  `REQUEST_INVALID`). The committed `.boundrail/language-servers.json` at the checkout root is an
+  array of `{server, languages?, extensions?}`, unknown keys refused, so it can name a server but
+  never a command, arguments or options. `server` names an entry of the user's config, else one
+  of the allowlist `KNOWN_SERVERS` in `src/arch/lsp/config.rs`, each run as its own name with
+  fixed arguments and default languages and extensions: `typescript-language-server --stdio`
+  (TypeScript and JavaScript extensions), `basedpyright-langserver --stdio` and
+  `pyright-langserver --stdio` (`py`, `pyi`), `rust-analyzer` (`rs`), `gopls` (`go`) and `jdtls`
+  (`java`). Elixir's server ships as a `language_server.sh` script, not a program on `PATH`, so it
+  is left out. On Windows a name resolves to a `.exe` only; `.cmd` shims are not run, since `cmd`
+  re-parses their arguments, so the npm-installed TypeScript and Pyright servers work on Unix
+  only unless the user defines them. The user's config,
+  `$XDG_CONFIG_HOME/boundrail/language-servers.json` (an absolute `XDG_CONFIG_HOME` only), else
+  `~/.config/boundrail/language-servers.json`, or `%APPDATA%\boundrail\language-servers.json` on
+  Windows, is an array of `{name, command, args, languages, extensions,
+  initialization_options?}`; it defines custom servers or redefines an allowlisted name, and its
+  definition wins. Its `command` is a program name or an absolute path. An entry's `languages`
+  and `extensions` replace the server's. `extensions` (with or without the dot, stored without)
+  decide which files a server covers; `languages` are LSP language identifiers, and a file opens
+  as the standard one of its extension when the list holds it, else as the first.
+  `initialization_options` goes to `initialize` as given, and only the user's config sets it,
+  since options can name programs a server runs (rust-analyzer's `check.overrideCommand`,
+  typescript-language-server's `tsserver.path`).
+- T13: security. `--language-servers` runs code from the checkout: the TypeScript server runs the
+  workspace's `tsserver.js` under `node_modules` and its `tsconfig.json` plugins, rust-analyzer
+  runs build scripts and proc macros and reads a committed `rust-analyzer.toml`, and jdtls runs
+  Gradle and Maven imports. It is for trusted checkouts only and must never be used on untrusted
+  pull request heads in CI; the flag's help says so. The servers run only with the flag on `model
+  check` or `model inspect`, and `model view` never runs them. Without it neither config is read,
+  and a skip `{subject: ".boundrail/language-servers.json", site: "language-server", reason:
+  "language-servers-not-enabled"}` is listed only when the repository's file exists. With it, a
+  file that does not parse, an entry with any other key (`command`, `args`,
+  `initialization_options`), an entry naming a server neither allowlisted nor defined by the
+  user (the refusal names the allowlist and the user's config path), or a user command that is
+  empty or a relative path refuses `REQUEST_INVALID` before any server starts. A program name is
+  looked up in the absolute folders of `PATH` only and must be an executable file, and the
+  server's own `PATH` holds only those folders, so neither Boundrail nor the server (an `env
+  node` launcher, say) finds a program a relative entry would reach in the checkout. `boundrail:
+  starting language server <name>: <program> <args>` goes to stderr before it starts, with the
+  resolved program path and shell-quoted arguments. It runs in the checkout root. This is the
+  third stated exception in `src/git.rs`'s hardening header, gated by the flag.
+- T13: client (`src/arch/lsp/`: `config.rs`, `wire.rs` for URIs and result mapping, `framing.rs`,
+  `client.rs`, and `mod.rs` for the evidence). JSON-RPC 2.0 over stdio with `Content-Length`
+  framing; a body over 16 MiB or a header line over 1 KiB is an error, and the reader holds at
+  most 4 messages before it stops reading. `initialize` names the canonical checkout as `rootUri`
+  and the one workspace folder, with client capabilities limited to references, definition,
+  document symbols and workspace symbols; then `initialized`, `textDocument/didOpen` of each
+  definition file and the first covered file of each binding or anchor symbol, `workspace/symbol`
+  once per name, `textDocument/documentSymbol` of single-file lookups when the server offers it,
+  `textDocument/references` (declaration excluded) per interface symbol, and `shutdown` (2 s)
+  then `exit`, the server killed when it has not exited a second later. A reader thread drains
+  stdout and a writer thread feeds stdin, so a server that stops reading cannot block past a
+  timeout. Server notifications are ignored; server requests are answered,
+  `workspace/configuration` with one null per item and anything else
+  (`client/registerCapability`, `window/workDoneProgress/create`) with null. Stderr is read on a
+  thread and dropped, keeping the last 5 lines (512 bytes each, control characters replaced) for
+  the failure warning. Each request may take 60 s, within a session budget of the tool timeout
+  (`--tool-timeout`, 600 s by default), or 600 s when it is 0; a request past either fails the
+  session, and dropping the session kills the server.
+- T13: evidence. Files map to modules exactly as the code check maps scanned files. A module's
+  interface symbols are those of `model inspect` (exports of its entry points, or of every file
+  it owns), asked about at their definition (the export's target): `workspace/symbol` finds the
+  declaration of that name in that file, and references are asked at the name's first whole-word
+  occurrence from the declaration's start, since a range may begin at a keyword. A reference from
+  a scanned file of one module to a definition owned by another is a call hop. A module is served
+  when every file it owns is covered by one server that answered, no file it owns is named by a
+  symbol limitation, it has at most 64 interface symbols, and the server found every one of them;
+  a container is served only when every judged part below it is. Between two served modules,
+  call evidence is the references, replacing the import approximation: a hop from the source or a
+  part of it into the target or a part of it supports a kind accepting `call`; under the T5
+  strictness rules a hop only the other way is `RELATIONSHIP_BACKWARDS` (`only Web calls Bank`)
+  and none is `RELATIONSHIP_UNSUPPORTED` (`never calls`). Elsewhere the import approximation
+  stays. Import evidence (`dependency`) is still import edges. `RELATIONSHIP_UNDRAWN` gains call
+  hops between modules no relationship covers (`src/web/index.ts:2 calls pay`), once per pair and
+  not when an import edge already reports it. For binding and anchor symbols, where the scan
+  cannot tell (no symbol data, or a file a limitation names), the servers decide: a declaration
+  of that name in one of the files, from `workspace/symbol` or a symbol list, confirms it; a
+  binding or anchor of one file whose `textDocument/documentSymbol` list is not empty and lacks
+  the name refutes it, `BINDING_SYMBOL_MISSING`/`ANCHOR_SYMBOL_MISSING` (`no file there declares
+  refund`). An empty answer refutes nothing, since a server may not have indexed the file, so
+  such a symbol, and any symbol of a folder the servers do not find, keeps its
+  `symbols-incomplete` or `language-unsupported` skip. A complete scan's verdict stands. `model
+  inspect` counts `used` from references for served modules, lists `unused` even when the scan's
+  coverage is incomplete, and adds `source: "language-server" | "scan"` to `symbols`; its
+  `language_servers` key lists the language-server skips, empty when none.
+- T13: failures. A missing program, a crash, a protocol error or a timeout prints `warning:
+  language server <name> failed: <reason>; stderr: <last lines>` and adds the skip `{subject:
+  <name>, site: "language-server", reason: "language-server-failed"}`; the check never fails for
+  it and uses none of that server's answers, falling back to imports. A server with nothing to
+  answer is not started.
+- T13: limits. ponytail: one session per server per command, and every question in it, so a large
+  repository can run past the budget and fall back to imports; a module with more than 64
+  interface symbols keeps the import approximation (ask in batches when real modules need more);
+  a mixed-language module is served only by a server covering all its files; only the direct
+  child is killed on timeout, so a server's own helper processes may outlive it, as for the
+  collectors. Languages are whatever servers the config names; the evidence needs the scan's
+  symbol data, so it reaches the languages the native engine indexes, and modules the scan does
+  not judge (the T5 polyglot gap) stay `not-scanned`. Tried by hand with
+  `typescript-language-server --stdio` on a three-module TypeScript checkout: references
+  supported the drawn calls, a line without one reported `never calls`, and inspect counted uses.
+- T13: tests. No real language server runs in CI. `tests/fake_lsp/server.rs` is a standard-library
+  program the integration tests build once per test process with the toolchain's `rustc` (beside
+  `$CARGO`, or `$RUSTC`) into a folder of `CARGO_TARGET_TMPDIR` named for the process, since
+  `cargo test --test arch_model` builds no example or extra test target, copy it as
+  `typescript-language-server` too (both with the platform's executable suffix), and put that
+  folder first on `PATH`. Each test points `XDG_CONFIG_HOME` at a temporary folder whose user
+  config defines `fake` with the script as its argument, and the repository names it. The script
+  is `method<TAB>needle<TAB>result` lines: a request gets the first matching result, else null,
+  and `hang` stops it answering. Run as the allowlisted name it gets `--stdio` and reads its
+  script from `$BOUNDRAIL_FAKE_LSP_SCRIPT`. It asks the client for its configuration first, as
+  real servers do. A Unix test starts it through `/usr/bin/env` with a planted program of its name
+  on a relative `PATH` entry, which never runs.

@@ -11,6 +11,7 @@ use serde::Serialize;
 use super::code::{self, NoScan, Ownership, SkipReason};
 use super::index::Index;
 use super::infra::Infra;
+use super::lsp::Facts;
 use super::types::{Evidence, Module};
 use crate::model::Document;
 use crate::surface::{SymbolExport, Symbols as SymbolData};
@@ -21,6 +22,8 @@ pub struct InspectReport {
     pub modules: Vec<Interface>,
     /// The modules whose code was not judged, with the code check's reason.
     pub skips: Vec<Skip>,
+    /// Language servers that failed, or the config when language servers are not enabled.
+    pub language_servers: Vec<code::Skip>,
 }
 
 #[derive(Debug, Serialize)]
@@ -69,12 +72,24 @@ pub struct HopEntry {
 pub struct Symbols {
     /// Exports of its entry points, or of every file it owns when it has none.
     pub exported: usize,
-    /// Exported symbols a file outside the module imports.
+    /// Exported symbols a file outside the module imports, or references when `source` is
+    /// `language-server`.
     pub used: usize,
     /// Exported symbols no file outside the module imports: candidates to make internal.
     /// `None` when the scan's symbol coverage is incomplete, as the scan's surface withholds
     /// its could-be-internal list.
     pub unused: Option<Vec<SymbolExport>>,
+    pub source: Source,
+}
+
+/// What `used` and `unused` were judged by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Source {
+    /// References a language server found.
+    LanguageServer,
+    /// The scan's imports.
+    Scan,
 }
 
 /// A file outside a module importing a file inside it that is not an entry point.
@@ -95,7 +110,7 @@ pub struct Neighbour {
 }
 
 /// The interface of every module of `modules`, or of `subject` alone (a qualified ID), against
-/// the checkout at `root`, its scan and its infrastructure.
+/// the checkout at `root`, its scan, its infrastructure and what language servers found.
 pub fn inspect(
     model: &str,
     modules: &[Module],
@@ -103,13 +118,17 @@ pub fn inspect(
     scan: Result<&Document, NoScan>,
     infra: &Infra,
     subject: Option<&str>,
+    lsp: &Facts,
 ) -> InspectReport {
     let index = Index::new(model, modules);
     let doc = scan.as_ref().ok().copied();
     let own = code::ownership(&index, root, scan, infra);
     let grouped = Grouped::new(&own, doc);
-    let uses = doc.and_then(|d| Some(Uses::new(d.symbols.as_ref()?, d)));
-    let mut report = InspectReport::default();
+    let uses = doc.and_then(|d| Some(Uses::new(d.symbols.as_ref()?, d, lsp)));
+    let mut report = InspectReport {
+        language_servers: lsp.skips.clone(),
+        ..InspectReport::default()
+    };
     for (id, status) in &own.status {
         if subject.is_some_and(|s| s != id) {
             continue;
@@ -137,8 +156,8 @@ fn interface(
 ) -> Interface {
     let empty = BTreeSet::new();
     let owned = grouped.owned.get(id).unwrap_or(&empty);
-    let entry_points: Vec<String> = own.entries.get(id).into_iter().flatten().cloned().collect();
-    let (symbols, symbols_skipped) = match symbols(own, uses, owned, &entry_points) {
+    let entry_points: Vec<String> = own.entry_points(id).map(str::to_owned).collect();
+    let (symbols, symbols_skipped) = match symbols(own, uses, owned, id) {
         Ok(symbols) => (Some(symbols), None),
         Err(reason) => (None, Some(reason)),
     };
@@ -206,15 +225,11 @@ struct Grouped<'o> {
 impl<'o> Grouped<'o> {
     fn new(own: &'o Ownership<'_>, doc: Option<&Document>) -> Self {
         let mut grouped = Self {
-            owned: HashMap::new(),
+            owned: own.owned_files(),
             deep: HashMap::new(),
             outgoing: HashMap::new(),
             incoming: HashMap::new(),
         };
-        for (file, id) in &own.owners {
-            let files = grouped.owned.entry(id.as_str()).or_default();
-            files.insert(file.as_str());
-        }
         for (id, edge) in &own.deep {
             grouped
                 .deep
@@ -257,16 +272,23 @@ struct Uses<'d> {
     by_file: HashMap<&'d str, Vec<&'d str>>,
     /// Whether a limitation names no scanned file, so coverage is incomplete everywhere.
     incomplete: bool,
+    /// Scanned files referring to each definition, by its file and name, as language servers
+    /// found them.
+    referrers: HashMap<(&'d str, &'d str), Vec<&'d str>>,
+    /// The modules whose interface the language servers were asked about in full.
+    served: &'d HashSet<String>,
 }
 
 impl<'d> Uses<'d> {
-    fn new(data: &'d SymbolData, doc: &'d Document) -> Self {
+    fn new(data: &'d SymbolData, doc: &'d Document, lsp: &'d Facts) -> Self {
         let mut uses = Self {
             data,
             by_target: HashMap::new(),
             by_name: HashMap::new(),
             by_file: HashMap::new(),
             incomplete: false,
+            referrers: HashMap::new(),
+            served: &lsp.queried,
         };
         let mut named: HashSet<(&str, &str)> = HashSet::new();
         for import in &data.imports {
@@ -288,6 +310,14 @@ impl<'d> Uses<'d> {
             }
         }
         let scanned: HashSet<&str> = doc.files.iter().map(|f| f.path.as_str()).collect();
+        for r in lsp
+            .references
+            .iter()
+            .filter(|r| scanned.contains(r.from.as_str()))
+        {
+            let key = (r.file.as_str(), r.name.as_str());
+            uses.referrers.entry(key).or_default().push(&r.from);
+        }
         uses.incomplete = !data.complete
             && (data.limitations.iter()).any(|l| {
                 l.split_once(':')
@@ -306,35 +336,49 @@ impl<'d> Uses<'d> {
         ];
         (importers.into_iter().flatten().flatten()).any(|from| !owned.contains(from))
     }
+
+    /// Whether a scanned file outside `owned` refers to `export`'s definition.
+    fn referred(&self, export: &SymbolExport, owned: &BTreeSet<&str>) -> bool {
+        let key = (export.target.file.as_str(), export.target.name.as_str());
+        (self.referrers.get(&key).into_iter().flatten()).any(|from| !owned.contains(from))
+    }
 }
 
 /// The exports of a module's interface files and who outside it uses them, or why not known.
+/// When language servers were asked about the whole interface of module `id`, their references
+/// decide what is used.
 fn symbols(
     own: &Ownership<'_>,
     uses: Option<&Uses<'_>>,
     owned: &BTreeSet<&str>,
-    entry_points: &[String],
+    id: &str,
 ) -> Result<Symbols, SkipReason> {
     let uses = uses.ok_or(SkipReason::LanguageUnsupported)?;
     if owned.iter().any(|f| own.limited.contains(f)) {
         return Err(SkipReason::SymbolsIncomplete);
     }
-    let interface: BTreeSet<&str> = if entry_points.is_empty() {
-        owned.clone()
-    } else {
-        entry_points.iter().map(String::as_str).collect()
+    let exported = own.interface_exports(&uses.data.exports, id, owned);
+    let served = uses.served.contains(id);
+    let used = |e: &SymbolExport| {
+        if served {
+            uses.referred(e, owned)
+        } else {
+            uses.used(e, owned)
+        }
     };
-    let exported: BTreeSet<&SymbolExport> = (uses.data.exports.iter())
-        .filter(|e| interface.contains(e.file.as_str()))
-        .collect();
     let unused: Vec<SymbolExport> = (exported.iter())
-        .filter(|e| !uses.used(e, owned))
+        .filter(|e| !used(e))
         .map(|&e| e.clone())
         .collect();
     Ok(Symbols {
         exported: exported.len(),
         used: exported.len() - unused.len(),
-        unused: (!uses.incomplete).then_some(unused),
+        unused: (served || !uses.incomplete).then_some(unused),
+        source: if served {
+            Source::LanguageServer
+        } else {
+            Source::Scan
+        },
     })
 }
 
@@ -400,7 +444,16 @@ mod tests {
         let mut modules = shop().to_vec();
         link(&mut modules[1], "WebBill1", "Billing", "call");
         modules.push(module("Loose", None, None));
-        let report = inspect(M, &modules, dir.path(), Ok(&doc), &Infra::default(), None);
+        let none = Facts::default();
+        let report = inspect(
+            M,
+            &modules,
+            dir.path(),
+            Ok(&doc),
+            &Infra::default(),
+            None,
+            &none,
+        );
 
         let billing = of(&report, "Billing");
         assert_eq!(billing.files, 2);
@@ -410,6 +463,7 @@ mod tests {
             exported: 2,
             used: 1,
             unused: Some(vec![refund]),
+            source: Source::Scan,
         };
         assert_eq!(billing.symbols.as_ref(), Some(&expected));
         let deep: Vec<(&str, &str)> = (billing.deep_imports.iter())
@@ -454,6 +508,7 @@ mod tests {
             Ok(&doc),
             &Infra::default(),
             Some(&only),
+            &Facts::default(),
         );
         assert_eq!(report.modules.len(), 1);
         // Billing's charge imports Bank's index with no symbol import: a use of all it exports.
@@ -461,6 +516,7 @@ mod tests {
             exported: 1,
             used: 1,
             unused: Some(Vec::new()),
+            source: Source::Scan,
         };
         assert_eq!(report.modules[0].symbols.as_ref(), Some(&expected));
 
@@ -474,6 +530,7 @@ mod tests {
             Ok(&doc),
             &Infra::default(),
             Some(&only),
+            &Facts::default(),
         );
         let symbols = report.modules[0].symbols.as_ref().unwrap();
         assert_eq!(
@@ -489,6 +546,7 @@ mod tests {
             Ok(&doc),
             &Infra::default(),
             Some(&only),
+            &Facts::default(),
         );
         assert_eq!(
             report.modules[0].symbols_skipped,
@@ -503,6 +561,7 @@ mod tests {
             Ok(&doc),
             &Infra::default(),
             Some(&only),
+            &Facts::default(),
         );
         assert_eq!(report.modules[0].symbols, None);
         assert_eq!(
@@ -517,6 +576,7 @@ mod tests {
             Err(NoScan::NotNeeded),
             &Infra::default(),
             None,
+            &Facts::default(),
         );
         assert!(report.modules.is_empty());
         assert!(

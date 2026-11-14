@@ -12,6 +12,7 @@ use serde::Serialize;
 use super::diagnostic::{Diagnostic, DiagnosticCode};
 use super::index::{Index, Line};
 use super::infra::{self, Hop, Infra, Joined, Unit};
+use super::lsp::{Facts, Reference};
 use super::segments;
 use super::types::{Binding, EXTERNAL_KIND, Evidence, Module, VaultConfig};
 use super::vault::parse_message;
@@ -45,6 +46,10 @@ pub enum SkipReason {
     ScanFailed,
     /// No module binds the infrastructure unit.
     InfraUnbound,
+    /// Language servers are configured but were not enabled with `--language-servers`.
+    LanguageServersNotEnabled,
+    /// The language server failed; the check went without it.
+    LanguageServerFailed,
 }
 
 impl SkipReason {
@@ -62,17 +67,21 @@ impl SkipReason {
             Self::NotScanned => "not-scanned",
             Self::ScanFailed => "scan-failed",
             Self::InfraUnbound => "infra-unbound",
+            Self::LanguageServersNotEnabled => "language-servers-not-enabled",
+            Self::LanguageServerFailed => "language-server-failed",
         }
     }
 }
 
-/// What a skip concerns: a module's binding, a relationship's anchor, or the relationship.
+/// What a skip concerns: a module's binding, a relationship's anchor, the relationship, or a
+/// language server (its name, or the config file).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum SkipSite {
     Binding,
     Anchor,
     Relationship,
+    LanguageServer,
 }
 
 impl SkipSite {
@@ -81,6 +90,7 @@ impl SkipSite {
             Self::Binding => "binding",
             Self::Anchor => "anchor",
             Self::Relationship => "relationship",
+            Self::LanguageServer => "language-server",
         }
     }
 }
@@ -165,7 +175,7 @@ impl<'i> Collected<'i> {
     }
 
     /// Whether evidence of this kind is collected for a relationship from `from` to `to`.
-    /// Import edges stand in for call evidence until language-server references arrive;
+    /// Import edges stand in for call evidence where language servers do not judge both ends;
     /// configured paths are collected between modules holding units, and build dependencies
     /// between modules holding workspace packages.
     fn holds(&self, evidence: Evidence, from: &str, to: &str) -> bool {
@@ -207,10 +217,11 @@ pub fn needs_scan(modules: &[Module], root: &Path) -> bool {
         .any(|(repo, path)| repo.is_none() && root.join(path).exists())
 }
 
-/// Every code diagnostic of model `model` against the checkout at `root`, its scan and its
-/// infrastructure, sorted, with what was not judged. Without a scan, existing paths are skipped
-/// as `not-scanned`, or as `scan-failed` with a `SCAN_FAILED` warning. The modules must have
-/// loaded, so parents and targets exist and containment has no cycle.
+/// Every code diagnostic of model `model` against the checkout at `root`, its scan, its
+/// infrastructure and what language servers found, sorted, with what was not judged. Without a
+/// scan, existing paths are skipped as `not-scanned`, or as `scan-failed` with a `SCAN_FAILED`
+/// warning. The modules must have loaded, so parents and targets exist and containment has no
+/// cycle.
 pub fn check(
     model: &str,
     modules: &[Module],
@@ -218,15 +229,26 @@ pub fn check(
     root: &Path,
     scan: Result<&Document, NoScan>,
     infra: &Infra,
+    lsp: &Facts,
 ) -> CodeReport {
     let index = Index::new(model, modules);
     let (scan, failure) = Scan::of(scan);
     let mut report = CodeReport::default();
-    let status = bindings(&index, root, &scan, infra, &mut report);
-    anchors(&index, root, &scan, &mut report);
+    report.skips.extend(lsp.skips.iter().cloned());
+    let status = bindings(&index, root, &scan, infra, lsp, &mut report);
+    anchors(&index, root, &scan, lsp, &mut report);
     let paths = path_owners(&status);
     let joined = joined(&index, &status, infra, &paths);
-    let pairs = Pairs::new(&index, &scan, &owners(&status, &paths), &joined.hops);
+    let owners = owners(&status, &paths);
+    let served = served(&index, &status, lsp);
+    let pairs = Pairs::new(
+        &index,
+        &scan,
+        &owners,
+        &joined.hops,
+        &lsp.references,
+        served,
+    );
     let collected = Collected::new(&index, &joined);
     report.units = unit_statuses(infra, &joined.owners);
     let judged = (&status, &pairs, &collected);
@@ -257,6 +279,43 @@ pub(super) struct Ownership<'d> {
     pub(super) hops: Vec<(String, String, &'d Hop)>,
 }
 
+impl Ownership<'_> {
+    /// The scanned files each module owns.
+    pub(super) fn owned_files(&self) -> HashMap<&str, BTreeSet<&str>> {
+        let mut owned: HashMap<&str, BTreeSet<&str>> = HashMap::new();
+        for (file, id) in &self.owners {
+            owned.entry(id.as_str()).or_default().insert(file.as_str());
+        }
+        owned
+    }
+
+    /// The entry points of module `id`, sorted.
+    pub(super) fn entry_points(&self, id: &str) -> impl Iterator<Item = &str> {
+        self.entries
+            .get(id)
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+    }
+
+    /// The exports of module `id`'s interface: those of its entry points, or of every file it
+    /// owns (`owned`) when it has none.
+    pub(super) fn interface_exports<'s>(
+        &self,
+        exports: &'s [SymbolExport],
+        id: &str,
+        owned: &BTreeSet<&str>,
+    ) -> BTreeSet<&'s SymbolExport> {
+        let entries = self.entries.get(id);
+        (exports.iter())
+            .filter(|e| match entries {
+                Some(entries) => entries.contains(&e.file),
+                None => owned.contains(e.file.as_str()),
+            })
+            .collect()
+    }
+}
+
 /// The code check's mapping of the modules of `index` to the code under `root`, without judging
 /// the relationships. Diagnostics are dropped: `model check` reports them.
 pub(super) fn ownership<'d>(
@@ -266,7 +325,8 @@ pub(super) fn ownership<'d>(
     infra: &'d Infra,
 ) -> Ownership<'d> {
     let (scan, _) = Scan::of(scan);
-    let status = bindings(index, root, &scan, infra, &mut CodeReport::default());
+    let none = Facts::default();
+    let status = bindings(index, root, &scan, infra, &none, &mut CodeReport::default());
     let paths = path_owners(&status);
     let hops = (joined(index, &status, infra, &paths).hops.into_iter())
         .map(|(from, to, hop)| (from.to_owned(), to.to_owned(), hop))
@@ -566,6 +626,7 @@ impl Site<'_> {
         &self,
         root: &Path,
         scan: &'s Scan<'d>,
+        lsp: &Facts,
         report: &mut CodeReport,
     ) -> Result<Found<'s, 'd>, SkipReason> {
         let found = self.locate(root, scan);
@@ -578,18 +639,15 @@ impl Site<'_> {
                 }
                 report.skip(self.site, subject, *reason);
             }
-            (Ok(found), Some(symbol)) => match scan.exports(found.files, symbol) {
-                Some(true) => {}
-                None => report.skip(self.site, subject, SkipReason::LanguageUnsupported),
-                Some(false) if found.files.iter().any(|f| scan.limited.contains(f)) => {
-                    report.skip(self.site, subject, SkipReason::SymbolsIncomplete);
-                }
-                Some(false) => {
+            (Ok(found), Some(symbol)) => match symbol_missing(found.files, symbol, scan, lsp) {
+                Ok(None) => {}
+                Ok(Some(verb)) => {
                     let label = self.label();
                     let message =
-                        format!("{label} {path} {symbol}, but no file there exports {symbol}");
+                        format!("{label} {path} {symbol}, but no file there {verb} {symbol}");
                     report.warn(self.symbol_code, vec![subject.to_owned()], message);
                 }
+                Err(reason) => report.skip(self.site, subject, reason),
             },
             (Ok(_), None) => {}
         }
@@ -619,6 +677,26 @@ impl Site<'_> {
     }
 }
 
+/// Whether `symbol` is missing from `files`, as the verb of the sentence saying so, or why that
+/// is not known. Where the scan cannot tell, the language servers decide: a declaration they
+/// found confirms it, and only a non-empty symbol list of a single file refutes it.
+fn symbol_missing(
+    files: &[&str],
+    symbol: &str,
+    scan: &Scan<'_>,
+    lsp: &Facts,
+) -> Result<Option<&'static str>, SkipReason> {
+    let limited = files.iter().any(|f| scan.limited.contains(f));
+    let indexed = scan.exports(files, symbol);
+    match (indexed, lsp.symbol(files, symbol)) {
+        (Some(true), _) => Ok(None),
+        (Some(false), _) if !limited => Ok(Some("exports")),
+        (_, Some(declared)) => Ok((!declared).then_some("declares")),
+        (None, None) => Err(SkipReason::LanguageUnsupported),
+        (Some(false), None) => Err(SkipReason::SymbolsIncomplete),
+    }
+}
+
 type Status<'i, 's, 'd> = BTreeMap<&'i str, Result<Found<'s, 'd>, SkipReason>>;
 
 /// `BINDING_PATH_MISSING` and `BINDING_SYMBOL_MISSING`. Every module's scanned files, or why
@@ -628,6 +706,7 @@ fn bindings<'i, 's, 'd>(
     root: &Path,
     scan: &'s Scan<'d>,
     infra: &Infra,
+    lsp: &Facts,
     report: &mut CodeReport,
 ) -> Status<'i, 's, 'd> {
     let mut status = BTreeMap::new();
@@ -650,7 +729,7 @@ fn bindings<'i, 's, 'd>(
                 path_code: DiagnosticCode::BindingPathMissing,
                 symbol_code: DiagnosticCode::BindingSymbolMissing,
             }
-            .judge(root, scan, report),
+            .judge(root, scan, lsp, report),
         };
         if let Err(reason @ (SkipReason::External | SkipReason::Unbound)) = found {
             report.skip(SkipSite::Binding, id, reason);
@@ -725,7 +804,7 @@ fn symbol_bindings(index: &Index<'_>, status: &mut Status<'_, '_, '_>) {
 }
 
 /// `ANCHOR_PATH_MISSING` and `ANCHOR_SYMBOL_MISSING`.
-fn anchors(index: &Index<'_>, root: &Path, scan: &Scan<'_>, report: &mut CodeReport) {
+fn anchors(index: &Index<'_>, root: &Path, scan: &Scan<'_>, lsp: &Facts, report: &mut CodeReport) {
     for line in &index.lines {
         let Some(anchor) = line.anchor else {
             continue;
@@ -742,7 +821,7 @@ fn anchors(index: &Index<'_>, root: &Path, scan: &Scan<'_>, report: &mut CodeRep
             symbol_code: DiagnosticCode::AnchorSymbolMissing,
         };
         // The skips and diagnostics are recorded; an anchor's files serve nothing else.
-        let _ = site.judge(root, scan, report);
+        let _ = site.judge(root, scan, lsp, report);
     }
 }
 
@@ -791,16 +870,41 @@ fn unit_statuses(infra: &Infra, owners: &[Option<&str>]) -> Vec<UnitStatus> {
         .collect()
 }
 
-/// The modules code edges and infrastructure hops join, through the written target of each
-/// edge.
+/// The judged modules language servers judge calls of: those whose every interface symbol a
+/// server was asked about, with every judged part below them.
+fn served<'i>(index: &'i Index<'_>, status: &Status<'i, '_, '_>, lsp: &Facts) -> HashSet<&'i str> {
+    let judged = status
+        .iter()
+        .filter(|(_, found)| found.is_ok())
+        .map(|(&id, _)| id);
+    let mut served: HashSet<&str> = judged
+        .clone()
+        .filter(|id| lsp.queried.contains(*id))
+        .collect();
+    for id in judged.filter(|id| !lsp.queried.contains(*id)) {
+        for above in index.chain(id) {
+            served.remove(above);
+        }
+    }
+    served
+}
+
+/// The modules code edges, language-server references and infrastructure hops join, through
+/// the written target of each edge.
 struct Pairs<'i, 'd, 'x> {
     /// Ordered pairs of different owners joined by a runtime edge, with the first one.
     runtime: BTreeMap<(&'i str, &'i str), &'d Edge>,
+    /// Ordered pairs of different owners joined by a reference, with the first one.
+    calls: BTreeMap<(&'i str, &'i str), &'x Reference>,
     /// Ordered pairs of different owners joined by a configured hop, with the first one.
     configured: BTreeMap<(&'i str, &'i str), &'x Hop>,
     /// Pairs of those owners or their ancestors with the evidence joining them: `import` for
     /// any edge, `call` for a runtime edge, and each hop's own evidence.
     reach: HashSet<(Evidence, &'i str, &'i str)>,
+    /// Pairs of those owners or their ancestors that a reference joins.
+    called: HashSet<(&'i str, &'i str)>,
+    /// The modules whose call evidence is the references rather than runtime edges.
+    served: HashSet<&'i str>,
 }
 
 impl<'i, 'd, 'x> Pairs<'i, 'd, 'x> {
@@ -809,14 +913,33 @@ impl<'i, 'd, 'x> Pairs<'i, 'd, 'x> {
         scan: &Scan<'d>,
         owners: &HashMap<&'d str, &'i str>,
         hops: &[(&'i str, &'i str, &'x Hop)],
+        references: &'x [Reference],
+        served: HashSet<&'i str>,
     ) -> Self {
         let mut joined = HashSet::new();
         let mut pairs = Self {
             runtime: BTreeMap::new(),
+            calls: BTreeMap::new(),
             configured: BTreeMap::new(),
             reach: HashSet::new(),
+            called: HashSet::new(),
+            served,
         };
-        for (from, to, edge) in owner_pairs(scan.edges, |f| owners.get(f).copied()) {
+        let owner = |file: &str| owners.get(file).copied();
+        for r in references {
+            if let (Some(from), Some(to)) = (owner(&r.from), owner(&r.file))
+                && from != to
+            {
+                pairs.calls.entry((from, to)).or_insert(r);
+            }
+        }
+        let lift = |from: &'i str, to: &'i str| {
+            let targets = index.chain(to);
+            (index.chain(from).into_iter())
+                .flat_map(move |above| targets.clone().into_iter().map(move |below| (above, below)))
+        };
+        (pairs.called).extend(pairs.calls.keys().flat_map(|&(from, to)| lift(from, to)));
+        for (from, to, edge) in owner_pairs(scan.edges, owner) {
             joined.insert((Evidence::Import, from, to));
             if runtime(edge) {
                 joined.insert((Evidence::Call, from, to));
@@ -830,18 +953,55 @@ impl<'i, 'd, 'x> Pairs<'i, 'd, 'x> {
             }
         }
         for (evidence, from, to) in joined {
-            let targets = index.chain(to);
-            for above in index.chain(from) {
-                (pairs.reach).extend(targets.iter().map(|&below| (evidence, above, below)));
-            }
+            (pairs.reach).extend(lift(from, to).map(|(above, below)| (evidence, above, below)));
         }
         pairs
     }
 
     /// Whether evidence of a kind in `accepted` joins `from` or a part of it to `to` or a part
-    /// of it.
+    /// of it. Call evidence between two modules language servers serve is their references.
     fn holds(&self, accepted: &[Evidence], from: &str, to: &str) -> bool {
-        (accepted.iter()).any(|&evidence| self.reach.contains(&(evidence, from, to)))
+        let served = self.served(from, to);
+        (accepted.iter()).any(|&evidence| match evidence {
+            Evidence::Call if served => self.called.contains(&(from, to)),
+            _ => self.reach.contains(&(evidence, from, to)),
+        })
+    }
+
+    /// Whether language servers judge the calls between `a` and `b`.
+    fn served(&self, a: &str, b: &str) -> bool {
+        self.served.contains(a) && self.served.contains(b)
+    }
+
+    /// Each pair's evidence as it reads, the first kind found: a runtime edge, else a
+    /// reference, else a configured hop.
+    fn evidence(&self) -> BTreeMap<(&'i str, &'i str), String> {
+        let mut found = BTreeMap::new();
+        for (&pair, edge) in &self.runtime {
+            found.insert(
+                pair,
+                format!("{} imports {}", location(edge), written(edge)),
+            );
+        }
+        for (&pair, r) in &self.calls {
+            let calls = || format!("{}:{} calls {}", r.from, r.line, r.name);
+            found.entry(pair).or_insert_with(calls);
+        }
+        for (&pair, hop) in &self.configured {
+            let (file, line, variable) = (&hop.file, hop.line, &hop.variable);
+            let names = || format!("{file}:{line} {variable} names {}", hop.address);
+            found.entry(pair).or_insert_with(names);
+        }
+        found
+    }
+
+    /// How call evidence from `from` to `to` reads: references or imports.
+    fn call_verb(&self, from: &str, to: &str) -> &'static str {
+        if self.served(from, to) {
+            "calls"
+        } else {
+            "imports"
+        }
     }
 }
 
@@ -903,16 +1063,19 @@ fn unsupported(
         let verb = match against {
             Some(Evidence::ConfiguredPath) => "names the address of",
             Some(Evidence::BuildDependency) => "depends on",
+            Some(Evidence::Call) => pairs.call_verb(line.to, &line.from),
             _ => "imports",
         };
         return format!("{from} -> {to} [{kind}] runs backwards: only {to} {verb} {from}");
     }
     let mut lacks = Vec::new();
-    if accepted
-        .iter()
-        .any(|e| matches!(e, Evidence::Call | Evidence::Import))
-    {
+    if accepted.contains(&Evidence::Import) {
         lacks.push(format!("never imports {to}"));
+    } else if accepted.contains(&Evidence::Call) {
+        lacks.push(format!(
+            "never {} {to}",
+            pairs.call_verb(&line.from, line.to)
+        ));
     }
     if accepted.contains(&Evidence::ConfiguredPath) {
         lacks.push(format!("names no address of {to}"));
@@ -962,9 +1125,10 @@ fn verdict(
     }))
 }
 
-/// `RELATIONSHIP_UNDRAWN`: runtime edges, or else configured hops, between two modules, neither
-/// containing the other, that no relationship from the source or an ancestor to the target or an
-/// ancestor covers. A backwards relationship already reports the evidence against it.
+/// `RELATIONSHIP_UNDRAWN`: runtime edges, or else references, or else configured hops, between
+/// two modules, neither containing the other, that no relationship from the source or an
+/// ancestor to the target or an ancestor covers. A backwards relationship already reports the
+/// evidence against it.
 fn undrawn(
     index: &Index<'_>,
     pairs: &Pairs<'_, '_, '_>,
@@ -980,22 +1144,7 @@ fn undrawn(
         from.iter()
             .any(|a| to.iter().any(|b| set.contains(&(*a, *b))))
     };
-    let edges = (pairs.runtime.iter()).map(|(&pair, edge)| {
-        (
-            pair,
-            format!("{} imports {}", location(edge), written(edge)),
-        )
-    });
-    let hops = (pairs.configured.iter())
-        .filter(|(pair, _)| !pairs.runtime.contains_key(*pair))
-        .map(|(&pair, hop)| {
-            let (file, line) = (&hop.file, hop.line);
-            (
-                pair,
-                format!("{file}:{line} {} names {}", hop.variable, hop.address),
-            )
-        });
-    for ((from, to), evidence) in edges.chain(hops) {
+    for ((from, to), evidence) in pairs.evidence() {
         if index.is_below(from, to) || index.is_below(to, from) {
             continue;
         }
@@ -1287,6 +1436,7 @@ pub(super) mod tests {
             root,
             Ok(doc),
             &Infra::default(),
+            &Facts::default(),
         )
     }
 
@@ -1388,6 +1538,7 @@ pub(super) mod tests {
             dir.path(),
             Ok(&doc),
             &Infra::default(),
+            &Facts::default(),
         );
         assert_eq!(
             subjects(&report, RelationshipUnsupported),
@@ -1535,6 +1686,7 @@ pub(super) mod tests {
                 dir.path(),
                 Err(scan),
                 &none,
+                &Facts::default(),
             )
         };
         let report = without(NoScan::NotNeeded);
@@ -1568,6 +1720,7 @@ pub(super) mod tests {
             dir.path(),
             Err(failed),
             &none,
+            &Facts::default(),
         );
         assert_eq!(found_codes(&report), [BindingPathMissing]);
     }

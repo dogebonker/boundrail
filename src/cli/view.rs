@@ -414,7 +414,7 @@ impl Server {
                 }
                 model_cli::read_output(root, param("checkpoint"), param("proposal"))?
             }
-            "/api/check" => model_cli::run_check(root, None, param("proposal"))?.output()?,
+            "/api/check" => model_cli::run_check(root, None, param("proposal"), false)?.output()?,
             "/api/proposals" => model_cli::proposals_output(root)?,
             "/api/checkpoints" => model_cli::checkpoints_output(root, None)?,
             "/api/compare" => {
@@ -423,7 +423,9 @@ impl Server {
                 let against = param("against").unwrap_or(CURRENT);
                 model_cli::compare_output(root, proposal, against)?
             }
-            "/api/inspect" => model_cli::inspect_output(root, param("subject"), param("proposal"))?,
+            "/api/inspect" => {
+                model_cli::inspect_output(root, param("subject"), param("proposal"), false)?
+            }
             _ => return Ok(None),
         }))
     }

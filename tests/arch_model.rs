@@ -2,7 +2,9 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use boundrail::collect::TempDir;
 use serde_json::{Value, json};
@@ -55,6 +57,30 @@ impl Checkout {
             out.status.code().unwrap(),
             String::from_utf8(out.stdout).unwrap(),
         )
+    }
+    /// `run` with the fake language server on PATH and `user` as the user's config folder: exit
+    /// code, stdout as JSON, and stderr.
+    fn run_served(&self, user: &Path, args: &[&str]) -> (i32, Value, String) {
+        self.run_served_after(&[fake_server_dir()], user, args)
+    }
+    /// `run_served` with `dirs` ahead of the rest of PATH.
+    fn run_served_after(&self, dirs: &[&Path], user: &Path, args: &[&str]) -> (i32, Value, String) {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let dirs = dirs.iter().map(|d| d.to_path_buf());
+        let path = std::env::join_paths(dirs.chain(std::env::split_paths(&path))).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_boundrail"))
+            .args(["--no-daemon", "model"])
+            .args(args)
+            .current_dir(self.path())
+            .env("PATH", path)
+            .env("XDG_CONFIG_HOME", user)
+            .env("BOUNDRAIL_FAKE_LSP_SCRIPT", user.join(SCRIPT))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        let value = serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        (out.status.code().unwrap(), value, stderr)
     }
     fn ok(&self, args: &[&str]) -> Value {
         let (code, value) = self.run(args);
@@ -4519,7 +4545,7 @@ fn inspect_counts_entry_points_deep_imports_and_unused_exports() {
     // imports, is withheld as a candidate, as the scan's surface withholds it.
     assert_eq!(
         billing["symbols"],
-        json!({"exported": 2, "used": 1, "unused": null})
+        json!({"exported": 2, "used": 1, "unused": null, "source": "scan"})
     );
     assert_eq!(
         billing["deep_imports"],
@@ -5318,4 +5344,510 @@ fn kubernetes_service_names_support_http_and_show_in_inspect() {
         out["diagnostics"][0]["message"],
         "Ghost is bound to k8s/app.yaml ghost, but no unit there is named ghost"
     );
+}
+
+/// The fake language server's program name.
+const FAKE_SERVER: &str = "boundrail-fake-lsp";
+/// The fake server's script, in the user's config folder.
+const SCRIPT: &str = "fake-lsp.script";
+/// The fake server again under an allowlisted name, which runs it with that name's arguments.
+const ALLOWLISTED: &str = "typescript-language-server";
+
+/// The program file `name` in `dir`, with the platform's executable suffix.
+fn program(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
+}
+
+/// The folder holding the fake language server, built once with the toolchain's `rustc` from
+/// `tests/fake_lsp/server.rs`, so no real language server is needed, and a copy under
+/// [`ALLOWLISTED`].
+fn fake_server_dir() -> &'static Path {
+    static BUILT: OnceLock<PathBuf> = OnceLock::new();
+    BUILT.get_or_init(|| {
+        let name = format!("fake-lsp-{}", std::process::id());
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+        fs::create_dir_all(&dir).unwrap();
+        let beside_cargo = std::env::var_os("CARGO").map(|cargo| {
+            PathBuf::from(cargo).with_file_name(format!("rustc{}", std::env::consts::EXE_SUFFIX))
+        });
+        let rustc = (std::env::var_os("RUSTC").map(PathBuf::from))
+            .or(beside_cargo.filter(|rustc| rustc.exists()))
+            .unwrap_or_else(|| "rustc".into());
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fake_lsp/server.rs");
+        let out = Command::new(rustc)
+            .args(["--edition", "2024", "-o"])
+            .arg(program(&dir, FAKE_SERVER))
+            .arg(source)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        fs::copy(program(&dir, FAKE_SERVER), program(&dir, ALLOWLISTED)).unwrap();
+        dir
+    })
+}
+
+/// Configures language servers: the user's config folder, returned, defines `fake`, the fake
+/// server answering by `rules` as (method, needle, result), and the servers of `extra`; the
+/// repository names `fake` and the extra servers.
+fn serve(checkout: &Checkout, rules: &[(&str, &str, String)], extra: &[Value]) -> TempDir {
+    let user = TempDir::new("arch-model-user").unwrap();
+    let script: String = (rules.iter())
+        .map(|(method, needle, result)| format!("{method}\t{needle}\t{result}\n"))
+        .collect();
+    let script_path = user.path().join(SCRIPT);
+    fs::write(&script_path, script).unwrap();
+    let mut defined = vec![json!({
+        "name": "fake",
+        "command": FAKE_SERVER,
+        "args": [script_path],
+        "languages": ["typescript", "javascript"],
+        "extensions": ["ts", ".js"],
+    })];
+    defined.extend_from_slice(extra);
+    fs::create_dir(user.path().join("boundrail")).unwrap();
+    let definitions = json!(defined).to_string();
+    fs::write(
+        user.path().join("boundrail/language-servers.json"),
+        definitions,
+    )
+    .unwrap();
+    let named: Vec<Value> = (defined.iter())
+        .map(|d| json!({"server": d["name"]}))
+        .collect();
+    name_servers(checkout, &json!(named));
+    user
+}
+
+/// Writes the repository's list of language servers.
+fn name_servers(checkout: &Checkout, entries: &Value) {
+    let dir = checkout.path().join(".boundrail");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("language-servers.json"), entries.to_string()).unwrap();
+}
+
+/// The `file:` URI of the checkout path `path`, as the client sends it.
+fn uri(checkout: &Checkout, path: &str) -> String {
+    let root = fs::canonicalize(checkout.path()).unwrap();
+    format!("file://{}/{path}", root.display())
+}
+
+/// A `workspace/symbol` answer declaring `name` on line `line` of `path`.
+fn declared(checkout: &Checkout, name: &str, path: &str, line: u64) -> String {
+    let range =
+        json!({"start": {"line": line, "character": 0}, "end": {"line": line, "character": 40}});
+    json!([{"name": name, "kind": 13, "location": {"uri": uri(checkout, path), "range": range}}])
+        .to_string()
+}
+
+/// A `textDocument/references` answer: a use on each (path, 0-based line).
+fn uses(checkout: &Checkout, at: &[(&str, u64)]) -> String {
+    let locations: Vec<Value> = (at.iter())
+        .map(|(path, line)| {
+            let start = json!({"line": line, "character": 2});
+            json!({"uri": uri(checkout, path), "range": {"start": start, "end": start}})
+        })
+        .collect();
+    json!(locations).to_string()
+}
+
+/// The TypeScript checkout with Web, Billing and Bank bound to its three folders, Web calling
+/// Billing and Billing calling Bank drawn, and a fake server that finds Web and Billing calling
+/// Bank's `pay` and Web calling Billing's `charge`; Web's `page` is used nowhere. Returns the
+/// model ID and the user's config folder.
+fn served_shop(checkout: &Checkout) -> (String, TempDir) {
+    typescript(checkout);
+    let model = checkout.init();
+    for (order, (id, name, path)) in [
+        ("WebApp01", "Web", "src/web"),
+        ("Billing1", "Billing", "src/billing"),
+        ("BankApi1", "Bank", "src/bank"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut module = module(id, name, "service", order as u32);
+        module["binding"] = json!({"path": path});
+        checkout.module(module);
+    }
+    draw(
+        checkout,
+        &model,
+        "WebApp01",
+        &[("WebBil01", "Billing1", "call")],
+    );
+    draw(
+        checkout,
+        &model,
+        "Billing1",
+        &[("BilBnk01", "BankApi1", "call")],
+    );
+    let (web, billing, bank) = (
+        "src/web/index.ts",
+        "src/billing/index.ts",
+        "src/bank/index.ts",
+    );
+    let rules = [
+        ("initialize", "", json!({"capabilities": {}}).to_string()),
+        (
+            "workspace/symbol",
+            r#""query":"pay""#,
+            declared(checkout, "pay", bank, 0),
+        ),
+        (
+            "workspace/symbol",
+            r#""query":"charge""#,
+            declared(checkout, "charge", billing, 1),
+        ),
+        (
+            "workspace/symbol",
+            r#""query":"page""#,
+            declared(checkout, "page", web, 1),
+        ),
+        (
+            "textDocument/references",
+            bank,
+            uses(checkout, &[(billing, 1), (web, 1)]),
+        ),
+        (
+            "textDocument/references",
+            billing,
+            uses(checkout, &[(web, 1)]),
+        ),
+        ("textDocument/references", web, "[]".to_owned()),
+    ];
+    let user = serve(checkout, &rules, &[]);
+    (model, user)
+}
+
+/// Sets the relationships drawn from `id` as (relationship ID, target ID, kind).
+fn draw(checkout: &Checkout, model: &str, id: &str, lines: &[(&str, &str, &str)]) {
+    let mut module = checkout.read_module(id);
+    module["outgoing"] = (lines.iter().enumerate())
+        .map(|(order, (rel, to, kind))| {
+            json!({"id": rel, "to": format!("{model}#{to}"), "kind": kind, "order": order})
+        })
+        .collect();
+    checkout.module(module);
+}
+
+/// Web's relationships to Billing and, with no import behind it, to Bank.
+fn draw_web_to_bank(checkout: &Checkout, model: &str) {
+    let lines = [
+        ("WebBil01", "Billing1", "call"),
+        ("WebBnk01", "BankApi1", "call"),
+    ];
+    draw(checkout, model, "WebApp01", &lines);
+}
+
+const CHECK_SERVED: [&str; 4] = ["check", "--only", "code", "--language-servers"];
+
+#[test]
+fn language_server_references_are_call_evidence_where_no_import_exists() {
+    let checkout = Checkout::new();
+    let (model, user) = served_shop(&checkout);
+    draw_web_to_bank(&checkout, &model);
+    let user = user.path();
+
+    // Without the flag the config is ignored: Web never imports Bank, and the skip says why.
+    let (code, out, stderr) = checkout.run_served(user, &["check", "--only", "code"]);
+    assert_eq!(code, 1, "{out:#}");
+    assert_eq!(found(&out), ["RELATIONSHIP_UNSUPPORTED WebBnk01"]);
+    assert_eq!(
+        out["diagnostics"][0]["message"],
+        "Web -> Bank [call] has no code evidence: Web never imports Bank"
+    );
+    let skip = json!({"subject": ".boundrail/language-servers.json", "site": "language-server", "reason": "language-servers-not-enabled"});
+    assert_eq!(out["skips"], json!([skip]));
+    assert!(!stderr.contains("language server"), "{stderr}");
+
+    // The repository names `fake`; the user's config defines its program and arguments.
+    let (code, out, stderr) = checkout.run_served(user, &CHECK_SERVED);
+    assert_eq!(code, 0, "{out:#} {stderr}");
+    assert_eq!(out["diagnostics"], json!([]));
+    assert_eq!(out["skips"], json!([]));
+    let program = program(fake_server_dir(), FAKE_SERVER);
+    let line = format!(
+        "boundrail: starting language server fake: {} {}\n",
+        program.display(),
+        user.join(SCRIPT).display()
+    );
+    assert!(stderr.contains(&line), "{stderr}");
+
+    // Inspect counts uses from the references; Web's `page` is used by no one.
+    let (_, out, _) = checkout.run_served(user, &["inspect"]);
+    assert_eq!(out["modules"][0]["symbols"]["source"], "scan");
+    assert_eq!(out["language_servers"], json!([skip]));
+    let (code, out, _) = checkout.run_served(user, &["inspect", "--language-servers"]);
+    assert_eq!(code, 0, "{out:#}");
+    assert_eq!(out["language_servers"], json!([]));
+    let symbols: Vec<(&str, Value)> = (out["modules"].as_array().unwrap().iter())
+        .map(|m| (m["name"].as_str().unwrap(), m["symbols"].clone()))
+        .collect();
+    let page = json!({"file": "src/web/index.ts", "name": "page", "target": {"file": "src/web/index.ts", "name": "page"}});
+    let served = |used, unused| json!({"exported": 1, "used": used, "unused": unused, "source": "language-server"});
+    assert_eq!(
+        symbols,
+        [
+            ("Bank", served(1, json!([]))),
+            ("Billing", served(1, json!([]))),
+            ("Web", served(0, json!([page]))),
+        ]
+    );
+}
+
+#[test]
+fn an_allowlisted_server_runs_its_own_name_with_fixed_arguments() {
+    let checkout = Checkout::new();
+    let (model, user) = served_shop(&checkout);
+    draw_web_to_bank(&checkout, &model);
+    // No user definition of the name: the allowlist's program and `--stdio` run.
+    name_servers(
+        &checkout,
+        &json!([{"server": ALLOWLISTED, "extensions": ["ts"]}]),
+    );
+    let (code, out, stderr) = checkout.run_served(user.path(), &CHECK_SERVED);
+    assert_eq!(code, 0, "{out:#} {stderr}");
+    let program = program(fake_server_dir(), ALLOWLISTED);
+    let line = format!(
+        "boundrail: starting language server {ALLOWLISTED}: {} --stdio\n",
+        program.display()
+    );
+    assert!(stderr.contains(&line), "{stderr}");
+}
+
+#[test]
+fn language_server_references_run_backwards_and_find_undrawn_calls() {
+    let checkout = Checkout::new();
+    let (model, user) = served_shop(&checkout);
+    let user = user.path();
+    draw(
+        &checkout,
+        &model,
+        "BankApi1",
+        &[("BnkWeb01", "WebApp01", "call")],
+    );
+
+    let (code, out, _) = checkout.run_served(user, &CHECK_SERVED);
+    assert_eq!(code, 1, "{out:#}");
+    assert_eq!(found(&out), ["RELATIONSHIP_BACKWARDS BnkWeb01"]);
+    assert_eq!(
+        out["diagnostics"][0]["message"],
+        "Bank -> Web [call] runs backwards: only Web calls Bank"
+    );
+
+    draw(&checkout, &model, "BankApi1", &[]);
+    let (code, out, _) = checkout.run_served(user, &CHECK_SERVED);
+    assert_eq!(code, 1, "{out:#}");
+    assert_eq!(found(&out), ["RELATIONSHIP_UNDRAWN WebApp01, BankApi1"]);
+    assert_eq!(
+        out["diagnostics"][0]["message"],
+        "Web uses Bank but no relationship is drawn: src/web/index.ts:2 calls pay"
+    );
+}
+
+#[test]
+fn language_servers_confirm_or_refute_symbols_the_scan_cannot_index() {
+    let checkout = Checkout::new();
+    typescript(&checkout);
+    let model = checkout.init();
+    let pay = "src/bank/pay.js";
+    fs::write(
+        checkout.path().join(pay),
+        "function charge(n) { return n; }\nmodule.exports = { charge };\n",
+    )
+    .unwrap();
+    let mut billing = module("Billing1", "Billing", "service", 0);
+    billing["binding"] = json!({"path": pay, "symbol": "charge"});
+    checkout.module(billing);
+    let mut web = module("WebApp01", "Web", "app", 1);
+    web["binding"] = json!({"path": "src/web"});
+    web["outgoing"] = json!([{
+        "id": "WebBil01", "to": format!("{model}#Billing1"), "kind": "other", "order": 0,
+        "anchor": {"path": pay, "symbol": "refund"},
+    }]);
+    checkout.module(web);
+    let rules = [
+        (
+            "workspace/symbol",
+            r#""query":"charge""#,
+            declared(&checkout, "charge", pay, 0),
+        ),
+        ("workspace/symbol", r#""query":"refund""#, "[]".to_owned()),
+    ];
+    let user = serve(&checkout, &rules, &[]);
+    let incomplete = |out: &Value| -> Vec<String> {
+        (out["skips"].as_array().unwrap().iter())
+            .filter(|s| s["reason"] == "symbols-incomplete")
+            .map(|s| {
+                s["subject"]
+                    .as_str()
+                    .unwrap()
+                    .split_once('#')
+                    .unwrap()
+                    .1
+                    .to_owned()
+            })
+            .collect()
+    };
+
+    let (code, out, _) = checkout.run_served(user.path(), &["check", "--only", "code"]);
+    assert_eq!(code, 0, "{out:#}");
+    assert_eq!(incomplete(&out), ["Billing1", "WebBil01"]);
+
+    // `charge` is found; an empty answer for `refund` refutes nothing.
+    let (code, out, _) = checkout.run_served(user.path(), &CHECK_SERVED);
+    assert_eq!(code, 0, "{out:#}");
+    assert_eq!(incomplete(&out), ["WebBil01"]);
+    assert_eq!(found(&out), Vec::<String>::new());
+
+    // A server listing the file's symbols without `refund` refutes it.
+    let listed = r#"[{"name": "charge", "kind": 12, "children": [{"name": "n"}]}]"#.to_owned();
+    let initialized = json!({"capabilities": {"documentSymbolProvider": true}}).to_string();
+    let rules = [
+        rules[0].clone(),
+        rules[1].clone(),
+        ("initialize", "", initialized),
+        ("textDocument/documentSymbol", pay, listed),
+    ];
+    let user = serve(&checkout, &rules, &[]);
+    let (code, out, _) = checkout.run_served(user.path(), &CHECK_SERVED);
+    assert_eq!(code, 1, "{out:#}");
+    assert_eq!(incomplete(&out), Vec::<String>::new());
+    assert_eq!(found(&out), ["ANCHOR_SYMBOL_MISSING WebBil01"]);
+    assert_eq!(
+        out["diagnostics"][0]["message"],
+        "Web -> Billing is anchored at src/bank/pay.js refund, but no file there declares refund"
+    );
+}
+
+#[test]
+fn the_repository_names_servers_but_never_their_commands() {
+    let checkout = Checkout::new();
+    let (_, user) = served_shop(&checkout);
+    let user = user.path();
+    let refused = |entries: Value, expected: &str| {
+        name_servers(&checkout, &entries);
+        // Without the flag the list is not even read.
+        let (code, out, _) = checkout.run_served(user, &["check", "--only", "code"]);
+        assert_eq!(code, 0, "{out:#}");
+        assert_eq!(out["skips"][0]["reason"], "language-servers-not-enabled");
+        for args in [&CHECK_SERVED[..], &["inspect", "--language-servers"]] {
+            let (code, out, stderr) = checkout.run_served(user, args);
+            assert_eq!(
+                (code, &out["error"]["code"]),
+                (2, &json!("REQUEST_INVALID")),
+                "{out:#}"
+            );
+            let message = out["error"]["message"].as_str().unwrap();
+            assert!(message.contains(expected), "{message}");
+            assert!(!stderr.contains("starting language server"), "{stderr}");
+        }
+    };
+    let entry = json!({"server": "fake", "command": "./boundrail-fake-lsp", "args": []});
+    refused(json!([entry]), "unknown field `command`");
+    refused(
+        json!([{"server": "gopls", "initialization_options": {}}]),
+        "unknown field `initialization_options`",
+    );
+    let config = user.join("boundrail/language-servers.json");
+    let unknown = format!(
+        "the language server \"evil\" is not one of typescript-language-server, \
+         basedpyright-langserver, pyright-langserver, rust-analyzer, gopls, jdtls, nor defined by \
+         the user; define it in {}",
+        config.display()
+    );
+    refused(json!([{"server": "evil"}]), &unknown);
+
+    // The user's own config may name an absolute program, never one relative to the checkout.
+    let fake = fs::read_to_string(&config).unwrap();
+    for command in ["./boundrail-fake-lsp", "bin\\server", ""] {
+        let local = json!([{"name": "fake", "command": command, "args": [], "languages": [], "extensions": ["ts"]}]);
+        fs::write(&config, local.to_string()).unwrap();
+        refused(
+            json!([{"server": "fake"}]),
+            "name a program on PATH or an absolute path",
+        );
+    }
+    let mut absolute: Value = serde_json::from_str(&fake).unwrap();
+    absolute[0]["command"] = json!(program(fake_server_dir(), FAKE_SERVER));
+    fs::write(&config, absolute.to_string()).unwrap();
+    // The server answers: only it finds Web calling Bank.
+    let (code, out, stderr) = checkout.run_served(user, &CHECK_SERVED);
+    assert_eq!(code, 1, "{out:#} {stderr}");
+    assert_eq!(found(&out), ["RELATIONSHIP_UNDRAWN WebApp01, BankApi1"]);
+    let line = format!(
+        "boundrail: starting language server fake: {} ",
+        program(fake_server_dir(), FAKE_SERVER).display()
+    );
+    assert!(stderr.contains(&line), "{stderr}");
+}
+
+#[test]
+fn a_failed_language_server_is_skipped_and_the_check_falls_back_to_imports() {
+    let checkout = Checkout::new();
+    let absent = json!({"name": "absent", "command": "boundrail-no-such-server", "args": [], "languages": ["typescript"], "extensions": ["ts"]});
+    let (model, _) = served_shop(&checkout);
+    draw_web_to_bank(&checkout, &model);
+    let user = serve(
+        &checkout,
+        &[("initialize", "", "hang".to_owned())],
+        &[absent],
+    );
+
+    let started = Instant::now();
+    let mut args = CHECK_SERVED.to_vec();
+    args.extend(["--tool-timeout", "2"]);
+    let (code, out, stderr) = checkout.run_served(user.path(), &args);
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(code, 1, "{out:#}");
+    // Web imports Billing, so only the line to Bank lacks evidence.
+    assert_eq!(found(&out), ["RELATIONSHIP_UNSUPPORTED WebBnk01"]);
+    let failed = |name: &str| json!({"subject": name, "site": "language-server", "reason": "language-server-failed"});
+    assert_eq!(out["skips"], json!([failed("absent"), failed("fake")]));
+    assert!(stderr.contains("warning: language server fake failed: initialize got no answer in time; stderr: fake server started | fake server hangs on initialize"), "{stderr}");
+    assert!(
+        stderr.contains(
+            "warning: language server absent failed: boundrail-no-such-server is not on PATH"
+        ),
+        "{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_server_never_finds_programs_in_relative_path_folders() {
+    let checkout = Checkout::new();
+    let (model, user) = served_shop(&checkout);
+    draw_web_to_bank(&checkout, &model);
+    // A program the checkout plants under the fake server's name, on a relative PATH entry.
+    let planted = checkout.path().join("planted");
+    fs::create_dir(&planted).unwrap();
+    let script = format!(
+        "#!/bin/sh\ntouch {}\nexit 1\n",
+        checkout.path().join("ran").display()
+    );
+    fs::write(program(&planted, FAKE_SERVER), script).unwrap();
+    let mode = <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755);
+    fs::set_permissions(program(&planted, FAKE_SERVER), mode).unwrap();
+    // The server is `env`, which looks the fake server up on the PATH it is given.
+    let config = user.path().join("boundrail/language-servers.json");
+    let mut defined: Value = serde_json::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+    let args = defined[0]["args"].clone();
+    defined[0]["command"] = json!("/usr/bin/env");
+    defined[0]["args"] = json!([FAKE_SERVER, args[0]]);
+    fs::write(&config, defined.to_string()).unwrap();
+
+    let dirs = [Path::new("planted"), fake_server_dir()];
+    let (code, out, stderr) = checkout.run_served_after(&dirs, user.path(), &CHECK_SERVED);
+    assert!(!checkout.path().join("ran").exists(), "{stderr}");
+    assert_eq!(code, 0, "{out:#} {stderr}");
+    assert_eq!(out["skips"], json!([]));
 }

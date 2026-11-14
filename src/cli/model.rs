@@ -12,6 +12,7 @@ use boundrail::arch::footprint::{self, CrossingsSkipped, FootprintReport, Range}
 use boundrail::arch::infra::{self, Infra};
 use boundrail::arch::inspect::{self, InspectReport};
 use boundrail::arch::locality::{self, History, LocalityReport};
+use boundrail::arch::lsp::{self, Facts};
 use boundrail::arch::proposal::{self, CURRENT, Writing};
 use boundrail::arch::render::{self, View};
 use boundrail::arch::request::INPUT_MAX;
@@ -50,6 +51,12 @@ enum Command {
         /// Check this proposal instead of the current state
         #[arg(long)]
         proposal: Option<String>,
+        /// Run the language servers .boundrail/language-servers.json names, for call references and symbols.
+        /// They run code from the checkout (a workspace tsserver.js under node_modules,
+        /// rust-analyzer build scripts and proc macros, jdtls Gradle and Maven imports): use it on
+        /// trusted checkouts only, never on untrusted pull request heads in CI
+        #[arg(long)]
+        language_servers: bool,
     },
     /// Draw the model as SVG: the architecture, or a flow as a sequence diagram or flowchart,
     /// optionally marked with what it changes against another state
@@ -263,6 +270,12 @@ enum ModelCmd {
         /// Inspect this proposal instead of the current state
         #[arg(long)]
         proposal: Option<String>,
+        /// Run the language servers .boundrail/language-servers.json names, for references to each interface symbol.
+        /// They run code from the checkout (a workspace tsserver.js under node_modules,
+        /// rust-analyzer build scripts and proc macros, jdtls Gradle and Maven imports): use it on
+        /// trusted checkouts only, never on untrusted pull request heads in CI
+        #[arg(long)]
+        language_servers: bool,
     },
     /// Report from Git history how often commits stay inside each module, which modules change
     /// together, and the pairs that do so with no relationship drawn
@@ -316,7 +329,17 @@ impl WritingArgs {
 pub(super) fn run(args: ModelArgs) -> Result<ExitCode> {
     let markdown = matches!(args.format, Some(Format::Markdown));
     let result = match args.command {
-        Command::Check { only, proposal } => check(&args.root, markdown, only, proposal.as_deref()),
+        Command::Check {
+            only,
+            proposal,
+            language_servers,
+        } => check(
+            &args.root,
+            markdown,
+            only,
+            proposal.as_deref(),
+            language_servers,
+        ),
         Command::Render(render) => {
             render_model(&args.root, args.format, &render).map(|()| ExitCode::SUCCESS)
         }
@@ -690,8 +713,13 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
                 }),
             )
         }
-        ModelCmd::Inspect { subject, proposal } => {
-            inspect_model(root, markdown, subject.as_deref(), proposal.as_deref())
+        ModelCmd::Inspect {
+            subject,
+            proposal,
+            language_servers,
+        } => {
+            let (subject, proposal) = (subject.as_deref(), proposal.as_deref());
+            inspect_model(root, markdown, subject, proposal, language_servers)
         }
         ModelCmd::Locality { since, limit } => {
             model_locality(root, markdown, since.as_deref(), limit)
@@ -1001,8 +1029,9 @@ fn check(
     markdown: bool,
     only: Option<CheckOnly>,
     proposal: Option<&str>,
+    language_servers: bool,
 ) -> Result<ExitCode> {
-    let checked = run_check(root, only, proposal)?;
+    let checked = run_check(root, only, proposal, language_servers)?;
     let code = ExitCode::from(u8::from(checked.warning > 0));
     if markdown {
         let Checked {
@@ -1039,11 +1068,13 @@ pub(super) struct Checked {
     information: usize,
 }
 
-/// Runs the checks `only` names, or both, on the current state or `proposal`.
+/// Runs the checks `only` names, or both, on the current state or `proposal`, the code check
+/// with the configured language servers when `language_servers` is set.
 pub(super) fn run_check(
     root: &Path,
     only: Option<CheckOnly>,
     proposal: Option<&str>,
+    language_servers: bool,
 ) -> Result<Checked> {
     let (model, _, pending) = load_for_read(root, proposal)?;
     let mut diagnostics = if only == Some(CheckOnly::Code) {
@@ -1053,7 +1084,7 @@ pub(super) fn run_check(
     };
     let (mut skips, mut units) = (None, None);
     if only != Some(CheckOnly::Semantic) {
-        let report = code_check(&model)?;
+        let report = code_check(&model, language_servers)?;
         diagnostics.extend(report.diagnostics);
         skips = Some(report.skips);
         units = Some(report.units);
@@ -1123,17 +1154,42 @@ fn scan_error(doc: &Result<Document, NoScan>) -> Option<&str> {
 
 /// The code check against the model's checkout and its infrastructure, scanning it once when a
 /// binding or anchor names code there. A failed scan becomes a `SCAN_FAILED` warning.
-fn code_check(model: &Model) -> Result<CodeReport> {
+fn code_check(model: &Model, language_servers: bool) -> Result<CodeReport> {
     let (checkout, doc) = scan_checkout(model)?;
     let checkout = checkout.as_path();
+    let infra = infra::read(checkout)?;
+    let lsp = language_server_facts(model, checkout, &doc, &infra, language_servers)?;
     Ok(code::check(
         &model.manifest.id,
         &model.modules,
         &model.config,
         checkout,
         doc.as_ref().map_err(Clone::clone),
-        &infra::read(checkout)?,
+        &infra,
+        &lsp,
     ))
+}
+
+/// What the configured language servers find when `enabled` and the scan ran; otherwise
+/// nothing, with a `language-servers-not-enabled` skip when servers are configured. An invalid
+/// config refuses only when `enabled`.
+fn language_server_facts(
+    model: &Model,
+    checkout: &Path,
+    doc: &Result<Document, NoScan>,
+    infra: &Infra,
+    enabled: bool,
+) -> Result<Facts> {
+    let (servers, skips) = lsp::configured(checkout, enabled)?;
+    let mut facts = match doc {
+        Ok(doc) => {
+            let (id, modules) = (&model.manifest.id, &model.modules);
+            lsp::gather(checkout, &servers, id, modules, doc, infra)
+        }
+        Err(_) => Facts::default(),
+    };
+    facts.skips.extend(skips);
+    Ok(facts)
 }
 
 /// `model inspect`: each bound module's interface, or one module's.
@@ -1142,11 +1198,15 @@ fn inspect_model(
     markdown: bool,
     subject: Option<&str>,
     proposal: Option<&str>,
+    language_servers: bool,
 ) -> Result<()> {
     if !markdown {
-        return write(None, &inspect_output(root, subject, proposal)?);
+        return write(
+            None,
+            &inspect_output(root, subject, proposal, language_servers)?,
+        );
     }
-    let Inspected { model, report, .. } = inspected(root, subject, proposal)?;
+    let Inspected { model, report, .. } = inspected(root, subject, proposal, language_servers)?;
     print_proposal(&model);
     print_inspect(&model, &report);
     Ok(())
@@ -1157,12 +1217,13 @@ pub(super) fn inspect_output(
     root: &Path,
     subject: Option<&str>,
     proposal: Option<&str>,
+    language_servers: bool,
 ) -> Result<Value> {
     let Inspected {
         model,
         report,
         scan_error,
-    } = inspected(root, subject, proposal)?;
+    } = inspected(root, subject, proposal, language_servers)?;
     let mut output = json!({
         "schema": MODEL_SCHEMA,
         "kind": "inspect",
@@ -1186,7 +1247,12 @@ struct Inspected {
     scan_error: Option<String>,
 }
 
-fn inspected(root: &Path, subject: Option<&str>, proposal: Option<&str>) -> Result<Inspected> {
+fn inspected(
+    root: &Path,
+    subject: Option<&str>,
+    proposal: Option<&str>,
+    language_servers: bool,
+) -> Result<Inspected> {
     let (model, _, _) = load_for_read(root, proposal)?;
     let id = &model.manifest.id;
     let subject = subject
@@ -1195,8 +1261,9 @@ fn inspected(root: &Path, subject: Option<&str>, proposal: Option<&str>) -> Resu
     let (checkout, doc) = scan_checkout(&model)?;
     let scan = doc.as_ref().map_err(Clone::clone);
     let infra = infra::read(&checkout)?;
+    let lsp = language_server_facts(&model, &checkout, &doc, &infra, language_servers)?;
     let (modules, subject) = (&model.modules, subject.as_deref());
-    let report = inspect::inspect(id, modules, &checkout, scan, &infra, subject);
+    let report = inspect::inspect(id, modules, &checkout, scan, &infra, subject, &lsp);
     let scan_error = scan_error(&doc).map(str::to_owned);
     Ok(Inspected {
         model,
@@ -1235,15 +1302,24 @@ fn drawn_as(relationships: &BTreeMap<String, String>, ids: &[String]) -> String 
     format!("drawn as {}", read.collect::<Vec<_>>().join(", "))
 }
 
+/// How a module's symbols read after its file and entry point counts.
+fn symbols_summary(m: &inspect::Interface) -> String {
+    match (&m.symbols, m.symbols_skipped) {
+        (Some(s), _) => {
+            let served = s.source == inspect::Source::LanguageServer;
+            let by = if served { " by language server" } else { "" };
+            format!(", {} exported, {} used outside{by}", s.exported, s.used)
+        }
+        (None, Some(reason)) => format!(", symbols {}", reason.as_str()),
+        (None, None) => String::new(),
+    }
+}
+
 fn print_inspect(model: &Model, report: &InspectReport) {
     let names = names(model);
     let relationships = relationship_names(model);
     for m in &report.modules {
-        let symbols = match (&m.symbols, m.symbols_skipped) {
-            (Some(s), _) => format!(", {} exported, {} used outside", s.exported, s.used),
-            (None, Some(reason)) => format!(", symbols {}", reason.as_str()),
-            (None, None) => String::new(),
-        };
+        let symbols = symbols_summary(m);
         let entries = count(m.entry_points.len(), "entry point");
         println!("{}: {}, {entries}{symbols}", m.name, count(m.files, "file"));
         for entry in &m.entry_points {
@@ -1274,15 +1350,13 @@ fn print_inspect(model: &Model, report: &InspectReport) {
             }
         }
     }
-    if !report.skips.is_empty() {
+    if !report.skips.is_empty() || !report.language_servers.is_empty() {
         println!("Skipped:");
     }
-    for skip in &report.skips {
-        println!(
-            "- {} {}",
-            name_of(&names, &skip.module),
-            skip.reason.as_str()
-        );
+    let modules = (report.skips.iter()).map(|s| (name_of(&names, &s.module), s.reason));
+    let servers = (report.language_servers.iter()).map(|s| (s.subject.as_str(), s.reason));
+    for (subject, reason) in modules.chain(servers) {
+        println!("- {subject} {}", reason.as_str());
     }
 }
 

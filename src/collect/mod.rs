@@ -140,6 +140,13 @@ pub fn request_timeout(timeout: Option<Duration>) {
 /// Default timeout for library callers without a request override.
 pub static TOOL_TIMEOUT: OnceLock<Option<Duration>> = OnceLock::new();
 
+/// The tool timeout of this thread's request, else the default; `None` waits forever.
+pub fn tool_timeout() -> Option<Duration> {
+    REQUEST_TIMEOUT
+        .with(|t| t.get())
+        .unwrap_or_else(|| TOOL_TIMEOUT.get().copied().flatten())
+}
+
 /// `run_with_input` with no input.
 pub fn run(command: &mut Command) -> Result<Output> {
     run_with_input(command, Vec::new())
@@ -164,10 +171,7 @@ pub fn run_with_input(command: &mut Command, input: Vec<u8>) -> Result<Output> {
     let writer = thread::spawn(move || stdin.write_all(&input));
     let stdout = read_all(child.stdout.take().expect("piped stdout"));
     let stderr = read_all(child.stderr.take().expect("piped stderr"));
-    let status = match REQUEST_TIMEOUT
-        .with(|t| t.get())
-        .unwrap_or_else(|| TOOL_TIMEOUT.get().copied().flatten())
-    {
+    let status = match tool_timeout() {
         None => child.wait()?,
         Some(timeout) => {
             let deadline = Instant::now() + timeout;

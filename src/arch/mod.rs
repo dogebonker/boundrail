@@ -13,6 +13,7 @@ mod index;
 pub mod infra;
 pub mod inspect;
 pub mod locality;
+pub mod lsp;
 pub mod proposal;
 pub mod render;
 pub mod request;
