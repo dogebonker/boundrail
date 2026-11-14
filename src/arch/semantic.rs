@@ -3,85 +3,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::{Serialize, Serializer};
-
-use super::ids;
+use super::diagnostic::{Diagnostic, DiagnosticCode};
+use super::index::Index;
+use super::segments;
 use super::types::{Binding, Module};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum DiagnosticCode {
-    ContainerUnbound,
-    ContainerPartsOutside,
-    ContainerPassThrough,
-    RootUnconnected,
-    BindingShared,
-    RelationshipRepeated,
-    ContainerLineToOwnPart,
-    RelationshipOnContainer,
-}
-
-impl DiagnosticCode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::ContainerUnbound => "CONTAINER_UNBOUND",
-            Self::ContainerPartsOutside => "CONTAINER_PARTS_OUTSIDE",
-            Self::ContainerPassThrough => "CONTAINER_PASS_THROUGH",
-            Self::RootUnconnected => "ROOT_UNCONNECTED",
-            Self::BindingShared => "BINDING_SHARED",
-            Self::RelationshipRepeated => "RELATIONSHIP_REPEATED",
-            Self::ContainerLineToOwnPart => "CONTAINER_LINE_TO_OWN_PART",
-            Self::RelationshipOnContainer => "RELATIONSHIP_ON_CONTAINER",
-        }
-    }
-
-    pub fn severity(self) -> Severity {
-        match self {
-            Self::ContainerPassThrough | Self::RelationshipOnContainer => Severity::Information,
-            Self::ContainerUnbound
-            | Self::ContainerPartsOutside
-            | Self::RootUnconnected
-            | Self::BindingShared
-            | Self::RelationshipRepeated
-            | Self::ContainerLineToOwnPart => Severity::Warning,
-        }
-    }
-}
-
-impl Serialize for DiagnosticCode {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-/// A warning fails the check; information never does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Severity {
-    Warning,
-    Information,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-pub struct Diagnostic {
-    pub code: DiagnosticCode,
-    pub severity: Severity,
-    /// Qualified IDs of the modules or relationships the diagnostic concerns.
-    pub subjects: Vec<String>,
-    pub message: String,
-    /// For `CONTAINER_UNBOUND`: the directory its bound parts share.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub suggested_binding: Option<String>,
-}
-
-fn diagnostic(code: DiagnosticCode, subjects: Vec<String>, message: String) -> Diagnostic {
-    Diagnostic {
-        code,
-        severity: code.severity(),
-        subjects,
-        message,
-        suggested_binding: None,
-    }
-}
 
 /// Every semantic diagnostic of the modules of model `model`, sorted. The modules must have
 /// loaded, so parents and targets exist and containment has no cycle.
@@ -96,103 +21,6 @@ pub fn check(model: &str, modules: &[Module]) -> Vec<Diagnostic> {
     relationship_ends(&index, &mut out);
     out.sort();
     out
-}
-
-struct Line<'a> {
-    id: String,
-    from: String,
-    to: &'a str,
-    kind: &'a str,
-}
-
-struct Index<'a> {
-    by_id: BTreeMap<String, &'a Module>,
-    roots: Vec<(String, &'a Module)>,
-    /// Modules keyed by their parent's qualified ID.
-    parts: BTreeMap<&'a str, Vec<(String, &'a Module)>>,
-    lines: Vec<Line<'a>>,
-}
-
-impl<'a> Index<'a> {
-    fn new(model: &str, modules: &'a [Module]) -> Self {
-        let mut index = Self {
-            by_id: BTreeMap::new(),
-            roots: Vec::new(),
-            parts: BTreeMap::new(),
-            lines: Vec::new(),
-        };
-        for module in modules {
-            let id = ids::qualify(model, &module.id);
-            match module.parent.as_deref() {
-                Some(parent) => index.parts.entry(parent).or_default(),
-                None => &mut index.roots,
-            }
-            .push((id.clone(), module));
-            index.lines.extend(module.outgoing.iter().map(|r| Line {
-                id: ids::qualify(model, &r.id),
-                from: id.clone(),
-                to: &r.to,
-                kind: &r.kind,
-            }));
-            index.by_id.insert(id, module);
-        }
-        index
-    }
-
-    fn name<'s>(&'s self, id: &'s str) -> &'s str {
-        self.by_id.get(id).map_or(id, |m| m.name.as_str())
-    }
-
-    fn parts_of(&self, id: &str) -> &[(String, &'a Module)] {
-        self.parts.get(id).map_or(&[], Vec::as_slice)
-    }
-
-    fn is_container(&self, id: &str) -> bool {
-        !self.parts_of(id).is_empty()
-    }
-
-    /// Every module below `id`, at any depth.
-    fn descendants(&self, id: &str) -> Vec<(&str, &'a Module)> {
-        let mut found = Vec::new();
-        let mut stack: Vec<&(String, &'a Module)> = self.parts_of(id).iter().collect();
-        while let Some((part, module)) = stack.pop() {
-            stack.extend(self.parts_of(part));
-            found.push((part.as_str(), *module));
-        }
-        found
-    }
-
-    /// The closest module above `id` that has a binding, with that binding.
-    fn bound_ancestor(&self, id: &str) -> Option<(&str, &'a Module, &'a Binding)> {
-        let module: &'a Module = self.by_id.get(id)?;
-        let mut at = module.parent.as_deref();
-        while let Some(parent) = at {
-            let (key, &above) = self.by_id.get_key_value(parent)?;
-            if let Some(binding) = &above.binding {
-                return Some((key, above, binding));
-            }
-            at = above.parent.as_deref();
-        }
-        None
-    }
-
-    fn is_below(&self, id: &str, ancestor: &str) -> bool {
-        let mut at = self.by_id.get(id).and_then(|m| m.parent.as_deref());
-        while let Some(parent) = at {
-            if parent == ancestor {
-                return true;
-            }
-            at = self.by_id.get(parent).and_then(|m| m.parent.as_deref());
-        }
-        false
-    }
-}
-
-/// A binding path's whole segments, ignoring empty and `.` segments.
-fn segments(path: &str) -> Vec<&str> {
-    path.split('/')
-        .filter(|s| !s.is_empty() && *s != ".")
-        .collect()
 }
 
 /// Whether `inner` names `outer`'s path or one below it, in the same repository.
@@ -227,7 +55,7 @@ fn containers(index: &Index<'_>, out: &mut Vec<Diagnostic>) {
         }
         let name = &module.name;
         if let [(part, only)] = parts {
-            out.push(diagnostic(
+            out.push(Diagnostic::new(
                 DiagnosticCode::ContainerPassThrough,
                 vec![id.clone(), part.clone()],
                 format!("{name} has one part, {}; draw the part directly", only.name),
@@ -239,7 +67,7 @@ fn containers(index: &Index<'_>, out: &mut Vec<Diagnostic>) {
                 .into_iter()
                 .filter_map(|(_, m)| m.binding.as_ref())
                 .collect();
-            let mut unbound = diagnostic(
+            let mut unbound = Diagnostic::new(
                 DiagnosticCode::ContainerUnbound,
                 vec![id.clone()],
                 format!("{name} has parts but no binding"),
@@ -259,7 +87,7 @@ fn parts_outside(index: &Index<'_>, out: &mut Vec<Diagnostic>) {
         if let Some((above_id, above, outer)) = index.bound_ancestor(id)
             && !encloses(outer, inner)
         {
-            out.push(diagnostic(
+            out.push(Diagnostic::new(
                 DiagnosticCode::ContainerPartsOutside,
                 vec![above_id.to_owned(), id.clone()],
                 format!(
@@ -296,7 +124,7 @@ fn unconnected_roots(index: &Index<'_>, out: &mut Vec<Diagnostic>) {
     }
     for (id, module) in &index.roots {
         if !connected.contains(id.as_str()) {
-            out.push(diagnostic(
+            out.push(Diagnostic::new(
                 DiagnosticCode::RootUnconnected,
                 vec![id.clone()],
                 format!(
@@ -326,7 +154,11 @@ fn shared_bindings(index: &Index<'_>, out: &mut Vec<Diagnostic>) {
         let names: Vec<&str> = subjects.iter().map(|s| index.name(s)).collect();
         let symbol = symbol.map(|s| format!(" {s}")).unwrap_or_default();
         let message = format!("{} share the binding {path}{symbol}", names.join(", "));
-        out.push(diagnostic(DiagnosticCode::BindingShared, subjects, message));
+        out.push(Diagnostic::new(
+            DiagnosticCode::BindingShared,
+            subjects,
+            message,
+        ));
     }
 }
 
@@ -352,7 +184,7 @@ fn repeated_relationships(index: &Index<'_>, out: &mut Vec<Diagnostic>) {
             subjects.len(),
             subjects.join(", ")
         );
-        out.push(diagnostic(
+        out.push(Diagnostic::new(
             DiagnosticCode::RelationshipRepeated,
             subjects,
             message,
@@ -365,13 +197,13 @@ fn relationship_ends(index: &Index<'_>, out: &mut Vec<Diagnostic>) {
     for line in &index.lines {
         let (from, to) = (index.name(&line.from), index.name(line.to));
         if index.is_below(line.to, &line.from) || index.is_below(&line.from, line.to) {
-            out.push(diagnostic(
+            out.push(Diagnostic::new(
                 DiagnosticCode::ContainerLineToOwnPart,
                 vec![line.id.clone()],
                 format!("{from} -> {to} joins a container and its own part"),
             ));
         } else if index.is_container(&line.from) || index.is_container(line.to) {
-            out.push(diagnostic(
+            out.push(Diagnostic::new(
                 DiagnosticCode::RelationshipOnContainer,
                 vec![line.id.clone()],
                 format!("{from} -> {to} ends on a container; draw it between parts"),
@@ -384,6 +216,8 @@ fn relationship_ends(index: &Index<'_>, out: &mut Vec<Diagnostic>) {
 mod tests {
     use super::DiagnosticCode::*;
     use super::*;
+    use crate::arch::diagnostic::Severity;
+    use crate::arch::ids;
     use crate::arch::types::{Relationship, SCHEMA_VERSION};
 
     const M: &str = "Model001";

@@ -35,7 +35,7 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 | T2 | Batch edits: add/edit/remove module and relationship, rename history, expected revision, operation IDs, `model edit` | done |
 | T3 | Claims: `model claim`, `model release`, `model claims`; an edit inside another writer's claim refuses, an edit with a claim must be covered by it | done |
 | T4 | Semantic check: container binding, parts outside container, unconnected roots, shared bindings, repeated relationships, relationships on containers, lines to own part, `model check` | done |
-| T5 | Code check: binding and anchor paths and symbols, relationships undrawn / unsupported / backwards from the scanned graph, module interface exposure | open |
+| T5 | Code check: binding and anchor paths and symbols, relationships undrawn / unsupported / backwards from the scanned graph, module interface exposure | done |
 | T6 | Flows: collections, flows, message/decision/loop steps, step moves, `model read --flow`, flow summary check (`FLOW_SUMMARY_MISSING`) | open |
 | T7 | Checkpoints: history branch, `model retain`, `model checkpoints`, `model read --checkpoint` | open |
 | T8 | Proposals: create/edit drafts against a predecessor, `model compare`, adopt, shelve, planning models without a current state | open |
@@ -53,3 +53,13 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 ## Notes
 
 - T16: scoped agent hooks treat .boundrail/model changes as out of scope; decide whether the vault is always in scope.
+- T5: the code check scans the checkout once with the native engine, which picks one language per
+  checkout. Bound code in any other language holds no scanned file and is skipped as
+  `not-scanned` (polyglot gap). The TypeScript and Python collectors scan only under `src/` when
+  it exists, so bindings outside it show as `not-scanned` too. A failed scan is a warning; paths
+  it would have judged are skipped as `scan-failed` and the semantic check still reports.
+- T5: import edges stand in for call evidence until T13. Only kinds whose evidence is entirely
+  import or call (`call`, `render` by default) get the strict check: no edge is unsupported, or
+  backwards. A kind with other evidence too (HTTP, RPC, event, queue, data, dependency) is
+  supported by an edge and otherwise skipped as `evidence-unavailable`.
+- T5: a binding or anchor symbol is the exported name, `default` for a default export.

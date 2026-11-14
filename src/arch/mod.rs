@@ -2,8 +2,11 @@
 //! `.boundrail/model/` and that Boundrail checks against the code.
 
 pub mod claims;
+pub mod code;
+pub mod diagnostic;
 pub mod edit;
 pub mod ids;
+mod index;
 pub mod request;
 pub mod revision;
 pub mod semantic;
@@ -26,6 +29,13 @@ pub fn state_dir(vault: &Path) -> anyhow::Result<PathBuf> {
 /// Whether `text` is one line of 1 to `max` characters: not blank and free of control characters.
 pub fn one_line(text: &str, max: usize) -> bool {
     !text.trim().is_empty() && text.chars().count() <= max && !text.chars().any(char::is_control)
+}
+
+/// A repository path's whole segments, ignoring empty and `.` segments.
+pub(crate) fn segments(path: &str) -> Vec<&str> {
+    path.split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect()
 }
 
 /// Why a model command declined to act. The CLI prints it on stdout and exits with code 2.

@@ -128,6 +128,16 @@ pub fn attach(doc: &mut Document, symbols: Symbols, max_symbols: usize) -> Resul
     Ok(())
 }
 
+/// Whether `path` is a conventional entry file of its directory: an index file or
+/// `__init__.py`. `exports` are the file's exports; a Python package marker that exports no
+/// name alone does not declare a public facade. Package entries are entries besides these.
+pub fn is_entry_file(path: &str, language: Language, exports: &[&SymbolExport]) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    crate::modules::is_index(name)
+        && (language != Language::Python
+            || exports.iter().any(|e| !e.name.is_empty() && e.name != "*"))
+}
+
 pub fn analyze(doc: &Document, max_symbols: usize) -> Result<SurfaceReport> {
     if max_symbols == 0 {
         bail!("surface size threshold must be positive");
@@ -260,9 +270,12 @@ pub fn analyze(doc: &Document, max_symbols: usize) -> Result<SurfaceReport> {
                 members
                     .iter()
                     .filter(|path| {
-                        let name = path.rsplit('/').next().unwrap_or(path);
                         root.as_deref() == Some(crate::modules::dir_of(path))
-                            && crate::modules::is_index(name)
+                            && is_entry_file(
+                                path,
+                                doc.source.language,
+                                exports_of.get(*path).map_or(&[], Vec::as_slice),
+                            )
                     })
                     .map(|path| path.to_string()),
             );
@@ -272,14 +285,6 @@ pub fn analyze(doc: &Document, max_symbols: usize) -> Result<SurfaceReport> {
                     .filter(|p| files.get(p.as_str()) == Some(&module.id.as_str()))
                     .cloned(),
             );
-            // A Python package marker alone does not declare a public facade.
-            if doc.source.language == Language::Python {
-                entries.retain(|path| {
-                    exports_of.get(path.as_str()).is_some_and(|exports| {
-                        exports.iter().any(|e| !e.name.is_empty() && e.name != "*")
-                    })
-                });
-            }
         }
         // Without a declared facade, direct file exports remain the observable public API.
         let all_exports = doc.source.language == Language::Go || entries.is_empty() && !explicit;

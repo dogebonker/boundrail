@@ -10,6 +10,8 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const RESPONSIBILITY_MAX: usize = 200;
 pub const DESCRIPTION_MAX: usize = 2000;
 pub const LABEL_MAX: usize = 60;
+/// The module kind for code outside the checkout, which the code check never judges.
+pub const EXTERNAL_KIND: &str = "external";
 const LOCAL_ID: &str = "^[A-Za-z0-9]{8}$";
 const QUALIFIED_ID: &str = "^[A-Za-z0-9]{8}#[A-Za-z0-9]{8}$";
 
@@ -195,7 +197,7 @@ impl Default for VaultConfig {
             ("queue", "Queue"),
             ("datastore", "Datastore"),
             ("cache", "Cache"),
-            ("external", "External"),
+            (EXTERNAL_KIND, "External"),
             ("ui", "UI"),
             ("config", "Config"),
             ("test", "Test"),

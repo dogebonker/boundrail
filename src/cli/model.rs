@@ -3,9 +3,11 @@ use std::io::Read as _;
 use std::iter;
 
 use boundrail::arch::claims::{self, Claim};
+use boundrail::arch::code::{self, CodeReport, Skip, SkipReason};
+use boundrail::arch::diagnostic::{Diagnostic, Severity};
 use boundrail::arch::edit::{self, Receipt};
 use boundrail::arch::request::INPUT_MAX;
-use boundrail::arch::semantic::{self, Diagnostic, Severity};
+use boundrail::arch::semantic;
 use boundrail::arch::types::{self, SCHEMAS};
 use boundrail::arch::vault::{self, Model, ModuleView, RelationshipView};
 use boundrail::arch::{Code, Refusal};
@@ -29,8 +31,18 @@ pub(super) struct ModelArgs {
 enum Command {
     #[command(flatten)]
     Model(ModelCmd),
-    /// Check the model's own shape; exits 1 when any warning is found
-    Check,
+    /// Check the model's own shape and compare it with the code; exits 1 when any warning is found
+    Check {
+        /// Run one check only; the code check scans the checkout
+        #[arg(long, value_enum)]
+        only: Option<CheckOnly>,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CheckOnly {
+    Semantic,
+    Code,
 }
 
 #[derive(Subcommand)]
@@ -94,7 +106,7 @@ enum ModelCmd {
 pub(super) fn run(args: ModelArgs) -> Result<ExitCode> {
     let markdown = matches!(args.format, Format::Markdown);
     let result = match args.command {
-        Command::Check => check(&args.root, markdown),
+        Command::Check { only } => check(&args.root, markdown, only),
         Command::Model(command) => {
             execute(&args.root, markdown, command).map(|()| ExitCode::SUCCESS)
         }
@@ -358,9 +370,21 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
 }
 
 /// `model check`: exit 0 without warnings, 1 with any. Like `model read`, it names a pending edit.
-fn check(root: &Path, markdown: bool) -> Result<ExitCode> {
+/// The skips are reported only when the code check ran.
+fn check(root: &Path, markdown: bool, only: Option<CheckOnly>) -> Result<ExitCode> {
     let (model, _, pending) = load_for_read(root)?;
-    let diagnostics = semantic::check(&model.manifest.id, &model.modules);
+    let mut diagnostics = if only == Some(CheckOnly::Code) {
+        Vec::new()
+    } else {
+        semantic::check(&model.manifest.id, &model.modules)
+    };
+    let mut skips = None;
+    if only != Some(CheckOnly::Semantic) {
+        let report = code_check(&model)?;
+        diagnostics.extend(report.diagnostics);
+        skips = Some(report.skips);
+    }
+    diagnostics.sort();
     let warning = diagnostics
         .iter()
         .filter(|d| d.severity == Severity::Warning)
@@ -368,7 +392,7 @@ fn check(root: &Path, markdown: bool) -> Result<ExitCode> {
     let information = diagnostics.len() - warning;
     let code = ExitCode::from(u8::from(warning > 0));
     if markdown {
-        print_diagnostics(&diagnostics, warning, information);
+        print_diagnostics(&diagnostics, skips.as_deref(), warning, information);
         return Ok(code);
     }
     let mut output = json!({
@@ -381,6 +405,9 @@ fn check(root: &Path, markdown: bool) -> Result<ExitCode> {
         "counts": {"warning": warning, "information": information},
         "passed": warning == 0,
     });
+    if let Some(skips) = skips {
+        output["skips"] = json!(skips);
+    }
     if let Some(pending) = pending {
         output["pending_operation"] = pending;
     }
@@ -388,7 +415,37 @@ fn check(root: &Path, markdown: bool) -> Result<ExitCode> {
     Ok(code)
 }
 
-fn print_diagnostics(diagnostics: &[Diagnostic], warning: usize, information: usize) {
+/// The code check against the model's checkout, scanning it once when a binding or anchor names
+/// code there. A failed scan is a warning on stderr: the check skips what needed it.
+fn code_check(model: &Model) -> Result<CodeReport> {
+    // The vault is `<checkout>/.boundrail/model`.
+    let checkout = model
+        .dir
+        .parent()
+        .and_then(Path::parent)
+        .context("the model vault has no checkout around it")?;
+    let doc = if code::needs_scan(&model.modules, checkout) {
+        super::scan_cli::live(checkout, None)
+            .inspect_err(|error| eprintln!("warning: code check without a scan: {error:#}"))
+            .map_err(|_| SkipReason::ScanFailed)
+    } else {
+        Err(SkipReason::NotScanned)
+    };
+    Ok(code::check(
+        &model.manifest.id,
+        &model.modules,
+        &model.config,
+        checkout,
+        doc.as_ref().map_err(|&reason| reason),
+    ))
+}
+
+fn print_diagnostics(
+    diagnostics: &[Diagnostic],
+    skips: Option<&[Skip]>,
+    warning: usize,
+    information: usize,
+) {
     for (severity, heading) in [
         (Severity::Warning, "Warnings:"),
         (Severity::Information, "Information:"),
@@ -408,6 +465,16 @@ fn print_diagnostics(diagnostics: &[Diagnostic], warning: usize, information: us
                 .unwrap_or_default();
             println!("- {} {}{suggestion}", d.code.as_str(), d.message);
         }
+    }
+    let mut skipped = BTreeMap::new();
+    for skip in skips.unwrap_or_default() {
+        *skipped.entry((skip.site, skip.reason)).or_insert(0) += 1;
+    }
+    if !skipped.is_empty() {
+        println!("Skipped:");
+    }
+    for ((site, reason), count) in skipped {
+        println!("- {} {}: {count}", site.as_str(), reason.as_str());
     }
     let verdict = if warning == 0 { "passed" } else { "failed" };
     println!("Check {verdict}: warnings: {warning}, information: {information}");

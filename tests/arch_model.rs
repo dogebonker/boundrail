@@ -2042,7 +2042,7 @@ fn check_passes_a_bound_model_and_fails_on_a_warning() {
     bind(&checkout, "WebApp01", "shop/web");
     bind(&checkout, "Billing1", "shop/billing");
 
-    let (code, out) = checkout.run(&["check"]);
+    let (code, out) = checkout.run(&["check", "--only", "semantic"]);
     assert_eq!(code, 1, "{out:#}");
     assert!(!checkout.path().join(".git/boundrail").exists());
     assert_eq!(out["schema"], "boundrail/model/v1");
@@ -2063,7 +2063,7 @@ fn check_passes_a_bound_model_and_fails_on_a_warning() {
     );
 
     bind(&checkout, "Platfrm1", "shop");
-    let out = checkout.ok(&["check"]);
+    let out = checkout.ok(&["check", "--only", "semantic"]);
     assert_eq!(out["passed"], true);
     assert_eq!(out["diagnostics"], json!([]));
     assert_eq!(out["counts"], json!({"warning": 0, "information": 0}));
@@ -2079,13 +2079,13 @@ fn check_information_never_fails_and_markdown_groups_by_severity() {
         json!([{"id": "RelBnk01", "to": format!("{model}#Platfrm1"), "kind": "event", "order": 0}]);
     checkout.module(bank);
 
-    let out = checkout.ok(&["check"]);
+    let out = checkout.ok(&["check", "--only", "semantic"]);
     assert_eq!(out["passed"], true);
     assert_eq!(out["counts"], json!({"warning": 0, "information": 1}));
     assert_eq!(out["diagnostics"][0]["code"], "RELATIONSHIP_ON_CONTAINER");
 
     bind(&checkout, "WebApp01", "web");
-    let (code, text) = checkout.run_raw(&["check", "--format", "markdown"]);
+    let (code, text) = checkout.run_raw(&["check", "--only", "semantic", "--format", "markdown"]);
     assert_eq!(code, 1, "{text}");
     assert_eq!(
         text,
@@ -2133,4 +2133,166 @@ fn binding_and_anchor_paths_stay_inside_the_repository() {
     ]));
     let error = checkout.edit_refused(&request, "MODEL_INVALID");
     assert_eq!(error["details"]["problems"][0]["subject"], "BankApi1");
+}
+
+/// A TypeScript checkout: Web imports Billing and Billing imports `src/bank`.
+fn typescript(checkout: &Checkout) {
+    for (path, text) in [
+        ("package.json", r#"{"name": "fixture"}"#),
+        (
+            "src/web/index.ts",
+            "import { charge } from \"../billing\";\nexport const page = () => charge(1);\n",
+        ),
+        (
+            "src/billing/index.ts",
+            "import { pay } from \"../bank\";\nexport const charge = (n: number) => pay(n);\n",
+        ),
+        (
+            "src/bank/index.ts",
+            "export const pay = (n: number) => n;\n",
+        ),
+    ] {
+        let file = checkout.path().join(path);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, text).unwrap();
+    }
+}
+
+/// Each diagnostic as `CODE subject, subject`.
+fn found(out: &Value) -> Vec<String> {
+    out["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| {
+            let subjects: Vec<&str> = d["subjects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| s.as_str().unwrap().split_once('#').unwrap().1)
+                .collect();
+            format!("{} {}", d["code"].as_str().unwrap(), subjects.join(", "))
+        })
+        .collect()
+}
+
+#[test]
+fn check_compares_the_model_with_the_code() {
+    let checkout = Checkout::new();
+    typescript(&checkout);
+    let model = shop(&checkout);
+    let q = |id: &str| format!("{model}#{id}");
+    bind(&checkout, "Platfrm1", "src");
+    bind(&checkout, "WebApp01", "src/web");
+    bind(&checkout, "Billing1", "src/billing");
+
+    // Web -> Billing has its import; Billing -> Bank ends on an external module.
+    let out = checkout.ok(&["check"]);
+    assert_eq!(out["passed"], true, "{out:#}");
+    assert_eq!(out["diagnostics"], json!([]));
+    assert_eq!(
+        out["skips"],
+        json!([
+            {"subject": q("BankApi1"), "site": "binding", "reason": "external"},
+            {"subject": q("RelBil01"), "site": "relationship", "reason": "external"},
+        ])
+    );
+
+    let mut ledger = module("Ledger01", "Ledger", "module", 2);
+    ledger["parent"] = q("Platfrm1").into();
+    ledger["binding"] = json!({"path": "src/bank"});
+    checkout.module(ledger.clone());
+    let mut ghost = module("Ghost001", "Ghost", "module", 3);
+    ghost["parent"] = q("Platfrm1").into();
+    ghost["binding"] = json!({"path": "src/ghost"});
+    checkout.module(ghost);
+    let (code, out) = checkout.run(&["check"]);
+    assert_eq!(code, 1, "{out:#}");
+    assert_eq!(
+        found(&out),
+        [
+            "BINDING_PATH_MISSING Ghost001",
+            "RELATIONSHIP_UNDRAWN Billing1, Ledger01"
+        ]
+    );
+    assert_eq!(
+        out["diagnostics"][1]["message"],
+        "Billing uses Ledger but no relationship is drawn: src/billing/index.ts:1 imports src/bank/index.ts"
+    );
+
+    // A line drawn against the import reports it once, as backwards.
+    ledger["outgoing"] = json!([
+        {"id": "RelLed01", "to": q("WebApp01"), "kind": "call", "order": 0},
+        {"id": "RelLed02", "to": q("Billing1"), "kind": "call", "order": 1},
+    ]);
+    checkout.module(ledger);
+    let (code, out) = checkout.run(&["check"]);
+    assert_eq!(code, 1, "{out:#}");
+    assert_eq!(
+        found(&out),
+        [
+            "BINDING_PATH_MISSING Ghost001",
+            "RELATIONSHIP_UNSUPPORTED RelLed01",
+            "RELATIONSHIP_BACKWARDS RelLed02",
+        ]
+    );
+
+    let (code, text) = checkout.run_raw(&["check", "--format", "markdown"]);
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.ends_with(
+            "Skipped:\n- binding path-missing: 1\n- binding external: 1\n- relationship external: 1\n\
+             Check failed: warnings: 3, information: 0\n"
+        ),
+        "{text}"
+    );
+}
+
+#[test]
+fn check_runs_one_check_with_only() {
+    let checkout = Checkout::new();
+    typescript(&checkout);
+    shop(&checkout);
+    bind(&checkout, "WebApp01", "src/web");
+    bind(&checkout, "Billing1", "src/gone");
+
+    let (code, out) = checkout.run(&["check", "--only", "code"]);
+    assert_eq!(code, 1, "{out:#}");
+    assert_eq!(found(&out), ["BINDING_PATH_MISSING Billing1"]);
+    let (code, out) = checkout.run(&["check"]);
+    assert_eq!(code, 1, "{out:#}");
+    assert_eq!(
+        found(&out),
+        [
+            "CONTAINER_UNBOUND Platfrm1",
+            "BINDING_PATH_MISSING Billing1"
+        ]
+    );
+}
+
+#[test]
+fn check_without_a_scan_keeps_the_semantic_check_and_skips_the_code() {
+    // Without source code the scan fails; the semantic check never scans.
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    fs::create_dir(checkout.path().join("docs")).unwrap();
+    fs::write(checkout.path().join("docs/README.md"), "notes").unwrap();
+    bind(&checkout, "Platfrm1", "docs");
+    let out = checkout.ok(&["check", "--only", "semantic"]);
+    assert_eq!(out["passed"], true);
+    assert!(out.get("skips").is_none(), "{out:#}");
+
+    bind(&checkout, "WebApp01", "web");
+    let (code, out) = checkout.run(&["check"]);
+    assert_eq!(code, 1, "{out:#}");
+    assert_eq!(
+        found(&out),
+        [
+            "CONTAINER_PARTS_OUTSIDE Platfrm1, WebApp01",
+            "BINDING_PATH_MISSING WebApp01"
+        ]
+    );
+    let skip =
+        json!({"subject": format!("{model}#Platfrm1"), "site": "binding", "reason": "scan-failed"});
+    assert!(out["skips"].as_array().unwrap().contains(&skip), "{out:#}");
 }
