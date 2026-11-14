@@ -83,6 +83,8 @@ mod surface_cli;
 mod sync_rules_cli;
 #[path = "cli/tour.rs"]
 mod tour_cli;
+#[path = "cli/view.rs"]
+mod view_cli;
 
 #[derive(Parser)]
 #[command(

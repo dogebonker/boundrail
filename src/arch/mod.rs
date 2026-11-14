@@ -20,6 +20,7 @@ pub mod semantic;
 mod state;
 pub mod types;
 pub mod vault;
+pub mod view;
 
 use std::fmt;
 use std::path::{Path, PathBuf};

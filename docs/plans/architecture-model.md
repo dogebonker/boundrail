@@ -19,7 +19,8 @@ supported, missing, or backwards according to what the code shows.
 - D4. Every write names the exact revision it read (a SHA-256 over the model inputs) and an
   operation ID. A stale revision refuses; repeating an operation ID returns the same receipt.
 - D5. Writes are CLI file operations under a vault lock. No server is required to read or write.
-  The live browser view reuses the existing `serve` daemon.
+  The live browser view, `boundrail model view`, runs its own local read-only HTTP server; it is
+  not grafted onto the `serve` daemon, whose socket protocol forwards scan commands.
 - D6. Checkpoints are commits on a separate history branch in the source repository, never on
   the working branch.
 - D7. New code lives under `src/arch/`. Existing scan code is reused as an evidence source, and
@@ -41,7 +42,7 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 | T8 | Proposals: create/edit drafts against a predecessor, `model compare`, adopt, shelve, planning models without a current state | done |
 | T9 | Render: SVG architecture view with automatic layout, sequence and flowchart views of a flow, comparison marks | done |
 | T10 | Measures: module interface counts (`model inspect`), co-change locality (`model locality`), branch footprint (`model footprint`) | done |
-| T11 | Live browser view: model canvas, drill-down, focus and filters, detail panel, warnings, comparison, history, split panes | open |
+| T11 | Live browser view: model canvas, drill-down, focus and filters, detail panel, warnings, comparison, history, split panes | done |
 | T12 | Infrastructure evidence: docker-compose, Kubernetes, Terraform bindings and configured-address hops between modules | open |
 | T13 | Language-server evidence: call-level references through configured language servers | open |
 | T14 | Walkthroughs: ordered beats over readings, playback in the browser | open |
@@ -281,3 +282,49 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   tree as checkpoints are read (proposals left out; modes 100644 and 100755, anything else refuses
   `MODEL_INVALID`), or null when the base holds no model, or null with `model_error` naming the
   commit when its model does not load. With `--head` the model is the one committed there.
+- T11: `model view [--port N] [--no-open]` serves the page and a JSON API on 127.0.0.1 only, port 0
+  (a free one) by default, and prints the URL with its token as the first line on stdout. Without
+  `--no-open` it starts the platform opener (`open`, `xdg-open`, `cmd /c start ""`) with the URL as
+  one argument, never through a shell string. The page (`src/arch/view/index.html`, `app.js`,
+  `style.css`) is embedded with `include_str!`, uses no framework and loads nothing from other
+  origins, so it works offline.
+- T11: the API answers with the command outputs through the same functions the CLI prints:
+  `/api/model?proposal=&checkpoint=` is `model read`, `/api/render?view=&flow=&scope=&depth=&proposal=&checkpoint=&against=`
+  is `model render` as `image/svg+xml`, `/api/check?proposal=` is `model check` with its skips,
+  `/api/proposals`, `/api/checkpoints`, `/api/compare?proposal=&against=` and
+  `/api/inspect?subject=&proposal=` are their commands. A refusal is its JSON output with 404 for
+  `*_NOT_FOUND` codes and 400 otherwise; any other error is a 500. An empty parameter counts as
+  absent. `/api/events` is a Server-Sent Events stream that sends `event: changed` with
+  `{"revision": ..., "parts": [...]}` once the watched files have been quiet for 200 ms (only a
+  relevant event restarts the wait), and a keepalive comment every 15 s so a closed page ends its
+  thread. The revision is the current state's, or null when it does not load, computed once by the
+  watcher for every stream. The parts say what changed: `model` (the current state's files),
+  `proposals`, `state` (this worktree's `<git dir>/boundrail`: claims, journal) and `history`
+  (`refs/boundrail` and `packed-refs` in the common Git directory, so checkpoints retained from any
+  worktree show); a stream that slept through several changes gets every part. The watcher
+  follows no symbolic links, ignores read access, and watches only those folders, deeply, plus
+  their parents shallowly so it sees them appear. The page reloads everything for `proposals`,
+  `history` or a moved revision, only claims and checks for `state`, and nothing when the revision
+  did not move; `/api/model` answers are kept per state until the next change.
+- T11: security. The server binds the loopback interface only. Each run's 128-bit token is a
+  SHA-256 over keys of the standard library's hasher, seeded once per thread from the operating
+  system (128 bits of OS entropy), with the time and process ID; every `/api/` request carries it as
+  `t` or the `X-Boundrail-Token` header, compared in constant time, or gets 403. The page drops the
+  token from the address bar once read and keeps it in the tab's session storage, so a reload
+  works. The page and its two assets carry no data and need no token. Every request must name
+  exactly one Host, `127.0.0.1:<port>` or `localhost:<port>`, else 403, which stops DNS rebinding.
+  Only GET is served (405 with `Allow: GET` otherwise). A request head is capped at 16 KiB (431) and
+  must arrive whole within 10 s (408), however slowly it drips. At most 64 connections are served at
+  once besides 16 event streams; more get 503, and a failed thread start or accept never stops the
+  server. Every response sends `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`,
+  `Referrer-Policy: no-referrer` and `Connection: close`. The page's Content-Security-Policy allows
+  only its own script, style and connections; SVG is parsed with `DOMParser` and imported, never
+  run, and `/api/render` opened on its own carries `default-src 'none'; style-src 'unsafe-inline'`.
+  The server writes nothing: every endpoint is a read the CLI already does.
+- T11: limits. ponytail: a thread per connection under the caps, fine for one person's pages; a
+  pool if many share a server. The vault watch is set at start: a vault folder deleted and made
+  again is not followed. Checks and interfaces scan the checkout on each request, as the commands
+  do, so `/api/check` and `/api/inspect` take as long as `model check` and `model inspect`;
+  checkpoints have neither. Dark mode inverts the rendered SVG with a CSS filter rather than
+  drawing it in other colors. `#<qualified module ID>` after the URL selects that module when the
+  page opens.

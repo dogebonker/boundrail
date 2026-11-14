@@ -53,48 +53,57 @@ enum Command {
     /// Draw the model as SVG: the architecture, or a flow as a sequence diagram or flowchart,
     /// optionally marked with what it changes against another state
     Render(RenderArgs),
+    /// Serve a live, read-only view of the model in the browser on a local port
+    View(super::view_cli::ViewArgs),
 }
 
 #[derive(Args)]
 struct RenderArgs {
-    /// Draw this proposal, marked against the current state unless --against names another
-    #[arg(long)]
-    proposal: Option<String>,
-    /// Draw the model a checkpoint holds, or with --against compare it: its ID or a unique
-    /// commit prefix
-    #[arg(long)]
-    checkpoint: Option<String>,
-    /// What to draw; a flow's sequence diagram when --flow is given, else the architecture
-    #[arg(long, value_enum)]
-    view: Option<RenderView>,
-    /// The flow a sequence or flowchart view draws: its qualified or local ID, or its unique name
-    #[arg(long)]
-    flow: Option<String>,
-    /// Draw only this module's parts: its ID or unique current or former name
-    #[arg(long)]
-    scope: Option<String>,
-    /// How many levels of containers the architecture view opens; deeper parts collapse
-    /// into their container [default: 2]
-    #[arg(long)]
-    depth: Option<usize>,
-    /// Compare with the current state or this proposal; the newer state (checkpoint, then
-    /// current, then proposal) is drawn with what it adds, removes and changes marked
-    #[arg(long)]
-    against: Option<String>,
+    #[command(flatten)]
+    spec: RenderSpec,
     /// Write to this file instead of standard output; its folder must exist
     #[arg(long)]
     output: Option<PathBuf>,
 }
 
+/// What `model render` draws, as the command line and the live view ask for it.
+#[derive(Args)]
+pub(super) struct RenderSpec {
+    /// Draw this proposal, marked against the current state unless --against names another
+    #[arg(long)]
+    pub(super) proposal: Option<String>,
+    /// Draw the model a checkpoint holds, or with --against compare it: its ID or a unique
+    /// commit prefix
+    #[arg(long)]
+    pub(super) checkpoint: Option<String>,
+    /// What to draw; a flow's sequence diagram when --flow is given, else the architecture
+    #[arg(long, value_enum)]
+    pub(super) view: Option<RenderView>,
+    /// The flow a sequence or flowchart view draws: its qualified or local ID, or its unique name
+    #[arg(long)]
+    pub(super) flow: Option<String>,
+    /// Draw only this module's parts: its ID or unique current or former name
+    #[arg(long)]
+    pub(super) scope: Option<String>,
+    /// How many levels of containers the architecture view opens; deeper parts collapse
+    /// into their container [default: 2]
+    #[arg(long)]
+    pub(super) depth: Option<usize>,
+    /// Compare with the current state or this proposal; the newer state (checkpoint, then
+    /// current, then proposal) is drawn with what it adds, removes and changes marked
+    #[arg(long)]
+    pub(super) against: Option<String>,
+}
+
 #[derive(Clone, Copy, ValueEnum)]
-enum RenderView {
+pub(super) enum RenderView {
     Architecture,
     Sequence,
     Flowchart,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum CheckOnly {
+pub(super) enum CheckOnly {
     Semantic,
     Code,
 }
@@ -310,6 +319,7 @@ pub(super) fn run(args: ModelArgs) -> Result<ExitCode> {
         Command::Render(render) => {
             render_model(&args.root, args.format, &render).map(|()| ExitCode::SUCCESS)
         }
+        Command::View(view) => super::view_cli::run(&args.root, &view).map(|()| ExitCode::SUCCESS),
         Command::Model(command) => {
             execute(&args.root, markdown, command).map(|()| ExitCode::SUCCESS)
         }
@@ -358,49 +368,24 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
             checkpoint,
             proposal,
         } => {
+            let (checkpoint, proposal) = (checkpoint.as_deref(), proposal.as_deref());
+            if !markdown {
+                return write(None, &read_output(root, checkpoint, proposal)?);
+            }
             let Loaded {
                 model,
                 state,
-                pending,
                 checkpoint,
-            } = load_reading(root, checkpoint.as_deref(), proposal.as_deref())?;
-            let reading = model.read();
-            let collections = model.collection_views();
-            let active = state.as_deref().and_then(active_claims);
-            if markdown {
-                if let Some(checkpoint) = &checkpoint {
-                    print_checkpoint(checkpoint);
-                }
-                print_proposal(&model);
-                print_reading(&model, &reading);
-                print_collections(&collections);
-                print_claims(active.as_deref());
-                return Ok(());
+                ..
+            } = load_reading(root, checkpoint, proposal)?;
+            if let Some(checkpoint) = &checkpoint {
+                print_checkpoint(checkpoint);
             }
-            let mut output = json!({
-                "schema": MODEL_SCHEMA,
-                "kind": "read",
-                "success": true,
-                "vault": model.dir,
-                "manifest": model.manifest,
-                "config": model.config,
-                "roots": reading.roots,
-                "modules": reading.modules,
-                "relationships": reading.relationships,
-                "collections": collections,
-                "revision": model.revision,
-            });
-            extend(&mut output, json!({ "proposal": model.proposal }))?;
-            if let Some(active) = active {
-                output["claims"] = json!(active);
-            }
-            if let Some(pending) = pending {
-                output["pending_operation"] = pending;
-            }
-            if let Some(checkpoint) = checkpoint {
-                output["checkpoint"] = json!(checkpoint);
-            }
-            write(None, &output)
+            print_proposal(&model);
+            print_reading(&model, &model.read());
+            print_collections(&model.collection_views());
+            print_claims(state.as_deref().and_then(active_claims).as_deref());
+            Ok(())
         }
         ModelCmd::Read {
             subject,
@@ -714,27 +699,59 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
             model_footprint(root, markdown, base.as_deref(), head.as_deref())
         }
         ModelCmd::Checkpoints { limit } => {
-            let dir = vault::path(root)?;
-            let list = checkpoint::list(root, limit)?;
-            if markdown {
-                if list.is_empty() {
-                    println!("No checkpoints");
-                }
-                list.iter().for_each(print_checkpoint);
-                return Ok(());
+            if !markdown {
+                return write(None, &checkpoints_output(root, limit)?);
             }
-            write(
-                None,
-                &json!({
-                    "schema": MODEL_SCHEMA,
-                    "kind": "checkpoints",
-                    "success": true,
-                    "vault": dir,
-                    "checkpoints": list,
-                }),
-            )
+            // Outside a checkout this refuses, as the JSON output does by naming the vault.
+            let _vault = vault::path(root)?;
+            let list = checkpoint::list(root, limit)?;
+            if list.is_empty() {
+                println!("No checkpoints");
+            }
+            list.iter().for_each(print_checkpoint);
+            Ok(())
         }
     }
+}
+
+/// The JSON output of `model read` of the whole model: the current state, a proposal or a
+/// checkpoint.
+pub(super) fn read_output(
+    root: &Path,
+    checkpoint: Option<&str>,
+    proposal: Option<&str>,
+) -> Result<Value> {
+    let Loaded {
+        model,
+        state,
+        pending,
+        checkpoint,
+    } = load_reading(root, checkpoint, proposal)?;
+    let reading = model.read();
+    let mut output = json!({
+        "schema": MODEL_SCHEMA,
+        "kind": "read",
+        "success": true,
+        "vault": model.dir,
+        "manifest": model.manifest,
+        "config": model.config,
+        "roots": reading.roots,
+        "modules": reading.modules,
+        "relationships": reading.relationships,
+        "collections": model.collection_views(),
+        "revision": model.revision,
+    });
+    extend(&mut output, json!({ "proposal": model.proposal }))?;
+    if let Some(active) = state.as_deref().and_then(active_claims) {
+        output["claims"] = json!(active);
+    }
+    if let Some(pending) = pending {
+        output["pending_operation"] = pending;
+    }
+    if let Some(checkpoint) = checkpoint {
+        output["checkpoint"] = json!(checkpoint);
+    }
+    Ok(output)
 }
 
 /// A `model read` of one collection or flow.
@@ -811,38 +828,14 @@ fn render_model(root: &Path, format: Option<Format>, args: &RenderArgs) -> Resul
         let message = "model render prints SVG, or JSON with --format json";
         return Err(Refusal::new(Code::RequestInvalid, message).into());
     }
-    let view = args.view()?;
-    let (drawn, base) = args.states()?;
-    let (model, name) = load_state(root, drawn)?;
-    let base = base.map(|b| load_state(root, b)).transpose()?;
-    // A proposal's local and qualified IDs name the same state.
-    let id = |model: &Model| model.proposal.as_ref().map(|p| p.id.clone());
-    if let Some((base, _)) = &base
-        && id(&model).is_some()
-        && id(&model) == id(base)
-    {
-        let message = "--against names the state being drawn";
-        return Err(Refusal::new(Code::RequestInvalid, message).into());
-    }
-    if let Some(output) = &args.output {
-        check_output(root, output)?;
-    }
-    let drawn = render::Side {
-        model: &model,
-        name,
-    };
-    let base = (base.as_ref()).map(|(model, name)| render::Side {
-        model,
-        name: name.clone(),
-    });
-    let svg = render::render(&drawn, base.as_ref(), &view)?;
     let output = args.output.as_deref();
+    let svg = render_svg(root, &args.spec, output)?;
     if matches!(format, Some(Format::Json)) {
         let envelope = json!({
             "schema": MODEL_SCHEMA,
             "kind": "render",
             "success": true,
-            "view": view.name(),
+            "view": args.spec.view()?.name(),
             "svg": svg,
         });
         return write(output, &envelope);
@@ -854,6 +847,35 @@ fn render_model(root: &Path, format: Option<Format>, args: &RenderArgs) -> Resul
             Ok(())
         }
     }
+}
+
+/// The SVG of what `spec` asks for, refusing an `output` it could not write to.
+pub(super) fn render_svg(root: &Path, spec: &RenderSpec, output: Option<&Path>) -> Result<String> {
+    let view = spec.view()?;
+    let (drawn, base) = spec.states()?;
+    let (model, name) = load_state(root, drawn)?;
+    let base = base.map(|b| load_state(root, b)).transpose()?;
+    // A proposal's local and qualified IDs name the same state.
+    let id = |model: &Model| model.proposal.as_ref().map(|p| p.id.clone());
+    if let Some((base, _)) = &base
+        && id(&model).is_some()
+        && id(&model) == id(base)
+    {
+        let message = "--against names the state being drawn";
+        return Err(Refusal::new(Code::RequestInvalid, message).into());
+    }
+    if let Some(output) = output {
+        check_output(root, output)?;
+    }
+    let drawn = render::Side {
+        model: &model,
+        name,
+    };
+    let base = (base.as_ref()).map(|(model, name)| render::Side {
+        model,
+        name: name.clone(),
+    });
+    Ok(render::render(&drawn, base.as_ref(), &view)?)
 }
 
 /// A state `model render` draws or compares with, oldest first.
@@ -882,7 +904,7 @@ fn load_state(root: &Path, state: RenderState<'_>) -> Result<(Model, Option<Stri
     Ok((model, name))
 }
 
-impl RenderArgs {
+impl RenderSpec {
     /// The state to draw and the one to compare it with. The newer of the two is drawn; of two
     /// proposals, the one `--proposal` names. A proposal alone is compared with the current state.
     fn states(&self) -> Result<(RenderState<'_>, Option<RenderState<'_>>)> {
@@ -979,6 +1001,42 @@ fn check(
     only: Option<CheckOnly>,
     proposal: Option<&str>,
 ) -> Result<ExitCode> {
+    let checked = run_check(root, only, proposal)?;
+    let code = ExitCode::from(u8::from(checked.warning > 0));
+    if markdown {
+        let Checked {
+            model,
+            diagnostics,
+            skips,
+            warning,
+            information,
+            ..
+        } = &checked;
+        print_proposal(model);
+        print_diagnostics(diagnostics, skips.as_deref(), *warning, *information);
+        return Ok(code);
+    }
+    write(None, &checked.output()?)?;
+    Ok(code)
+}
+
+/// What `model check` found.
+pub(super) struct Checked {
+    model: Model,
+    diagnostics: Vec<Diagnostic>,
+    /// `None` when the code check did not run.
+    skips: Option<Vec<Skip>>,
+    pending: Option<Value>,
+    warning: usize,
+    information: usize,
+}
+
+/// Runs the checks `only` names, or both, on the current state or `proposal`.
+pub(super) fn run_check(
+    root: &Path,
+    only: Option<CheckOnly>,
+    proposal: Option<&str>,
+) -> Result<Checked> {
     let (model, _, pending) = load_for_read(root, proposal)?;
     let mut diagnostics = if only == Some(CheckOnly::Code) {
         Vec::new()
@@ -997,31 +1055,38 @@ fn check(
         .filter(|d| d.severity == Severity::Warning)
         .count();
     let information = diagnostics.len() - warning;
-    let code = ExitCode::from(u8::from(warning > 0));
-    if markdown {
-        print_proposal(&model);
-        print_diagnostics(&diagnostics, skips.as_deref(), warning, information);
-        return Ok(code);
+    Ok(Checked {
+        model,
+        diagnostics,
+        skips,
+        pending,
+        warning,
+        information,
+    })
+}
+
+impl Checked {
+    /// The JSON output of `model check`.
+    pub(super) fn output(self) -> Result<Value> {
+        let mut output = json!({
+            "schema": MODEL_SCHEMA,
+            "kind": "check",
+            "success": true,
+            "vault": self.model.dir,
+            "revision": self.model.revision,
+            "diagnostics": self.diagnostics,
+            "counts": {"warning": self.warning, "information": self.information},
+            "passed": self.warning == 0,
+        });
+        if let Some(skips) = self.skips {
+            output["skips"] = json!(skips);
+        }
+        extend(&mut output, json!({ "proposal": self.model.proposal }))?;
+        if let Some(pending) = self.pending {
+            output["pending_operation"] = pending;
+        }
+        Ok(output)
     }
-    let mut output = json!({
-        "schema": MODEL_SCHEMA,
-        "kind": "check",
-        "success": true,
-        "vault": model.dir,
-        "revision": model.revision,
-        "diagnostics": diagnostics,
-        "counts": {"warning": warning, "information": information},
-        "passed": warning == 0,
-    });
-    if let Some(skips) = skips {
-        output["skips"] = json!(skips);
-    }
-    extend(&mut output, json!({ "proposal": model.proposal }))?;
-    if let Some(pending) = pending {
-        output["pending_operation"] = pending;
-    }
-    write(None, &output)?;
-    Ok(code)
 }
 
 /// The model's checkout and its scan, made only when a binding or anchor names code there.
@@ -1064,19 +1129,26 @@ fn inspect_model(
     subject: Option<&str>,
     proposal: Option<&str>,
 ) -> Result<()> {
-    let (model, _, _) = load_for_read(root, proposal)?;
-    let id = &model.manifest.id;
-    let subject = subject
-        .map(|s| vault::find(id, &model.modules, s).map(|m| model.qualify(&m.id)))
-        .transpose()?;
-    let (checkout, doc) = scan_checkout(&model)?;
-    let scan = doc.as_ref().map_err(Clone::clone);
-    let report = inspect::inspect(id, &model.modules, &checkout, scan, subject.as_deref());
-    if markdown {
-        print_proposal(&model);
-        print_inspect(&model, &report);
-        return Ok(());
+    if !markdown {
+        return write(None, &inspect_output(root, subject, proposal)?);
     }
+    let Inspected { model, report, .. } = inspected(root, subject, proposal)?;
+    print_proposal(&model);
+    print_inspect(&model, &report);
+    Ok(())
+}
+
+/// The JSON output of `model inspect`.
+pub(super) fn inspect_output(
+    root: &Path,
+    subject: Option<&str>,
+    proposal: Option<&str>,
+) -> Result<Value> {
+    let Inspected {
+        model,
+        report,
+        scan_error,
+    } = inspected(root, subject, proposal)?;
     let mut output = json!({
         "schema": MODEL_SCHEMA,
         "kind": "inspect",
@@ -1086,10 +1158,35 @@ fn inspect_model(
     });
     extend(&mut output, &report)?;
     extend(&mut output, json!({ "proposal": model.proposal }))?;
-    if let Some(error) = scan_error(&doc) {
+    if let Some(error) = scan_error {
         output["scan_error"] = json!(error);
     }
-    write(None, &output)
+    Ok(output)
+}
+
+/// What `model inspect` measured.
+struct Inspected {
+    model: Model,
+    report: InspectReport,
+    /// The error of a failed scan.
+    scan_error: Option<String>,
+}
+
+fn inspected(root: &Path, subject: Option<&str>, proposal: Option<&str>) -> Result<Inspected> {
+    let (model, _, _) = load_for_read(root, proposal)?;
+    let id = &model.manifest.id;
+    let subject = subject
+        .map(|s| vault::find(id, &model.modules, s).map(|m| model.qualify(&m.id)))
+        .transpose()?;
+    let (checkout, doc) = scan_checkout(&model)?;
+    let scan = doc.as_ref().map_err(Clone::clone);
+    let report = inspect::inspect(id, &model.modules, &checkout, scan, subject.as_deref());
+    let scan_error = scan_error(&doc).map(str::to_owned);
+    Ok(Inspected {
+        model,
+        report,
+        scan_error,
+    })
 }
 
 /// `n` and `noun`, plural unless `n` is 1.
@@ -1618,49 +1715,102 @@ fn print_receipt(label: &str, receipt: &Receipt) {
 /// `model proposals`: every proposal folder with its ID, name, status and predecessor, or why
 /// its `proposal.json` does not read. `model read --proposal` shows a proposal's revision.
 fn list_proposals(root: &Path, markdown: bool) -> Result<()> {
+    if !markdown {
+        return write(None, &proposals_output(root)?);
+    }
+    let entries = proposal_entries(&vault::locate(root)?)?;
+    if entries.is_empty() {
+        println!("No proposals");
+    }
+    for entry in &entries {
+        let id = entry["id"].as_str().unwrap_or_default();
+        match entry["error"].as_str() {
+            Some(error) => println!("- {id}: {error}"),
+            None => println!(
+                "- {} {id}, {}, drawn from {}",
+                entry["name"].as_str().unwrap_or_default(),
+                entry["status"].as_str().unwrap_or_default(),
+                entry["predecessor"]["state"]
+                    .as_str()
+                    .unwrap_or("no current state"),
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// The JSON output of `model proposals`.
+pub(super) fn proposals_output(root: &Path) -> Result<Value> {
     let dir = vault::locate(root)?;
-    let list = proposal::list(&dir)?;
-    let entries: Vec<Value> = list
+    let entries = proposal_entries(&dir)?;
+    Ok(json!({
+        "schema": MODEL_SCHEMA,
+        "kind": "proposals",
+        "success": true,
+        "vault": dir,
+        "proposals": entries,
+    }))
+}
+
+fn proposal_entries(dir: &Path) -> Result<Vec<Value>> {
+    let list = proposal::list(dir)?;
+    Ok(list
         .iter()
         .map(|listed| match &listed.proposal {
             Ok(p) => json!({"id": listed.id, "name": p.name, "status": p.status, "predecessor": p.predecessor}),
             Err(error) => json!({"id": listed.id, "error": error}),
         })
-        .collect();
-    if markdown {
-        if entries.is_empty() {
-            println!("No proposals");
-        }
-        for entry in &entries {
-            let id = entry["id"].as_str().unwrap_or_default();
-            match entry["error"].as_str() {
-                Some(error) => println!("- {id}: {error}"),
-                None => println!(
-                    "- {} {id}, {}, drawn from {}",
-                    entry["name"].as_str().unwrap_or_default(),
-                    entry["status"].as_str().unwrap_or_default(),
-                    entry["predecessor"]["state"]
-                        .as_str()
-                        .unwrap_or("no current state"),
-                ),
-            }
-        }
-        return Ok(());
-    }
-    write(
-        None,
-        &json!({
-            "schema": MODEL_SCHEMA,
-            "kind": "proposals",
-            "success": true,
-            "vault": dir,
-            "proposals": entries,
-        }),
-    )
+        .collect())
+}
+
+/// The JSON output of `model checkpoints`.
+pub(super) fn checkpoints_output(root: &Path, limit: Option<usize>) -> Result<Value> {
+    let dir = vault::path(root)?;
+    let list = checkpoint::list(root, limit)?;
+    Ok(json!({
+        "schema": MODEL_SCHEMA,
+        "kind": "checkpoints",
+        "success": true,
+        "vault": dir,
+        "checkpoints": list,
+    }))
 }
 
 /// `model compare`: the proposal `subject` against the current state or the proposal `against`.
 fn compare_proposal(root: &Path, markdown: bool, subject: &str, against: &str) -> Result<()> {
+    if !markdown {
+        return write(None, &compare_output(root, subject, against)?);
+    }
+    let c = compared(root, subject, against)?;
+    print_comparison(&c.proposal, &c.against, &c.comparison);
+    Ok(())
+}
+
+/// The JSON output of `model compare`.
+pub(super) fn compare_output(root: &Path, subject: &str, against: &str) -> Result<Value> {
+    let c = compared(root, subject, against)?;
+    let mut output = json!({
+        "schema": MODEL_SCHEMA,
+        "kind": "compare",
+        "success": true,
+        "vault": c.vault,
+        "proposal": c.proposal,
+        "against": c.against,
+    });
+    extend(&mut output, &c.comparison)?;
+    Ok(output)
+}
+
+/// What `model compare` found.
+struct Compared {
+    vault: PathBuf,
+    /// How the output names the proposal and the state it is compared with.
+    proposal: Value,
+    against: Value,
+    comparison: Comparison,
+}
+
+fn compared(root: &Path, subject: &str, against: &str) -> Result<Compared> {
     let dir = vault::locate(root)?;
     let after = vault::load_proposal(dir.clone(), subject)?;
     let before = match against {
@@ -1678,20 +1828,12 @@ fn compare_proposal(root: &Path, markdown: bool, subject: &str, against: &str) -
         }
         None => json!({"id": CURRENT, "revision": model.revision.digest}),
     };
-    if markdown {
-        print_comparison(&side(&after), &side(&before), &comparison);
-        return Ok(());
-    }
-    let mut output = json!({
-        "schema": MODEL_SCHEMA,
-        "kind": "compare",
-        "success": true,
-        "vault": dir,
-        "proposal": side(&after),
-        "against": side(&before),
-    });
-    extend(&mut output, &comparison)?;
-    write(None, &output)
+    Ok(Compared {
+        proposal: side(&after),
+        against: side(&before),
+        vault: dir,
+        comparison,
+    })
 }
 
 fn print_comparison(proposal: &Value, against: &Value, comparison: &Comparison) {
@@ -1749,19 +1891,21 @@ fn print_refusal(refusal: &Refusal, markdown: bool) -> Result<()> {
         }
         return Ok(());
     }
+    write(None, &refusal_output(refusal))
+}
+
+/// The JSON output of a refused command.
+pub(super) fn refusal_output(refusal: &Refusal) -> Value {
     let mut error = json!({"code": refusal.code, "message": refusal.message});
     if let Some(details) = &refusal.details {
         error["details"] = details.clone();
     }
-    write(
-        None,
-        &json!({
-            "schema": MODEL_SCHEMA,
-            "kind": "refusal",
-            "success": false,
-            "error": error,
-        }),
-    )
+    json!({
+        "schema": MODEL_SCHEMA,
+        "kind": "refusal",
+        "success": false,
+        "error": error,
+    })
 }
 
 fn names(model: &Model) -> BTreeMap<String, &str> {

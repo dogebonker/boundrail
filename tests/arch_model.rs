@@ -4779,3 +4779,218 @@ fn a_shallow_checkout_needs_a_base_and_drops_its_boundary_commit() {
     assert_eq!(out["history"]["commits"], 1);
     assert_eq!(out["modules"][0]["name"], "Billing");
 }
+
+/// A running `model view --no-open --port 0`, killed when dropped.
+struct View {
+    child: std::process::Child,
+    port: u16,
+    token: String,
+}
+
+impl Drop for View {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl View {
+    /// Starts the view and reads the URL it prints first.
+    fn start(checkout: &Checkout) -> Self {
+        use std::io::BufRead as _;
+        let mut child = Command::new(env!("CARGO_BIN_EXE_boundrail"))
+            .args(["--no-daemon", "model", "view", "--no-open", "--port", "0"])
+            .current_dir(checkout.path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let mut view = View {
+            child,
+            port: 0,
+            token: String::new(),
+        };
+        let mut url = String::new();
+        std::io::BufReader::new(stdout).read_line(&mut url).unwrap();
+        let rest = url.trim().strip_prefix("http://127.0.0.1:").expect(&url);
+        let (port, token) = rest.split_once("/?t=").expect(&url);
+        view.port = port.parse().unwrap();
+        view.token = token.to_owned();
+        view
+    }
+
+    fn connect(&self) -> std::net::TcpStream {
+        let stream = std::net::TcpStream::connect(("127.0.0.1", self.port)).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        stream
+    }
+
+    /// Sends `method target` with `host` and returns the status and the whole response.
+    fn send(&self, method: &str, target: &str, host: &str) -> (u16, String) {
+        use std::io::Read as _;
+        let mut stream = self.connect();
+        write!(stream, "{method} {target} HTTP/1.1\r\nHost: {host}\r\n\r\n").unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        let status = response[9..12].parse().unwrap();
+        (status, response)
+    }
+
+    fn get(&self, target: &str) -> (u16, String) {
+        self.send("GET", target, &format!("127.0.0.1:{}", self.port))
+    }
+
+    /// The body of a response, after its head.
+    fn body(response: &str) -> &str {
+        response.split_once("\r\n\r\n").unwrap().1
+    }
+}
+
+#[test]
+fn view_serves_the_page_and_the_model_to_its_token_only() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let view = View::start(&checkout);
+    let t = &view.token;
+
+    let (status, page) = view.get(&format!("/?t={t}"));
+    assert_eq!(status, 200, "{page}");
+    assert!(page.contains("Content-Type: text/html"), "{page}");
+    assert!(page.contains("<script src=\"app.js\">"), "{page}");
+    assert!(page.contains(
+        "Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self';"
+    ));
+    let (status, script) = view.get("/app.js");
+    assert_eq!(status, 200);
+    assert!(script.contains("EventSource"));
+
+    let (status, read) = view.get(&format!("/api/model?t={t}"));
+    assert_eq!(status, 200, "{read}");
+    assert!(read.contains("Content-Type: application/json"));
+    let read: Value = serde_json::from_str(View::body(&read)).unwrap();
+    assert_eq!(
+        read,
+        checkout.ok(&["read"]),
+        "the same output as `model read`"
+    );
+
+    let (status, refused) = view.get("/api/model");
+    assert_eq!(status, 403, "{refused}");
+    let refused: Value = serde_json::from_str(View::body(&refused)).unwrap();
+    assert_eq!(refused["kind"], "refusal");
+    assert_eq!(view.get(&format!("/api/model?t={}x", &t[1..])).0, 403);
+
+    // A page on another site that resolved its own name to this machine names itself as Host.
+    let foreign = view.send(
+        "GET",
+        &format!("/api/model?t={t}"),
+        &format!("evil.example:{}", view.port),
+    );
+    assert_eq!(foreign.0, 403, "{}", foreign.1);
+    assert_eq!(
+        view.send("GET", "/", &format!("localhost:{}", view.port)).0,
+        200
+    );
+
+    let (status, svg) = view.get(&format!("/api/render?t={t}&view=architecture&depth=1"));
+    assert_eq!(status, 200, "{svg}");
+    assert!(svg.contains("Content-Type: image/svg+xml"));
+    assert!(
+        svg.contains("Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\r\n")
+    );
+    let svg = View::body(&svg);
+    assert_xml(svg);
+    assert!(svg.starts_with("<svg") && svg.contains("Platform"), "{svg}");
+
+    // A refusal keeps its JSON, with a 4xx status.
+    let (status, refused) = view.get(&format!("/api/render?t={t}&view=sequence"));
+    assert_eq!(status, 400, "{refused}");
+    let refused: Value = serde_json::from_str(View::body(&refused)).unwrap();
+    assert_eq!(refused["error"]["code"], "REQUEST_INVALID");
+    let (status, _) = view.get(&format!("/api/model?t={t}&checkpoint=ffff"));
+    assert_eq!(status, 404);
+
+    for path in ["proposals", "checkpoints", "check"] {
+        let (status, out) = view.get(&format!("/api/{path}?t={t}"));
+        assert_eq!(status, 200, "{out}");
+        let out: Value = serde_json::from_str(View::body(&out)).unwrap();
+        assert_eq!(out["kind"], path, "{out:#}");
+    }
+
+    let (status, response) = view.send(
+        "POST",
+        &format!("/api/model?t={t}"),
+        &format!("127.0.0.1:{}", view.port),
+    );
+    assert_eq!(status, 405, "{response}");
+    assert!(response.contains("Allow: GET"));
+}
+
+#[test]
+fn view_events_tell_the_page_when_the_model_changes() {
+    use std::io::Read as _;
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let view = View::start(&checkout);
+    let mut events = view.connect();
+    write!(
+        events,
+        "GET /api/events?t={} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+        view.token, view.port
+    )
+    .unwrap();
+    let mut seen = String::new();
+    let read_until = |stream: &mut std::net::TcpStream, seen: &mut String, needle: &str| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut chunk = [0u8; 1024];
+        while !seen.contains(needle) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no {needle:?} in {seen}"
+            );
+            let n = stream.read(&mut chunk).expect(seen);
+            assert!(n > 0, "the stream closed: {seen}");
+            seen.push_str(&String::from_utf8_lossy(&chunk[..n]));
+        }
+    };
+    read_until(&mut events, &mut seen, "retry:");
+    assert!(seen.starts_with("HTTP/1.1 200"), "{seen}");
+    for header in [
+        "Content-Type: text/event-stream",
+        "Connection: close",
+        "Referrer-Policy: no-referrer",
+    ] {
+        assert!(seen.contains(&format!("{header}\r\n")), "{seen}");
+    }
+
+    let out = checkout.edited(json!([
+        {"type": "add-module", "module": {"name": "Ledger", "kind": "service", "order": 2}},
+    ]));
+    let revision = out["after"]["digest"].as_str().unwrap();
+    // The edit's lock and journal are Boundrail state too, so `state` may come with `model`.
+    let changed =
+        format!("event: changed\ndata: {{\"revision\":\"{revision}\",\"parts\":[\"model\"");
+    read_until(&mut events, &mut seen, &changed);
+
+    // A claim changes no vault file; the page reloads claims and checks only. The edit made the
+    // state folder, which the watcher follows from then on.
+    seen.clear();
+    checkout.claim("tester", json!(["Billing"]));
+    let claimed = format!("data: {{\"revision\":\"{revision}\",\"parts\":[\"state\"]}}");
+    read_until(&mut events, &mut seen, &claimed);
+}
+
+#[test]
+fn proposals_lists_its_keys_in_the_order_they_always_had() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let (code, out) = checkout.run_raw(&["proposals"]);
+    assert_eq!(code, 0, "{out}");
+    let at = |key: &str| out.find(&format!("\n  \"{key}\":")).expect(key);
+    let keys = ["schema", "kind", "success", "vault", "proposals"];
+    let positions: Vec<usize> = keys.iter().map(|k| at(k)).collect();
+    assert!(positions.is_sorted(), "{out}");
+}

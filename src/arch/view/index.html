@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Boundrail model</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="identity">
+    <span class="mark" aria-hidden="true"></span>
+    <h1 id="model-name">Loading model</h1>
+    <span id="revision" class="revision" title="Revision"></span>
+    <span id="live" class="live" aria-hidden="true" title="Connecting"></span>
+  </div>
+  <div class="controls">
+    <label class="field">State
+      <select id="state" aria-label="State to show"></select>
+    </label>
+    <label class="field">Compare with
+      <select id="against" aria-label="State to compare with"></select>
+    </label>
+    <div class="switch" role="group" aria-label="View">
+      <button type="button" data-view="architecture" aria-pressed="true">Architecture</button>
+      <button type="button" data-view="sequence" aria-pressed="false">Sequence</button>
+      <button type="button" data-view="flowchart" aria-pressed="false">Flowchart</button>
+    </div>
+  </div>
+</header>
+<main class="workspace">
+  <nav class="sidebar" aria-label="Model contents">
+    <div class="filter">
+      <input id="filter" type="search" placeholder="Filter by name   /" aria-label="Filter modules by name" autocomplete="off">
+      <div id="kinds" class="chips" role="group" aria-label="Filter by kind"></div>
+    </div>
+    <section aria-labelledby="h-modules">
+      <h2 id="h-modules">Modules</h2>
+      <ul id="tree" class="tree"></ul>
+    </section>
+    <section aria-labelledby="h-flows">
+      <h2 id="h-flows">Flows</h2>
+      <div id="flows"></div>
+    </section>
+    <section aria-labelledby="h-warnings">
+      <h2 id="h-warnings">Warnings</h2>
+      <div id="warnings"></div>
+    </section>
+    <section id="changes-section" aria-labelledby="h-changes" hidden>
+      <h2 id="h-changes">Changes</h2>
+      <div id="changes"></div>
+    </section>
+    <section aria-labelledby="h-proposals">
+      <h2 id="h-proposals">Proposals</h2>
+      <div id="proposals"></div>
+    </section>
+    <section aria-labelledby="h-history">
+      <h2 id="h-history">History</h2>
+      <div id="history"></div>
+    </section>
+  </nav>
+  <section class="stage" aria-label="Diagram">
+    <div class="toolbar">
+      <label class="field inline">Depth
+        <input id="depth" type="number" min="1" max="9" value="2" aria-label="Container depth">
+      </label>
+      <button type="button" id="fit" aria-label="Fit diagram to screen">Fit</button>
+      <button type="button" id="focus" aria-pressed="false" aria-label="Focus on selection: dim unconnected modules">Focus</button>
+      <button type="button" id="split" aria-pressed="false" aria-label="Split the canvas into two panes">Split</button>
+    </div>
+    <div id="panes" class="panes"></div>
+  </section>
+  <aside id="detail" class="detail" aria-label="Selected module"></aside>
+</main>
+<p id="announce" class="visually-hidden" role="status"></p>
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+<script src="app.js"></script>
+</body>
+</html>
