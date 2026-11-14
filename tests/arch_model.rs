@@ -6365,6 +6365,8 @@ fn check_warns_about_beats_whose_target_state_is_missing() {
     let ids: Vec<&str> = (out["allocated"].as_array().unwrap().iter())
         .map(|a| a["id"].as_str().unwrap())
         .collect();
+    // Allocated IDs are random, so diagnostics of one code can come in either order.
+    let pair = |walkthrough: &str, beat: &str| json!([walkthrough, beat]);
     let found = |checkout: &Checkout| -> Vec<(String, Value, String)> {
         let (code, out) = checkout.run(&["check", "--only", "semantic"]);
         assert_eq!(code, 1, "{out:#}");
@@ -6383,7 +6385,7 @@ fn check_warns_about_beats_whose_target_state_is_missing() {
     let first = found(&checkout);
     assert_eq!(first.len(), 2, "{first:#?}");
     assert_eq!(first[0].0, "WALKTHROUGH_TARGET_MISSING");
-    assert_eq!(first[0].1, json!([ids[0], ids[2]]));
+    assert_eq!(first[0].1, pair(ids[0], ids[2]));
     assert!(
         first[0]
             .2
@@ -6403,9 +6405,11 @@ fn check_warns_about_beats_whose_target_state_is_missing() {
     );
     let dropped = found(&checkout);
     assert_eq!(dropped.len(), 3, "{dropped:#?}");
-    assert_eq!(dropped[0].1, json!([ids[0], ids[1]]));
+    let focus = (dropped.iter())
+        .find(|(_, subjects, _)| *subjects == pair(ids[0], ids[1]))
+        .unwrap();
     assert_eq!(
-        dropped[0].2,
+        focus.2,
         format!(
             "Plans, beat 1 (Next): focus {model}#BankApi1 is not a module of proposal {model}#{proposal}"
         )
@@ -6430,7 +6434,7 @@ fn check_warns_about_beats_whose_target_state_is_missing() {
     let after = found(&checkout);
     assert_eq!(after.len(), 3, "{after:#?}");
     let gone = (after.iter())
-        .find(|(_, subjects, _)| *subjects == json!([ids[0], ids[1]]))
+        .find(|(_, subjects, _)| *subjects == pair(ids[0], ids[1]))
         .unwrap();
     assert_eq!(gone.0, "WALKTHROUGH_TARGET_MISSING");
     assert!(
