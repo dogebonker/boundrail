@@ -68,32 +68,40 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   symbol as `symbols-incomplete`. Elixir files whose definitions `use` macros generate are not
   marked yet, so a symbol such a macro defines reports missing.
 - T6: a flow's place in its collection is its `order`, as for modules; a step's place is its index
-  in its list, since a sequence has no other order. Collections and flows resolve by ID or unique
-  name, so one batch can add a collection and its flows; steps, branches and loops resolve by ID
-  only, and `add-flow`, `add-step` and `add-branch` take nested steps so a whole tree lands in one
-  change. `model read <subject>` and claims resolve collection and flow IDs, not names, before
-  module names. `model read --flow` prints every flow, step and branch ID qualified.
-- T6: a claim on a flow covers its steps; a claim on a collection covers its flows. A step's
-  module references need no claim. Adding or renaming a collection or flow touches every one that
-  already has the name, as for modules. `REFERENCED_BY_FLOW` refuses only references the batch
-  broke by removing a module or removing or moving a relationship, in steps the batch did not
-  edit; an edited step whose reference does not hold is `MODEL_INVALID`.
+  in its list, since a sequence has no other order. Collections and flows resolve by ID, else by
+  unique current or former name, so one batch can add a collection and its flows; steps, branches
+  and loops resolve by ID only, and `add-flow`, `add-step` and `add-branch` take nested steps so a
+  whole tree lands in one change. `model read <subject>` and claims resolve collection and flow IDs,
+  not names, before module names. The JSON output of `model read --flow` qualifies every flow, step
+  and branch ID; its Markdown is a readable sequence.
+- T6: a claim on a flow covers its steps; a claim on a collection covers its flows. A step's module
+  references need no claim. A rename records the former name, as for modules. Adding or renaming a
+  collection or flow touches every one that has or had the name. `REFERENCED_BY_FLOW` refuses only
+  references the batch broke by removing a module or removing or moving a relationship, in steps the
+  batch did not edit; an edited step whose reference does not hold is `MODEL_INVALID`.
 - T7: the history is the ref `refs/boundrail/history`, one per repository, so checkpoints from any
-  worktree land on it. A checkpoint's tree holds the recognized vault files at their
-  vault-relative paths (`model.json` at the root), not at `.boundrail/model/`. Commits are built
-  with `hash-object`, a disposable index and `commit-tree`, so HEAD, the index and the working
-  tree never change. With `commit.gpgSign` set, `commit-tree -S` signs with the user's signing
-  program and key, the one program repository config may name for us; a failed signature refuses
-  `SIGNING_FAILED` before the ref moves. The ref moves by compare-and-swap with a reflog entry; a
-  lost race or a held ref lock refuses `HISTORY_MOVED` and a retry builds on the new tip.
-  Retaining an unchanged model refuses `NOTHING_TO_RETAIN`. Trailers `Source` and `Operation`
-  appear only when there is a value.
+  worktree land on it. A checkpoint's tree holds the recognized vault files at their vault-relative
+  paths (`model.json` at the root), not at `.boundrail/model/`. Commits are built with
+  `hash-object`, a disposable index and `commit-tree`, so HEAD, the index and the working tree never
+  change. With `commit.gpgSign` set, `commit-tree -S` signs with the user's signing program and key,
+  the one program repository config may name for us; a failed signature refuses `SIGNING_FAILED`
+  before the ref moves, whatever the signer prints. A signing program named by repository config is
+  accepted scope: writing `.git/config` already allows running code, and reading only global config
+  would break `include.path` and per-repository signing setups. The ref moves by compare-and-swap
+  with a reflog entry; a lost race or a held ref lock refuses `HISTORY_MOVED` and a retry builds on
+  the new tip. The new commit's parent and the swap's old value are the tip the history was read
+  from, even a commit without checkpoint trailers. A vault file larger than the 4 MiB a checkpoint
+  reader accepts refuses `MODEL_INVALID` before anything is written. Retaining an unchanged model
+  refuses `NOTHING_TO_RETAIN`. Trailers `Source` and `Operation` appear only when there is a value.
 - T7: `model retain` takes flags, not a request body. `--writer` defaults to the Git author name.
-  Its operation fingerprint covers the writer and `--doing`, since `--doing` is the checkpoint's
-  content; an edit's fingerprint leaves `--doing` out. The journal record is written `pending`
-  before the ref moves and `done` after; a pending record whose commit is on the ref counts as
-  done. The journal is per worktree, so a retry from another worktree is answered from the
-  `Operation` trailers on the shared ref.
+  `--expected-revision` refuses `STALE_REVISION` when the model is at another revision; agents
+  should pass the revision they reviewed. Its operation fingerprint covers the writer, `--doing` and
+  `--expected-revision` when given, since `--doing` is the checkpoint's content; an edit's
+  fingerprint leaves `--doing` out. The journal record is written `pending` before the ref moves and
+  `done` after; a pending record whose commit is on the ref counts as done. The journal is per
+  worktree, so a retry from another worktree is answered from the `Operation` trailers on the shared
+  ref. Such a retry cannot tell whether the first attempt passed `--expected-revision`, so it
+  accepts the flag absent or equal to the retained revision.
 - T7: `model checkpoints` and `model read --checkpoint` need no vault in the checkout, so a
   deleted vault can be restored from its history. `--checkpoint` takes a checkpoint ID (any
   case), else a unique commit prefix of at least 4 hex digits; an ambiguous prefix refuses

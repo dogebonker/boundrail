@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::{Batch, Diff, at, both, request_invalid};
+use super::{Batch, Diff, at, both, rename, request_invalid};
 use crate::arch::types::{Branch, Collection, Emphasis, Flow, SCHEMA_VERSION, Step, find_step};
 use crate::arch::vault::{self, Model};
 use crate::arch::{Code, Refusal, ids};
@@ -236,6 +236,7 @@ impl Batch<'_> {
             name: new.name,
             order: new.order,
             description: new.description,
+            former_names: Vec::new(),
             flows: Vec::new(),
         });
         Ok(())
@@ -256,7 +257,7 @@ impl Batch<'_> {
         self.edit_once(index, &id)?;
         let collection = &mut self.collections[c];
         if let Some(name) = set.name {
-            collection.name = name;
+            rename(&mut collection.name, &mut collection.former_names, name);
         }
         if let Some(order) = set.order {
             collection.order = order;
@@ -283,6 +284,7 @@ impl Batch<'_> {
             order: new.order,
             summary: new.summary,
             description: new.description,
+            former_names: Vec::new(),
             steps,
         });
         Ok(())
@@ -303,7 +305,7 @@ impl Batch<'_> {
         self.edit_once(index, &id)?;
         let flow = &mut self.collections[c].flows[f];
         if let Some(name) = set.name {
-            flow.name = name;
+            rename(&mut flow.name, &mut flow.former_names, name);
         }
         if let Some(order) = set.order {
             flow.order = order;
@@ -648,7 +650,8 @@ fn take(steps: &mut Vec<Step>, id: &str) -> Option<Step> {
 /// collection and flow subjects, and retired IDs. It adds to `touched` the subjects a claim must
 /// cover: a collection whose own fields change, the root level when a collection comes or goes,
 /// a flow that changes, the collections a flow enters or leaves, and every collection or flow
-/// whose name an added or renamed one takes. Steps and branches are covered by their flow.
+/// whose current or former name an added or renamed one takes. Steps and branches are covered by
+/// their flow.
 pub(super) fn diff_collections<'a>(
     model: &'a Model,
     new: &'a [Collection],
@@ -687,7 +690,8 @@ pub(super) fn diff_collections<'a>(
         }
         // A name an added or renamed collection takes would stop naming another alone.
         if let Some(named) = after.filter(|a| before.is_none_or(|b| b.name != a.name)) {
-            let same = old.values().filter(|c| c.name == named.name);
+            let same =
+                (old.values()).filter(|c| vault::holds_name(&c.name, &c.former_names, &named.name));
             touched.extend(same.map(|c| Some(model.qualify(&c.id))));
         }
     }
@@ -717,7 +721,8 @@ fn diff_flows(
         if let Some((_, named)) =
             after.filter(|(_, a)| before.is_none_or(|(_, b)| b.name != a.name))
         {
-            let same = old.iter().filter(|(_, (_, f))| f.name == named.name);
+            let same = (old.iter())
+                .filter(|(_, (_, f))| vault::holds_name(&f.name, &f.former_names, &named.name));
             touched.extend(same.map(|(id, _)| Some(model.qualify(id))));
         }
         let (left, entered) = (before.map(|(c, _)| *c), after.map(|(c, _)| *c));

@@ -117,9 +117,13 @@ enum ModelCmd {
         /// Who retains it; defaults to the Git author name
         #[arg(long)]
         writer: Option<String>,
-        /// Repeating an operation ID with the same writer and --doing returns the same checkpoint
+        /// Repeating an operation ID with the same writer, --doing and --expected-revision returns
+        /// the same checkpoint
         #[arg(long)]
         operation_id: Option<String>,
+        /// The revision digest the retain is for; a model at another revision refuses
+        #[arg(long)]
+        expected_revision: Option<String>,
     },
     /// List checkpoints, newest first
     Checkpoints {
@@ -451,10 +455,16 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
             doing,
             writer,
             operation_id,
+            expected_revision,
         } => {
             let dir = vault::locate(root)?;
-            let checkpoint =
-                checkpoint::retain(&dir, &doing, writer.as_deref(), operation_id.as_deref())?;
+            let checkpoint = checkpoint::retain(
+                &dir,
+                &doing,
+                writer.as_deref(),
+                operation_id.as_deref(),
+                expected_revision.as_deref(),
+            )?;
             if markdown {
                 print_checkpoint(&checkpoint);
                 return Ok(());

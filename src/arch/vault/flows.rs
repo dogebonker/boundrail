@@ -100,6 +100,7 @@ pub(super) fn check(
             Some(DESCRIPTION_MAX),
             true,
         );
+        check_former_names(problems, file, id, &collection.former_names);
         for flow in &collection.flows {
             check_flow(file, flow, ends.as_ref(), problems);
         }
@@ -125,6 +126,7 @@ fn check_flow(file: &str, flow: &Flow, ends: Option<&Ends>, problems: &mut Probl
         Some(DESCRIPTION_MAX),
         true,
     );
+    check_former_names(problems, file, id, &flow.former_names);
     let steps = walk(&flow.steps);
     if steps.len() > FLOW_STEPS_MAX {
         let message = format!("has {} steps, more than {FLOW_STEPS_MAX}", steps.len());
@@ -175,6 +177,21 @@ fn check_step(file: &str, step: &Step, depth: usize, ends: Option<&Ends>, proble
     }
 }
 
+/// Former names follow the module's rule: one line without control characters.
+fn check_former_names(problems: &mut Problems, file: &str, subject: &str, names: &[String]) {
+    for name in names {
+        check_text(
+            problems,
+            file,
+            subject,
+            "former name",
+            Some(name),
+            None,
+            false,
+        );
+    }
+}
+
 fn check_label(problems: &mut Problems, file: &str, subject: &str, label: &str) {
     if !one_line(label, LABEL_MAX) {
         let message = format!("label needs 1 to {LABEL_MAX} characters and no control characters");
@@ -182,24 +199,29 @@ fn check_label(problems: &mut Problems, file: &str, subject: &str, label: &str) 
     }
 }
 
-/// What `items` (key, local ID, name) holds for the one item `subject` names: its qualified or
-/// local ID, else its unique name. `what` names the kind of item in a refusal.
+pub(crate) fn holds_name(current: &str, former_names: &[String], name: &str) -> bool {
+    current == name || former_names.iter().any(|n| n == name)
+}
+
+/// What `items` (key, local ID, name, former names) holds for the one item `subject` names: its
+/// qualified or local ID, else its unique current or former name. `what` names the kind of item
+/// in a refusal.
 fn pick<'a, K: Copy>(
     model: &str,
     what: &str,
-    items: impl Iterator<Item = (K, &'a str, &'a str)> + Clone,
+    items: impl Iterator<Item = (K, &'a str, &'a str, &'a [String])> + Clone,
     subject: &str,
 ) -> Result<K, Refusal> {
     let local = ids::local(model, subject);
     let mut found: Vec<(K, &str)> = items
         .clone()
-        .filter(|(_, id, _)| *id == local)
-        .map(|(key, id, _)| (key, id))
+        .filter(|(_, id, _, _)| *id == local)
+        .map(|(key, id, _, _)| (key, id))
         .collect();
     if found.is_empty() {
         found = items
-            .filter(|(_, _, name)| *name == subject)
-            .map(|(key, id, _)| (key, id))
+            .filter(|(_, _, name, former)| holds_name(name, former, subject))
+            .map(|(key, id, _, _)| (key, id))
             .collect();
     }
     match found.as_slice() {
@@ -223,26 +245,29 @@ fn pick<'a, K: Copy>(
 }
 
 /// The position among `collections` of the collection `subject` names: its qualified or local
-/// ID, else its unique name.
+/// ID, else its unique current or former name.
 pub(crate) fn collection_position(
     model: &str,
     collections: &[Collection],
     subject: &str,
 ) -> Result<usize, Refusal> {
-    let items = (collections.iter().enumerate()).map(|(c, x)| (c, x.id.as_str(), x.name.as_str()));
+    let items = (collections.iter().enumerate())
+        .map(|(c, x)| (c, x.id.as_str(), x.name.as_str(), x.former_names.as_slice()));
     pick(model, "collection", items, subject)
 }
 
 /// The positions among `collections` of the collection holding the flow `subject` names, and of
-/// the flow in it: its qualified or local ID, else its unique name.
+/// the flow in it: its qualified or local ID, else its unique current or former name.
 pub(crate) fn flow_position(
     model: &str,
     collections: &[Collection],
     subject: &str,
 ) -> Result<(usize, usize), Refusal> {
     let items = collections.iter().enumerate().flat_map(|(c, collection)| {
-        (collection.flows.iter().enumerate())
-            .map(move |(f, flow)| ((c, f), flow.id.as_str(), flow.name.as_str()))
+        (collection.flows.iter().enumerate()).map(move |(f, flow)| {
+            let former = flow.former_names.as_slice();
+            ((c, f), flow.id.as_str(), flow.name.as_str(), former)
+        })
     });
     pick(model, "flow", items, subject)
 }
@@ -344,8 +369,8 @@ impl Model {
         })
     }
 
-    /// The flow `subject` names, its qualified or local ID or its unique name, with its
-    /// collection.
+    /// The flow `subject` names, its qualified or local ID or its unique current or former name,
+    /// with its collection.
     pub fn flow(&self, subject: &str) -> Result<(&Collection, &Flow), Refusal> {
         let (c, f) = flow_position(&self.manifest.id, &self.collections, subject)?;
         let collection = &self.collections[c];
@@ -514,6 +539,33 @@ mod tests {
                 "has 501 steps, more than 500".to_owned()
             )]
         );
+    }
+
+    #[test]
+    fn former_names_carry_no_control_characters() {
+        let collection: Collection = serde_json::from_value(json!({
+            "schema_version": 1, "id": "Coll0001", "name": "Orders", "order": 0,
+            "former_names": ["Sales\u{1b}[31m"],
+            "flows": [{"id": "Flow0001", "name": "Checkout", "order": 0,
+                       "former_names": ["Buy", "Pay\nnow"]}],
+        }))
+        .unwrap();
+        let found: Vec<(String, String)> = super::super::problems(
+            &manifest(),
+            &VaultConfig::default(),
+            &modules(),
+            &[collection],
+        )
+        .into_iter()
+        .map(|p| (p.subject, p.message))
+        .collect();
+        let problem = |subject: &str| {
+            (
+                subject.to_owned(),
+                "former name contains a control character".to_owned(),
+            )
+        };
+        assert_eq!(found, [problem("Coll0001"), problem("Flow0001")]);
     }
 
     #[test]

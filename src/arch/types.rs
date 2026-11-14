@@ -204,6 +204,8 @@ pub struct Collection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = DESCRIPTION_MAX))]
     pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub former_names: Vec<String>,
     #[serde(default)]
     pub flows: Vec<Flow>,
 }
@@ -223,6 +225,8 @@ pub struct Flow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = DESCRIPTION_MAX))]
     pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub former_names: Vec<String>,
     #[serde(default)]
     pub steps: Vec<Step>,
 }

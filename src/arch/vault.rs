@@ -22,7 +22,7 @@ use crate::sync_rules::hash;
 mod flows;
 
 pub use flows::{CollectionView, FlowEntry, FlowView, Found};
-pub(super) use flows::{Ends, collection_position, flow_position, message_problems};
+pub(super) use flows::{Ends, collection_position, flow_position, holds_name, message_problems};
 
 /// Boundrail's state folder at the checkout root, and the vault folder inside it.
 const STATE: &str = ".boundrail";

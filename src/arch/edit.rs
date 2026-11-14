@@ -755,7 +755,7 @@ fn diff<'a>(
                 model
                     .modules
                     .iter()
-                    .filter(|m| m.name == named.name || m.former_names.contains(&named.name))
+                    .filter(|m| vault::holds_name(&m.name, &m.former_names, &named.name))
                     .map(|m| Some(model.qualify(&m.id))),
             );
         }
@@ -1037,7 +1037,7 @@ impl<'a> Batch<'a> {
         let parent = self.reference(index, set.parent.as_deref())?;
         let module = &mut self.modules[at];
         if let Some(name) = set.name {
-            rename(module, name);
+            rename(&mut module.name, &mut module.former_names, name);
         }
         if let Some(kind) = set.kind {
             module.kind = kind;
@@ -1275,14 +1275,14 @@ impl<'a> Batch<'a> {
 }
 
 /// A rename keeps the old name as a former name; renaming back to a former name drops it.
-fn rename(module: &mut Module, name: String) {
-    if name == module.name {
+fn rename(current: &mut String, former_names: &mut Vec<String>, name: String) {
+    if name == *current {
         return;
     }
-    module.former_names.retain(|n| *n != name);
-    let old = std::mem::replace(&mut module.name, name);
-    if !module.former_names.contains(&old) {
-        module.former_names.push(old);
+    former_names.retain(|n| *n != name);
+    let old = std::mem::replace(current, name);
+    if !former_names.contains(&old) {
+        former_names.push(old);
     }
 }
 

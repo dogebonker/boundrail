@@ -2727,6 +2727,45 @@ fn taking_a_claimed_collections_or_flows_name_conflicts() {
     );
 }
 
+#[test]
+fn a_renamed_flow_keeps_its_old_name() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let ids = add_checkout(&checkout);
+    let (orders, flow) = (&ids[0], &ids[1]);
+    checkout
+        .edited(json!([{"type": "edit-flow", "subject": "Checkout", "set": {"name": "Purchase"}}]));
+    let read = checkout.ok(&["read", "--flow", "Checkout"]);
+    assert_eq!(read["flow"]["id"], *flow);
+    assert_eq!(read["flow"]["name"], "Purchase");
+    let file = checkout
+        .vault()
+        .join(format!("collections/{}.collection.json", local(orders)));
+    let stored: Value = serde_json::from_str(&fs::read_to_string(file).unwrap()).unwrap();
+    assert_eq!(stored["flows"][0]["former_names"], json!(["Checkout"]));
+    assert_eq!(stored.get("former_names"), None);
+
+    // A claim on the renamed flow protects its old name.
+    let claim = checkout.claim("alice", json!([flow]));
+    let take = json!([{"type": "add-flow", "collection": "Orders", "flow": {"name": "Checkout", "order": 1}}]);
+    let error = checkout.edit_refused(
+        &checkout.request_by("bob", None, take.clone()),
+        "CLAIM_CONFLICT",
+    );
+    assert_eq!(error["details"]["conflicts"][0]["subjects"], json!([flow]));
+    let (code, out) = checkout.release(&claim, "alice");
+    assert_eq!(code, 0, "{out:#}");
+
+    // Once a new flow takes the name, it names two flows.
+    checkout.edited(take);
+    let error = checkout.refused(&["read", "--flow", "Checkout"], "SUBJECT_AMBIGUOUS");
+    assert_eq!(error["details"]["matches"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        checkout.ok(&["read", "--flow", "Purchase"])["flow"]["id"],
+        *flow
+    );
+}
+
 /// A checkout with an initial commit and a local identity, so checkpoints can be committed.
 fn committed() -> Checkout {
     let checkout = Checkout::new();
@@ -2991,6 +3030,121 @@ fn a_locked_history_ref_refuses_and_leaves_it_unchanged() {
     assert_eq!(second["parent"], first["id"]);
 }
 
+#[cfg(unix)]
+#[test]
+fn retain_builds_on_a_history_tip_that_is_not_a_checkpoint() {
+    use std::os::unix::fs::PermissionsExt;
+    let checkout = committed();
+    shop(&checkout);
+    let first = checkout.ok(&["retain", "--doing", "the shop as built"])["checkpoint"].clone();
+    // Another tool lands a commit without checkpoint trailers on the ref.
+    let tree = git(&checkout, &["rev-parse", "refs/boundrail/history^{tree}"]);
+    let foreign = git(
+        &checkout,
+        &[
+            "commit-tree",
+            tree.trim(),
+            "-p",
+            "refs/boundrail/history",
+            "-m",
+            "not a checkpoint",
+        ],
+    );
+    let foreign = foreign.trim();
+    git(
+        &checkout,
+        &["update-ref", "refs/boundrail/history", foreign],
+    );
+
+    checkout.edited(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 4}}]));
+    let second = checkout.ok(&["retain", "--doing", "move the bank"])["checkpoint"].clone();
+    assert_eq!(second["parent"], first["id"]);
+    let parent = git(&checkout, &["rev-parse", "refs/boundrail/history^"]);
+    assert_eq!(parent.trim(), foreign);
+    let list = checkout.ok(&["checkpoints"])["checkpoints"].clone();
+    assert_eq!(list, json!([second, first]));
+    // A limit counts checkpoints, not the commits between them.
+    let list = checkout.ok(&["checkpoints", "--limit", "1"])["checkpoints"].clone();
+    assert_eq!(list, json!([second]));
+    assert_eq!(list[0]["parent"], first["id"]);
+    let list = checkout.ok(&["checkpoints", "--limit", "2"])["checkpoints"].clone();
+    assert_eq!(list, json!([second, first]));
+
+    // A commit that lands while the checkpoint is written, here from inside its signer, refuses.
+    let tools = TempDir::new("signer").unwrap();
+    let signer = tools.path().join("sign");
+    let script = format!(
+        "#!/bin/sh\ncat >/dev/null\ngit update-ref refs/boundrail/history {foreign}\n\
+         printf '\\n[GNUPG:] SIG_CREATED D 1 8 00 1 FAKE\\n' >&2\n\
+         printf -- '-----BEGIN PGP SIGNATURE-----\\n\\nfake\\n-----END PGP SIGNATURE-----\\n'\n"
+    );
+    fs::write(&signer, script).unwrap();
+    fs::set_permissions(&signer, fs::Permissions::from_mode(0o755)).unwrap();
+    git(&checkout, &["config", "commit.gpgsign", "true"]);
+    git(&checkout, &["config", "gpg.format", "openpgp"]);
+    git(
+        &checkout,
+        &["config", "gpg.program", signer.to_str().unwrap()],
+    );
+    checkout.edited(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 5}}]));
+    let error = checkout.refused(&["retain", "--doing", "move it again"], "HISTORY_MOVED");
+    assert_eq!(error["details"]["expected"], second["commit"]);
+    assert_eq!(error["details"]["current"], foreign);
+}
+
+#[test]
+fn retain_builds_on_a_history_ref_holding_an_annotated_tag() {
+    let checkout = committed();
+    shop(&checkout);
+    let first = checkout.ok(&["retain", "--doing", "the shop as built"])["checkpoint"].clone();
+    let commit = first["commit"].as_str().unwrap();
+    git(&checkout, &["tag", "-a", "-m", "tagged", "built", commit]);
+    let tag = git(&checkout, &["rev-parse", "refs/tags/built"]);
+    git(
+        &checkout,
+        &["update-ref", "refs/boundrail/history", tag.trim()],
+    );
+
+    checkout.edited(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 4}}]));
+    let second = checkout.ok(&["retain", "--doing", "move the bank"])["checkpoint"].clone();
+    assert_eq!(second["parent"], first["id"]);
+    let parent = git(&checkout, &["rev-parse", "refs/boundrail/history^"]);
+    assert_eq!(parent.trim(), commit);
+}
+
+#[test]
+fn retain_checks_the_expected_revision_when_given() {
+    let checkout = committed();
+    shop(&checkout);
+    let reviewed = checkout.digest();
+    checkout.edited(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 4}}]));
+    let current = checkout.digest();
+    let retain = ["retain", "--doing", "move the bank", "--expected-revision"];
+    let stale = [&retain[..], &[reviewed.as_str().unwrap()]].concat();
+    let error = checkout.refused(&stale, "STALE_REVISION");
+    assert_eq!(error["details"]["current"], current);
+    assert_eq!(checkout.ok(&["checkpoints"])["checkpoints"], json!([]));
+
+    let fresh = [&retain[..], &[current.as_str().unwrap()]].concat();
+    let retained = checkout.ok(&fresh)["checkpoint"].clone();
+    assert_eq!(retained["revision"], current);
+}
+
+#[test]
+fn retain_refuses_a_vault_file_too_large_to_read_back() {
+    let checkout = committed();
+    shop(&checkout);
+    let id = add_checkout(&checkout)[0].clone();
+    let path = format!("collections/{}.collection.json", local(&id));
+    let file = checkout.vault().join(&path);
+    let mut text = fs::read_to_string(&file).unwrap();
+    text.push_str(&" ".repeat(4 * 1024 * 1024));
+    fs::write(&file, text).unwrap();
+    let error = checkout.refused(&["retain", "--doing", "the shop as built"], "MODEL_INVALID");
+    assert_eq!(error["details"]["path"], path);
+    assert_eq!(checkout.ok(&["checkpoints"])["checkpoints"], json!([]));
+}
+
 /// Puts a checkpoint on the history ref whose tree is the tree of `base` plus `extra` files as
 /// (path, blob), and returns its ID.
 fn forge(checkout: &Checkout, id: &str, base: &str, extra: &[(&str, &str)]) -> String {
@@ -3089,15 +3243,24 @@ fn checkpoints_follow_the_users_signing_config() {
         "{commit}"
     );
 
-    // A failing signer refuses before the ref moves.
-    script("echo 'fake signer: no key' >&2\nexit 1\n");
+    // A failing signer refuses before the ref moves, whatever it prints: with SSH signing, Git
+    // reports only the signer's own words.
+    script("echo 'no secret key' >&2\nexit 1\n");
+    let key = tools.path().join("key");
+    fs::write(&key, "").unwrap();
+    git(&checkout, &["config", "gpg.format", "ssh"]);
+    git(
+        &checkout,
+        &["config", "gpg.ssh.program", signer.to_str().unwrap()],
+    );
+    git(
+        &checkout,
+        &["config", "user.signingkey", key.to_str().unwrap()],
+    );
     checkout.edited(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 4}}]));
     let before = checkout_state(&checkout);
     let error = checkout.refused(&["retain", "--doing", "move the bank"], "SIGNING_FAILED");
-    assert!(
-        !error["details"]["stderr"].as_str().unwrap().is_empty(),
-        "{error:#}"
-    );
+    assert_eq!(error["details"]["stderr"], "error: no secret key");
     let tip = git(&checkout, &["rev-parse", "refs/boundrail/history"]);
     assert_eq!(tip.trim(), first["commit"]);
     assert_eq!(checkout_state(&checkout), before);
