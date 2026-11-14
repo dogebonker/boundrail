@@ -108,6 +108,66 @@ impl Checkout {
             "changes": changes,
         })
     }
+    /// A model command with `input` on standard input: exit code and stdout parsed as JSON.
+    fn pipe(&self, args: &[&str], input: &Value) -> (i32, Value) {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_boundrail"))
+            .args(["--no-daemon", "model"])
+            .args(args)
+            .current_dir(self.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(input.to_string().as_bytes()).unwrap();
+        drop(stdin);
+        let out = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        let value = serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
+        (out.status.code().unwrap(), value)
+    }
+    /// `model claim` by `writer` on `subjects`: the exit code and the output.
+    fn try_claim(&self, writer: &str, subjects: Value) -> (i32, Value) {
+        let read = self.ok(&["read"]);
+        let request = json!({
+            "target": {"model": read["manifest"]["id"], "state": read["manifest"]["current"]["id"]},
+            "writer": writer,
+            "reason": format!("{writer} works here"),
+            "subjects": subjects,
+        });
+        self.pipe(&["claim", "--doing", "reserve my modules"], &request)
+    }
+    /// The claim `model claim` records for `writer` on `subjects`.
+    fn claim(&self, writer: &str, subjects: Value) -> Value {
+        let (code, out) = self.try_claim(writer, subjects);
+        assert_eq!(code, 0, "{out:#}");
+        assert_eq!(out["kind"], "claim");
+        out["claim"].clone()
+    }
+    fn claim_refused(&self, writer: &str, subjects: Value, expected: &str) -> Value {
+        let (code, out) = self.try_claim(writer, subjects);
+        assert_eq!(code, 2, "{out:#}");
+        assert_eq!(out["error"]["code"], expected, "{out:#}");
+        out["error"].clone()
+    }
+    fn release(&self, claim: &Value, writer: &str) -> (i32, Value) {
+        self.pipe(
+            &["release"],
+            &json!({"claim": claim["id"], "writer": writer}),
+        )
+    }
+    fn claims(&self) -> Value {
+        self.ok(&["claims"])["claims"].clone()
+    }
+    /// An edit request by `writer`, naming `claim` when given.
+    fn request_by(&self, writer: &str, claim: Option<&Value>, changes: Value) -> Value {
+        let mut request = self.request(changes);
+        request["writer"] = writer.into();
+        if let Some(claim) = claim {
+            request["claim"] = claim["id"].clone();
+        }
+        request
+    }
     /// `model edit` with `request` on standard input.
     fn edit_with(&self, request: &Value, doing: &str, env: &[(&str, &str)]) -> (i32, String) {
         let mut child = Command::new(env!("CARGO_BIN_EXE_boundrail"))
@@ -580,7 +640,14 @@ fn schemas_describe_the_vault_files() {
     let names = checkout.ok(&["schema"]);
     assert_eq!(
         names["schemas"],
-        json!(["model-edit", "model-manifest", "module", "vault-config"])
+        json!([
+            "model-claim",
+            "model-edit",
+            "model-manifest",
+            "model-release",
+            "module",
+            "vault-config"
+        ])
     );
     checkout.refused(&["schema", "nope"], "SCHEMA_NOT_FOUND");
 
@@ -606,6 +673,24 @@ fn schemas_describe_the_vault_files() {
             .map(|e| e.to_string())
             .collect();
         assert!(errors.is_empty(), "{name}: {errors:#?}");
+    }
+    for (name, request) in [
+        (
+            "model-claim",
+            json!({"target": {"model": "Model001", "state": "State001"}, "writer": "alice", "reason": "billing work", "subjects": ["Billing"]}),
+        ),
+        (
+            "model-release",
+            json!({"claim": "Claim001", "writer": "alice"}),
+        ),
+    ] {
+        let (code, schema) = checkout.run(&["schema", name]);
+        assert_eq!(code, 0);
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        assert!(validator.is_valid(&request), "{name}");
+        let mut bad = request.clone();
+        bad["surprise"] = true.into();
+        assert!(!validator.is_valid(&bad), "{name}");
     }
     let (_, schema) = checkout.run(&["schema", "module"]);
     let validator = jsonschema::validator_for(&schema).unwrap();
@@ -1107,6 +1192,7 @@ fn a_held_edit_lock_refuses() {
     let request =
         checkout.request(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 4}}]));
     let error = checkout.edit_refused(&request, "VAULT_LOCKED");
+    checkout.claim_refused("alice", json!(["Bank"]), "VAULT_LOCKED");
     assert!(
         error["details"]["lock"]
             .as_str()
@@ -1255,4 +1341,372 @@ fn the_model_edit_schema_validates_a_request() {
         bad[key] = value;
         assert!(!validator.is_valid(&bad), "{key}");
     }
+}
+
+#[test]
+fn claims_round_trip_and_show_in_the_reading() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let q = |id: &str| format!("{model}#{id}");
+    assert_eq!(checkout.claims(), json!([]));
+    assert_eq!(checkout.ok(&["read"])["claims"], json!([]));
+
+    // Subjects resolve like `model read`, are stored qualified, sorted and once each.
+    let claim = checkout.claim(
+        "alice",
+        json!(["Billing", q("BankApi1"), "RelBil01", model, "Billing1"]),
+    );
+    assert!(boundrail::arch::ids::is_local(
+        claim["id"].as_str().unwrap()
+    ));
+    assert_eq!(claim["writer"], "alice");
+    assert_eq!(claim["reason"], "alice works here");
+    assert_eq!(claim["doing"], "reserve my modules");
+    assert!(claim["created"].as_u64().unwrap() > 0);
+    assert!(claim.get("revoked").is_none());
+    assert_eq!(
+        claim["subjects"],
+        json!(sorted(&[
+            &model,
+            &q("BankApi1"),
+            &q("Billing1"),
+            &q("RelBil01")
+        ]))
+    );
+    assert_eq!(checkout.claims(), json!([claim]));
+    assert_eq!(checkout.ok(&["read"])["claims"], json!([claim]));
+    // Reading a module shows the claims that hold it, its parts or its relationships.
+    assert_eq!(checkout.ok(&["read", "Bank"])["claims"], json!([claim]));
+    assert_eq!(checkout.ok(&["read", "Platform"])["claims"], json!([claim]));
+    assert_eq!(checkout.ok(&["read", "Web"])["claims"], json!([]));
+    let stored: Value = serde_json::from_str(
+        &fs::read_to_string(checkout.path().join(".git/boundrail/claims.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(stored, json!({"claims": [claim]}));
+    let (code, text) = checkout.run_raw(&["claims", "--format", "markdown"]);
+    assert_eq!(code, 0);
+    assert!(text.contains("by alice: alice works here"), "{text}");
+
+    checkout.claim_refused("alice", json!(["Payments"]), "SUBJECT_NOT_FOUND");
+    checkout.claim_refused("alice", json!([]), "REQUEST_INVALID");
+    let (code, out) = checkout.release(&json!({"id": "Missing1"}), "alice");
+    assert_eq!(
+        (code, &out["error"]["code"]),
+        (2, &json!("CLAIM_NOT_FOUND"))
+    );
+
+    let (code, out) = checkout.release(&claim, "alice");
+    assert_eq!(code, 0, "{out:#}");
+    assert_eq!(out["kind"], "release");
+    assert_eq!(out["claim"], claim);
+    assert_eq!(checkout.claims(), json!([]));
+    assert_eq!(checkout.ok(&["read", "Bank"])["claims"], json!([]));
+
+    // A corrupt claims file never fails a reading: the claims are left out with a warning.
+    fs::write(
+        checkout.path().join(".git/boundrail/claims.json"),
+        "{ broken",
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_boundrail"))
+        .args(["--no-daemon", "model", "read"])
+        .current_dir(checkout.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let read: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(read.get("claims").is_none());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("warning: claims omitted"));
+}
+
+#[test]
+fn claims_wait_for_an_interrupted_edit() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let claim = checkout.claim("alice", json!(["Bank"]));
+    let request = checkout.request_by(
+        "alice",
+        Some(&claim),
+        json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 7}}]),
+    );
+    let (code, _) = checkout.edit_with(
+        &request,
+        "reorder",
+        &[("BOUNDRAIL_TEST_STOP_AFTER_JOURNAL", "1")],
+    );
+    assert_eq!(code, 2);
+    checkout.claim_refused("bob", json!(["Web"]), "RECOVERY_REQUIRED");
+    let (code, out) = checkout.release(&claim, "alice");
+    assert_eq!(
+        (code, &out["error"]["code"]),
+        (2, &json!("RECOVERY_REQUIRED"))
+    );
+    checkout.ok(&["recover"]);
+    checkout.claim("bob", json!(["Web"]));
+}
+
+#[test]
+fn a_container_claim_holds_its_parts() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let q = |id: &str| format!("{model}#{id}");
+    let platform = checkout.claim("alice", json!(["Platform"]));
+    let (code, out) = checkout.edit(&checkout.request_by(
+        "alice",
+        Some(&platform),
+        json!([{"type": "edit-module", "subject": "Billing", "set": {"description": "Takes money"}}]),
+    ));
+    assert_eq!(code, 0, "{out:#}");
+    // Claims on either side of a containment clash.
+    let error = checkout.claim_refused("bob", json!(["Billing"]), "CLAIM_CONFLICT");
+    assert_eq!(
+        error["details"]["conflicts"][0]["subjects"],
+        json!([q("Billing1")])
+    );
+    checkout.claim_refused("bob", json!(["RelWeb01"]), "CLAIM_CONFLICT");
+    let bank = checkout.claim("bob", json!(["Bank"]));
+    checkout.claim_refused("alice", json!(["Bank"]), "CLAIM_CONFLICT");
+    checkout.edit_refused(
+        &checkout.request(json!([{"type": "edit-module", "subject": "Web", "set": {"order": 3}}])),
+        "CLAIM_CONFLICT",
+    );
+
+    // A hand-edited ledger that gives bob a part of alice's container still blocks alice.
+    let path = checkout.path().join(".git/boundrail/claims.json");
+    let mut ledger: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let mut forged = bank.clone();
+    forged["subjects"] = json!([q("WebApp01")]);
+    ledger["claims"].as_array_mut().unwrap().push(forged);
+    fs::write(&path, ledger.to_string()).unwrap();
+    checkout.edit_refused(
+        &checkout.request_by(
+            "alice",
+            Some(&platform),
+            json!([{"type": "edit-module", "subject": "Web", "set": {"order": 3}}]),
+        ),
+        "CLAIM_CONFLICT",
+    );
+}
+
+#[test]
+fn writers_cannot_claim_or_release_each_others_subjects() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let q = |id: &str| format!("{model}#{id}");
+    let first = checkout.claim("alice", json!(["Billing"]));
+    let error = checkout.claim_refused("bob", json!(["Bank", "Billing"]), "CLAIM_CONFLICT");
+    assert_eq!(
+        error["details"]["conflicts"],
+        json!([{"id": first["id"], "writer": "alice", "reason": "alice works here", "subjects": [q("Billing1")]}])
+    );
+    // The same writer may hold several claims, overlapping ones included.
+    let second = checkout.claim("alice", json!(["Billing", "Web"]));
+    checkout.claim("bob", json!(["Bank"]));
+    assert_eq!(checkout.claims().as_array().unwrap().len(), 3);
+
+    let (code, out) = checkout.release(&second, "bob");
+    assert_eq!(code, 2, "{out:#}");
+    assert_eq!(out["error"]["code"], "CLAIM_NOT_HELD");
+    assert_eq!(out["error"]["details"]["writer"], "alice");
+    assert_eq!(checkout.claims().as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn a_revoked_claim_stops_blocking_and_refuses_its_holder() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let claim = checkout.claim("alice", json!(["Bank"]));
+    let change = || json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 4}}]);
+    checkout.edit_refused(
+        &checkout.request_by("bob", None, change()),
+        "CLAIM_CONFLICT",
+    );
+
+    let id = claim["id"].as_str().unwrap();
+    let revoke = [
+        "release",
+        "--revoke",
+        id,
+        "--writer",
+        "dan",
+        "--reason",
+        "alice left",
+    ];
+    let out = checkout.ok(&revoke);
+    assert_eq!(out["kind"], "revoke");
+    assert_eq!(out["claim"]["revoked"]["by"], "dan");
+    assert_eq!(out["claim"]["revoked"]["reason"], "alice left");
+    // Revoked claims stay listed until released, but the reading shows only active ones.
+    assert_eq!(checkout.claims(), json!([out["claim"]]));
+    assert_eq!(checkout.ok(&["read"])["claims"], json!([]));
+
+    let error = checkout.edit_refused(
+        &checkout.request_by("alice", Some(&claim), change()),
+        "CLAIM_REVOKED",
+    );
+    assert_eq!(error["details"]["revoked"]["by"], "dan");
+    let (code, out) = checkout.edit(&checkout.request_by("bob", None, change()));
+    assert_eq!(code, 0, "{out:#}");
+
+    // A revoked claim blocks nobody, so any writer may clear it.
+    let (code, out) = checkout.release(&claim, "bob");
+    assert_eq!(code, 0, "{out:#}");
+    assert_eq!(checkout.claims(), json!([]));
+}
+
+#[test]
+fn an_edit_with_a_claim_needs_it_to_cover_every_subject() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let q = |id: &str| format!("{model}#{id}");
+    let web = checkout.claim("alice", json!(["Web"]));
+    let add = json!([
+        {"type": "add-relationship", "source": "Web", "relationship": {"to": "Bank", "kind": "call", "order": 1}},
+    ]);
+    // A new relationship needs its source and target; its own ID did not exist to claim.
+    let error = checkout.edit_refused(
+        &checkout.request_by("alice", Some(&web), add.clone()),
+        "CLAIM_INCOMPLETE",
+    );
+    assert_eq!(error["details"]["missing"], json!([q("BankApi1")]));
+    checkout.edit_refused(
+        &checkout.request_by("bob", Some(&web), add.clone()),
+        "CLAIM_NOT_HELD",
+    );
+    let mut unknown = checkout.request_by("alice", None, add.clone());
+    unknown["claim"] = "Missing1".into();
+    checkout.edit_refused(&unknown, "CLAIM_NOT_FOUND");
+
+    let ends = checkout.claim("alice", json!(["Web", "Bank"]));
+    let request = checkout.request_by("alice", Some(&ends), add);
+    let (code, out) = checkout.edit(&request);
+    assert_eq!(code, 0, "{out:#}");
+
+    // A done operation replays its receipt without checking claims again.
+    let (code, _) = checkout.release(&ends, "alice");
+    assert_eq!(code, 0);
+    let (code, replayed) = checkout.edit(&request);
+    assert_eq!(code, 0, "{replayed:#}");
+    assert_eq!(replayed, out);
+
+    // Moving a root module into another needs the module, the new parent and the root level.
+    let bank = checkout.claim("alice", json!(["Bank"]));
+    let error = checkout.edit_refused(
+        &checkout.request_by(
+            "alice",
+            Some(&bank),
+            json!([{"type": "edit-module", "subject": "Bank", "set": {"parent": "Platform"}}]),
+        ),
+        "CLAIM_INCOMPLETE",
+    );
+    assert_eq!(
+        error["details"]["missing"],
+        json!(sorted(&[&model, &q("Platfrm1")]))
+    );
+
+    // Modules and relationships added in the batch are covered by where they land.
+    let platform = checkout.claim("alice", json!(["Platform"]));
+    let (code, out) = checkout.edit(&checkout.request_by(
+        "alice",
+        Some(&platform),
+        json!([
+            {"type": "add-module", "module": {"name": "Ledger", "kind": "service", "order": 3, "parent": "Platform"}},
+            {"type": "add-module", "module": {"name": "Journal", "kind": "module", "order": 0, "parent": "Ledger"}},
+            {"type": "add-module", "module": {"name": "Audit", "kind": "service", "order": 4, "parent": "Platform"}},
+            {"type": "add-relationship", "source": "Audit", "relationship": {"to": "Billing", "kind": "call", "order": 0}},
+        ]),
+    ));
+    assert_eq!(code, 0, "{out:#}");
+
+    // A batch that only retires an ID still rewrites the manifest, which the model ID holds.
+    let temporary = json!([
+        {"type": "add-module", "module": {"name": "Scratch", "kind": "other", "order": 9, "parent": "Platform"}},
+        {"type": "remove-module", "subject": "Scratch"},
+    ]);
+    let error = checkout.edit_refused(
+        &checkout.request_by("alice", Some(&platform), temporary.clone()),
+        "CLAIM_INCOMPLETE",
+    );
+    assert_eq!(error["details"]["missing"], json!([model]));
+    let root = checkout.claim("alice", json!([model]));
+    let (code, out) = checkout.edit(&checkout.request_by("alice", Some(&root), temporary));
+    assert_eq!(code, 0, "{out:#}");
+}
+
+#[test]
+fn taking_a_claimed_modules_name_conflicts() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    checkout.claim("bob", json!(["Bank"]));
+    for change in [
+        json!({"type": "add-module", "module": {"name": "Bank", "kind": "service", "order": 0, "parent": "Platform"}}),
+        json!({"type": "edit-module", "subject": "Web", "set": {"name": "Bank"}}),
+    ] {
+        let error = checkout.edit_refused(&checkout.request(json!([change])), "CLAIM_CONFLICT");
+        assert_eq!(error["details"]["conflicts"][0]["writer"], "bob");
+    }
+    // Another writer holding the root level does not stop a change inside a module.
+    checkout.claim("bob", json!([checkout.ok(&["read"])["manifest"]["id"]]));
+    checkout.edited(json!([
+        {"type": "add-module", "module": {"name": "Cart", "kind": "service", "order": 2, "parent": "Platform"}},
+    ]));
+}
+
+#[test]
+fn an_edit_without_a_claim_is_blocked_only_by_overlapping_claims() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    checkout.claim("bob", json!(["Bank"]));
+    // Relabelling Billing's call touches its target, Bank, which bob holds.
+    let error = checkout.edit_refused(
+        &checkout.request(json!([
+            {"type": "edit-relationship", "subject": "RelBil01", "set": {"label": "pays"}},
+        ])),
+        "CLAIM_CONFLICT",
+    );
+    assert_eq!(error["details"]["conflicts"][0]["writer"], "bob");
+    checkout.edited(json!([{"type": "edit-module", "subject": "Web", "set": {"order": 3}}]));
+    // bob's own claims never block bob.
+    let (code, out) = checkout.edit(&checkout.request_by(
+        "bob",
+        None,
+        json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 4}}]),
+    ));
+    assert_eq!(code, 0, "{out:#}");
+}
+
+#[test]
+fn a_relationship_transfer_needs_its_old_and_new_source() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let q = |id: &str| format!("{model}#{id}");
+    let transfer = json!([{"type": "edit-relationship", "subject": "RelBil01", "source": "Web"}]);
+    let partial = checkout.claim("alice", json!(["RelBil01", "Billing", "Bank"]));
+    let error = checkout.edit_refused(
+        &checkout.request_by("alice", Some(&partial), transfer.clone()),
+        "CLAIM_INCOMPLETE",
+    );
+    assert_eq!(error["details"]["missing"], json!([q("WebApp01")]));
+    let full = checkout.claim("alice", json!(["RelBil01", "Billing", "Bank", "Web"]));
+    let (code, out) = checkout.edit(&checkout.request_by("alice", Some(&full), transfer));
+    assert_eq!(code, 0, "{out:#}");
+
+    // Removing a root module needs it, its relationships' ends and the root level. Its ID stays in
+    // the claim, where it never matches again.
+    let both = checkout.claim("alice", json!([model, "Bank", "Web", "RelBil01"]));
+    let (code, out) = checkout.edit(&checkout.request_by(
+        "alice",
+        Some(&both),
+        json!([{"type": "remove-module", "subject": "Bank"}]),
+    ));
+    assert_eq!(code, 0, "{out:#}");
+    let listed = checkout.claims();
+    assert!(listed.as_array().unwrap().iter().any(|c| {
+        c["subjects"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(q("BankApi1")))
+    }));
+    checkout.claim_refused("bob", json!(["Bank"]), "SUBJECT_NOT_FOUND");
 }

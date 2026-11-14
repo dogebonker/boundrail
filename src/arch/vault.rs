@@ -379,6 +379,18 @@ fn module_file(id: &str) -> String {
     format!("{MODULES}/{id}{MODULE_SUFFIX}")
 }
 
+/// Every relationship by its local ID, with the local ID of the module that owns it.
+pub(super) fn relationships(modules: &[Module]) -> BTreeMap<&str, (&str, &Relationship)> {
+    modules
+        .iter()
+        .flat_map(|m| {
+            m.outgoing
+                .iter()
+                .map(move |r| (r.id.as_str(), (m.id.as_str(), r)))
+        })
+        .collect()
+}
+
 /// One vault file an edit writes: its vault-relative path and new contents, `None` to delete it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct FileWrite {

@@ -238,10 +238,12 @@ impl Default for VaultConfig {
 /// Builds one vault file format's JSON Schema.
 pub type SchemaFn = fn() -> Schema;
 
-/// Every vault file format and the edit request, by its `model schema` name.
-pub const SCHEMAS: [(&str, SchemaFn); 4] = [
+/// Every vault file format and request, by its `model schema` name.
+pub const SCHEMAS: [(&str, SchemaFn); 6] = [
+    ("model-claim", root::<super::claims::ClaimRequest>),
     ("model-edit", root::<super::edit::EditRequest>),
     ("model-manifest", root::<Manifest>),
+    ("model-release", root::<super::claims::ReleaseRequest>),
     ("module", root::<Module>),
     ("vault-config", root::<VaultConfig>),
 ];

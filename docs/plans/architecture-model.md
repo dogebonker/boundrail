@@ -33,7 +33,7 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 |----|------|--------|
 | T1 | Model core: types, vault read/write, revision digest, `model init`, `model read`, `model schema` | done |
 | T2 | Batch edits: add/edit/remove module and relationship, rename history, expected revision, operation IDs, `model edit` | done |
-| T3 | Claims: `model claim`, `model release`, `model claims`; edits require a claim covering their subjects | open |
+| T3 | Claims: `model claim`, `model release`, `model claims`; an edit inside another writer's claim refuses, an edit with a claim must be covered by it | done |
 | T4 | Semantic check: container binding, parts outside container, unconnected roots, shared bindings, repeated relationships, relationships on containers, lines to own part, flow summaries | open |
 | T5 | Code check: binding and anchor paths and symbols, relationships undrawn / unsupported / backwards from the scanned graph, module interface exposure | open |
 | T6 | Flows: collections, flows, message/decision/loop steps, step moves, `model read --flow` | open |

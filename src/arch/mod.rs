@@ -1,9 +1,12 @@
 //! The authored architecture model: modules and relationships that agents write in
 //! `.boundrail/model/` and that Boundrail checks against the code.
 
+pub mod claims;
 pub mod edit;
 pub mod ids;
+pub mod request;
 pub mod revision;
+mod state;
 pub mod types;
 pub mod vault;
 
@@ -43,6 +46,11 @@ pub enum Code {
     VaultLocked,
     OperationReused,
     RecoveryRequired,
+    ClaimNotFound,
+    ClaimConflict,
+    ClaimNotHeld,
+    ClaimRevoked,
+    ClaimIncomplete,
 }
 
 impl Code {
@@ -64,6 +72,11 @@ impl Code {
             Code::VaultLocked => "VAULT_LOCKED",
             Code::OperationReused => "OPERATION_REUSED",
             Code::RecoveryRequired => "RECOVERY_REQUIRED",
+            Code::ClaimNotFound => "CLAIM_NOT_FOUND",
+            Code::ClaimConflict => "CLAIM_CONFLICT",
+            Code::ClaimNotHeld => "CLAIM_NOT_HELD",
+            Code::ClaimRevoked => "CLAIM_REVOKED",
+            Code::ClaimIncomplete => "CLAIM_INCOMPLETE",
         }
     }
 }

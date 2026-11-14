@@ -1,7 +1,10 @@
 use super::*;
 use std::io::Read as _;
+use std::iter;
 
+use boundrail::arch::claims::{self, Claim};
 use boundrail::arch::edit::{self, Receipt};
+use boundrail::arch::request::INPUT_MAX;
 use boundrail::arch::types::{self, SCHEMAS};
 use boundrail::arch::vault::{self, Model, ModuleView, RelationshipView};
 use boundrail::arch::{Code, Refusal};
@@ -45,6 +48,32 @@ enum ModelCmd {
     },
     /// Finish edits that a crash or failed write left partly applied
     Recover,
+    /// Reserve modules, relationships or the model's structure for one writer (schema `model-claim`)
+    Claim {
+        /// Request file; `-` or absent reads standard input
+        #[arg(long)]
+        input: Option<PathBuf>,
+        /// One line saying why, 1 to 140 characters
+        #[arg(long)]
+        doing: String,
+    },
+    /// Release your own claim (schema `model-release`), or revoke another writer's with --revoke
+    Release {
+        /// Request file; `-` or absent reads standard input
+        #[arg(long, conflicts_with = "revoke")]
+        input: Option<PathBuf>,
+        /// Claim ID to revoke, so it stops blocking anyone
+        #[arg(long, requires_all = ["writer", "reason"])]
+        revoke: Option<String>,
+        /// Who revokes the claim
+        #[arg(long, requires = "revoke")]
+        writer: Option<String>,
+        /// One line saying why the claim is revoked
+        #[arg(long, requires = "revoke")]
+        reason: Option<String>,
+    },
+    /// List active claims and revoked ones not yet released
+    Claims,
 }
 
 /// A refusal is printed on stdout and exits with code 2; other errors go to main's handler.
@@ -92,31 +121,42 @@ fn execute(args: ModelArgs) -> Result<()> {
         ModelCmd::Read { subject: None } => {
             let model = vault::load(&args.root)?;
             let reading = model.read();
+            let active = active_claims(&model.dir);
             if markdown {
                 print_reading(&model, &reading);
+                print_claims(active.as_deref());
                 return Ok(());
             }
-            write(
-                None,
-                &json!({
-                    "schema": MODEL_SCHEMA,
-                    "kind": "read",
-                    "success": true,
-                    "vault": model.dir,
-                    "manifest": model.manifest,
-                    "config": model.config,
-                    "roots": reading.roots,
-                    "modules": reading.modules,
-                    "relationships": reading.relationships,
-                    "revision": model.revision,
-                }),
-            )
+            let mut output = json!({
+                "schema": MODEL_SCHEMA,
+                "kind": "read",
+                "success": true,
+                "vault": model.dir,
+                "manifest": model.manifest,
+                "config": model.config,
+                "roots": reading.roots,
+                "modules": reading.modules,
+                "relationships": reading.relationships,
+                "revision": model.revision,
+            });
+            if let Some(active) = active {
+                output["claims"] = json!(active);
+            }
+            write(None, &output)
         }
         ModelCmd::Read {
             subject: Some(subject),
         } => {
             let model = vault::load(&args.root)?;
             let selection = model.select(&subject)?;
+            let subjects: Vec<&str> = iter::once(&selection.module.id)
+                .chain(selection.parts.iter().map(|m| &m.id))
+                .chain(selection.incoming.iter().map(|r| &r.id))
+                .chain(selection.outgoing.iter().map(|r| &r.id))
+                .map(String::as_str)
+                .collect();
+            let active =
+                active_claims(&model.dir).map(|active| claims::holding(&model, active, &subjects));
             if markdown {
                 let names = names(&model);
                 print_module(&selection.module, 0);
@@ -136,22 +176,24 @@ fn execute(args: ModelArgs) -> Result<()> {
                         list.iter().for_each(|r| print_relationship(&names, r));
                     }
                 }
+                print_claims(active.as_deref());
                 return Ok(());
             }
-            write(
-                None,
-                &json!({
-                    "schema": MODEL_SCHEMA,
-                    "kind": "read-module",
-                    "success": true,
-                    "vault": model.dir,
-                    "module": selection.module,
-                    "parts": selection.parts,
-                    "incoming": selection.incoming,
-                    "outgoing": selection.outgoing,
-                    "revision": model.revision,
-                }),
-            )
+            let mut output = json!({
+                "schema": MODEL_SCHEMA,
+                "kind": "read-module",
+                "success": true,
+                "vault": model.dir,
+                "module": selection.module,
+                "parts": selection.parts,
+                "incoming": selection.incoming,
+                "outgoing": selection.outgoing,
+                "revision": model.revision,
+            });
+            if let Some(active) = active {
+                output["claims"] = json!(active);
+            }
+            write(None, &output)
         }
         ModelCmd::Schema { name: None } => {
             let names: Vec<&str> = SCHEMAS.iter().map(|(name, _)| *name).collect();
@@ -179,18 +221,7 @@ fn execute(args: ModelArgs) -> Result<()> {
         }
         ModelCmd::Edit { input, doing } => {
             let dir = vault::locate(&args.root)?;
-            // One byte past the limit is enough for `edit::run` to refuse an oversized request.
-            let mut request = Vec::new();
-            match input.as_deref() {
-                Some(path) if path != Path::new("-") => fs::File::open(path)
-                    .and_then(|file| file.take(edit::INPUT_MAX + 1).read_to_end(&mut request))
-                    .with_context(|| format!("reading {}", path.display()))?,
-                _ => std::io::stdin()
-                    .take(edit::INPUT_MAX + 1)
-                    .read_to_end(&mut request)
-                    .context("reading the edit request from standard input")?,
-            };
-            let receipt = edit::run(&dir, &request, &doing)?;
+            let receipt = edit::run(&dir, &read_request(input.as_deref())?, &doing)?;
             if markdown {
                 print_receipt(&receipt);
                 return Ok(());
@@ -229,6 +260,106 @@ fn execute(args: ModelArgs) -> Result<()> {
                 }),
             )
         }
+        ModelCmd::Claim { input, doing } => {
+            let dir = vault::locate(&args.root)?;
+            let claim = claims::claim(&dir, &read_request(input.as_deref())?, &doing)?;
+            print_claim_output(markdown, "claim", &dir, &claim)
+        }
+        ModelCmd::Release {
+            input,
+            revoke,
+            writer,
+            reason,
+        } => {
+            let dir = vault::locate(&args.root)?;
+            if let Some(claim) = revoke {
+                let (Some(writer), Some(reason)) = (writer, reason) else {
+                    anyhow::bail!("--revoke needs --writer and --reason");
+                };
+                let claim = claims::revoke(&dir, &claim, &writer, &reason)?;
+                return print_claim_output(markdown, "revoke", &dir, &claim);
+            }
+            let claim = claims::release(&dir, &read_request(input.as_deref())?)?;
+            print_claim_output(markdown, "release", &dir, &claim)
+        }
+        ModelCmd::Claims => {
+            let dir = vault::locate(&args.root)?;
+            let list = claims::list(&dir)?;
+            if markdown {
+                if list.is_empty() {
+                    println!("No claims");
+                }
+                list.iter().for_each(print_claim);
+                return Ok(());
+            }
+            write(
+                None,
+                &json!({
+                    "schema": MODEL_SCHEMA,
+                    "kind": "claims",
+                    "success": true,
+                    "vault": dir,
+                    "claims": list,
+                }),
+            )
+        }
+    }
+}
+
+/// A request from `input`, or standard input for `-` or none. One byte past the limit is enough
+/// for the command to refuse an oversized request.
+fn read_request(input: Option<&Path>) -> Result<Vec<u8>> {
+    let mut request = Vec::new();
+    match input {
+        Some(path) if path != Path::new("-") => fs::File::open(path)
+            .and_then(|file| file.take(INPUT_MAX + 1).read_to_end(&mut request))
+            .with_context(|| format!("reading {}", path.display()))?,
+        _ => std::io::stdin()
+            .take(INPUT_MAX + 1)
+            .read_to_end(&mut request)
+            .context("reading the request from standard input")?,
+    };
+    Ok(request)
+}
+
+fn print_claim_output(markdown: bool, kind: &str, dir: &Path, claim: &Claim) -> Result<()> {
+    if markdown {
+        print_claim(claim);
+        return Ok(());
+    }
+    write(
+        None,
+        &json!({
+            "schema": MODEL_SCHEMA,
+            "kind": kind,
+            "success": true,
+            "vault": dir,
+            "claim": claim,
+        }),
+    )
+}
+
+/// The active claims, or `None` with a warning on stderr when the claims file cannot be read:
+/// machine-local coordination state never makes a reading fail.
+fn active_claims(vault: &Path) -> Option<Vec<Claim>> {
+    claims::active(vault)
+        .inspect_err(|error| eprintln!("warning: claims omitted: {error:#}"))
+        .ok()
+}
+
+fn print_claims(claims: Option<&[Claim]>) {
+    if let Some(claims) = claims.filter(|c| !c.is_empty()) {
+        println!("Claims:");
+        claims.iter().for_each(print_claim);
+    }
+}
+
+fn print_claim(claim: &Claim) {
+    println!("Claim {} by {}: {}", claim.id, claim.writer, claim.reason);
+    println!("  doing {}", claim.doing);
+    println!("  holds {}", claim.subjects.join(", "));
+    if let Some(revoked) = &claim.revoked {
+        println!("  revoked by {}: {}", revoked.by, revoked.reason);
     }
 }
 

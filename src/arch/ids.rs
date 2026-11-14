@@ -19,6 +19,14 @@ pub fn qualify(model: &str, local: &str) -> String {
     format!("{model}#{local}")
 }
 
+/// The local part of `subject` when it is qualified with `model`, else `subject` itself.
+pub fn local<'a>(model: &str, subject: &'a str) -> &'a str {
+    subject
+        .strip_prefix(model)
+        .and_then(|rest| rest.strip_prefix('#'))
+        .unwrap_or(subject)
+}
+
 /// A fresh local ID that `taken` (existing and retired IDs) does not hold. Module files are named
 /// by ID and collide on case-insensitive file systems, so `taken` is asked about the candidate in
 /// ASCII lowercase and must answer for the lowercase forms of the IDs it holds.

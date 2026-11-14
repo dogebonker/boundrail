@@ -3,8 +3,7 @@
 //! write can be completed and every operation replays its receipt.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions, TryLockError};
-use std::io::ErrorKind;
+use std::fs;
 use std::iter;
 use std::path::{Path, PathBuf};
 
@@ -13,23 +12,18 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use super::claims;
+use super::request::{Target, WRITER_MAX, check_doing, check_model, check_writer, invalid, parse};
 use super::revision::Revision;
+use super::state::{self, Locked, OPERATIONS};
 use super::types::{Anchor, Binding, Emphasis, Module, Relationship, SCHEMA_VERSION};
-use super::vault::{self, FileWrite, Model};
-use super::{Code, Refusal, ids, one_line};
-use crate::history::{refuse_symlink, write_atomic};
+use super::vault::{self, FileWrite, Model, relationships};
+use super::{Code, Refusal, ids};
+use crate::history::refuse_symlink;
 use crate::sync_rules::hash;
 
-/// The largest request `model edit` reads, in bytes.
-pub const INPUT_MAX: u64 = 4 * 1024 * 1024;
 const CHANGES_MAX: usize = 1000;
-const DOING_MAX: usize = 140;
 const OPERATION_MAX: usize = 64;
-const WRITER_MAX: usize = 64;
-/// Under the Git directory, outside the committed vault: the edit lock and the journal.
-const STATE: &str = "boundrail";
-const LOCK: &str = "model.lock";
-const OPERATIONS: &str = "operations";
 /// Debug builds stop after writing the journal when this is set, so tests can simulate a crash.
 #[cfg(debug_assertions)]
 const STOP_AFTER_JOURNAL: &str = "BOUNDRAIL_TEST_STOP_AFTER_JOURNAL";
@@ -48,15 +42,10 @@ pub struct EditRequest {
     pub writer: String,
     #[schemars(length(min = 1, max = CHANGES_MAX))]
     pub changes: Vec<Change>,
-}
-
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct Target {
-    /// The model's local ID.
-    pub model: String,
-    /// The current state's local ID.
-    pub state: String,
+    /// The writer's claim covering every subject the edit touches. Without one, the edit may not
+    /// touch a subject that another writer's active claim holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim: Option<String>,
 }
 
 /// One change. A module subject or reference is a qualified ID, a local ID, or a unique current
@@ -247,22 +236,7 @@ enum Status {
 /// operation returns its stored receipt, finishing it first when it was interrupted.
 pub fn run(vault: &Path, input: &[u8], doing: &str) -> Result<Receipt> {
     check_doing(doing)?;
-    if input.len() as u64 > INPUT_MAX {
-        return Err(Refusal::new(
-            Code::RequestInvalid,
-            format!("the edit request is larger than {INPUT_MAX} bytes"),
-        )
-        .into());
-    }
-    let request: EditRequest = serde_json::from_slice(input).map_err(|e| {
-        Refusal::new(
-            Code::RequestInvalid,
-            format!(
-                "the edit request does not parse: {}",
-                vault::parse_message(&e)
-            ),
-        )
-    })?;
+    let request: EditRequest = parse(input, "edit")?;
     check_request(&request)?;
     let fingerprint = hash(&serde_json::to_vec(&request)?);
     let journal = Journal::open(vault)?;
@@ -280,20 +254,18 @@ pub fn run(vault: &Path, input: &[u8], doing: &str) -> Result<Receipt> {
             Status::Pending => complete(vault, &journal, record),
         };
     }
-    if let Some(pending) = journal.pending()?.first() {
-        return Err(Refusal::new(
-            Code::RecoveryRequired,
-            format!(
-                "operation {} was interrupted; run `boundrail model recover` to finish it",
-                pending.output.operation_id
-            ),
-        )
-        .with_details(json!({ "operation_id": pending.output.operation_id }))
-        .into());
-    }
+    state::refuse_interrupted(&journal.state.dir)?;
     let model = vault::load_dir(vault.to_path_buf())?;
     check_target(&model, &request)?;
-    let record = plan(&model, request, doing, fingerprint)?;
+    let claim = request.claim.clone();
+    let (record, affected) = plan(&model, request, doing, fingerprint)?;
+    claims::check_edit(
+        &journal.state.dir,
+        &model,
+        &record.output.writer,
+        claim.as_deref(),
+        &affected,
+    )?;
     journal.write(&record)?;
     #[cfg(debug_assertions)]
     if std::env::var_os(STOP_AFTER_JOURNAL).is_some() {
@@ -312,17 +284,6 @@ pub fn recover(vault: &Path) -> Result<Vec<Receipt>> {
         .collect()
 }
 
-fn check_doing(doing: &str) -> Result<()> {
-    if !one_line(doing, DOING_MAX) {
-        return Err(Refusal::new(
-            Code::DoingInvalid,
-            format!("--doing needs one line of 1 to {DOING_MAX} characters"),
-        )
-        .into());
-    }
-    Ok(())
-}
-
 fn check_request(request: &EditRequest) -> Result<()> {
     let operation = &request.operation_id;
     let problem = if operation.is_empty()
@@ -334,29 +295,16 @@ fn check_request(request: &EditRequest) -> Result<()> {
         format!(
             "operation_id needs 1 to {OPERATION_MAX} characters from A-Z, a-z, 0-9, `.`, `_`, `-`"
         )
-    } else if !one_line(&request.writer, WRITER_MAX) {
-        format!("writer needs 1 to {WRITER_MAX} characters and no control characters")
     } else if request.changes.is_empty() || request.changes.len() > CHANGES_MAX {
         format!("changes needs 1 to {CHANGES_MAX} entries")
     } else {
-        return Ok(());
+        return check_writer(&request.writer);
     };
-    Err(Refusal::new(Code::RequestInvalid, problem).into())
+    Err(invalid(problem))
 }
 
 fn check_target(model: &Model, request: &EditRequest) -> Result<()> {
-    let manifest = &model.manifest;
-    if request.target.model != manifest.id || request.target.state != manifest.current.id {
-        return Err(Refusal::new(
-            Code::TargetMismatch,
-            format!(
-                "the request targets model {} state {}, but the vault holds model {} state {}",
-                request.target.model, request.target.state, manifest.id, manifest.current.id
-            ),
-        )
-        .with_details(json!({ "model": manifest.id, "state": manifest.current.id }))
-        .into());
-    }
+    check_model(model, &request.target)?;
     if request.expected_revision != model.revision.digest {
         return Err(Refusal::new(
             Code::StaleRevision,
@@ -368,8 +316,14 @@ fn check_target(model: &Model, request: &EditRequest) -> Result<()> {
     Ok(())
 }
 
-/// Applies the batch in memory, validates the result and plans its writes as a pending record.
-fn plan(model: &Model, request: EditRequest, doing: &str, fingerprint: String) -> Result<Record> {
+/// Applies the batch in memory, validates the result and plans its writes as a pending record,
+/// returned with the subjects a claim must cover.
+fn plan(
+    model: &Model,
+    request: EditRequest,
+    doing: &str,
+    fingerprint: String,
+) -> Result<(Record, BTreeSet<String>)> {
     let EditRequest {
         operation_id,
         writer,
@@ -400,7 +354,7 @@ fn plan(model: &Model, request: EditRequest, doing: &str, fingerprint: String) -
             .iter()
             .map(|w| (w.path.as_str(), w.content.as_deref().map(str::as_bytes))),
     );
-    Ok(Record {
+    let record = Record {
         request_sha256: fingerprint,
         status: Status::Pending,
         before: Some(model.revision.digest.clone()),
@@ -415,7 +369,8 @@ fn plan(model: &Model, request: EditRequest, doing: &str, fingerprint: String) -
             subjects: diff.subjects,
             allocated: batch.allocated,
         },
-    })
+    };
+    Ok((record, diff.affected))
 }
 
 /// Applies a pending record's writes, checks the vault reached its revision and marks it done.
@@ -453,6 +408,8 @@ struct Diff<'a> {
     /// IDs leaving the model, allocated-then-removed ones included; they stay reserved.
     retired: Vec<String>,
     subjects: Subjects,
+    /// The pre-existing subjects a claim must cover, and the model ID for the root level.
+    affected: BTreeSet<String>,
 }
 
 fn diff<'a>(model: &'a Model, new: &'a [Module], fresh: &[String]) -> Diff<'a> {
@@ -465,6 +422,7 @@ fn diff<'a>(model: &'a Model, new: &'a [Module], fresh: &[String]) -> Diff<'a> {
         remove: Vec::new(),
         retired: Vec::new(),
         subjects: Subjects::default(),
+        affected: BTreeSet::new(),
     };
     for (id, module) in &new_modules {
         match old_modules.get(id) {
@@ -501,23 +459,75 @@ fn diff<'a>(model: &'a Model, new: &'a [Module], fresh: &[String]) -> Diff<'a> {
     ] {
         list.sort();
     }
+
+    // The subjects a claim must cover, `None` standing for the root level that the model ID
+    // holds. A module or relationship is touched when it changes or leaves. So is a module
+    // gaining or losing a part, or the root level for a root module, and the old and new source
+    // and target of each relationship added, changed, moved or removed. So is every module whose
+    // current or former name an added or renamed module takes, since the name would then stop
+    // naming it alone. IDs this batch allocates are left out: nobody could have claimed them.
+    let mut touched: Vec<Option<String>> = Vec::new();
+    let module_ids: BTreeSet<&str> = old_modules
+        .keys()
+        .chain(new_modules.keys())
+        .copied()
+        .collect();
+    for id in module_ids {
+        let (before, after) = (old_modules.get(id), new_modules.get(id));
+        if before == after {
+            continue;
+        }
+        touched.push(Some(model.qualify(id)));
+        let parent = |module: Option<&&Module>| module.map(|m| m.parent.clone());
+        if parent(before) != parent(after) {
+            touched.extend(parent(before).into_iter().chain(parent(after)));
+        }
+        if let Some(named) = after.filter(|a| before.is_none_or(|b| b.name != a.name)) {
+            touched.extend(
+                model
+                    .modules
+                    .iter()
+                    .filter(|m| m.name == named.name || m.former_names.contains(&named.name))
+                    .map(|m| Some(model.qualify(&m.id))),
+            );
+        }
+    }
+    let relationship_ids: BTreeSet<&str> = old_relationships
+        .keys()
+        .chain(new_relationships.keys())
+        .copied()
+        .collect();
+    for id in relationship_ids {
+        let (before, after) = (old_relationships.get(id), new_relationships.get(id));
+        if before == after {
+            continue;
+        }
+        touched.push(Some(model.qualify(id)));
+        for (owner, relationship) in before.into_iter().chain(after) {
+            touched.push(Some(model.qualify(owner)));
+            touched.push(Some(relationship.to.clone()));
+        }
+    }
+    let existed = |id: &str| {
+        let local = ids::local(&model.manifest.id, id);
+        old_modules.contains_key(local) || old_relationships.contains_key(local)
+    };
+    diff.affected = touched
+        .into_iter()
+        .filter_map(|subject| match subject {
+            None => Some(model.manifest.id.clone()),
+            Some(id) => existed(&id).then_some(id),
+        })
+        .collect();
+    // A batch that only retires IDs, adding and removing a module, still rewrites the manifest.
+    if diff.affected.is_empty() && !diff.retired.is_empty() {
+        diff.affected.insert(model.manifest.id.clone());
+    }
     diff
 }
 
 fn by_id(modules: &[Module]) -> BTreeMap<&str, &Module> {
     modules.iter().map(|m| (m.id.as_str(), m)).collect()
-}
-
-/// Every relationship by its ID, with the local ID of the module that owns it.
-fn relationships(modules: &[Module]) -> BTreeMap<&str, (&str, &Relationship)> {
-    modules
-        .iter()
-        .flat_map(|m| {
-            m.outgoing
-                .iter()
-                .map(move |r| (r.id.as_str(), (m.id.as_str(), r)))
-        })
-        .collect()
 }
 
 /// The model while a batch applies. Removed modules stay until `finish`, so a later change can
@@ -610,10 +620,7 @@ impl<'a> Batch<'a> {
 
     /// The owning module's position and the relationship's position in its outgoing list.
     fn relationship(&self, index: usize, subject: &str) -> Result<(usize, usize)> {
-        let local = subject
-            .strip_prefix(self.model)
-            .and_then(|rest| rest.strip_prefix('#'))
-            .unwrap_or(subject);
+        let local = ids::local(self.model, subject);
         self.modules
             .iter()
             .enumerate()
@@ -898,75 +905,37 @@ fn both(index: usize, field: impl Serialize) -> anyhow::Error {
     request_invalid(index, format!("sets and clears `{name}`"))
 }
 
-/// `<git dir>/boundrail`, held under the edit lock for as long as this value lives.
+/// The journal in `<git dir>/boundrail/operations`, read and written under the vault lock.
 struct Journal {
-    dir: PathBuf,
-    /// The OS lock on `model.lock`; dropping the file releases it.
-    _lock: File,
+    state: Locked,
 }
 
 impl Journal {
     fn open(vault: &Path) -> Result<Self> {
-        let dir = crate::git::git_dir(vault)?.join(STATE);
+        let state = state::lock(vault)?;
+        let dir = state.dir.join(OPERATIONS);
         refuse_symlink(&dir)?;
-        refuse_symlink(&dir.join(OPERATIONS))?;
-        fs::create_dir_all(dir.join(OPERATIONS))
-            .with_context(|| format!("creating {}", dir.display()))?;
-        let path = dir.join(LOCK);
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let file = options
-            .open(&path)
-            .with_context(|| format!("opening {}", path.display()))?;
-        match file.try_lock() {
-            Ok(()) => Ok(Self { dir, _lock: file }),
-            Err(TryLockError::WouldBlock) => Err(Refusal::new(
-                Code::VaultLocked,
-                "another edit holds the model lock; retry when it finishes",
-            )
-            .with_details(json!({ "lock": path }))
-            .into()),
-            Err(TryLockError::Error(e)) => {
-                Err(e).with_context(|| format!("locking {}", path.display()))
-            }
-        }
+        fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        Ok(Self { state })
     }
 
     fn path(&self, operation: &str) -> PathBuf {
-        self.dir.join(OPERATIONS).join(format!("{operation}.json"))
+        self.state
+            .dir
+            .join(OPERATIONS)
+            .join(format!("{operation}.json"))
     }
 
     fn read(&self, operation: &str) -> Result<Option<Record>> {
-        let path = self.path(operation);
-        match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map(Some)
-                .with_context(|| format!("reading the journal record {}", path.display())),
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
-        }
+        state::read(&self.path(operation))
     }
 
     /// Every pending record, in operation ID order.
     // ponytail: reads every record per edit; keep pending records apart if journals grow large.
     fn pending(&self) -> Result<Vec<Record>> {
-        let dir = self.dir.join(OPERATIONS);
-        let mut operations: Vec<String> = fs::read_dir(&dir)
-            .with_context(|| format!("reading {}", dir.display()))?
-            .filter_map(|entry| {
-                let name = entry.ok()?.file_name().into_string().ok()?;
-                name.strip_suffix(".json").map(str::to_owned)
-            })
-            .collect();
-        operations.sort();
         let mut pending = Vec::new();
-        for operation in operations {
-            if let Some(record) = self.read(&operation)?
+        for path in state::operations(&self.state.dir)? {
+            if let Some(record) = state::read::<Record>(&path)?
                 && record.status == Status::Pending
             {
                 pending.push(record);
@@ -975,12 +944,8 @@ impl Journal {
         Ok(pending)
     }
 
+    /// Fails, before any vault write for a pending record, when the record is too large to read.
     fn write(&self, record: &Record) -> Result<()> {
-        let path = self.path(&record.output.operation_id);
-        write_atomic(
-            &path,
-            (serde_json::to_string_pretty(record)? + "\n").as_bytes(),
-        )
-        .with_context(|| format!("writing the journal record {}", path.display()))
+        state::write(&self.path(&record.output.operation_id), record)
     }
 }
