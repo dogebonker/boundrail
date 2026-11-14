@@ -1854,7 +1854,7 @@ fn reads_point_to_an_interrupted_edit() {
         checkout.request(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 7}}]));
     interrupt(&checkout, &request);
     let operation = &request["operation_id"];
-    for args in [&["read"][..], &["read", "Bank"]] {
+    for args in [&["read"][..], &["read", "Bank"], &["check"]] {
         let (value, stderr) = read(args);
         assert_eq!(value["success"], true);
         assert_eq!(value["pending_operation"]["operation_id"], *operation);
@@ -2026,4 +2026,111 @@ fn an_edit_refuses_a_file_written_while_it_was_planned() {
             .exists()
     );
     checkout.edited(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 7}}]));
+}
+
+fn bind(checkout: &Checkout, id: &str, path: &str) {
+    let mut module = checkout.read_module(id);
+    module["binding"] = json!({"path": path});
+    checkout.module(module);
+}
+
+#[test]
+fn check_passes_a_bound_model_and_fails_on_a_warning() {
+    let checkout = Checkout::new();
+    checkout.refused(&["check"], "VAULT_NOT_FOUND");
+    let model = shop(&checkout);
+    bind(&checkout, "WebApp01", "shop/web");
+    bind(&checkout, "Billing1", "shop/billing");
+
+    let (code, out) = checkout.run(&["check"]);
+    assert_eq!(code, 1, "{out:#}");
+    assert!(!checkout.path().join(".git/boundrail").exists());
+    assert_eq!(out["schema"], "boundrail/model/v1");
+    assert_eq!(out["kind"], "check");
+    assert_eq!(out["success"], true);
+    assert_eq!(out["passed"], false);
+    assert_eq!(out["counts"], json!({"warning": 1, "information": 0}));
+    assert_eq!(out["revision"]["digest"], checkout.digest());
+    assert_eq!(
+        out["diagnostics"],
+        json!([{
+            "code": "CONTAINER_UNBOUND",
+            "severity": "warning",
+            "subjects": [format!("{model}#Platfrm1")],
+            "message": "Platform has parts but no binding",
+            "suggested_binding": "shop",
+        }])
+    );
+
+    bind(&checkout, "Platfrm1", "shop");
+    let out = checkout.ok(&["check"]);
+    assert_eq!(out["passed"], true);
+    assert_eq!(out["diagnostics"], json!([]));
+    assert_eq!(out["counts"], json!({"warning": 0, "information": 0}));
+}
+
+#[test]
+fn check_information_never_fails_and_markdown_groups_by_severity() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    bind(&checkout, "Platfrm1", "shop");
+    let mut bank = checkout.read_module("BankApi1");
+    bank["outgoing"] =
+        json!([{"id": "RelBnk01", "to": format!("{model}#Platfrm1"), "kind": "event", "order": 0}]);
+    checkout.module(bank);
+
+    let out = checkout.ok(&["check"]);
+    assert_eq!(out["passed"], true);
+    assert_eq!(out["counts"], json!({"warning": 0, "information": 1}));
+    assert_eq!(out["diagnostics"][0]["code"], "RELATIONSHIP_ON_CONTAINER");
+
+    bind(&checkout, "WebApp01", "web");
+    let (code, text) = checkout.run_raw(&["check", "--format", "markdown"]);
+    assert_eq!(code, 1, "{text}");
+    assert_eq!(
+        text,
+        "Warnings:\n\
+         - CONTAINER_PARTS_OUTSIDE Web is bound to web, outside Platform at shop\n\
+         Information:\n\
+         - RELATIONSHIP_ON_CONTAINER Bank -> Platform ends on a container; draw it between parts\n\
+         Check failed: warnings: 1, information: 1\n"
+    );
+}
+
+#[test]
+fn binding_and_anchor_paths_stay_inside_the_repository() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    bind(&checkout, "Platfrm1", ".");
+    checkout.ok(&["read"]);
+    let cases = [
+        ("", "src/a.rs", "Billing1", "binding path"),
+        ("/etc", "src/a.rs", "Billing1", "binding path"),
+        ("src", "src/../../a.rs", "RelWeb01", "anchor path"),
+    ];
+    for (binding, anchor, subject, field) in cases {
+        bind(&checkout, "Billing1", binding);
+        let mut web = checkout.read_module("WebApp01");
+        web["outgoing"][0]["anchor"] = json!({"path": anchor, "symbol": "charge"});
+        checkout.module(web);
+        let error = checkout.refused(&["read"], "MODEL_INVALID");
+        let problems = error["details"]["problems"].as_array().unwrap();
+        let message = format!("{field} is not a relative path inside the repository");
+        assert!(
+            problems
+                .iter()
+                .any(|p| p["subject"] == subject && p["message"] == message),
+            "{binding} {anchor}: {problems:#?}"
+        );
+    }
+
+    bind(&checkout, "Billing1", "src/billing");
+    let mut web = checkout.read_module("WebApp01");
+    web["outgoing"][0]["anchor"] = json!({"path": "src/web.rs", "symbol": "charge"});
+    checkout.module(web);
+    let request = checkout.request(json!([
+        {"type": "edit-module", "subject": "Bank", "set": {"binding": {"path": "vendor/../../bank"}}}
+    ]));
+    let error = checkout.edit_refused(&request, "MODEL_INVALID");
+    assert_eq!(error["details"]["problems"][0]["subject"], "BankApi1");
 }

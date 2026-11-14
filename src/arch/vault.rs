@@ -191,7 +191,8 @@ fn refuse_links(dir: &Path) -> Result<()> {
         .try_for_each(|(_, path)| refuse_symlink(path))
 }
 
-pub(super) fn load_dir(dir: PathBuf) -> Result<Model> {
+/// Loads the vault folder `dir`, refusing a model with any problem.
+pub fn load_dir(dir: PathBuf) -> Result<Model> {
     // A linked folder could point reads outside the checkout, so nothing is read through it.
     let mut problems = Problems::default();
     for (path, folder) in folders(&dir) {
@@ -605,6 +606,7 @@ fn check_module(
     if let Some(b) = &module.binding {
         text(problems, "binding repo", b.repo.as_deref(), None, id);
         text(problems, "binding path", Some(&b.path), None, id);
+        check_path(problems, file, id, "binding path", &b.path);
         text(problems, "binding symbol", b.symbol.as_deref(), None, id);
     }
     for r in &module.outgoing {
@@ -620,6 +622,7 @@ fn check_module(
         if let Some(a) = &r.anchor {
             text(problems, "anchor repo", a.repo.as_deref(), None, &r.id);
             text(problems, "anchor path", Some(&a.path), None, &r.id);
+            check_path(problems, file, &r.id, "anchor path", &a.path);
             text(problems, "anchor symbol", Some(&a.symbol), None, &r.id);
         }
     }
@@ -650,6 +653,18 @@ fn check_module(
                 format!("kind `{}` is not a relationship kind in {CONFIG}", r.kind),
             );
         }
+    }
+}
+
+/// A code path relative to the repository root: not empty, not absolute, and without a `..`
+/// segment, so it never names a file outside the repository.
+fn check_path(problems: &mut Problems, file: &str, subject: &str, field: &str, path: &str) {
+    if path.is_empty() || path.starts_with('/') || path.split('/').any(|s| s == "..") {
+        problems.push(
+            file,
+            subject,
+            format!("{field} is not a relative path inside the repository"),
+        );
     }
 }
 

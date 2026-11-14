@@ -34,9 +34,9 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 | T1 | Model core: types, vault read/write, revision digest, `model init`, `model read`, `model schema` | done |
 | T2 | Batch edits: add/edit/remove module and relationship, rename history, expected revision, operation IDs, `model edit` | done |
 | T3 | Claims: `model claim`, `model release`, `model claims`; an edit inside another writer's claim refuses, an edit with a claim must be covered by it | done |
-| T4 | Semantic check: container binding, parts outside container, unconnected roots, shared bindings, repeated relationships, relationships on containers, lines to own part, flow summaries | open |
+| T4 | Semantic check: container binding, parts outside container, unconnected roots, shared bindings, repeated relationships, relationships on containers, lines to own part, `model check` | done |
 | T5 | Code check: binding and anchor paths and symbols, relationships undrawn / unsupported / backwards from the scanned graph, module interface exposure | open |
-| T6 | Flows: collections, flows, message/decision/loop steps, step moves, `model read --flow` | open |
+| T6 | Flows: collections, flows, message/decision/loop steps, step moves, `model read --flow`, flow summary check (`FLOW_SUMMARY_MISSING`) | open |
 | T7 | Checkpoints: history branch, `model retain`, `model checkpoints`, `model read --checkpoint` | open |
 | T8 | Proposals: create/edit drafts against a predecessor, `model compare`, adopt, shelve, planning models without a current state | open |
 | T9 | Render: SVG architecture view with automatic layout, sequence and flowchart views of a flow, comparison marks | open |

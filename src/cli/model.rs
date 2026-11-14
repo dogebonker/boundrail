@@ -5,6 +5,7 @@ use std::iter;
 use boundrail::arch::claims::{self, Claim};
 use boundrail::arch::edit::{self, Receipt};
 use boundrail::arch::request::INPUT_MAX;
+use boundrail::arch::semantic::{self, Diagnostic, Severity};
 use boundrail::arch::types::{self, SCHEMAS};
 use boundrail::arch::vault::{self, Model, ModuleView, RelationshipView};
 use boundrail::arch::{Code, Refusal};
@@ -20,7 +21,16 @@ pub(super) struct ModelArgs {
     #[arg(long, global = true, value_enum, default_value_t = Format::Json)]
     format: Format,
     #[command(subcommand)]
-    command: ModelCmd,
+    command: Command,
+}
+
+/// `model check` exits with its own verdict code; every other command exits 0 or refuses.
+#[derive(Subcommand)]
+enum Command {
+    #[command(flatten)]
+    Model(ModelCmd),
+    /// Check the model's own shape; exits 1 when any warning is found
+    Check,
 }
 
 #[derive(Subcommand)]
@@ -83,8 +93,14 @@ enum ModelCmd {
 /// A refusal is printed on stdout and exits with code 2; other errors go to main's handler.
 pub(super) fn run(args: ModelArgs) -> Result<ExitCode> {
     let markdown = matches!(args.format, Format::Markdown);
-    match execute(args) {
-        Ok(()) => Ok(ExitCode::SUCCESS),
+    let result = match args.command {
+        Command::Check => check(&args.root, markdown),
+        Command::Model(command) => {
+            execute(&args.root, markdown, command).map(|()| ExitCode::SUCCESS)
+        }
+    };
+    match result {
+        Ok(code) => Ok(code),
         Err(error) => match error.downcast_ref::<Refusal>() {
             Some(refusal) => {
                 print_refusal(refusal, markdown)?;
@@ -95,11 +111,10 @@ pub(super) fn run(args: ModelArgs) -> Result<ExitCode> {
     }
 }
 
-fn execute(args: ModelArgs) -> Result<()> {
-    let markdown = matches!(args.format, Format::Markdown);
-    match args.command {
+fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
+    match command {
         ModelCmd::Init { name } => {
-            let model = vault::init(&args.root, &name)?;
+            let model = vault::init(root, &name)?;
             if markdown {
                 println!(
                     "Created model {} ({}) at {}",
@@ -123,9 +138,7 @@ fn execute(args: ModelArgs) -> Result<()> {
             )
         }
         ModelCmd::Read { subject: None } => {
-            let state = state_dir(&args.root);
-            let pending = state.as_deref().and_then(pending_operation);
-            let model = load_for_read(&args.root, pending.as_ref())?;
+            let (model, state, pending) = load_for_read(root)?;
             let reading = model.read();
             let active = state.as_deref().and_then(active_claims);
             if markdown {
@@ -156,9 +169,7 @@ fn execute(args: ModelArgs) -> Result<()> {
         ModelCmd::Read {
             subject: Some(subject),
         } => {
-            let state = state_dir(&args.root);
-            let pending = state.as_deref().and_then(pending_operation);
-            let model = load_for_read(&args.root, pending.as_ref())?;
+            let (model, state, pending) = load_for_read(root)?;
             let selection = model.select(&subject)?;
             let subjects: Vec<&str> = iter::once(&selection.module.id)
                 .chain(selection.parts.iter().map(|m| &m.id))
@@ -236,7 +247,7 @@ fn execute(args: ModelArgs) -> Result<()> {
             write(None, &schema)
         }
         ModelCmd::Edit { input, doing } => {
-            let dir = vault::locate(&args.root)?;
+            let dir = vault::locate(root)?;
             let receipt = edit::run(&dir, &read_request(input.as_deref())?, &doing)?;
             if markdown {
                 print_receipt(&receipt);
@@ -258,7 +269,7 @@ fn execute(args: ModelArgs) -> Result<()> {
         ModelCmd::Recover {
             abandon: Some(operation),
         } => {
-            let dir = vault::locate(&args.root)?;
+            let dir = vault::locate(root)?;
             let abandoned = edit::abandon(&dir, &operation)?;
             if markdown {
                 println!("Abandoned operation {}", abandoned.operation_id);
@@ -280,7 +291,7 @@ fn execute(args: ModelArgs) -> Result<()> {
             )
         }
         ModelCmd::Recover { abandon: None } => {
-            let dir = vault::locate(&args.root)?;
+            let dir = vault::locate(root)?;
             let completed = edit::recover(&dir)?;
             if markdown {
                 if completed.is_empty() {
@@ -301,7 +312,7 @@ fn execute(args: ModelArgs) -> Result<()> {
             )
         }
         ModelCmd::Claim { input, doing } => {
-            let dir = vault::locate(&args.root)?;
+            let dir = vault::locate(root)?;
             let claim = claims::claim(&dir, &read_request(input.as_deref())?, &doing)?;
             print_claim_output(markdown, "claim", &dir, &claim)
         }
@@ -311,7 +322,7 @@ fn execute(args: ModelArgs) -> Result<()> {
             writer,
             reason,
         } => {
-            let dir = vault::locate(&args.root)?;
+            let dir = vault::locate(root)?;
             if let Some(claim) = revoke {
                 let (Some(writer), Some(reason)) = (writer, reason) else {
                     anyhow::bail!("--revoke needs --writer and --reason");
@@ -323,7 +334,7 @@ fn execute(args: ModelArgs) -> Result<()> {
             print_claim_output(markdown, "release", &dir, &claim)
         }
         ModelCmd::Claims => {
-            let dir = vault::locate(&args.root)?;
+            let dir = vault::locate(root)?;
             let list = claims::list(&dir)?;
             if markdown {
                 if list.is_empty() {
@@ -344,6 +355,62 @@ fn execute(args: ModelArgs) -> Result<()> {
             )
         }
     }
+}
+
+/// `model check`: exit 0 without warnings, 1 with any. Like `model read`, it names a pending edit.
+fn check(root: &Path, markdown: bool) -> Result<ExitCode> {
+    let (model, _, pending) = load_for_read(root)?;
+    let diagnostics = semantic::check(&model.manifest.id, &model.modules);
+    let warning = diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Warning)
+        .count();
+    let information = diagnostics.len() - warning;
+    let code = ExitCode::from(u8::from(warning > 0));
+    if markdown {
+        print_diagnostics(&diagnostics, warning, information);
+        return Ok(code);
+    }
+    let mut output = json!({
+        "schema": MODEL_SCHEMA,
+        "kind": "check",
+        "success": true,
+        "vault": model.dir,
+        "revision": model.revision,
+        "diagnostics": diagnostics,
+        "counts": {"warning": warning, "information": information},
+        "passed": warning == 0,
+    });
+    if let Some(pending) = pending {
+        output["pending_operation"] = pending;
+    }
+    write(None, &output)?;
+    Ok(code)
+}
+
+fn print_diagnostics(diagnostics: &[Diagnostic], warning: usize, information: usize) {
+    for (severity, heading) in [
+        (Severity::Warning, "Warnings:"),
+        (Severity::Information, "Information:"),
+    ] {
+        let mut group = diagnostics
+            .iter()
+            .filter(|d| d.severity == severity)
+            .peekable();
+        if group.peek().is_some() {
+            println!("{heading}");
+        }
+        for d in group {
+            let suggestion = d
+                .suggested_binding
+                .as_ref()
+                .map(|path| format!(" (suggested binding: {path})"))
+                .unwrap_or_default();
+            println!("- {} {}{suggestion}", d.code.as_str(), d.message);
+        }
+    }
+    let verdict = if warning == 0 { "passed" } else { "failed" };
+    println!("Check {verdict}: warnings: {warning}, information: {information}");
 }
 
 /// A request from `input`, or standard input for `-` or none. One byte past the limit is enough
@@ -379,15 +446,6 @@ fn print_claim_output(markdown: bool, kind: &str, dir: &Path, claim: &Claim) -> 
     )
 }
 
-/// The machine-local state folder for a reading, or `None` with a warning on stderr. Without a
-/// vault there is none, and `load_for_read` reports the missing vault.
-fn state_dir(root: &Path) -> Option<PathBuf> {
-    let dir = vault::locate(root).ok()?;
-    boundrail::arch::state_dir(&dir)
-        .inspect_err(|error| eprintln!("warning: claims and pending edits omitted: {error:#}"))
-        .ok()
-}
-
 /// The edit waiting in the journal of `state`, as `{operation_id, in_progress, hint}`, with a
 /// warning on stderr. Reading the journal never makes a reading fail, and never creates it.
 fn pending_operation(state: &Path) -> Option<Value> {
@@ -411,17 +469,25 @@ fn pending_operation(state: &Path) -> Option<Value> {
     Some(json!({ "operation_id": operation_id, "in_progress": in_progress, "hint": hint }))
 }
 
-/// The model for `model read`; a `MODEL_INVALID` refusal also names the interrupted edit.
-fn load_for_read(root: &Path, pending: Option<&Value>) -> Result<Model> {
-    vault::load(root).map_err(|mut error| {
-        if let (Some(pending), Some(refusal)) = (pending, error.downcast_mut::<Refusal>())
+/// The model for `model read` and `model check`, its machine-local state folder (`None` with a
+/// warning on stderr) and the edit pending there. A `MODEL_INVALID` refusal also names the
+/// pending edit.
+fn load_for_read(root: &Path) -> Result<(Model, Option<PathBuf>, Option<Value>)> {
+    let dir = vault::locate(root)?;
+    let state = boundrail::arch::state_dir(&dir)
+        .inspect_err(|error| eprintln!("warning: claims and pending edits omitted: {error:#}"))
+        .ok();
+    let pending = state.as_deref().and_then(pending_operation);
+    let model = vault::load_dir(dir).map_err(|mut error| {
+        if let (Some(pending), Some(refusal)) = (&pending, error.downcast_mut::<Refusal>())
             && refusal.code == Code::ModelInvalid
             && let Some(details) = refusal.details.as_mut()
         {
             details["pending_operation"] = pending.clone();
         }
         error
-    })
+    })?;
+    Ok((model, state, pending))
 }
 
 /// The active claims, or `None` with a warning on stderr when the claims file cannot be read:

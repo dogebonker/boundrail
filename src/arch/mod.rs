@@ -6,6 +6,7 @@ pub mod edit;
 pub mod ids;
 pub mod request;
 pub mod revision;
+pub mod semantic;
 mod state;
 pub mod types;
 pub mod vault;
