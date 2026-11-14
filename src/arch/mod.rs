@@ -1,6 +1,7 @@
 //! The authored architecture model: modules and relationships that agents write in
 //! `.boundrail/model/` and that Boundrail checks against the code.
 
+pub mod checkpoint;
 pub mod claims;
 pub mod code;
 pub mod diagnostic;
@@ -72,6 +73,10 @@ pub enum Code {
     ClaimNotHeld,
     ClaimRevoked,
     ClaimIncomplete,
+    NothingToRetain,
+    HistoryMoved,
+    CheckpointNotFound,
+    SigningFailed,
 }
 
 impl Code {
@@ -101,6 +106,10 @@ impl Code {
             Code::ClaimNotHeld => "CLAIM_NOT_HELD",
             Code::ClaimRevoked => "CLAIM_REVOKED",
             Code::ClaimIncomplete => "CLAIM_INCOMPLETE",
+            Code::NothingToRetain => "NOTHING_TO_RETAIN",
+            Code::HistoryMoved => "HISTORY_MOVED",
+            Code::CheckpointNotFound => "CHECKPOINT_NOT_FOUND",
+            Code::SigningFailed => "SIGNING_FAILED",
         }
     }
 }

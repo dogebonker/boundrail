@@ -2,6 +2,7 @@ use super::*;
 use std::io::Read as _;
 use std::iter;
 
+use boundrail::arch::checkpoint::{self, Checkpoint};
 use boundrail::arch::claims::{self, Claim};
 use boundrail::arch::code::{self, CodeReport, NoScan, Skip};
 use boundrail::arch::diagnostic::{Diagnostic, Severity};
@@ -61,6 +62,9 @@ enum ModelCmd {
         /// Print one flow with its steps: its qualified or local ID, or its unique name
         #[arg(long)]
         flow: Option<String>,
+        /// Read the model a checkpoint holds: its ID or a unique commit prefix
+        #[arg(long)]
+        checkpoint: Option<String>,
     },
     /// List the vault file and request schemas, or print one as JSON Schema
     Schema { name: Option<String> },
@@ -105,6 +109,24 @@ enum ModelCmd {
     },
     /// List active claims and revoked ones not yet released
     Claims,
+    /// Retain the current model as a checkpoint on the history ref, with why it changed
+    Retain {
+        /// One line saying why the model changed, 1 to 140 characters
+        #[arg(long)]
+        doing: String,
+        /// Who retains it; defaults to the Git author name
+        #[arg(long)]
+        writer: Option<String>,
+        /// Repeating an operation ID with the same writer and --doing returns the same checkpoint
+        #[arg(long)]
+        operation_id: Option<String>,
+    },
+    /// List checkpoints, newest first
+    Checkpoints {
+        /// List at most this many
+        #[arg(long)]
+        limit: Option<usize>,
+    },
 }
 
 /// A refusal is printed on stdout and exits with code 2; other errors go to main's handler.
@@ -157,12 +179,21 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
         ModelCmd::Read {
             subject: None,
             flow: None,
+            checkpoint,
         } => {
-            let (model, state, pending) = load_for_read(root)?;
+            let Loaded {
+                model,
+                state,
+                pending,
+                checkpoint,
+            } = load_reading(root, checkpoint.as_deref())?;
             let reading = model.read();
             let collections = model.collection_views();
             let active = state.as_deref().and_then(active_claims);
             if markdown {
+                if let Some(checkpoint) = &checkpoint {
+                    print_checkpoint(checkpoint);
+                }
                 print_reading(&model, &reading);
                 print_collections(&collections);
                 print_claims(active.as_deref());
@@ -187,10 +218,22 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
             if let Some(pending) = pending {
                 output["pending_operation"] = pending;
             }
+            if let Some(checkpoint) = checkpoint {
+                output["checkpoint"] = json!(checkpoint);
+            }
             write(None, &output)
         }
-        ModelCmd::Read { subject, flow } => {
-            let (model, state, pending) = load_for_read(root)?;
+        ModelCmd::Read {
+            subject,
+            flow,
+            checkpoint,
+        } => {
+            let Loaded {
+                model,
+                state,
+                pending,
+                checkpoint,
+            } = load_reading(root, checkpoint.as_deref())?;
             let found = match &flow {
                 Some(flow) => {
                     let (collection, flow) = model.flow(flow)?;
@@ -203,6 +246,7 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
                     model: &model,
                     state,
                     pending,
+                    checkpoint,
                     markdown,
                 };
                 return read.print(found);
@@ -221,6 +265,9 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
                 .and_then(active_claims)
                 .map(|active| claims::holding(&model, active, &subjects));
             if markdown {
+                if let Some(checkpoint) = &checkpoint {
+                    print_checkpoint(checkpoint);
+                }
                 let names = names(&model);
                 print_module(&selection.module, 0);
                 if let Some(parent) = selection.module.parent {
@@ -258,6 +305,9 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
             }
             if let Some(pending) = pending {
                 output["pending_operation"] = pending;
+            }
+            if let Some(checkpoint) = checkpoint {
+                output["checkpoint"] = json!(checkpoint);
             }
             write(None, &output)
         }
@@ -397,6 +447,50 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
                 }),
             )
         }
+        ModelCmd::Retain {
+            doing,
+            writer,
+            operation_id,
+        } => {
+            let dir = vault::locate(root)?;
+            let checkpoint =
+                checkpoint::retain(&dir, &doing, writer.as_deref(), operation_id.as_deref())?;
+            if markdown {
+                print_checkpoint(&checkpoint);
+                return Ok(());
+            }
+            write(
+                None,
+                &json!({
+                    "schema": MODEL_SCHEMA,
+                    "kind": "retain",
+                    "success": true,
+                    "vault": dir,
+                    "checkpoint": checkpoint,
+                }),
+            )
+        }
+        ModelCmd::Checkpoints { limit } => {
+            let dir = vault::path(root)?;
+            let list = checkpoint::list(root, limit)?;
+            if markdown {
+                if list.is_empty() {
+                    println!("No checkpoints");
+                }
+                list.iter().for_each(print_checkpoint);
+                return Ok(());
+            }
+            write(
+                None,
+                &json!({
+                    "schema": MODEL_SCHEMA,
+                    "kind": "checkpoints",
+                    "success": true,
+                    "vault": dir,
+                    "checkpoints": list,
+                }),
+            )
+        }
     }
 }
 
@@ -405,6 +499,7 @@ struct GroupingRead<'a> {
     model: &'a Model,
     state: Option<PathBuf>,
     pending: Option<Value>,
+    checkpoint: Option<Checkpoint>,
     markdown: bool,
 }
 
@@ -412,6 +507,11 @@ impl GroupingRead<'_> {
     /// Prints the collection or flow with the active claims holding it.
     fn print(self, found: Found<'_>) -> Result<()> {
         let model = self.model;
+        if self.markdown
+            && let Some(checkpoint) = &self.checkpoint
+        {
+            print_checkpoint(checkpoint);
+        }
         let (subject, mut output) = match found {
             Found::Collection(collection) => {
                 let view = model.collection_view(collection);
@@ -451,6 +551,9 @@ impl GroupingRead<'_> {
         }
         if let Some(pending) = self.pending {
             output["pending_operation"] = pending;
+        }
+        if let Some(checkpoint) = self.checkpoint {
+            output["checkpoint"] = json!(checkpoint);
         }
         write(None, &output)
     }
@@ -658,6 +761,36 @@ fn load_for_read(root: &Path) -> Result<(Model, Option<PathBuf>, Option<Value>)>
     Ok((model, state, pending))
 }
 
+/// The model `model read` prints, with its machine-local state folder, the edit pending there
+/// and the checkpoint it came from.
+struct Loaded {
+    model: Model,
+    state: Option<PathBuf>,
+    pending: Option<Value>,
+    checkpoint: Option<Checkpoint>,
+}
+
+/// [`load_for_read`], or with `checkpoint` the model that checkpoint holds, which has no claims
+/// or pending edit and needs no vault in the checkout.
+fn load_reading(root: &Path, checkpoint: Option<&str>) -> Result<Loaded> {
+    let Some(which) = checkpoint else {
+        let (model, state, pending) = load_for_read(root)?;
+        return Ok(Loaded {
+            model,
+            state,
+            pending,
+            checkpoint: None,
+        });
+    };
+    let (checkpoint, model) = checkpoint::load(root, which)?;
+    Ok(Loaded {
+        model,
+        state: None,
+        pending: None,
+        checkpoint: Some(checkpoint),
+    })
+}
+
 /// The active claims, or `None` with a warning on stderr when the claims file cannot be read:
 /// machine-local coordination state never makes a reading fail.
 fn active_claims(state: &Path) -> Option<Vec<Claim>> {
@@ -680,6 +813,17 @@ fn print_claim(claim: &Claim) {
     if let Some(revoked) = &claim.revoked {
         println!("  revoked by {}: {}", revoked.by, revoked.reason);
     }
+}
+
+fn print_checkpoint(checkpoint: &Checkpoint) {
+    println!(
+        "Checkpoint {} by {} at {}: {}",
+        checkpoint.id, checkpoint.writer, checkpoint.time, checkpoint.doing
+    );
+    println!(
+        "  commit {} revision {}",
+        checkpoint.commit, checkpoint.revision
+    );
 }
 
 fn print_receipt(receipt: &Receipt) {

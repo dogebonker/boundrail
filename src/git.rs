@@ -1,5 +1,6 @@
 //! Every Git subprocess boundrail runs, hardened so a repository's config never names a program
-//! Git would run on our behalf (fsmonitor, hooks).
+//! Git would run on our behalf (fsmonitor, hooks). The one exception is the signing program:
+//! when the user opts into `commit.gpgSign`, `model retain` signs its checkpoints with it.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

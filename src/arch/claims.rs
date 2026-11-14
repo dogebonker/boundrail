@@ -17,7 +17,7 @@ use std::iter;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -26,9 +26,10 @@ use super::request::{
     OPERATION_MAX, OPERATION_PATTERN, Target, WRITER_MAX, check_doing, check_model,
     check_operation, check_writer, invalid, parse,
 };
+use super::state::{self, Operation};
 use super::types::Relationship;
 use super::vault::{self, Model};
-use super::{Code, Refusal, ids, one_line, state};
+use super::{Code, Refusal, ids, one_line};
 
 const REASON_MAX: usize = 200;
 const SUBJECTS_MAX: usize = 1000;
@@ -121,7 +122,7 @@ pub fn claim(vault: &Path, input: &[u8], doing: &str) -> Result<Claim> {
         request.operation_id.as_deref(),
         "claim",
         &request,
-        |claim| ledger.claims.iter().any(|c| c.id == claim.id),
+        |claim: &Claim| Ok(ledger.claims.iter().any(|c| c.id == claim.id)),
     )?;
     if let Operation::Done(claim) = operation {
         return Ok(claim);
@@ -158,10 +159,10 @@ pub fn claim(vault: &Path, input: &[u8], doing: &str) -> Result<Claim> {
         created: now(),
         revoked: None,
     };
-    operation.record(&state.dir, "pending", &claim)?;
+    operation.pending(&state.dir, &claim)?;
     ledger.claims.push(claim.clone());
     write(&state.dir, &ledger)?;
-    operation.record(&state.dir, "done", &claim)?;
+    operation.done(&state.dir, &claim)?;
     Ok(claim)
 }
 
@@ -183,7 +184,7 @@ pub fn release(vault: &Path, input: &[u8]) -> Result<Claim> {
         request.operation_id.as_deref(),
         "release",
         &request,
-        |claim| !ledger.claims.iter().any(|c| c.id == claim.id),
+        |claim: &Claim| Ok(!ledger.claims.iter().any(|c| c.id == claim.id)),
     )?;
     if let Operation::Done(claim) = operation {
         return Ok(claim);
@@ -194,82 +195,10 @@ pub fn release(vault: &Path, input: &[u8]) -> Result<Claim> {
         check_holder(&ledger.claims[at], &request.writer)?;
     }
     let claim = ledger.claims.remove(at);
-    operation.record(&state.dir, "pending", &claim)?;
+    operation.pending(&state.dir, &claim)?;
     write(&state.dir, &ledger)?;
-    operation.record(&state.dir, "done", &claim)?;
+    operation.done(&state.dir, &claim)?;
     Ok(claim)
-}
-
-/// A claim or release request's record in the journal, `operations/<operation_id>.json`, so a
-/// retry returns the claim instead of acting twice. The record is written `pending` with the claim
-/// before the ledger changes and `done` after; it never blocks edits.
-enum Operation {
-    /// No operation ID: nothing is recorded.
-    Untracked,
-    /// A first attempt, or a retry of one that never reached the ledger.
-    New {
-        operation: String,
-        kind: &'static str,
-        fingerprint: String,
-    },
-    /// Already done: the recorded claim.
-    Done(Claim),
-}
-
-#[derive(Deserialize)]
-struct Record {
-    status: String,
-    output: Claim,
-}
-
-impl Operation {
-    /// The operation `operation` of `request`, a `kind` request. A pending record counts as done
-    /// when `landed` says its claim reached the ledger.
-    fn start(
-        dir: &Path,
-        operation: Option<&str>,
-        kind: &'static str,
-        request: &impl Serialize,
-        landed: impl Fn(&Claim) -> bool,
-    ) -> Result<Self> {
-        let Some(operation) = operation else {
-            return Ok(Self::Untracked);
-        };
-        let (fingerprint, record) = state::recorded(dir, operation, request)?;
-        if let Some(record) = record {
-            let record: Record = serde_json::from_value(record)
-                .with_context(|| format!("parsing the journal record of {operation}"))?;
-            match record.status.as_str() {
-                "done" => return Ok(Self::Done(record.output)),
-                "pending" if landed(&record.output) => return Ok(Self::Done(record.output)),
-                "pending" => {}
-                status => {
-                    bail!("the journal record of {operation} has the unknown status {status}")
-                }
-            }
-        }
-        Ok(Self::New {
-            operation: operation.to_owned(),
-            kind,
-            fingerprint,
-        })
-    }
-
-    fn record(&self, dir: &Path, status: &str, claim: &Claim) -> Result<()> {
-        let Self::New {
-            operation,
-            kind,
-            fingerprint,
-        } = self
-        else {
-            return Ok(());
-        };
-        state::write_record(
-            dir,
-            operation,
-            &json!({"request_sha256": fingerprint, "kind": kind, "status": status, "output": claim}),
-        )
-    }
 }
 
 /// Marks a claim revoked, so it stops blocking anyone; the first revocation stays.

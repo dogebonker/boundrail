@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, ensure};
-use serde::Serialize;
+use anyhow::{Context, Result, bail, ensure};
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::request::INPUT_MAX;
@@ -23,6 +23,8 @@ const LOCK: &str = "model.lock";
 /// not finished. Records differ by their `kind`: `edit`, `claim` or `release`.
 const OPERATIONS: &str = "operations";
 const PENDING: &str = "pending";
+/// The status of a finished operation's record.
+const DONE: &str = "done";
 /// How long taking the vault lock retries before it refuses: long enough to outlast a reader's
 /// brief shared-lock probe, short enough that a held lock refuses promptly.
 const LOCK_WAIT: Duration = Duration::from_millis(250);
@@ -209,6 +211,88 @@ pub(super) fn finish(dir: &Path, operation: &str, record: &impl Serialize) -> Re
             Err(e).with_context(|| format!("removing {}", path.display()))
         }
         _ => Ok(()),
+    }
+}
+
+/// A claim, release or retain request's record in the journal, `operations/<operation_id>.json`,
+/// so a retry returns the recorded output instead of acting twice. The record is written
+/// `pending` with the output before the change and `done` after; it never blocks edits.
+pub(super) enum Operation<T> {
+    /// No operation ID: nothing is recorded.
+    Untracked,
+    /// A first attempt, or a retry of one whose change never landed.
+    New {
+        operation: String,
+        kind: &'static str,
+        fingerprint: String,
+    },
+    /// Already done: the recorded output.
+    Done(T),
+}
+
+#[derive(Deserialize)]
+struct Record<T> {
+    status: String,
+    output: T,
+}
+
+impl<T: Serialize + DeserializeOwned> Operation<T> {
+    /// The operation `operation` of `request`, a `kind` request, in the state folder `dir`. A
+    /// pending record counts as done when `landed` says its change took effect.
+    pub(super) fn start(
+        dir: &Path,
+        operation: Option<&str>,
+        kind: &'static str,
+        request: &impl Serialize,
+        landed: impl FnOnce(&T) -> Result<bool>,
+    ) -> Result<Self> {
+        let Some(operation) = operation else {
+            return Ok(Self::Untracked);
+        };
+        let (fingerprint, record) = recorded(dir, operation, request)?;
+        if let Some(record) = record {
+            let record: Record<T> = serde_json::from_value(record)
+                .with_context(|| format!("parsing the journal record of {operation}"))?;
+            match record.status.as_str() {
+                DONE => return Ok(Self::Done(record.output)),
+                PENDING if landed(&record.output)? => return Ok(Self::Done(record.output)),
+                PENDING => {}
+                status => {
+                    bail!("the journal record of {operation} has the unknown status {status}")
+                }
+            }
+        }
+        Ok(Self::New {
+            operation: operation.to_owned(),
+            kind,
+            fingerprint,
+        })
+    }
+
+    /// Records `output` as about to take effect.
+    pub(super) fn pending(&self, dir: &Path, output: &T) -> Result<()> {
+        self.record(dir, PENDING, output)
+    }
+
+    /// Records `output` as done.
+    pub(super) fn done(&self, dir: &Path, output: &T) -> Result<()> {
+        self.record(dir, DONE, output)
+    }
+
+    fn record(&self, dir: &Path, status: &str, output: &T) -> Result<()> {
+        let Self::New {
+            operation,
+            kind,
+            fingerprint,
+        } = self
+        else {
+            return Ok(());
+        };
+        write_record(
+            dir,
+            operation,
+            &json!({"request_sha256": fingerprint, "kind": kind, "status": status, "output": output}),
+        )
     }
 }
 

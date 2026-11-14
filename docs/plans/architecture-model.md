@@ -37,7 +37,7 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 | T4 | Semantic check: container binding, parts outside container, unconnected roots, shared bindings, repeated relationships, relationships on containers, lines to own part, `model check` | done |
 | T5 | Code check: binding and anchor paths and symbols, relationships undrawn / unsupported / backwards from the scanned graph, module interface exposure | done |
 | T6 | Flows: collections of flows in `collections/<id>.collection.json`, message/decision/loop steps, collection/flow/step/branch edits with flow and step moves, `REFERENCED_BY_FLOW`, collection and flow claims, `model read --flow`, `FLOW_SUMMARY_MISSING` and `MESSAGE_UNDRAWN` in the semantic check | done |
-| T7 | Checkpoints: history branch, `model retain`, `model checkpoints`, `model read --checkpoint` | open |
+| T7 | Checkpoints: history branch, `model retain`, `model checkpoints`, `model read --checkpoint` | done |
 | T8 | Proposals: create/edit drafts against a predecessor, `model compare`, adopt, shelve, planning models without a current state | open |
 | T9 | Render: SVG architecture view with automatic layout, sequence and flowchart views of a flow, comparison marks | open |
 | T10 | Measures: module interface counts (`model inspect`), co-change locality (`model locality`), branch footprint (`model footprint`) | open |
@@ -78,3 +78,27 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   already has the name, as for modules. `REFERENCED_BY_FLOW` refuses only references the batch
   broke by removing a module or removing or moving a relationship, in steps the batch did not
   edit; an edited step whose reference does not hold is `MODEL_INVALID`.
+- T7: the history is the ref `refs/boundrail/history`, one per repository, so checkpoints from any
+  worktree land on it. A checkpoint's tree holds the recognized vault files at their
+  vault-relative paths (`model.json` at the root), not at `.boundrail/model/`. Commits are built
+  with `hash-object`, a disposable index and `commit-tree`, so HEAD, the index and the working
+  tree never change. With `commit.gpgSign` set, `commit-tree -S` signs with the user's signing
+  program and key, the one program repository config may name for us; a failed signature refuses
+  `SIGNING_FAILED` before the ref moves. The ref moves by compare-and-swap with a reflog entry; a
+  lost race or a held ref lock refuses `HISTORY_MOVED` and a retry builds on the new tip.
+  Retaining an unchanged model refuses `NOTHING_TO_RETAIN`. Trailers `Source` and `Operation`
+  appear only when there is a value.
+- T7: `model retain` takes flags, not a request body. `--writer` defaults to the Git author name.
+  Its operation fingerprint covers the writer and `--doing`, since `--doing` is the checkpoint's
+  content; an edit's fingerprint leaves `--doing` out. The journal record is written `pending`
+  before the ref moves and `done` after; a pending record whose commit is on the ref counts as
+  done. The journal is per worktree, so a retry from another worktree is answered from the
+  `Operation` trailers on the shared ref.
+- T7: `model checkpoints` and `model read --checkpoint` need no vault in the checkout, so a
+  deleted vault can be restored from its history. `--checkpoint` takes a checkpoint ID (any
+  case), else a unique commit prefix of at least 4 hex digits; an ambiguous prefix refuses
+  `SUBJECT_AMBIGUOUS` and an unknown one `CHECKPOINT_NOT_FOUND`. A checkpoint tree that holds
+  anything `model retain` never writes refuses `MODEL_INVALID`. Files are read with one
+  `git show` of their blobs, which applies no attributes or filters. A checkpoint reading shows
+  no claims or pending edit, which belong to the checkout. Listing without `--limit` walks the
+  whole ref.

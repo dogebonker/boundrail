@@ -2726,3 +2726,379 @@ fn taking_a_claimed_collections_or_flows_name_conflicts() {
         json!([ids[1]])
     );
 }
+
+/// A checkout with an initial commit and a local identity, so checkpoints can be committed.
+fn committed() -> Checkout {
+    let checkout = Checkout::new();
+    for args in [
+        &["config", "user.name", "tester"][..],
+        &["config", "user.email", "tester@example.com"],
+        &["config", "commit.gpgsign", "false"],
+        &["commit", "-q", "--allow-empty", "-m", "initial"],
+    ] {
+        git(&checkout, args);
+    }
+    checkout
+}
+
+fn git(checkout: &Checkout, args: &[&str]) -> String {
+    git_with(checkout, &[], args)
+}
+
+fn git_with(checkout: &Checkout, env: &[(&str, &Path)], args: &[&str]) -> String {
+    let out = Command::new("git")
+        .args(args)
+        .envs(env.iter().copied())
+        .current_dir(checkout.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// The checkout's HEAD, branches, index and working tree status.
+fn checkout_state(checkout: &Checkout) -> Vec<String> {
+    let index = fs::read(checkout.path().join(".git/index")).unwrap_or_default();
+    vec![
+        git(checkout, &["rev-parse", "HEAD"]),
+        git(checkout, &["for-each-ref", "refs/heads"]),
+        git(
+            checkout,
+            &["status", "--porcelain", "--untracked-files=all"],
+        ),
+        sha256(&index),
+    ]
+}
+
+#[test]
+fn checkpoints_keep_the_model_history_off_the_working_branch() {
+    let checkout = committed();
+    shop(&checkout);
+    assert_eq!(checkout.ok(&["checkpoints"])["checkpoints"], json!([]));
+    let before = checkout_state(&checkout);
+    let head = git(&checkout, &["rev-parse", "HEAD"]);
+
+    let first = checkout.ok(&["retain", "--doing", "the shop as built"])["checkpoint"].clone();
+    assert_eq!(checkout_state(&checkout), before);
+    assert_eq!(first["doing"], "the shop as built");
+    assert_eq!(first["writer"], "tester");
+    assert_eq!(first["source"], head.trim());
+    assert_eq!(first["revision"], checkout.digest());
+    assert_eq!(first["parent"], Value::Null);
+    assert_eq!(first["id"].as_str().unwrap().len(), 8);
+    let tip = git(&checkout, &["rev-parse", "refs/boundrail/history"]);
+    assert_eq!(first["commit"], tip.trim());
+    let files = git(&checkout, &["ls-tree", "-r", "--name-only", tip.trim()]);
+    assert_eq!(
+        files.lines().collect::<Vec<_>>(),
+        [
+            "config.yaml",
+            "model.json",
+            "modules/BankApi1.module.json",
+            "modules/Billing1.module.json",
+            "modules/Platfrm1.module.json",
+            "modules/WebApp01.module.json",
+        ]
+    );
+
+    let error = checkout.refused(&["retain", "--doing", "again"], "NOTHING_TO_RETAIN");
+    assert_eq!(error["details"]["checkpoint"], first["id"]);
+
+    checkout.edited(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 4}}]));
+    let second =
+        checkout.ok(&["retain", "--doing", "move the bank", "--writer", "none"])["checkpoint"]
+            .clone();
+    assert_eq!(second["parent"], first["id"]);
+    assert_eq!(second["writer"], "none");
+    assert_eq!(second["operation_id"], Value::Null);
+    assert_eq!(checkout_state(&checkout), before);
+
+    let list = checkout.ok(&["checkpoints"])["checkpoints"].clone();
+    assert_eq!(list, json!([second, first]));
+    let list = checkout.ok(&["checkpoints", "--limit", "1"])["checkpoints"].clone();
+    assert_eq!(list, json!([second]));
+
+    // The older checkpoint reads back the older model, whole or by subject.
+    let id = first["id"].as_str().unwrap();
+    let old = checkout.ok(&["read", "--checkpoint", &id.to_ascii_lowercase()]);
+    assert_eq!(old["checkpoint"], first);
+    assert_eq!(old["revision"]["digest"], first["revision"]);
+    let bank = |read: &Value| {
+        read["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["name"] == "Bank")
+            .unwrap()["order"]
+            .clone()
+    };
+    assert_eq!(bank(&old), 1);
+    assert_eq!(bank(&checkout.ok(&["read"])), 4);
+    let prefix = &first["commit"].as_str().unwrap()[..10];
+    let module = checkout.ok(&["read", "Bank", "--checkpoint", prefix]);
+    assert_eq!(module["module"]["order"], 1);
+    assert_eq!(module["checkpoint"]["id"], first["id"]);
+    let (code, text) = checkout.run_raw(&["read", "--checkpoint", id, "--format", "markdown"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.starts_with(&format!("Checkpoint {id} by tester")),
+        "{text}"
+    );
+
+    checkout.refused(
+        &["read", "--checkpoint", "Unknown1"],
+        "CHECKPOINT_NOT_FOUND",
+    );
+    checkout.refused(&["read", "--checkpoint", "abc"], "CHECKPOINT_NOT_FOUND");
+    let (code, text) = checkout.run_raw(&[
+        "read",
+        "Nowhere",
+        "--checkpoint",
+        id,
+        "--format",
+        "markdown",
+    ]);
+    assert_eq!(code, 2, "{text}");
+    assert!(text.starts_with("SUBJECT_NOT_FOUND"), "{text}");
+    assert_eq!(checkout_state(&checkout), before);
+}
+
+#[test]
+fn retain_is_idempotent_by_operation_id() {
+    let checkout = committed();
+    shop(&checkout);
+    let args = [
+        "retain",
+        "--doing",
+        "the shop as built",
+        "--operation-id",
+        "retain-1",
+    ];
+    let (code, first) = checkout.run_raw(&args);
+    assert_eq!(code, 0, "{first}");
+    let (code, again) = checkout.run_raw(&args);
+    assert_eq!(code, 0, "{again}");
+    assert_eq!(again, first);
+
+    // A record left pending by a crash after the ref moved counts as done.
+    let record = checkout
+        .path()
+        .join(".git/boundrail/operations/retain-1.json");
+    let pending = fs::read_to_string(&record)
+        .unwrap()
+        .replace(r#""status": "done""#, r#""status": "pending""#);
+    assert!(pending.contains(r#""status": "pending""#), "{pending}");
+    fs::write(&record, pending).unwrap();
+    let (code, again) = checkout.run_raw(&args);
+    assert_eq!(code, 0, "{again}");
+    assert_eq!(again, first);
+
+    // After the model changes, the same operation still returns its checkpoint.
+    checkout.edited(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 4}}]));
+    let (code, again) = checkout.run_raw(&args);
+    assert_eq!(code, 0, "{again}");
+    assert_eq!(again, first);
+    let list = checkout.ok(&["checkpoints"])["checkpoints"].clone();
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    assert_eq!(list[0]["operation_id"], "retain-1");
+
+    checkout.refused(
+        &[
+            "retain",
+            "--doing",
+            "another reason",
+            "--operation-id",
+            "retain-1",
+        ],
+        "OPERATION_REUSED",
+    );
+    // An edit's operation ID cannot be reused for a retain either.
+    let mut request =
+        checkout.request(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 5}}]));
+    request["operation_id"] = "retain-1".into();
+    checkout.edit_refused(&request, "OPERATION_REUSED");
+}
+
+/// A linked worktree of `checkout`, detached at its HEAD, in a directory of its own.
+fn worktree(checkout: &Checkout) -> Checkout {
+    let linked = Checkout::outside();
+    let path = linked.path().to_str().unwrap();
+    git(checkout, &["worktree", "add", "-q", "--detach", path]);
+    linked
+}
+
+#[test]
+fn worktrees_share_the_history_and_its_operation_ids() {
+    let checkout = committed();
+    shop(&checkout);
+    let args = [
+        "retain",
+        "--doing",
+        "the shop as built",
+        "--operation-id",
+        "retain-1",
+    ];
+    let first = checkout.ok(&args)["checkpoint"].clone();
+
+    // A worktree without a vault still reads the history.
+    let linked = worktree(&checkout);
+    assert!(!linked.vault().exists());
+    let list = linked.ok(&["checkpoints"]);
+    assert_eq!(list["checkpoints"], json!([first]));
+    let id = first["id"].as_str().unwrap();
+    let read = linked.ok(&["read", "--checkpoint", id]);
+    assert_eq!(read["checkpoint"], first);
+    assert_eq!(read["modules"].as_array().unwrap().len(), 4);
+    assert!(
+        read["vault"]
+            .as_str()
+            .unwrap()
+            .ends_with(".boundrail/model")
+    );
+    assert!(!linked.vault().exists());
+
+    // Its journal is its own, but the shared ref answers a retry of the same operation.
+    linked.init();
+    assert_eq!(linked.ok(&args)["checkpoint"], first);
+    linked.refused(
+        &[
+            "retain",
+            "--doing",
+            "another reason",
+            "--operation-id",
+            "retain-1",
+        ],
+        "OPERATION_REUSED",
+    );
+    assert_eq!(checkout.ok(&["checkpoints"])["checkpoints"], json!([first]));
+}
+
+#[test]
+fn a_locked_history_ref_refuses_and_leaves_it_unchanged() {
+    let checkout = committed();
+    shop(&checkout);
+    let first = checkout.ok(&["retain", "--doing", "the shop as built"])["checkpoint"].clone();
+    checkout.edited(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 4}}]));
+    let lock = checkout.path().join(".git/refs/boundrail/history.lock");
+    fs::write(&lock, "").unwrap();
+    let error = checkout.refused(&["retain", "--doing", "move the bank"], "HISTORY_MOVED");
+    assert_eq!(error["details"]["current"], first["commit"]);
+    let tip = git(&checkout, &["rev-parse", "refs/boundrail/history"]);
+    assert_eq!(tip.trim(), first["commit"]);
+
+    fs::remove_file(&lock).unwrap();
+    let second = checkout.ok(&["retain", "--doing", "move the bank"])["checkpoint"].clone();
+    assert_eq!(second["parent"], first["id"]);
+}
+
+/// Puts a checkpoint on the history ref whose tree is the tree of `base` plus `extra` files as
+/// (path, blob), and returns its ID.
+fn forge(checkout: &Checkout, id: &str, base: &str, extra: &[(&str, &str)]) -> String {
+    let temp = TempDir::new("forge").unwrap();
+    let index = temp.path().join("index");
+    let env = [("GIT_INDEX_FILE", index.as_path())];
+    git_with(checkout, &env, &["read-tree", base]);
+    for (path, blob) in extra {
+        let entry = format!("100644,{blob},{path}");
+        git_with(
+            checkout,
+            &env,
+            &["update-index", "--add", "--cacheinfo", &entry],
+        );
+    }
+    let tree = git_with(checkout, &env, &["write-tree"]);
+    let message = format!("forged\n\nCheckpoint: {id}\nRevision: forged\nWriter: forger\n");
+    let commit = git(
+        checkout,
+        &[
+            "commit-tree",
+            tree.trim(),
+            "-p",
+            "refs/boundrail/history",
+            "-m",
+            &message,
+        ],
+    );
+    git(
+        checkout,
+        &["update-ref", "refs/boundrail/history", commit.trim()],
+    );
+    id.to_owned()
+}
+
+#[test]
+fn a_checkpoint_tree_holding_anything_but_vault_files_is_refused() {
+    let checkout = committed();
+    shop(&checkout);
+    let first = checkout.ok(&["retain", "--doing", "the shop as built"])["checkpoint"].clone();
+    let base = first["commit"].as_str().unwrap();
+    let config = git(
+        &checkout,
+        &["rev-parse", "refs/boundrail/history:config.yaml"],
+    );
+
+    let id = forge(&checkout, "Forged01", base, &[("run.sh", config.trim())]);
+    let error = checkout.refused(&["read", "--checkpoint", &id], "MODEL_INVALID");
+    assert_eq!(error["details"]["path"], "run.sh");
+    assert_eq!(error["details"]["checkpoint"], id);
+
+    // A tree of vault files that do not load names the checkpoint, not a temporary folder.
+    let id = forge(
+        &checkout,
+        "Forged02",
+        base,
+        &[("model.json", config.trim())],
+    );
+    let error = checkout.refused(&["read", "--checkpoint", &id], "MODEL_INVALID");
+    let message = error["message"].as_str().unwrap();
+    assert!(message.contains("checkpoint Forged02"), "{message}");
+    assert_eq!(error["details"]["checkpoint"], id);
+    assert_eq!(error["details"]["problems"][0]["file"], "model.json");
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoints_follow_the_users_signing_config() {
+    use std::os::unix::fs::PermissionsExt;
+    let checkout = committed();
+    shop(&checkout);
+    let tools = TempDir::new("signer").unwrap();
+    let signer = tools.path().join("sign");
+    let script = |body: &str| {
+        fs::write(&signer, format!("#!/bin/sh\ncat >/dev/null\n{body}")).unwrap();
+        fs::set_permissions(&signer, fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    script(
+        "printf '\\n[GNUPG:] SIG_CREATED D 1 8 00 1 FAKE\\n' >&2\n\
+         printf -- '-----BEGIN PGP SIGNATURE-----\\n\\nfake\\n-----END PGP SIGNATURE-----\\n'\n",
+    );
+    git(&checkout, &["config", "commit.gpgsign", "true"]);
+    git(&checkout, &["config", "gpg.format", "openpgp"]);
+    git(
+        &checkout,
+        &["config", "gpg.program", signer.to_str().unwrap()],
+    );
+
+    let first = checkout.ok(&["retain", "--doing", "the shop as built"])["checkpoint"].clone();
+    let commit = git(
+        &checkout,
+        &["cat-file", "commit", first["commit"].as_str().unwrap()],
+    );
+    assert!(
+        commit.contains("gpgsig -----BEGIN PGP SIGNATURE-----"),
+        "{commit}"
+    );
+
+    // A failing signer refuses before the ref moves.
+    script("echo 'fake signer: no key' >&2\nexit 1\n");
+    checkout.edited(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 4}}]));
+    let before = checkout_state(&checkout);
+    let error = checkout.refused(&["retain", "--doing", "move the bank"], "SIGNING_FAILED");
+    assert!(
+        !error["details"]["stderr"].as_str().unwrap().is_empty(),
+        "{error:#}"
+    );
+    let tip = git(&checkout, &["rev-parse", "refs/boundrail/history"]);
+    assert_eq!(tip.trim(), first["commit"]);
+    assert_eq!(checkout_state(&checkout), before);
+}

@@ -154,9 +154,14 @@ fn populate(dir: &Path, name: &str) -> Result<()> {
     write_atomic(&dir.join(MANIFEST), file_json(&manifest)?.as_bytes())
 }
 
+/// Where the vault folder of the checkout around `start` is, whether or not it exists.
+pub fn path(start: &Path) -> Result<PathBuf> {
+    Ok(checkout_root(start)?.join(STATE).join(VAULT))
+}
+
 /// The vault folder of the checkout around `start`, refusing when no vault exists there.
 pub fn locate(start: &Path) -> Result<PathBuf> {
-    let dir = checkout_root(start)?.join(STATE).join(VAULT);
+    let dir = path(start)?;
     match fs::symlink_metadata(&dir) {
         Ok(_) => Ok(dir),
         Err(e) if e.kind() == ErrorKind::NotFound => Err(not_found(&dir)),
@@ -570,6 +575,12 @@ fn vault_file(path: &str) -> Option<(&'static str, &str)> {
             .strip_suffix(suffix)?;
         Some((*folder, id))
     })
+}
+
+/// Whether `path` names a file `load_dir` reads: the manifest, the config, or a module or
+/// collection file directly inside its folder.
+pub(super) fn is_vault_file(path: &str) -> bool {
+    path == MANIFEST || path == CONFIG || vault_file(path).is_some_and(|(_, id)| !id.contains('/'))
 }
 
 fn file_subject(path: &str) -> &str {
