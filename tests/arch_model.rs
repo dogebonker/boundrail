@@ -1,6 +1,8 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use boundrail::collect::TempDir;
 use serde_json::{Value, json};
@@ -86,6 +88,66 @@ impl Checkout {
             &format!("modules/{id}.module.json"),
             &serde_json::to_string_pretty(&value).unwrap(),
         );
+    }
+    fn read_module(&self, id: &str) -> Value {
+        let path = self.vault().join(format!("modules/{id}.module.json"));
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    }
+    fn digest(&self) -> Value {
+        self.ok(&["read"])["revision"]["digest"].clone()
+    }
+    /// An edit request against the current model and revision with a fresh operation ID.
+    fn request(&self, changes: Value) -> Value {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let read = self.ok(&["read"]);
+        json!({
+            "target": {"model": read["manifest"]["id"], "state": read["manifest"]["current"]["id"]},
+            "expected_revision": read["revision"]["digest"],
+            "operation_id": format!("op-{}", NEXT.fetch_add(1, Ordering::Relaxed)),
+            "writer": "tester",
+            "changes": changes,
+        })
+    }
+    /// `model edit` with `request` on standard input.
+    fn edit_with(&self, request: &Value, doing: &str, env: &[(&str, &str)]) -> (i32, String) {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_boundrail"))
+            .args(["--no-daemon", "model", "edit", "--doing", doing])
+            .envs(env.iter().copied())
+            .current_dir(self.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(request.to_string().as_bytes()).unwrap();
+        drop(stdin);
+        let out = child.wait_with_output().unwrap();
+        (
+            out.status.code().unwrap(),
+            String::from_utf8(out.stdout).unwrap(),
+        )
+    }
+    fn edit(&self, request: &Value) -> (i32, Value) {
+        let (code, stdout) = self.edit_with(request, "testing edits", &[]);
+        let value = serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
+        (code, value)
+    }
+    fn edited(&self, changes: Value) -> Value {
+        let (code, value) = self.edit(&self.request(changes));
+        assert_eq!(code, 0, "{value:#}");
+        assert_eq!(value["kind"], "edit");
+        assert_eq!(value["success"], true);
+        value
+    }
+    /// Refuses the request with `expected`, leaving the revision and the lock untouched.
+    fn edit_refused(&self, request: &Value, expected: &str) -> Value {
+        let before = self.digest();
+        let (code, value) = self.edit(request);
+        assert_eq!(code, 2, "{value:#}");
+        assert_eq!(value["kind"], "refusal");
+        assert_eq!(value["error"]["code"], expected, "{value:#}");
+        assert_eq!(self.digest(), before, "a refused edit wrote the vault");
+        value["error"].clone()
     }
 }
 
@@ -274,7 +336,7 @@ fn read_returns_containment_and_relationships_in_order() {
 #[test]
 fn every_invalid_model_is_refused_with_its_problems() {
     type Break = fn(&Checkout, &str);
-    let cases: [(&str, Break, &str, &str, &str); 12] = [
+    let cases: [(&str, Break, &str, &str, &str); 14] = [
         (
             "module JSON",
             |c, _| c.write("modules/Broken01.module.json", "{ not json"),
@@ -400,6 +462,24 @@ fn every_invalid_model_is_refused_with_its_problems() {
             "RelLng01",
             "label has 61 characters",
         ),
+        (
+            "escape sequence in a name",
+            |c, _| c.module(module("Escape01", "Red\u{1b}[31m", "service", 0)),
+            "modules/Escape01.module.json",
+            "Escape01",
+            "name needs 1 to 120 characters",
+        ),
+        (
+            "tab in a label",
+            |c, m| {
+                let mut tab = module("TabLbl01", "Tab", "service", 0);
+                tab["outgoing"] = json!([{"id": "RelTab01", "to": format!("{m}#BankApi1"), "kind": "call", "order": 0, "label": "a\tb"}]);
+                c.module(tab);
+            },
+            "modules/TabLbl01.module.json",
+            "RelTab01",
+            "label contains a control character",
+        ),
     ];
     for (case, breaks, file, subject, message) in cases {
         let checkout = Checkout::new();
@@ -420,6 +500,7 @@ fn every_invalid_model_is_refused_with_its_problems() {
     shop(&checkout);
     let mut fits = module("Fits0001", "Fits", "service", 0);
     fits["responsibility"] = "x".repeat(200).into();
+    fits["description"] = "Line one\n\tLine two".into();
     checkout.module(fits);
     checkout.ok(&["read"]);
     checkout.module(module("Lambda01", "Lambda", "lambda", 0));
@@ -479,6 +560,7 @@ fn revision_follows_recognized_files_only() {
     checkout.write("notes.md", "scratch");
     checkout.write("modules/README.txt", "scratch");
     checkout.write("modules/draft.json", "{}");
+    checkout.write(".lock", "{}");
     assert_eq!(digest(), first);
     let files = checkout.ok(&["read"])["revision"]["files"].clone();
     assert_eq!(files.as_array().unwrap().len(), 6);
@@ -498,7 +580,7 @@ fn schemas_describe_the_vault_files() {
     let names = checkout.ok(&["schema"]);
     assert_eq!(
         names["schemas"],
-        json!(["model-manifest", "module", "vault-config"])
+        json!(["model-edit", "model-manifest", "module", "vault-config"])
     );
     checkout.refused(&["schema", "nope"], "SCHEMA_NOT_FOUND");
 
@@ -533,4 +615,644 @@ fn schemas_describe_the_vault_files() {
     bad["responsibility"] = "ok".into();
     bad["surprise"] = true.into();
     assert!(!validator.is_valid(&bad));
+}
+
+#[cfg(unix)]
+#[test]
+fn symbolic_links_in_the_vault_are_refused_not_followed() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let elsewhere = checkout.path().join("elsewhere.yaml");
+    fs::copy(checkout.vault().join("config.yaml"), &elsewhere).unwrap();
+    fs::remove_file(checkout.vault().join("config.yaml")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, checkout.vault().join("config.yaml")).unwrap();
+    let error = checkout.refused(&["read"], "MODEL_INVALID");
+    assert_eq!(
+        error["details"]["problems"][0],
+        json!({"file": "config.yaml", "subject": "config.yaml", "message": "is a symbolic link"})
+    );
+
+    let linked = Checkout::new();
+    shop(&linked);
+    let target = linked.path().join("bank.json");
+    fs::rename(linked.vault().join("modules/BankApi1.module.json"), &target).unwrap();
+    std::os::unix::fs::symlink(&target, linked.vault().join("modules/BankApi1.module.json"))
+        .unwrap();
+    let error = linked.refused(&["read"], "MODEL_INVALID");
+    let problems = error["details"]["problems"].as_array().unwrap();
+    assert!(
+        problems
+            .iter()
+            .any(|p| p["file"] == "modules/BankApi1.module.json"
+                && p["message"] == "is a symbolic link"),
+        "{problems:#?}"
+    );
+
+    // A linked folder is refused before anything is read through it.
+    let folder = Checkout::new();
+    shop(&folder);
+    let elsewhere = folder.path().join("elsewhere");
+    fs::rename(folder.vault().join("modules"), &elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, folder.vault().join("modules")).unwrap();
+    let error = folder.refused(&["read"], "MODEL_INVALID");
+    assert_eq!(
+        error["details"]["problems"],
+        json!([{"file": "modules", "subject": "modules", "message": "is a symbolic link"}])
+    );
+    let request = json!({"target": {"model": "x", "state": "y"}, "expected_revision": "z",
+        "operation_id": "op", "writer": "w", "changes": [{"type": "remove-module", "subject": "Bank"}]});
+    let (code, value) = folder.edit(&request);
+    assert_eq!(code, 2, "{value:#}");
+    assert_eq!(value["error"]["code"], "MODEL_INVALID");
+}
+
+#[test]
+fn edit_applies_every_change_type() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let q = |id: &str| format!("{model}#{id}");
+    let before = checkout.digest();
+
+    // A module added in the batch is referenced by name later in the same batch.
+    let out = checkout.edited(json!([
+        {"type": "add-module", "module": {"name": "Ledger", "kind": "service", "order": 2, "parent": "Billing", "description": "Books\nentries"}},
+        {"type": "add-relationship", "source": "Ledger", "relationship": {"to": "Bank", "kind": "call", "order": 0, "label": "settles"}},
+    ]));
+    assert_eq!(out["schema"], "boundrail/model/v1");
+    assert!(out["operation_id"].as_str().unwrap().starts_with("op-"));
+    assert_eq!(out["writer"], "tester");
+    assert_eq!(out["doing"], "testing edits");
+    assert_eq!(out["before"]["digest"], before);
+    assert_eq!(out["after"]["digest"], checkout.digest());
+    let ledger = out["allocated"][0]["id"].as_str().unwrap().to_owned();
+    let settles = out["allocated"][1]["id"].as_str().unwrap().to_owned();
+    assert_eq!(out["allocated"][0]["name"], "Ledger");
+    assert_eq!(
+        out["allocated"][1]["name"],
+        "relationship from Ledger to Bank"
+    );
+    let mut added = vec![ledger.clone(), settles.clone()];
+    added.sort();
+    assert_eq!(out["subjects"]["added"], json!(added));
+    assert_eq!(out["subjects"]["changed"], json!([]));
+    let local = ledger.split_once('#').unwrap().1.to_owned();
+    let file = checkout.read_module(&local);
+    assert_eq!(file["parent"], q("Billing1"));
+    assert_eq!(file["description"], "Books\nentries");
+    assert_eq!(file["outgoing"][0]["to"], q("BankApi1"));
+    assert_eq!(file["outgoing"][0]["label"], "settles");
+
+    let out = checkout.edited(json!([
+        {"type": "edit-module", "subject": "Ledger", "set": {"kind": "module", "order": 3, "responsibility": "Keeps the books"}, "clear": ["description"]},
+        {"type": "edit-relationship", "subject": q("RelBil01"), "set": {"label": "pays", "kind": "http", "emphasis": "hero"}},
+        {"type": "remove-relationship", "subject": "RelWeb01"},
+    ]));
+    assert_eq!(
+        out["subjects"]["changed"],
+        json!(sorted(&[
+            &ledger,
+            &q("Billing1"),
+            &q("RelBil01"),
+            &q("WebApp01")
+        ]))
+    );
+    assert_eq!(out["subjects"]["removed"], json!([q("RelWeb01")]));
+    let file = checkout.read_module(&local);
+    assert_eq!(file["kind"], "module");
+    assert_eq!(file["order"], 3);
+    assert_eq!(file["responsibility"], "Keeps the books");
+    assert!(file.get("description").is_none());
+    let billing = checkout.read_module("Billing1");
+    assert_eq!(
+        billing["outgoing"],
+        json!([{"id": "RelBil01", "to": q("BankApi1"), "kind": "http", "order": 0, "label": "pays", "emphasis": "hero"}])
+    );
+    assert_eq!(checkout.read_module("WebApp01")["outgoing"], json!([]));
+    let manifest = checkout.ok(&["read"])["manifest"].clone();
+    assert_eq!(manifest["retired_ids"], json!(["RelWeb01"]));
+
+    let out = checkout.edited(json!([{"type": "remove-module", "subject": ledger}]));
+    assert_eq!(
+        out["subjects"]["removed"],
+        json!(sorted(&[&ledger, &settles]))
+    );
+    assert!(
+        !checkout
+            .vault()
+            .join(format!("modules/{local}.module.json"))
+            .exists()
+    );
+    let retired = checkout.ok(&["read"])["manifest"]["retired_ids"].clone();
+    assert_eq!(retired.as_array().unwrap().len(), 3);
+}
+
+fn sorted(ids: &[&str]) -> Vec<String> {
+    let mut ids: Vec<String> = ids.iter().map(|id| (*id).to_owned()).collect();
+    ids.sort();
+    ids
+}
+
+#[test]
+fn rename_keeps_the_id_and_records_former_names() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    checkout.edited(
+        json!([{"type": "edit-module", "subject": "Billing", "set": {"name": "Payments"}}]),
+    );
+    let billing = checkout.read_module("Billing1");
+    assert_eq!(billing["name"], "Payments");
+    assert_eq!(billing["former_names"], json!(["Billing"]));
+    assert_eq!(
+        checkout.ok(&["read", "Billing"])["module"]["id"],
+        format!("{model}#Billing1")
+    );
+
+    // Renaming back drops the name from the former names and records the one it leaves.
+    checkout.edited(
+        json!([{"type": "edit-module", "subject": "Payments", "set": {"name": "Billing"}}]),
+    );
+    let billing = checkout.read_module("Billing1");
+    assert_eq!(billing["name"], "Billing");
+    assert_eq!(billing["former_names"], json!(["Payments"]));
+    checkout
+        .edited(json!([{"type": "edit-module", "subject": "Web", "set": {"name": "Storefront"}}]));
+    assert_eq!(
+        checkout.read_module("WebApp01")["former_names"],
+        json!(["Web"])
+    );
+}
+
+#[test]
+fn edit_moves_modules_and_refuses_containment_cycles() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let q = |id: &str| format!("{model}#{id}");
+    checkout.edited(json!([
+        {"type": "edit-module", "subject": "Bank", "set": {"parent": "Platform"}},
+        {"type": "edit-module", "subject": "Web", "clear": ["parent"]},
+    ]));
+    assert_eq!(checkout.read_module("BankApi1")["parent"], q("Platfrm1"));
+    assert!(checkout.read_module("WebApp01").get("parent").is_none());
+    assert_eq!(
+        checkout.ok(&["read"])["roots"],
+        json!([q("Platfrm1"), q("WebApp01")])
+    );
+
+    let request = checkout.request(json!([
+        {"type": "edit-module", "subject": "Platform", "set": {"parent": "Billing"}},
+    ]));
+    let error = checkout.edit_refused(&request, "MODEL_INVALID");
+    let problems = error["details"]["problems"].as_array().unwrap();
+    assert!(
+        problems.iter().any(|p| p["subject"] == "Platfrm1"
+            && p["change"] == 0
+            && p["message"].as_str().unwrap().contains("cycle")),
+        "{problems:#?}"
+    );
+}
+
+#[test]
+fn remove_module_takes_its_relationships_unless_the_batch_moves_them() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let q = |id: &str| format!("{model}#{id}");
+    let out = checkout.edited(json!([{"type": "remove-module", "subject": "Billing"}]));
+    assert_eq!(
+        out["subjects"]["removed"],
+        json!(sorted(&[&q("Billing1"), &q("RelBil01"), &q("RelWeb01")]))
+    );
+    assert_eq!(out["subjects"]["changed"], json!([q("WebApp01")]));
+    assert!(
+        !checkout
+            .vault()
+            .join("modules/Billing1.module.json")
+            .exists()
+    );
+    assert_eq!(checkout.read_module("WebApp01")["outgoing"], json!([]));
+    assert_eq!(
+        checkout.ok(&["read"])["manifest"]["retired_ids"],
+        json!(["Billing1", "RelBil01", "RelWeb01"])
+    );
+
+    // Later changes in the batch can still re-target incoming and move outgoing relationships.
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let q = |id: &str| format!("{model}#{id}");
+    let out = checkout.edited(json!([
+        {"type": "remove-module", "subject": "Billing"},
+        {"type": "edit-relationship", "subject": "RelWeb01", "set": {"to": "Bank"}},
+        {"type": "edit-relationship", "subject": "RelBil01", "source": "Platform"},
+    ]));
+    assert_eq!(out["subjects"]["removed"], json!([q("Billing1")]));
+    assert_eq!(
+        checkout.read_module("WebApp01")["outgoing"][0]["to"],
+        q("BankApi1")
+    );
+    assert_eq!(
+        checkout.read_module("Platfrm1")["outgoing"][0]["id"],
+        "RelBil01"
+    );
+}
+
+#[test]
+fn removing_a_parent_needs_its_children_removed_or_reparented() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let q = |id: &str| format!("{model}#{id}");
+    let request = checkout.request(json!([{"type": "remove-module", "subject": "Platform"}]));
+    let error = checkout.edit_refused(&request, "CHILDREN_ORPHANED");
+    assert_eq!(
+        error["details"]["children"],
+        json!([q("Billing1"), q("WebApp01")])
+    );
+
+    checkout.edited(json!([
+        {"type": "remove-module", "subject": "Platform"},
+        {"type": "edit-module", "subject": "Billing", "set": {"parent": "Bank"}},
+        {"type": "remove-module", "subject": "Web"},
+    ]));
+    assert_eq!(checkout.read_module("Billing1")["parent"], q("BankApi1"));
+    assert_eq!(checkout.ok(&["read"])["roots"], json!([q("BankApi1")]));
+}
+
+#[test]
+fn relationship_transfer_keeps_its_id() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let out = checkout.edited(json!([
+        {"type": "edit-relationship", "subject": format!("{model}#RelBil01"), "source": "Web", "set": {"order": 1}},
+    ]));
+    assert_eq!(out["allocated"], json!([]));
+    assert_eq!(checkout.read_module("Billing1")["outgoing"], json!([]));
+    let web = checkout.read_module("WebApp01");
+    let ids: Vec<_> = web["outgoing"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["RelWeb01", "RelBil01"]);
+    let read = checkout.ok(&["read", "Web"]);
+    assert_eq!(read["outgoing"][1]["id"], format!("{model}#RelBil01"));
+    assert_eq!(read["outgoing"][1]["from"], format!("{model}#WebApp01"));
+}
+
+#[test]
+fn edit_refusals_write_nothing() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let base =
+        checkout.request(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 5}}]));
+    let with = |key: &str, value: Value| {
+        let mut request = base.clone();
+        request[key] = value;
+        request
+    };
+
+    let error = checkout.edit_refused(
+        &with("expected_revision", "0".repeat(64).into()),
+        "STALE_REVISION",
+    );
+    assert_eq!(error["details"]["current"], checkout.digest());
+    checkout.edit_refused(
+        &with("target", json!({"model": model, "state": "Other001"})),
+        "TARGET_MISMATCH",
+    );
+    checkout.edit_refused(
+        &with(
+            "target",
+            json!({"model": "Other001", "state": base["target"]["state"]}),
+        ),
+        "TARGET_MISMATCH",
+    );
+
+    for doing in ["", "   ", "two\nlines", &"x".repeat(141)] {
+        let (code, stdout) = checkout.edit_with(&base, doing, &[]);
+        assert_eq!(code, 2, "{doing:?}");
+        let value: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(value["error"]["code"], "DOING_INVALID", "{doing:?}");
+    }
+
+    let change = |change: Value| with("changes", json!([change]));
+    let invalid = [
+        with("operation_id", "has space".into()),
+        with("operation_id", "x".repeat(65).into()),
+        with("writer", "".into()),
+        with("changes", json!([])),
+        with("surprise", true.into()),
+        change(json!({"type": "edit-module", "subject": "Bank", "bogus": 1})),
+        change(json!({"type": "rename-module", "subject": "Bank"})),
+        change(
+            json!({"type": "add-module", "module": {"id": "Chosen01", "name": "X", "kind": "service", "order": 0}}),
+        ),
+        change(
+            json!({"type": "edit-module", "subject": "Bank", "set": {"parent": "Platform"}, "clear": ["parent"]}),
+        ),
+        change(json!({"type": "edit-module", "subject": "Bank", "clear": ["name"]})),
+        change(
+            json!({"type": "edit-relationship", "subject": "RelBil01", "set": {"label": "x"}, "clear": ["label"]}),
+        ),
+        change(json!({"type": "edit-relationship", "subject": "RelBil01", "clear": ["kind"]})),
+        with(
+            "changes",
+            json!([
+                {"type": "edit-module", "subject": "Bank", "set": {"order": 5}},
+                {"type": "edit-module", "subject": "BankApi1", "set": {"order": 6}},
+            ]),
+        ),
+    ];
+    for request in &invalid {
+        checkout.edit_refused(request, "REQUEST_INVALID");
+    }
+
+    let error = checkout.edit_refused(
+        &with(
+            "changes",
+            json!([
+                {"type": "edit-module", "subject": "Bank", "set": {"order": 5}},
+                {"type": "remove-relationship", "subject": "Missing1"},
+            ]),
+        ),
+        "SUBJECT_NOT_FOUND",
+    );
+    assert_eq!(error["details"]["change"], 1);
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("changes[1]: ")
+    );
+    checkout.edit_refused(
+        &change(json!({"type": "remove-module", "subject": "Payments"})),
+        "SUBJECT_NOT_FOUND",
+    );
+    checkout.module(module("Storefr2", "Storefront", "app", 2));
+    let base = checkout.request(json!([]));
+    let mut ambiguous = base.clone();
+    ambiguous["changes"] = json!([{"type": "remove-module", "subject": "Storefront"}]);
+    let error = checkout.edit_refused(&ambiguous, "SUBJECT_AMBIGUOUS");
+    assert_eq!(error["details"]["change"], 0);
+    assert_eq!(error["details"]["matches"].as_array().unwrap().len(), 2);
+
+    let mut unknown_kind = base.clone();
+    unknown_kind["changes"] = json!([
+        {"type": "add-module", "module": {"name": "Fn", "kind": "lambda", "order": 0}},
+    ]);
+    let error = checkout.edit_refused(&unknown_kind, "MODEL_INVALID");
+    let problem = &error["details"]["problems"][0];
+    assert_eq!(problem["change"], 0);
+    assert!(problem["message"].as_str().unwrap().contains("node kind"));
+
+    let mut escape = base.clone();
+    escape["changes"] = json!([
+        {"type": "edit-module", "subject": "Bank", "set": {"name": "Bank\u{1b}[2J"}},
+    ]);
+    let error = checkout.edit_refused(&escape, "MODEL_INVALID");
+    assert!(
+        error["details"]["problems"][0]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("name needs 1 to 120 characters")
+    );
+    let mut blank = base.clone();
+    blank["changes"] = json!([{"type": "edit-module", "subject": "Bank", "set": {"name": ""}}]);
+    checkout.edit_refused(&blank, "MODEL_INVALID");
+
+    let mut oversized = base.clone();
+    oversized["writer"] = "x".repeat(4 * 1024 * 1024).into();
+    let error = checkout.edit_refused(&oversized, "REQUEST_INVALID");
+    assert!(error["message"].as_str().unwrap().contains("larger than"));
+    let mut many = base.clone();
+    many["changes"] = (0..1001)
+        .map(|_| json!({"type": "remove-relationship", "subject": "RelBil01"}))
+        .collect();
+    checkout.edit_refused(&many, "REQUEST_INVALID");
+}
+
+#[test]
+fn operation_ids_replay_their_receipt_or_refuse_another_request() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let request = checkout.request(json!([
+        {"type": "add-module", "module": {"name": "Ledger", "kind": "service", "order": 0}},
+    ]));
+    fs::write(checkout.path().join("request.json"), request.to_string()).unwrap();
+    let args = [
+        "edit",
+        "--input",
+        "request.json",
+        "--doing",
+        "add the ledger",
+    ];
+    let (code, first) = checkout.run_raw(&args);
+    assert_eq!(code, 0, "{first}");
+    let receipt = checkout
+        .path()
+        .join(".git/boundrail/operations")
+        .join(format!(
+            "{}.json",
+            request["operation_id"].as_str().unwrap()
+        ));
+    assert!(receipt.is_file());
+
+    // Another edit moves the revision on; the first operation still replays its receipt.
+    checkout.edited(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 4}}]));
+    let moved = checkout.digest();
+    let (code, again) = checkout.run_raw(&args);
+    assert_eq!(code, 0, "{again}");
+    assert_eq!(again, first);
+    assert_eq!(checkout.digest(), moved);
+    let modules = checkout.ok(&["read"])["modules"].as_array().unwrap().len();
+    assert_eq!(modules, 5);
+    let (code, text) = checkout.run_raw(&[
+        "edit",
+        "--input",
+        "request.json",
+        "--doing",
+        "add the ledger",
+        "--format",
+        "markdown",
+    ]);
+    assert_eq!(code, 0);
+    assert!(text.contains("by tester: add the ledger"), "{text}");
+    assert!(text.contains("for Ledger"), "{text}");
+
+    // A reworded --doing is the same request; the receipt keeps the original reason.
+    let (code, stdout) = checkout.edit_with(&request, "another reason", &[]);
+    assert_eq!(code, 0, "{stdout}");
+    assert_eq!(stdout, first);
+    let mut changed = request.clone();
+    changed["writer"] = "someone else".into();
+    let (code, stdout) = checkout.edit_with(&changed, "add the ledger", &[]);
+    assert_eq!(code, 2);
+    let value: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(value["error"]["code"], "OPERATION_REUSED");
+    assert_eq!(checkout.digest(), moved);
+}
+
+#[test]
+fn a_held_edit_lock_refuses() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let state = checkout.path().join(".git/boundrail");
+    fs::create_dir_all(&state).unwrap();
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(state.join("model.lock"))
+        .unwrap();
+    lock.try_lock().unwrap();
+    let request =
+        checkout.request(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 4}}]));
+    let error = checkout.edit_refused(&request, "VAULT_LOCKED");
+    assert!(
+        error["details"]["lock"]
+            .as_str()
+            .unwrap()
+            .ends_with("model.lock")
+    );
+
+    drop(lock);
+    let (code, value) = checkout.edit(&request);
+    assert_eq!(code, 0, "{value:#}");
+    assert!(!checkout.vault().join("model.lock").exists());
+}
+
+#[test]
+fn an_interrupted_edit_blocks_others_until_recovered() {
+    const STOP: (&str, &str) = ("BOUNDRAIL_TEST_STOP_AFTER_JOURNAL", "1");
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let request = checkout.request(json!([
+        {"type": "add-module", "module": {"name": "Ledger", "kind": "service", "order": 0}},
+        {"type": "remove-module", "subject": "Web"},
+    ]));
+    let before = checkout.digest();
+    // An error, not a refusal: nothing on stdout.
+    let (code, stdout) = checkout.edit_with(&request, "add the ledger", &[STOP]);
+    assert_eq!((code, stdout.as_str()), (2, ""));
+    assert_eq!(checkout.digest(), before);
+    let operation = request["operation_id"].as_str().unwrap();
+    let record_path = checkout
+        .path()
+        .join(format!(".git/boundrail/operations/{operation}.json"));
+    let read_record =
+        || -> Value { serde_json::from_str(&fs::read_to_string(&record_path).unwrap()).unwrap() };
+    let record = read_record();
+    assert_eq!(record["status"], "pending");
+    assert_eq!(record["before"], before);
+    let after = record["after"].clone();
+    assert_eq!(record["output"]["after"]["digest"], after);
+    let paths: Vec<_> = record["writes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths[0], "model.json", "the manifest is written first");
+    assert_eq!(*paths.last().unwrap(), "modules/WebApp01.module.json");
+
+    let other =
+        checkout.request(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 4}}]));
+    let error = checkout.edit_refused(&other, "RECOVERY_REQUIRED");
+    assert_eq!(error["details"]["operation_id"], operation);
+
+    let recovered = checkout.ok(&["recover"]);
+    assert_eq!(recovered["kind"], "recover");
+    assert_eq!(recovered["completed"][0]["operation_id"], operation);
+    assert_eq!(checkout.digest(), after);
+    assert!(
+        !checkout
+            .vault()
+            .join("modules/WebApp01.module.json")
+            .exists()
+    );
+    let retired = checkout.ok(&["read"])["manifest"]["retired_ids"].clone();
+    assert!(retired.as_array().unwrap().contains(&json!("WebApp01")));
+    let record = read_record();
+    assert_eq!(record["status"], "done");
+    assert!(record.get("writes").is_none());
+    assert_eq!(checkout.ok(&["recover"])["completed"], json!([]));
+
+    let (code, replayed) = checkout.edit(&request);
+    assert_eq!(code, 0, "{replayed:#}");
+    assert_eq!(replayed["after"]["digest"], after);
+    assert_eq!(replayed["doing"], "add the ledger");
+    assert!(
+        replayed["subjects"]["removed"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(format!("{model}#WebApp01")))
+    );
+    checkout.edited(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 4}}]));
+
+    // Replaying the interrupted operation itself also finishes it.
+    let again = Checkout::new();
+    shop(&again);
+    let request =
+        again.request(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 7}}]));
+    let (code, stdout) = again.edit_with(&request, "reorder", &[STOP]);
+    assert_eq!((code, stdout.as_str()), (2, ""));
+    let (code, value) = again.edit(&request);
+    assert_eq!(code, 0, "{value:#}");
+    assert_eq!(again.read_module("BankApi1")["order"], 7);
+    assert_eq!(value["after"]["digest"], again.digest());
+}
+
+#[test]
+fn editing_a_relationship_keeps_its_place() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    checkout.edited(json!([
+        {"type": "add-relationship", "source": "Billing", "relationship": {"to": "Platform", "kind": "call", "order": 1}},
+    ]));
+    checkout.edited(json!([
+        {"type": "edit-relationship", "subject": "RelBil01", "set": {"label": "pays"}},
+    ]));
+    let outgoing = checkout.read_module("Billing1")["outgoing"].clone();
+    assert_eq!(outgoing.as_array().unwrap().len(), 2);
+    assert_eq!(outgoing[0]["id"], "RelBil01");
+    assert_eq!(outgoing[0]["label"], "pays");
+}
+
+#[test]
+fn the_model_edit_schema_validates_a_request() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let request = checkout.request(json!([
+        {"type": "add-module", "module": {"name": "Ledger", "kind": "service", "order": 0, "parent": "Billing", "groups": [], "binding": {"path": "src/ledger"}}},
+        {"type": "edit-module", "subject": "Ledger", "set": {"name": "Books", "order": 1}, "clear": ["binding"]},
+        {"type": "add-relationship", "source": "Books", "relationship": {"to": "Bank", "kind": "call", "order": 0, "emphasis": "muted", "anchor": {"path": "src/ledger.rs", "symbol": "settle"}}},
+        {"type": "edit-relationship", "subject": format!("{model}#RelWeb01"), "source": "Platform", "set": {"label": "routes"}, "clear": ["description"]},
+        {"type": "remove-relationship", "subject": "RelBil01"},
+        {"type": "remove-module", "subject": "Bank"},
+    ]));
+    let (code, schema) = checkout.run(&["schema", "model-edit"]);
+    assert_eq!(code, 0);
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let errors: Vec<_> = validator
+        .iter_errors(&request)
+        .map(|e| e.to_string())
+        .collect();
+    assert!(errors.is_empty(), "{errors:#?}");
+    checkout.edited(request["changes"].clone());
+
+    for (key, value) in [
+        ("operation_id", json!("has space")),
+        ("surprise", json!(true)),
+        (
+            "changes",
+            json!([{"type": "edit-module", "subject": "Bank", "clear": ["name"]}]),
+        ),
+        (
+            "changes",
+            json!([{"type": "remove-module", "subject": "Bank", "bogus": 1}]),
+        ),
+    ] {
+        let mut bad = request.clone();
+        bad[key] = value;
+        assert!(!validator.is_valid(&bad), "{key}");
+    }
 }

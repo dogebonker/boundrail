@@ -19,11 +19,13 @@ pub fn qualify(model: &str, local: &str) -> String {
     format!("{model}#{local}")
 }
 
-/// A fresh local ID that `taken` (existing and retired IDs) does not hold.
+/// A fresh local ID that `taken` (existing and retired IDs) does not hold. Module files are named
+/// by ID and collide on case-insensitive file systems, so `taken` is asked about the candidate in
+/// ASCII lowercase and must answer for the lowercase forms of the IDs it holds.
 pub fn allocate(taken: impl Fn(&str) -> bool) -> Result<String> {
     for _ in 0..ATTEMPTS {
         let id = candidate();
-        if !taken(&id) {
+        if !taken(&id.to_ascii_lowercase()) {
             return Ok(id);
         }
     }
@@ -84,6 +86,17 @@ mod tests {
         assert_eq!(calls.get(), 4);
         assert!(!rejected.borrow().contains(&id));
         assert!(is_local(&id));
+    }
+
+    #[test]
+    fn allocation_asks_about_the_lowercase_candidate() {
+        let asked = RefCell::new(String::new());
+        let id = allocate(|candidate| {
+            asked.replace(candidate.to_owned());
+            false
+        })
+        .unwrap();
+        assert_eq!(*asked.borrow(), id.to_ascii_lowercase());
     }
 
     #[test]

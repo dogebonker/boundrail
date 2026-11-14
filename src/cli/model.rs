@@ -1,8 +1,11 @@
 use super::*;
+use std::io::Read as _;
+
+use boundrail::arch::edit::{self, Receipt};
 use boundrail::arch::types::{self, SCHEMAS};
 use boundrail::arch::vault::{self, Model, ModuleView, RelationshipView};
 use boundrail::arch::{Code, Refusal};
-use serde_json::json;
+use serde_json::{Value, json};
 
 const MODEL_SCHEMA: &str = "boundrail/model/v1";
 
@@ -29,8 +32,19 @@ enum ModelCmd {
         /// Qualified ID, local ID, or a unique current or former module name
         subject: Option<String>,
     },
-    /// List the vault file schemas, or print one as JSON Schema
+    /// List the vault file and request schemas, or print one as JSON Schema
     Schema { name: Option<String> },
+    /// Apply a batch of module and relationship changes (schema `model-edit`)
+    Edit {
+        /// Request file; `-` or absent reads standard input
+        #[arg(long)]
+        input: Option<PathBuf>,
+        /// One line saying why the model changes, 1 to 140 characters
+        #[arg(long)]
+        doing: String,
+    },
+    /// Finish edits that a crash or failed write left partly applied
+    Recover,
 }
 
 /// A refusal is printed on stdout and exits with code 2; other errors go to main's handler.
@@ -163,6 +177,81 @@ fn execute(args: ModelArgs) -> Result<()> {
             })?;
             write(None, &schema)
         }
+        ModelCmd::Edit { input, doing } => {
+            let dir = vault::locate(&args.root)?;
+            // One byte past the limit is enough for `edit::run` to refuse an oversized request.
+            let mut request = Vec::new();
+            match input.as_deref() {
+                Some(path) if path != Path::new("-") => fs::File::open(path)
+                    .and_then(|file| file.take(edit::INPUT_MAX + 1).read_to_end(&mut request))
+                    .with_context(|| format!("reading {}", path.display()))?,
+                _ => std::io::stdin()
+                    .take(edit::INPUT_MAX + 1)
+                    .read_to_end(&mut request)
+                    .context("reading the edit request from standard input")?,
+            };
+            let receipt = edit::run(&dir, &request, &doing)?;
+            if markdown {
+                print_receipt(&receipt);
+                return Ok(());
+            }
+            let mut output = json!({
+                "schema": MODEL_SCHEMA,
+                "kind": "edit",
+                "success": true,
+                "vault": dir,
+            });
+            if let (Some(envelope), Value::Object(fields)) =
+                (output.as_object_mut(), serde_json::to_value(&receipt)?)
+            {
+                envelope.extend(fields);
+            }
+            write(None, &output)
+        }
+        ModelCmd::Recover => {
+            let dir = vault::locate(&args.root)?;
+            let completed = edit::recover(&dir)?;
+            if markdown {
+                if completed.is_empty() {
+                    println!("No interrupted edits");
+                }
+                completed.iter().for_each(print_receipt);
+                return Ok(());
+            }
+            write(
+                None,
+                &json!({
+                    "schema": MODEL_SCHEMA,
+                    "kind": "recover",
+                    "success": true,
+                    "vault": dir,
+                    "completed": completed,
+                }),
+            )
+        }
+    }
+}
+
+fn print_receipt(receipt: &Receipt) {
+    println!(
+        "Edit {} by {}: {}",
+        receipt.operation_id, receipt.writer, receipt.doing
+    );
+    println!(
+        "revision {} -> {}",
+        receipt.before.digest, receipt.after.digest
+    );
+    for (label, list) in [
+        ("added", &receipt.subjects.added),
+        ("changed", &receipt.subjects.changed),
+        ("removed", &receipt.subjects.removed),
+    ] {
+        if !list.is_empty() {
+            println!("{label}: {}", list.join(", "));
+        }
+    }
+    for allocation in &receipt.allocated {
+        println!("allocated {} for {}", allocation.id, allocation.name);
     }
 }
 

@@ -6,8 +6,8 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
-use serde::Serialize;
+use anyhow::{Context, Result, ensure};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::revision::{self, Revision};
@@ -15,7 +15,7 @@ use super::types::{
     Anchor, Binding, DESCRIPTION_MAX, Emphasis, LABEL_MAX, Manifest, Module, RESPONSIBILITY_MAX,
     Relationship, SCHEMA_VERSION, State, VaultConfig,
 };
-use super::{Code, Refusal, ids};
+use super::{Code, Refusal, ids, one_line};
 use crate::history::{refuse_symlink, write_atomic};
 
 /// Boundrail's state folder at the checkout root, and the vault folder inside it.
@@ -26,6 +26,7 @@ const CONFIG: &str = "config.yaml";
 const MODULES: &str = "modules";
 const MODULE_SUFFIX: &str = ".module.json";
 const CURRENT: &str = "Current";
+/// The longest model or module name.
 const NAME_MAX: usize = 120;
 
 #[derive(Debug)]
@@ -44,6 +45,9 @@ pub struct Problem {
     pub file: String,
     pub subject: String,
     pub message: String,
+    /// The index of the edit change that last touched `subject`, when an edit caused it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub change: Option<usize>,
 }
 
 #[derive(Default)]
@@ -55,6 +59,7 @@ impl Problems {
             file: file.to_owned(),
             subject: subject.to_owned(),
             message: message.into(),
+            change: None,
         });
     }
 }
@@ -81,8 +86,7 @@ fn file_json(value: &impl Serialize) -> Result<String> {
 /// A model name trimmed of surrounding space: non-empty, at most 120 characters, no controls.
 fn valid_name(name: &str) -> Result<&str> {
     let name = name.trim();
-    let count = name.chars().count();
-    if count == 0 || count > NAME_MAX || name.chars().any(char::is_control) {
+    if !one_line(name, NAME_MAX) {
         return Err(Refusal::new(
             Code::NameInvalid,
             format!("a model name needs 1 to {NAME_MAX} characters and no control characters"),
@@ -122,7 +126,7 @@ pub fn init(start: &Path, name: &str) -> Result<Model> {
 fn populate(dir: &Path, name: &str) -> Result<()> {
     fs::create_dir(dir.join(MODULES)).with_context(|| format!("creating {MODULES}"))?;
     let id = ids::allocate(|_| false)?;
-    let current = ids::allocate(|candidate| candidate == id)?;
+    let current = ids::allocate(|candidate| candidate == id.to_ascii_lowercase())?;
     let manifest = Manifest {
         schema_version: SCHEMA_VERSION,
         id,
@@ -138,27 +142,78 @@ fn populate(dir: &Path, name: &str) -> Result<()> {
     write_atomic(&dir.join(MANIFEST), file_json(&manifest)?.as_bytes())
 }
 
-/// Loads the vault of the checkout around `start`, refusing a model with any problem.
-pub fn load(start: &Path) -> Result<Model> {
-    load_dir(checkout_root(start)?.join(STATE).join(VAULT))
+/// The vault folder of the checkout around `start`, refusing when no vault exists there.
+pub fn locate(start: &Path) -> Result<PathBuf> {
+    let dir = checkout_root(start)?.join(STATE).join(VAULT);
+    match fs::symlink_metadata(&dir) {
+        Ok(_) => Ok(dir),
+        Err(e) if e.kind() == ErrorKind::NotFound => Err(not_found(&dir)),
+        Err(e) => Err(e).with_context(|| format!("reading {}", dir.display())),
+    }
 }
 
-fn load_dir(dir: PathBuf) -> Result<Model> {
+fn not_found(dir: &Path) -> anyhow::Error {
+    Refusal::new(
+        Code::VaultNotFound,
+        format!(
+            "no model vault at {}; create one with `boundrail model init --name <name>`",
+            dir.display()
+        ),
+    )
+    .into()
+}
+
+/// Loads the vault of the checkout around `start`, refusing a model with any problem.
+pub fn load(start: &Path) -> Result<Model> {
+    load_dir(locate(start)?)
+}
+
+const LINKED: &str = "is a symbolic link";
+
+/// The state, vault and modules folders by their vault-relative paths.
+fn folders(dir: &Path) -> [(&'static str, PathBuf); 3] {
+    [
+        ("..", dir.parent().unwrap_or(dir).to_path_buf()),
+        (".", dir.to_path_buf()),
+        (MODULES, dir.join(MODULES)),
+    ]
+}
+
+fn is_link(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+}
+
+/// Refuses to write through a linked state, vault or modules folder.
+fn refuse_links(dir: &Path) -> Result<()> {
+    folders(dir)
+        .iter()
+        .try_for_each(|(_, path)| refuse_symlink(path))
+}
+
+pub(super) fn load_dir(dir: PathBuf) -> Result<Model> {
+    // A linked folder could point reads outside the checkout, so nothing is read through it.
+    let mut problems = Problems::default();
+    for (path, folder) in folders(&dir) {
+        if is_link(&folder) {
+            problems.push(path, path, LINKED);
+        }
+    }
+    if !problems.0.is_empty() {
+        return Err(invalid(&dir, problems.0));
+    }
     // Each file is read once: the revision and the parsed model come from the same bytes.
     let mut inputs: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut problems = Problems::default();
     for path in [MANIFEST, CONFIG] {
-        match fs::read(dir.join(path)) {
-            Ok(bytes) => inputs.push((path.to_owned(), bytes)),
+        let file = dir.join(path);
+        match fs::symlink_metadata(&file) {
+            Ok(meta) if meta.is_file() => {
+                let bytes = fs::read(&file).with_context(|| format!("reading {path}"))?;
+                inputs.push((path.to_owned(), bytes));
+            }
+            Ok(meta) if meta.file_type().is_symlink() => problems.push(path, path, LINKED),
+            Ok(_) => problems.push(path, path, "is not a regular file"),
             Err(e) if e.kind() == ErrorKind::NotFound && path == MANIFEST => {
-                return Err(Refusal::new(
-                    Code::VaultNotFound,
-                    format!(
-                        "no model vault at {}; create one with `boundrail model init --name <name>`",
-                        dir.display()
-                    ),
-                )
-                .into());
+                return Err(not_found(&dir));
             }
             Err(e) if e.kind() == ErrorKind::NotFound => {
                 problems.push(path, path, "file is missing");
@@ -172,11 +227,19 @@ fn load_dir(dir: PathBuf) -> Result<Model> {
         Ok(entries) => {
             for entry in entries {
                 let entry = entry?;
-                if let Some(name) = entry.file_name().to_str()
-                    && name.ends_with(MODULE_SUFFIX)
-                    && entry.file_type()?.is_file()
-                {
-                    names.push(name.to_owned());
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                if !name.ends_with(MODULE_SUFFIX) {
+                    continue;
+                }
+                // `file_type` does not follow links: a linked module file is reported, not read.
+                let kind = entry.file_type()?;
+                let path = format!("{MODULES}/{name}");
+                if kind.is_symlink() {
+                    problems.push(&path, file_subject(&path), LINKED);
+                } else if kind.is_file() {
+                    names.push(name);
                 }
             }
         }
@@ -196,27 +259,15 @@ fn load_dir(dir: PathBuf) -> Result<Model> {
     let mut modules = Vec::new();
     for (path, bytes) in &inputs {
         let parsed = match path.as_str() {
-            MANIFEST => match serde_json::from_slice(bytes) {
-                Ok(m) => {
-                    manifest = Some(m);
-                    Ok(())
-                }
-                Err(e) => Err(e.to_string()),
-            },
-            CONFIG => match serde_yaml_ng::from_slice(bytes) {
-                Ok(c) => {
-                    config = Some(c);
-                    Ok(())
-                }
-                Err(e) => Err(e.to_string()),
-            },
-            _ => match serde_json::from_slice::<Module>(bytes) {
-                Ok(m) => {
-                    modules.push((path.as_str(), m));
-                    Ok(())
-                }
-                Err(e) => Err(e.to_string()),
-            },
+            MANIFEST => serde_json::from_slice(bytes)
+                .map(|m| manifest = Some(m))
+                .map_err(|e| parse_message(&e)),
+            CONFIG => serde_yaml_ng::from_slice(bytes)
+                .map(|c| config = Some(c))
+                .map_err(|e| parse_message(&e)),
+            _ => serde_json::from_slice::<Module>(bytes)
+                .map(|m| modules.push((path.as_str(), m)))
+                .map_err(|e| parse_message(&e)),
         };
         if let Err(message) = parsed {
             problems.push(
@@ -226,13 +277,8 @@ fn load_dir(dir: PathBuf) -> Result<Model> {
             );
         }
     }
-    check_ids(manifest.as_ref(), &modules, &mut problems);
-    for (file, module) in &modules {
-        check_module(file, module, config.as_ref(), &mut problems);
-    }
-    if let Some(m) = &manifest {
-        check_containment(&m.id, &modules, &mut problems);
-    }
+    let pairs: Vec<(&str, &Module)> = modules.iter().map(|(f, m)| (*f, m)).collect();
+    check(manifest.as_ref(), config.as_ref(), &pairs, &mut problems);
     let problems = problems.0;
     match (manifest, config) {
         (Some(manifest), Some(config)) if problems.is_empty() => {
@@ -246,18 +292,151 @@ fn load_dir(dir: PathBuf) -> Result<Model> {
                 revision,
             })
         }
-        _ => Err(Refusal::new(
-            Code::ModelInvalid,
-            format!(
-                "the model at {} has {} problem{}",
-                dir.display(),
-                problems.len(),
-                if problems.len() == 1 { "" } else { "s" }
-            ),
-        )
-        .with_details(json!({ "problems": problems }))
-        .into()),
+        _ => Err(invalid(&dir, problems)),
     }
+}
+
+/// `MODEL_INVALID` listing every problem.
+pub(super) fn invalid(dir: &Path, problems: Vec<Problem>) -> anyhow::Error {
+    Refusal::new(
+        Code::ModelInvalid,
+        format!(
+            "the model at {} has {} problem{}",
+            dir.display(),
+            problems.len(),
+            if problems.len() == 1 { "" } else { "s" }
+        ),
+    )
+    .with_details(json!({ "problems": problems }))
+    .into()
+}
+
+/// A parser's message cut to its first line, with control characters escaped, so a refusal
+/// never replays file content into a terminal.
+pub(super) fn parse_message(error: &impl std::fmt::Display) -> String {
+    let text = error.to_string();
+    text.lines()
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .fold(String::new(), |mut out, c| {
+            if c.is_control() {
+                out.extend(c.escape_debug());
+            } else {
+                out.push(c);
+            }
+            out
+        })
+}
+
+/// Every problem of an in-memory model, as `load` would report it after writing the model.
+pub(super) fn problems(
+    manifest: &Manifest,
+    config: &VaultConfig,
+    modules: &[Module],
+) -> Vec<Problem> {
+    let files: Vec<String> = modules.iter().map(|m| module_file(&m.id)).collect();
+    let pairs: Vec<(&str, &Module)> = files.iter().map(String::as_str).zip(modules).collect();
+    let mut problems = Problems::default();
+    check(Some(manifest), Some(config), &pairs, &mut problems);
+    problems.0
+}
+
+fn check(
+    manifest: Option<&Manifest>,
+    config: Option<&VaultConfig>,
+    modules: &[(&str, &Module)],
+    problems: &mut Problems,
+) {
+    check_ids(manifest, modules, problems);
+    for (file, module) in modules {
+        check_module(file, module, config, problems);
+    }
+    if let Some(m) = manifest {
+        check_text(
+            problems,
+            MANIFEST,
+            &m.id,
+            "name",
+            Some(&m.name),
+            None,
+            false,
+        );
+        check_text(
+            problems,
+            MANIFEST,
+            &m.current.id,
+            "state name",
+            Some(&m.current.name),
+            None,
+            false,
+        );
+        check_containment(&m.id, modules, problems);
+    }
+}
+
+fn module_file(id: &str) -> String {
+    format!("{MODULES}/{id}{MODULE_SUFFIX}")
+}
+
+/// One vault file an edit writes: its vault-relative path and new contents, `None` to delete it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct FileWrite {
+    pub(super) path: String,
+    pub(super) content: Option<String>,
+}
+
+/// The writes that store `manifest` (when given) and `modules` and delete the `removed` module
+/// files, in the order they apply: the manifest first, so retired IDs are recorded before any
+/// file leaves, then the modules, then the deletions.
+pub(super) fn plan_writes(
+    manifest: Option<&Manifest>,
+    modules: &[&Module],
+    removed: &[&str],
+) -> Result<Vec<FileWrite>> {
+    let mut writes = Vec::with_capacity(modules.len() + removed.len() + 1);
+    if let Some(manifest) = manifest {
+        writes.push(FileWrite {
+            path: MANIFEST.to_owned(),
+            content: Some(file_json(manifest)?),
+        });
+    }
+    for module in modules {
+        writes.push(FileWrite {
+            path: module_file(&module.id),
+            content: Some(file_json(module)?),
+        });
+    }
+    writes.extend(removed.iter().map(|id| FileWrite {
+        path: module_file(id),
+        content: None,
+    }));
+    Ok(writes)
+}
+
+/// Applies `writes` in order. Each one sets a file's whole contents or deletes it, so a journal
+/// can apply the same writes again after an interruption.
+pub(super) fn apply_writes(dir: &Path, writes: &[FileWrite]) -> Result<()> {
+    refuse_links(dir)?;
+    for write in writes {
+        let path = write.path.as_str();
+        ensure!(
+            path == MANIFEST
+                || (path.starts_with(&format!("{MODULES}/")) && ids::is_local(file_subject(path))),
+            "`{path}` is not a vault file an edit writes"
+        );
+        let file = dir.join(path);
+        match &write.content {
+            Some(content) => write_atomic(&file, content.as_bytes())
+                .with_context(|| format!("writing {path}"))?,
+            None => match fs::remove_file(&file) {
+                Ok(()) => {}
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => return Err(e).with_context(|| format!("removing {path}")),
+            },
+        }
+    }
+    Ok(())
 }
 
 fn file_subject(path: &str) -> &str {
@@ -268,7 +447,7 @@ fn file_subject(path: &str) -> &str {
 
 /// Every allocated ID (model, state, module, relationship) shares one namespace: each must be
 /// well formed, unique and not retired.
-fn check_ids(manifest: Option<&Manifest>, modules: &[(&str, Module)], problems: &mut Problems) {
+fn check_ids(manifest: Option<&Manifest>, modules: &[(&str, &Module)], problems: &mut Problems) {
     let retired: BTreeSet<&str> = manifest
         .map(|m| m.retired_ids.iter().map(String::as_str).collect())
         .unwrap_or_default();
@@ -331,37 +510,62 @@ fn check_module(
     if file_subject(file) != id {
         problems.push(file, id, format!("file name does not match ID {id}"));
     }
-    let mut limit = |field: &str, value: Option<&str>, max: usize, subject: &str| {
-        if let Some(n) = value.map(|v| v.chars().count())
-            && n > max
-        {
-            problems.push(
-                file,
-                subject,
-                format!("{field} has {n} characters, more than {max}"),
-            );
-        }
+    if !one_line(&module.name, NAME_MAX) {
+        problems.push(
+            file,
+            id,
+            format!("name needs 1 to {NAME_MAX} characters and no control characters"),
+        );
+    }
+    let text = |problems: &mut Problems, field: &str, value: Option<&str>, max, subject: &str| {
+        check_text(problems, file, subject, field, value, max, false);
     };
-    limit(
+    let description = |problems: &mut Problems, value: Option<&str>, subject: &str| {
+        check_text(
+            problems,
+            file,
+            subject,
+            "description",
+            value,
+            Some(DESCRIPTION_MAX),
+            true,
+        );
+    };
+    text(problems, "kind", Some(&module.kind), None, id);
+    text(
+        problems,
         "responsibility",
         module.responsibility.as_deref(),
-        RESPONSIBILITY_MAX,
+        Some(RESPONSIBILITY_MAX),
         id,
     );
-    limit(
-        "description",
-        module.description.as_deref(),
-        DESCRIPTION_MAX,
-        id,
-    );
+    description(problems, module.description.as_deref(), id);
+    for name in &module.former_names {
+        text(problems, "former name", Some(name), None, id);
+    }
+    for group in &module.groups {
+        text(problems, "group", Some(group), None, id);
+    }
+    if let Some(b) = &module.binding {
+        text(problems, "binding repo", b.repo.as_deref(), None, id);
+        text(problems, "binding path", Some(&b.path), None, id);
+        text(problems, "binding symbol", b.symbol.as_deref(), None, id);
+    }
     for r in &module.outgoing {
-        limit("label", r.label.as_deref(), LABEL_MAX, &r.id);
-        limit(
-            "description",
-            r.description.as_deref(),
-            DESCRIPTION_MAX,
+        text(problems, "kind", Some(&r.kind), None, &r.id);
+        text(
+            problems,
+            "label",
+            r.label.as_deref(),
+            Some(LABEL_MAX),
             &r.id,
         );
+        description(problems, r.description.as_deref(), &r.id);
+        if let Some(a) = &r.anchor {
+            text(problems, "anchor repo", a.repo.as_deref(), None, &r.id);
+            text(problems, "anchor path", Some(&a.path), None, &r.id);
+            text(problems, "anchor symbol", Some(&a.symbol), None, &r.id);
+        }
     }
     let Some(config) = config else {
         return;
@@ -393,8 +597,44 @@ fn check_module(
     }
 }
 
+/// An authored string within its length limit and free of control characters; a `multiline`
+/// one may hold line breaks and tabs.
+fn check_text(
+    problems: &mut Problems,
+    file: &str,
+    subject: &str,
+    field: &str,
+    value: Option<&str>,
+    max: Option<usize>,
+    multiline: bool,
+) {
+    let Some(value) = value else {
+        return;
+    };
+    let count = value.chars().count();
+    if let Some(max) = max
+        && count > max
+    {
+        problems.push(
+            file,
+            subject,
+            format!("{field} has {count} characters, more than {max}"),
+        );
+    }
+    if value
+        .chars()
+        .any(|c| c.is_control() && !(multiline && matches!(c, '\n' | '\t')))
+    {
+        problems.push(
+            file,
+            subject,
+            format!("{field} contains a control character"),
+        );
+    }
+}
+
 /// Parents and relationship targets name modules of this model, and containment has no cycle.
-fn check_containment(model: &str, modules: &[(&str, Module)], problems: &mut Problems) {
+fn check_containment(model: &str, modules: &[(&str, &Module)], problems: &mut Problems) {
     let parents: BTreeMap<String, Option<&str>> = modules
         .iter()
         .map(|(_, module)| (ids::qualify(model, &module.id), module.parent.as_deref()))
@@ -482,6 +722,48 @@ pub struct Selection<'a> {
 }
 
 type Children<'a> = BTreeMap<Option<&'a str>, Vec<&'a Module>>;
+
+/// The module `subject` names in the model with ID `model`: its qualified or local ID, else its
+/// unique current or former name.
+pub fn find<'a, I>(model: &str, modules: I, subject: &str) -> Result<&'a Module, Refusal>
+where
+    I: IntoIterator<Item = &'a Module>,
+    I::IntoIter: Clone,
+{
+    let modules = modules.into_iter();
+    let by_id: Vec<&Module> = modules
+        .clone()
+        .filter(|m| m.id == subject || ids::qualify(model, &m.id) == subject)
+        .collect();
+    let matches = if by_id.is_empty() {
+        modules
+            .filter(|m| m.name == subject || m.former_names.iter().any(|n| n == subject))
+            .collect()
+    } else {
+        by_id
+    };
+    match matches.as_slice() {
+        [module] => Ok(module),
+        [] => Err(Refusal::new(
+            Code::SubjectNotFound,
+            format!("no module has the ID or name `{subject}`"),
+        )),
+        _ => {
+            let listed: Vec<_> = matches
+                .iter()
+                .map(|m| json!({"id": ids::qualify(model, &m.id), "name": m.name, "former_names": m.former_names}))
+                .collect();
+            Err(Refusal::new(
+                Code::SubjectAmbiguous,
+                format!(
+                    "{} modules match `{subject}`; name one by ID",
+                    matches.len()
+                ),
+            )
+            .with_details(json!({ "matches": listed })))
+        }
+    }
+}
 
 impl Model {
     pub fn qualify(&self, local: &str) -> String {
@@ -584,46 +866,9 @@ impl Model {
         }
     }
 
-    /// The module `subject` names: its qualified or local ID, else its current or a former name.
+    /// The module `subject` names, with its parts and the relationships that touch it.
     pub fn select(&self, subject: &str) -> Result<Selection<'_>> {
-        let by_id: Vec<&Module> = self
-            .modules
-            .iter()
-            .filter(|m| m.id == subject || self.qualify(&m.id) == subject)
-            .collect();
-        let matches = if by_id.is_empty() {
-            self.modules
-                .iter()
-                .filter(|m| m.name == subject || m.former_names.iter().any(|n| n == subject))
-                .collect()
-        } else {
-            by_id
-        };
-        let module = match matches.as_slice() {
-            [module] => *module,
-            [] => {
-                return Err(Refusal::new(
-                    Code::SubjectNotFound,
-                    format!("no module has the ID or name `{subject}`"),
-                )
-                .into());
-            }
-            _ => {
-                let listed: Vec<_> = matches
-                    .iter()
-                    .map(|m| json!({"id": self.qualify(&m.id), "name": m.name, "former_names": m.former_names}))
-                    .collect();
-                return Err(Refusal::new(
-                    Code::SubjectAmbiguous,
-                    format!(
-                        "{} modules match `{subject}`; name one by ID",
-                        matches.len()
-                    ),
-                )
-                .with_details(json!({ "matches": listed }))
-                .into());
-            }
-        };
+        let module = find(&self.manifest.id, &self.modules, subject)?;
         let children = self.children();
         let id = self.qualify(&module.id);
         Ok(Selection {
@@ -678,6 +923,14 @@ mod tests {
   ]
 }
 "#
+        );
+    }
+
+    #[test]
+    fn parse_messages_keep_one_line_and_escape_control_characters() {
+        assert_eq!(
+            parse_message(&"unknown field `a\u{1b}[31m`\nsecond line"),
+            "unknown field `a\\u{1b}[31m`"
         );
     }
 

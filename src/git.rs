@@ -66,6 +66,12 @@ pub fn toplevel(root: &Path) -> Result<PathBuf> {
     std::fs::canonicalize(path.trim_end_matches(['\n', '\r'])).context("resolving the Git root")
 }
 
+/// The absolute Git directory of the work tree containing `root`.
+pub fn git_dir(root: &Path) -> Result<PathBuf> {
+    let path = text(root, &["rev-parse", "--absolute-git-dir"])?;
+    Ok(PathBuf::from(path.trim_end_matches(['\n', '\r'])))
+}
+
 /// The full hash of the commit `rev` names.
 pub fn resolve(root: &Path, rev: &str) -> Result<String> {
     Ok(text(

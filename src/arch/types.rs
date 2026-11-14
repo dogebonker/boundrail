@@ -91,7 +91,7 @@ pub enum Evidence {
 }
 
 /// `modules/<id>.module.json`: one module and the relationships it owns.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Module {
     #[schemars(range(min = 1, max = 1))]
@@ -122,7 +122,7 @@ pub struct Module {
 }
 
 /// The code a module stands for.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Binding {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -132,7 +132,7 @@ pub struct Binding {
     pub symbol: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Relationship {
     #[schemars(pattern(LOCAL_ID))]
@@ -163,7 +163,7 @@ pub enum Emphasis {
 }
 
 /// The code site that carries a relationship.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Anchor {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -238,8 +238,9 @@ impl Default for VaultConfig {
 /// Builds one vault file format's JSON Schema.
 pub type SchemaFn = fn() -> Schema;
 
-/// Every vault file format by its `model schema` name.
-pub const SCHEMAS: [(&str, SchemaFn); 3] = [
+/// Every vault file format and the edit request, by its `model schema` name.
+pub const SCHEMAS: [(&str, SchemaFn); 4] = [
+    ("model-edit", root::<super::edit::EditRequest>),
     ("model-manifest", root::<Manifest>),
     ("module", root::<Module>),
     ("vault-config", root::<VaultConfig>),

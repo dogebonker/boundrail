@@ -1,6 +1,7 @@
 //! The authored architecture model: modules and relationships that agents write in
 //! `.boundrail/model/` and that Boundrail checks against the code.
 
+pub mod edit;
 pub mod ids;
 pub mod revision;
 pub mod types;
@@ -10,6 +11,11 @@ use std::fmt;
 
 use serde::{Serialize, Serializer};
 use serde_json::Value;
+
+/// Whether `text` is one line of 1 to `max` characters: not blank and free of control characters.
+pub fn one_line(text: &str, max: usize) -> bool {
+    !text.trim().is_empty() && text.chars().count() <= max && !text.chars().any(char::is_control)
+}
 
 /// Why a model command declined to act. The CLI prints it on stdout and exits with code 2.
 #[derive(Debug)]
@@ -29,6 +35,14 @@ pub enum Code {
     SubjectNotFound,
     SubjectAmbiguous,
     SchemaNotFound,
+    DoingInvalid,
+    RequestInvalid,
+    TargetMismatch,
+    StaleRevision,
+    ChildrenOrphaned,
+    VaultLocked,
+    OperationReused,
+    RecoveryRequired,
 }
 
 impl Code {
@@ -42,6 +56,14 @@ impl Code {
             Code::SubjectNotFound => "SUBJECT_NOT_FOUND",
             Code::SubjectAmbiguous => "SUBJECT_AMBIGUOUS",
             Code::SchemaNotFound => "SCHEMA_NOT_FOUND",
+            Code::DoingInvalid => "DOING_INVALID",
+            Code::RequestInvalid => "REQUEST_INVALID",
+            Code::TargetMismatch => "TARGET_MISMATCH",
+            Code::StaleRevision => "STALE_REVISION",
+            Code::ChildrenOrphaned => "CHILDREN_ORPHANED",
+            Code::VaultLocked => "VAULT_LOCKED",
+            Code::OperationReused => "OPERATION_REUSED",
+            Code::RecoveryRequired => "RECOVERY_REQUIRED",
         }
     }
 }
