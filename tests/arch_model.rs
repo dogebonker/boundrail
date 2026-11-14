@@ -4441,3 +4441,341 @@ fn render_refuses_flags_that_do_not_go_together() {
     assert!(stdout.starts_with("REQUEST_INVALID: "), "{stdout}");
     checkout.refused(&["render", "--flow", "Nowhere"], "SUBJECT_NOT_FOUND");
 }
+
+/// Writes `files` into the checkout.
+fn sources(checkout: &Checkout, files: &[(&str, &str)]) {
+    for (path, text) in files {
+        let file = checkout.path().join(path);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, text).unwrap();
+    }
+}
+
+/// A committed TypeScript checkout on `main` with modules Web, Billing and Bank bound to their
+/// folders and Docs unbound. Web imports Billing's charge through its index and its fee past
+/// it; Billing's charge calls Bank. Billing's index also exports `refund`, which nobody imports.
+fn measured() -> (Checkout, String) {
+    let checkout = committed();
+    git(&checkout, &["branch", "-M", "main"]);
+    sources(
+        &checkout,
+        &[
+            ("package.json", r#"{"name": "fixture"}"#),
+            (
+                "src/web/index.ts",
+                "import { charge } from \"../billing\";\nimport { fee } from \"../billing/fee\";\nexport const page = () => charge(1) + fee;\n",
+            ),
+            (
+                "src/billing/index.ts",
+                "export { charge } from \"./charge\";\nexport const refund = 2;\n",
+            ),
+            (
+                "src/billing/charge.ts",
+                "import { pay } from \"../bank\";\nexport const charge = (n: number) => pay(n);\n",
+            ),
+            ("src/billing/fee.ts", "export const fee = 1;\n"),
+            (
+                "src/bank/index.ts",
+                "export const pay = (n: number) => n;\n",
+            ),
+        ],
+    );
+    let model = checkout.init();
+    for (id, name, path, order) in [
+        ("WebApp01", "Web", "src/web", 0),
+        ("Billing1", "Billing", "src/billing", 1),
+        ("BankApi1", "Bank", "src/bank", 2),
+    ] {
+        let mut value = module(id, name, "module", order);
+        value["binding"] = json!({"path": path});
+        checkout.module(value);
+    }
+    checkout.module(module("Docs0001", "Docs", "module", 3));
+    let mut web = checkout.read_module("WebApp01");
+    web["outgoing"] =
+        json!([{"id": "RelWeb01", "to": format!("{model}#Billing1"), "kind": "call", "order": 0}]);
+    checkout.module(web);
+    git(&checkout, &["add", "-A"]);
+    git(&checkout, &["commit", "-q", "-m", "shop"]);
+    (checkout, model)
+}
+
+#[test]
+fn inspect_counts_entry_points_deep_imports_and_unused_exports() {
+    let (checkout, model) = measured();
+    let q = |id: &str| format!("{model}#{id}");
+    let out = checkout.ok(&["inspect"]);
+    assert_eq!(out["kind"], "inspect");
+    assert_eq!(out["revision"]["digest"], checkout.digest());
+    assert_eq!(
+        out["skips"],
+        json!([{"module": q("Docs0001"), "reason": "unbound"}])
+    );
+    let billing = &out["modules"][1];
+    assert_eq!(billing["name"], "Billing");
+    assert_eq!(billing["files"], 3);
+    assert_eq!(billing["entry_points"], json!(["src/billing/index.ts"]));
+    // The TypeScript scan reports incomplete symbol coverage, so `refund`, which nobody
+    // imports, is withheld as a candidate, as the scan's surface withholds it.
+    assert_eq!(
+        billing["symbols"],
+        json!({"exported": 2, "used": 1, "unused": null})
+    );
+    assert_eq!(
+        billing["deep_imports"],
+        json!([{"from": "src/web/index.ts", "to": "src/billing/fee.ts"}])
+    );
+    assert_eq!(
+        billing["incoming"],
+        json!([{"module": q("WebApp01"), "edges": 2, "relationships": [q("RelWeb01")]}])
+    );
+    assert_eq!(
+        billing["outgoing"],
+        json!([{"module": q("BankApi1"), "edges": 1, "relationships": []}])
+    );
+
+    let one = checkout.ok(&["inspect", "Billing"]);
+    assert_eq!(one["modules"].as_array().unwrap().len(), 1);
+    assert_eq!(one["skips"], json!([]));
+    checkout.refused(&["inspect", "Nowhere"], "SUBJECT_NOT_FOUND");
+    let (code, text) = checkout.run_raw(&["inspect", "Billing", "--format", "markdown"]);
+    assert_eq!(code, 0, "{text}");
+    assert_eq!(
+        text,
+        "Billing: 3 files, 1 entry point, 2 exported, 1 used outside\n  \
+         entry point src/billing/index.ts\n  \
+         unused outside: withheld, symbol coverage is incomplete\n  \
+         deep import: src/web/index.ts -> src/billing/fee.ts\n  \
+         -> Bank: 1 edge, undrawn\n  \
+         <- Web: 2 edges, drawn as Web -> Billing [call]\n"
+    );
+}
+
+/// Appends a line to each of `paths` and commits them.
+fn change(checkout: &Checkout, paths: &[&str], message: &str) {
+    for path in paths {
+        let file = checkout.path().join(path);
+        let mut text = fs::read_to_string(&file).unwrap_or_default();
+        text.push_str("// changed\n");
+        fs::write(file, text).unwrap();
+    }
+    git(checkout, &["add", "-A"]);
+    git(checkout, &["commit", "-q", "-m", message]);
+}
+
+#[test]
+fn locality_shows_a_local_module_and_a_hidden_coupling() {
+    let (checkout, model) = measured();
+    let q = |id: &str| format!("{model}#{id}");
+    let start = git(&checkout, &["rev-parse", "HEAD"]);
+    let start = start.trim();
+    for n in 0..3 {
+        let paths = ["src/web/index.ts", "src/bank/index.ts"];
+        change(&checkout, &paths, &format!("web and bank {n}"));
+    }
+    change(&checkout, &["src/billing/fee.ts"], "billing");
+    change(&checkout, &["src/billing/charge.ts"], "billing again");
+
+    let out = checkout.ok(&["locality", "--since", start]);
+    assert_eq!(out["kind"], "locality");
+    let limit = boundrail::cochange::HISTORY_LIMIT;
+    assert_eq!(
+        out["history"],
+        json!({"range": format!("{start}..HEAD"), "limit": limit, "commits": 5, "sweeps": 0, "max_files": 30, "shallow": false})
+    );
+    let billing = &out["modules"][1];
+    assert_eq!(
+        (
+            &billing["name"],
+            &billing["commits"],
+            &billing["local_share"]
+        ),
+        (&json!("Billing"), &json!(2), &json!(1.0))
+    );
+    assert_eq!(
+        out["hidden_couplings"],
+        json!([{"modules": [q("BankApi1"), q("WebApp01")], "commits": 3, "jaccard": 1.0}])
+    );
+    assert_eq!(out["unbound_commits"], 0);
+
+    // The whole history holds the commit that added every module at once.
+    let out = checkout.ok(&["locality", "--limit", "2"]);
+    assert_eq!(out["history"]["commits"], 2);
+    assert_eq!(out["history"]["range"], "HEAD");
+    assert_eq!(out["hidden_couplings"], json!([]));
+    checkout.refused(&["locality", "--since", "nowhere"], "REQUEST_INVALID");
+    let (code, text) = checkout.run_raw(&["locality", "--since", start, "--format", "markdown"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.ends_with("Hidden couplings:\n- Bank and Web: 3 commits together, no relationship\n"),
+        "{text}"
+    );
+
+    // Moving a file from Billing to Bank touches both: renames are not followed.
+    let moved = git(&checkout, &["rev-parse", "HEAD"]);
+    git(&checkout, &["mv", "src/billing/fee.ts", "src/bank/fee.ts"]);
+    git(&checkout, &["commit", "-q", "-m", "move the fee"]);
+    let out = checkout.ok(&["locality", "--since", moved.trim()]);
+    let touched: Vec<&Value> = out["modules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| &m["name"])
+        .collect();
+    assert_eq!(touched, [&json!("Bank"), &json!("Billing")]);
+}
+
+#[test]
+fn footprint_shows_the_touched_modules_and_the_model_change() {
+    let (checkout, model) = measured();
+    let q = |id: &str| format!("{model}#{id}");
+    let base = git(&checkout, &["rev-parse", "HEAD"]).trim().to_owned();
+    git(&checkout, &["checkout", "-q", "-b", "feature"]);
+    change(&checkout, &["src/billing/fee.ts"], "fees");
+    // Main moves on with a Bank change the branch never saw.
+    git(&checkout, &["checkout", "-q", "main"]);
+    change(&checkout, &["src/bank/index.ts"], "bank on main");
+    git(&checkout, &["checkout", "-q", "feature"]);
+    let mut fees = module("Fees0001", "Fees", "module", 4);
+    fees["binding"] = json!({"path": "src/billing/fee.ts"});
+    fees["parent"] = q("Billing1").into();
+    checkout.module(fees);
+    sources(&checkout, &[("NOTES.md", "draft\n")]);
+
+    // The working tree since the merge-base: the new module owns the changed fee, which Billing
+    // contains; main's Bank change is not the branch's.
+    let out = checkout.ok(&["footprint"]);
+    assert_eq!(out["kind"], "footprint");
+    assert_eq!(
+        out["base"],
+        json!({"commit": base, "source": "merge-base", "ref": "main"})
+    );
+    assert_eq!(out["head"], Value::Null);
+    assert_eq!(
+        out["modules"],
+        json!([
+            {"module": q("Billing1"), "name": "Billing", "files": [], "in_parts": 1},
+            {"module": q("Fees0001"), "name": "Fees", "files": ["src/billing/fee.ts"], "in_parts": 0},
+        ])
+    );
+    assert_eq!(out["outside"], json!(["NOTES.md"]));
+    // Web imports the fee past Billing's index: the crossing lifts to Web -> Billing's line.
+    assert_eq!(
+        out["crossings"],
+        json!([{"from": q("WebApp01"), "to": q("Fees0001"), "edges": 1, "relationships": [q("RelWeb01")]}])
+    );
+    assert_eq!(out["crossings_skipped"], Value::Null);
+    assert_eq!(
+        out["model"]["modules"]["added"],
+        json!([{"id": q("Fees0001"), "name": "Fees"}])
+    );
+
+    // A committed head reads its own model; an explicit base also starts at the merge-base.
+    git(&checkout, &["add", "-A"]);
+    git(&checkout, &["commit", "-q", "-m", "fees module"]);
+    let head = git(&checkout, &["rev-parse", "HEAD"]).trim().to_owned();
+    let out = checkout.ok(&["footprint", "--base", "main", "--head", "HEAD"]);
+    assert_eq!(
+        out["base"],
+        json!({"commit": base, "source": "explicit", "ref": "main"})
+    );
+    assert_eq!(out["head"], head);
+    assert_eq!(out["model"]["modules"]["added"][0]["id"], q("Fees0001"));
+    assert_eq!(out["crossings"][0]["to"], q("Fees0001"));
+
+    // From main, the default base is the merge-base with the head named, and the checkout's
+    // scan cannot show that head's edges.
+    git(&checkout, &["checkout", "-q", "main"]);
+    let out = checkout.ok(&["footprint", "--head", "feature"]);
+    assert_eq!(out["base"]["commit"], base);
+    let touched: Vec<&Value> = out["modules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| &m["name"])
+        .collect();
+    assert_eq!(touched, [&json!("Billing"), &json!("Fees")]);
+    assert_eq!(out["crossings"], Value::Null);
+    assert_eq!(out["crossings_skipped"], "head-not-checked-out");
+    assert_eq!(out["model"]["modules"]["added"][0]["id"], q("Fees0001"));
+    let (code, text) =
+        checkout.run_raw(&["footprint", "--head", "feature", "--format", "markdown"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.contains("Crossings not checked: head-not-checked-out\n"),
+        "{text}"
+    );
+
+    let out = checkout.ok(&["footprint", "--base", "HEAD", "--head", "HEAD"]);
+    assert_eq!(out["modules"], json!([]));
+    assert!(
+        out["model"]["modules"]["added"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(out["crossings"], json!([]));
+    checkout.refused(&["footprint", "--base", "nowhere"], "REQUEST_INVALID");
+    // A base without a vault has no model to compare.
+    let first = git(&checkout, &["rev-list", "--max-parents=0", "HEAD"]);
+    let out = checkout.ok(&["footprint", "--base", first.trim()]);
+    assert_eq!(out["model"], Value::Null);
+    assert!(out.get("model_error").is_none(), "{out:#}");
+}
+
+#[test]
+fn footprint_reports_a_base_model_that_does_not_load() {
+    let (checkout, _) = measured();
+    git(&checkout, &["checkout", "-q", "-b", "broken"]);
+    checkout.write("modules/Bad00001.module.json", "{");
+    git(&checkout, &["add", "-A"]);
+    git(&checkout, &["commit", "-q", "-m", "broken model"]);
+    let broken = git(&checkout, &["rev-parse", "HEAD"]).trim().to_owned();
+    // The branch repairs the vault and commits a module file executable, which still loads.
+    git(&checkout, &["checkout", "-q", "-b", "repaired"]);
+    fs::remove_file(checkout.vault().join("modules/Bad00001.module.json")).unwrap();
+    git(&checkout, &["add", "-A"]);
+    git(
+        &checkout,
+        &[
+            "update-index",
+            "--chmod=+x",
+            ".boundrail/model/modules/Billing1.module.json",
+        ],
+    );
+    git(&checkout, &["commit", "-q", "-m", "repaired model"]);
+
+    let out = checkout.ok(&["footprint", "--base", "broken", "--head", "repaired"]);
+    assert_eq!(out["base"]["commit"], broken);
+    assert_eq!(out["model"], Value::Null);
+    let error = out["model_error"].as_str().unwrap();
+    assert!(error.contains(&format!("commit {broken}")), "{error}");
+    assert!(!error.contains("committed"), "{error}");
+}
+
+#[test]
+fn a_shallow_checkout_needs_a_base_and_drops_its_boundary_commit() {
+    let (origin, _) = measured();
+    change(&origin, &["src/billing/fee.ts"], "billing");
+    let shallow = Checkout::outside();
+    let url = format!("file://{}", origin.path().display());
+    let out = Command::new("git")
+        .args(["clone", "-q", "--depth", "2", &url, "."])
+        .current_dir(shallow.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    git(&shallow, &["remote", "remove", "origin"]);
+    git(&shallow, &["branch", "-m", "main", "work"]);
+
+    let error = shallow.refused(&["footprint"], "REQUEST_INVALID");
+    assert!(
+        error["message"].as_str().unwrap().contains("--base"),
+        "{error:#}"
+    );
+    // The boundary commit shows its whole tree as added; only the commit after it counts.
+    let out = shallow.ok(&["locality"]);
+    assert_eq!(out["history"]["shallow"], true);
+    assert_eq!(out["history"]["commits"], 1);
+    assert_eq!(out["modules"][0]["name"], "Billing");
+}

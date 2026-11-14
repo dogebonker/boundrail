@@ -87,7 +87,8 @@ struct Changes {
 
 pub(crate) struct Change {
     pub(crate) path: String,
-    old: Option<String>,
+    /// The path before a rename.
+    pub(crate) old: Option<String>,
     added: usize,
     deleted: usize,
 }
@@ -258,6 +259,11 @@ pub(crate) fn follow_renames(mut commits: Vec<Commit>, max_files: usize) -> (Vec
             renamed.insert(old, change.path.clone());
         }
     }
+    drop_sweeps(commits, max_files)
+}
+
+/// Drops commits touching more than `max_files` files; returns the rest and how many it dropped.
+pub(crate) fn drop_sweeps(mut commits: Vec<Commit>, max_files: usize) -> (Vec<Commit>, usize) {
     let total = commits.len();
     commits.retain(|c| c.changes.len() <= max_files);
     let sweeps = total - commits.len();

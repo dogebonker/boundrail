@@ -8,6 +8,9 @@ use boundrail::arch::code::{self, CodeReport, NoScan, Skip};
 use boundrail::arch::compare::{self, Comparison};
 use boundrail::arch::diagnostic::{Diagnostic, Severity};
 use boundrail::arch::edit::{self, Receipt};
+use boundrail::arch::footprint::{self, CrossingsSkipped, FootprintReport, Range};
+use boundrail::arch::inspect::{self, InspectReport};
+use boundrail::arch::locality::{self, History, LocalityReport};
 use boundrail::arch::proposal::{self, CURRENT, Writing};
 use boundrail::arch::render::{self, View};
 use boundrail::arch::request::INPUT_MAX;
@@ -241,6 +244,36 @@ enum ModelCmd {
         /// List at most this many
         #[arg(long)]
         limit: Option<usize>,
+    },
+    /// Report each bound module's interface from a scan: entry points, exported, used and unused
+    /// symbols, imports past its entry points, and import edges per neighbouring module
+    Inspect {
+        /// One module: its ID or unique current or former name
+        subject: Option<String>,
+        /// Inspect this proposal instead of the current state
+        #[arg(long)]
+        proposal: Option<String>,
+    },
+    /// Report from Git history how often commits stay inside each module, which modules change
+    /// together, and the pairs that do so with no relationship drawn
+    Locality {
+        /// Read only commits after this revision
+        #[arg(long)]
+        since: Option<String>,
+        /// Read at most this many commits
+        #[arg(long, default_value_t = boundrail::cochange::HISTORY_LIMIT)]
+        limit: usize,
+    },
+    /// Report the modules a branch changes, the relationships its changed imports cross, and
+    /// what it changes in the model
+    Footprint {
+        /// The revision the branch starts from [default: the merge-base of HEAD with
+        /// origin/HEAD, main or master, else HEAD]
+        #[arg(long)]
+        base: Option<String>,
+        /// The branch's last commit [default: HEAD with the working tree]
+        #[arg(long)]
+        head: Option<String>,
     },
 }
 
@@ -671,6 +704,15 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
                 }),
             )
         }
+        ModelCmd::Inspect { subject, proposal } => {
+            inspect_model(root, markdown, subject.as_deref(), proposal.as_deref())
+        }
+        ModelCmd::Locality { since, limit } => {
+            model_locality(root, markdown, since.as_deref(), limit)
+        }
+        ModelCmd::Footprint { base, head } => {
+            model_footprint(root, markdown, base.as_deref(), head.as_deref())
+        }
         ModelCmd::Checkpoints { limit } => {
             let dir = vault::path(root)?;
             let list = checkpoint::list(root, limit)?;
@@ -982,20 +1024,30 @@ fn check(
     Ok(code)
 }
 
-/// The code check against the model's checkout, scanning it once when a binding or anchor names
-/// code there. A failed scan becomes a `SCAN_FAILED` warning.
-fn code_check(model: &Model) -> Result<CodeReport> {
-    // The vault is `<checkout>/.boundrail/model`.
-    let checkout = model
-        .dir
-        .parent()
-        .and_then(Path::parent)
-        .context("the model vault has no checkout around it")?;
-    let doc = if code::needs_scan(&model.modules, checkout) {
-        super::scan_cli::live(checkout, None).map_err(|error| NoScan::Failed(format!("{error:#}")))
+/// The model's checkout and its scan, made only when a binding or anchor names code there.
+fn scan_checkout(model: &Model) -> Result<(PathBuf, Result<Document, NoScan>)> {
+    let checkout = checkpoint::checkout(&model.dir)?;
+    let doc = if code::needs_scan(&model.modules, &checkout) {
+        super::scan_cli::live(&checkout, None).map_err(|error| NoScan::Failed(format!("{error:#}")))
     } else {
         Err(NoScan::NotNeeded)
     };
+    Ok((checkout, doc))
+}
+
+/// The error of a failed scan, for the output of a measure that went without it.
+fn scan_error(doc: &Result<Document, NoScan>) -> Option<&str> {
+    match doc {
+        Err(NoScan::Failed(error)) => Some(error),
+        _ => None,
+    }
+}
+
+/// The code check against the model's checkout, scanning it once when a binding or anchor names
+/// code there. A failed scan becomes a `SCAN_FAILED` warning.
+fn code_check(model: &Model) -> Result<CodeReport> {
+    let (checkout, doc) = scan_checkout(model)?;
+    let checkout = checkout.as_path();
     Ok(code::check(
         &model.manifest.id,
         &model.modules,
@@ -1003,6 +1055,293 @@ fn code_check(model: &Model) -> Result<CodeReport> {
         checkout,
         doc.as_ref().map_err(Clone::clone),
     ))
+}
+
+/// `model inspect`: each bound module's interface, or one module's.
+fn inspect_model(
+    root: &Path,
+    markdown: bool,
+    subject: Option<&str>,
+    proposal: Option<&str>,
+) -> Result<()> {
+    let (model, _, _) = load_for_read(root, proposal)?;
+    let id = &model.manifest.id;
+    let subject = subject
+        .map(|s| vault::find(id, &model.modules, s).map(|m| model.qualify(&m.id)))
+        .transpose()?;
+    let (checkout, doc) = scan_checkout(&model)?;
+    let scan = doc.as_ref().map_err(Clone::clone);
+    let report = inspect::inspect(id, &model.modules, &checkout, scan, subject.as_deref());
+    if markdown {
+        print_proposal(&model);
+        print_inspect(&model, &report);
+        return Ok(());
+    }
+    let mut output = json!({
+        "schema": MODEL_SCHEMA,
+        "kind": "inspect",
+        "success": true,
+        "vault": model.dir,
+        "revision": model.revision,
+    });
+    extend(&mut output, &report)?;
+    extend(&mut output, json!({ "proposal": model.proposal }))?;
+    if let Some(error) = scan_error(&doc) {
+        output["scan_error"] = json!(error);
+    }
+    write(None, &output)
+}
+
+/// `n` and `noun`, plural unless `n` is 1.
+fn count(n: usize, noun: &str) -> String {
+    format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
+}
+
+/// Each relationship's qualified ID with how it reads: `From -> To [kind]`.
+fn relationship_names(model: &Model) -> BTreeMap<String, String> {
+    let names = names(model);
+    let mut found = BTreeMap::new();
+    for module in &model.modules {
+        let from = &module.name;
+        for r in &module.outgoing {
+            let to = name_of(&names, &r.to);
+            found.insert(model.qualify(&r.id), format!("{from} -> {to} [{}]", r.kind));
+        }
+    }
+    found
+}
+
+/// The relationships `ids` as they read, or `undrawn` for none.
+fn drawn_as(relationships: &BTreeMap<String, String>, ids: &[String]) -> String {
+    if ids.is_empty() {
+        return "undrawn".to_owned();
+    }
+    let read = ids
+        .iter()
+        .map(|id| relationships.get(id).unwrap_or(id).as_str());
+    format!("drawn as {}", read.collect::<Vec<_>>().join(", "))
+}
+
+fn print_inspect(model: &Model, report: &InspectReport) {
+    let names = names(model);
+    let relationships = relationship_names(model);
+    for m in &report.modules {
+        let symbols = match (&m.symbols, m.symbols_skipped) {
+            (Some(s), _) => format!(", {} exported, {} used outside", s.exported, s.used),
+            (None, Some(reason)) => format!(", symbols {}", reason.as_str()),
+            (None, None) => String::new(),
+        };
+        let entries = count(m.entry_points.len(), "entry point");
+        println!("{}: {}, {entries}{symbols}", m.name, count(m.files, "file"));
+        for entry in &m.entry_points {
+            println!("  entry point {entry}");
+        }
+        match m.symbols.as_ref().map(|s| &s.unused) {
+            Some(Some(unused)) => {
+                (unused.iter()).for_each(|u| println!("  unused outside: {} {}", u.file, u.name))
+            }
+            Some(None) => println!("  unused outside: withheld, symbol coverage is incomplete"),
+            None => {}
+        }
+        for deep in &m.deep_imports {
+            println!("  deep import: {} -> {}", deep.from, deep.to);
+        }
+        for (arrow, list) in [("->", &m.outgoing), ("<-", &m.incoming)] {
+            for n in list {
+                let edges = count(n.edges, "edge");
+                let drawn = drawn_as(&relationships, &n.relationships);
+                println!("  {arrow} {}: {edges}, {drawn}", name_of(&names, &n.module));
+            }
+        }
+    }
+    if !report.skips.is_empty() {
+        println!("Skipped:");
+    }
+    for skip in &report.skips {
+        println!(
+            "- {} {}",
+            name_of(&names, &skip.module),
+            skip.reason.as_str()
+        );
+    }
+}
+
+/// `model locality`: co-change locality of the current state's modules over Git history.
+fn model_locality(root: &Path, markdown: bool, since: Option<&str>, limit: usize) -> Result<()> {
+    let (model, _, _) = load_for_read(root, None)?;
+    let history = locality::read(&checkpoint::checkout(&model.dir)?, since, limit)?;
+    let report = locality::measure(&model.manifest.id, &model.modules, &history.changes);
+    if markdown {
+        print_locality(&model, &history, &report);
+        return Ok(());
+    }
+    let mut output = json!({
+        "schema": MODEL_SCHEMA,
+        "kind": "locality",
+        "success": true,
+        "vault": model.dir,
+        "revision": model.revision,
+        "history": history,
+    });
+    extend(&mut output, &report)?;
+    write(None, &output)
+}
+
+fn print_locality(model: &Model, history: &History, report: &LocalityReport) {
+    let names = names(model);
+    println!(
+        "Read {} of {} (at most {}; {} of more than {} files left out)",
+        count(history.commits, "commit"),
+        history.range,
+        history.limit,
+        count(history.sweeps, "sweep"),
+        history.max_files
+    );
+    if history.shallow {
+        println!("The checkout is shallow: older history is missing");
+    }
+    for m in &report.modules {
+        let partners: Vec<String> = (m.partners.iter().take(3))
+            .map(|p| format!("{} x{}", name_of(&names, &p.module), p.commits))
+            .collect();
+        let with = if partners.is_empty() {
+            String::new()
+        } else {
+            format!("; changes with {}", partners.join(", "))
+        };
+        println!(
+            "- {}: {}, {} local ({:.0}%){with}",
+            m.name,
+            count(m.commits, "commit"),
+            m.local,
+            m.local_share * 100.0
+        );
+    }
+    if !report.hidden_couplings.is_empty() {
+        println!("Hidden couplings:");
+    }
+    for c in &report.hidden_couplings {
+        let [a, b] = &c.modules;
+        let (a, b) = (name_of(&names, a), name_of(&names, b));
+        println!(
+            "- {a} and {b}: {} commits together, no relationship",
+            c.commits
+        );
+    }
+}
+
+/// `model footprint`: the modules a branch's changes touch and its model changes. A base model
+/// that does not load leaves `model` null with `model_error`.
+fn model_footprint(
+    root: &Path,
+    markdown: bool,
+    base: Option<&str>,
+    head: Option<&str>,
+) -> Result<()> {
+    let checkout = checkpoint::checkout(&vault::path(root)?)?;
+    let range = footprint::range(&checkout, base, head)?;
+    let model = match &range.head {
+        None => load_for_read(root, None)?.0,
+        Some(head) => checkpoint::load_committed(&checkout, head)?.ok_or_else(|| {
+            Refusal::new(Code::VaultNotFound, format!("commit {head} holds no model"))
+        })?,
+    };
+    let (before, model_error) = match checkpoint::load_committed(&checkout, &range.base.commit) {
+        Ok(before) => (before, None),
+        Err(error) => (None, Some(format!("{error:#}"))),
+    };
+    let files = footprint::changed(&checkout, &range.base.commit, range.head.as_deref())?;
+    let (doc, scan_error) = footprint_scan(&model, &range, &files)?;
+    let head_state = (&model.modules[..], &model.collections[..]);
+    let base_state = (before.as_ref()).map(|m| (&m.modules[..], &m.collections[..]));
+    let (id, scan) = (&model.manifest.id, doc.as_ref().map_err(|s| *s));
+    let report = footprint::measure(id, head_state, base_state, &files, scan);
+    if markdown {
+        print_footprint(&model, &range, &report, model_error.as_deref());
+        return Ok(());
+    }
+    let mut output = json!({
+        "schema": MODEL_SCHEMA,
+        "kind": "footprint",
+        "success": true,
+        "vault": model.dir,
+        "revision": model.revision,
+        "base": range.base,
+        "head": range.head,
+    });
+    extend(&mut output, &report)?;
+    // Absent parts stay as null, so the output keeps one shape.
+    output["crossings"] = json!(report.crossings);
+    output["crossings_skipped"] = json!(report.crossings_skipped);
+    output["model"] = json!(report.model);
+    for (key, error) in [("model_error", model_error), ("scan_error", scan_error)] {
+        if let Some(error) = error {
+            output[key] = json!(error);
+        }
+    }
+    write(None, &output)
+}
+
+/// The scan footprint crossings read, or why there is none, with the error of a failed scan.
+/// The scan reads the checkout, so it serves only a head that is checked out.
+fn footprint_scan(
+    model: &Model,
+    range: &Range,
+    files: &[String],
+) -> Result<(Result<Document, CrossingsSkipped>, Option<String>)> {
+    if !range.checked_out {
+        return Ok((Err(CrossingsSkipped::HeadNotCheckedOut), None));
+    }
+    if files.is_empty() {
+        return Ok((Err(CrossingsSkipped::NotNeeded), None));
+    }
+    Ok(match scan_checkout(model)?.1 {
+        Ok(doc) => (Ok(doc), None),
+        Err(NoScan::NotNeeded) => (Err(CrossingsSkipped::NotNeeded), None),
+        Err(NoScan::Failed(error)) => (Err(CrossingsSkipped::ScanFailed), Some(error)),
+    })
+}
+
+fn print_footprint(model: &Model, range: &Range, report: &FootprintReport, error: Option<&str>) {
+    let names = names(model);
+    let relationships = relationship_names(model);
+    let head = range.head.as_deref().unwrap_or("the working tree");
+    let reference = range.base.reference.as_deref().unwrap_or("HEAD");
+    println!(
+        "Footprint of {head} since {} ({reference})",
+        range.base.commit
+    );
+    for m in &report.modules {
+        let parts = match m.in_parts {
+            0 => String::new(),
+            n => format!(", {n} in parts"),
+        };
+        println!("- {}: {}{parts}", m.name, count(m.files.len(), "file"));
+    }
+    if !report.outside.is_empty() {
+        println!("Outside every binding: {}", report.outside.join(", "));
+    }
+    for c in report.crossings.iter().flatten() {
+        let (from, to) = (name_of(&names, &c.from), name_of(&names, &c.to));
+        let drawn = drawn_as(&relationships, &c.relationships);
+        println!(
+            "Crosses {from} -> {to}: {}, {drawn}",
+            count(c.edges, "edge")
+        );
+    }
+    if let Some(skipped) = report.crossings_skipped {
+        println!("Crossings not checked: {}", skipped.as_str());
+    }
+    for (section, changes) in report.model.iter().flat_map(|m| m.sections()) {
+        let (added, removed) = (changes.added.len(), changes.removed.len());
+        let changed = changes.changed.len();
+        if added + removed + changed > 0 {
+            println!("Model {section}: {added} added, {removed} removed, {changed} changed");
+        }
+    }
+    if let Some(error) = error {
+        println!("Model changes not compared: {error}");
+    }
 }
 
 fn print_diagnostics(

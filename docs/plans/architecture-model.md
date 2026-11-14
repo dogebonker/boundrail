@@ -40,7 +40,7 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 | T7 | Checkpoints: history branch, `model retain`, `model checkpoints`, `model read --checkpoint` | done |
 | T8 | Proposals: create/edit drafts against a predecessor, `model compare`, adopt, shelve, planning models without a current state | done |
 | T9 | Render: SVG architecture view with automatic layout, sequence and flowchart views of a flow, comparison marks | done |
-| T10 | Measures: module interface counts (`model inspect`), co-change locality (`model locality`), branch footprint (`model footprint`) | open |
+| T10 | Measures: module interface counts (`model inspect`), co-change locality (`model locality`), branch footprint (`model footprint`) | done |
 | T11 | Live browser view: model canvas, drill-down, focus and filters, detail panel, warnings, comparison, history, split panes | open |
 | T12 | Infrastructure evidence: docker-compose, Kubernetes, Terraform bindings and configured-address hops between modules | open |
 | T13 | Language-server evidence: call-level references through configured language servers | open |
@@ -230,3 +230,54 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   else it is not drawn. The flow resolves in the drawn state, so a flow it lacks
   refuses `SUBJECT_NOT_FOUND`. Notes appear beside their message in the sequence view only, and an
   empty flow draws `no steps`.
+- T10: the measures read only; each prints JSON, or Markdown with `--format markdown`, sorted by
+  qualified ID. `model inspect [subject] [--proposal P]` maps scanned files to modules exactly as
+  the code check does (the deepest judged binding owns a file) and skips modules with the code
+  check's reasons. Outside a module means any file it does not own: a part's files are outside its
+  container, and unbound files are outside every module. A module's entry points are those of
+  `ENTRY_POINT_UNEXPOSED`: entry files directly in its bound directory and files a package
+  publishes below it; a module bound to a file has none. Its exported symbols are the exports of
+  its entry points, or of every file it owns when it has none. An export is used when a file
+  outside imports it: by resolved target, by name from the exporting file when unresolved, by an
+  unresolved wildcard import of that file, or by an import edge into that file from a file with
+  no symbol import of it, which counts as a wildcard use. The scan's surface ignores unresolved
+  named imports, so inspect errs toward "used" where the two differ. The rest are `unused`, the
+  candidates to make internal, withheld as null when symbol coverage is incomplete (not
+  `complete` and a limitation naming no scanned file), as the surface withholds its
+  could-be-internal list; TypeScript scans report that today, so they show counts without
+  candidates. Without symbol data `symbols` is null with `symbols_skipped`
+  `language-unsupported`; a file a symbol limitation names makes it `symbols-incomplete`. Deep
+  imports are the runtime edges `ENTRY_POINT_UNEXPOSED` reports. Incoming and outgoing entries
+  count import edges between files of two owners, type-only edges included, and list the
+  relationships drawn that way between the two or modules containing them.
+- T10: `model locality` and `model footprint` map paths by binding alone, without a scan, so
+  deleted files and unscanned languages count: the deepest binding in this repository that is not
+  external wins (one path lookup per folder), a module bound with a symbol to a path another
+  module holds owns nothing, and the vault's own files belong to no module.
+  `model locality [--since <rev>] [--limit N]` reads at most N (default 500) non-merge commits of
+  HEAD, after `--since` when given, through the co-change log reader without following renames: a
+  rename counts at its old and new path, so a move between modules touches both. Sweeps of more
+  than 30 files are left out and counted. In a shallow checkout the boundary commits, whose diffs
+  show their whole tree as added, are left out and `history.shallow` is true. Per module: commits
+  touching it, `local` (touching no other module), `local_share`, and partners by commits together
+  with a Jaccard ratio (together over either), to three decimals. A pair is a hidden coupling when
+  it changed together in at least 3 commits (the co-change minimum) and no relationship is drawn
+  either way between the two or modules containing them, and neither contains the other. Locality
+  counts the module owning each path, not its containers.
+- T10: `model footprint [--base <rev>] [--head <rev>]` diffs from the merge-base of the base and
+  the head to the head, or to the working tree with untracked files when `--head` is absent;
+  renames count as a deletion and an addition, and the vault's own files are left out. The base is
+  `--base`, else the first of origin/HEAD, main or master, else the head itself; `base` is
+  `{commit, source: explicit|merge-base|head-fallback, ref}` with the merge-base in `commit`. A
+  shallow checkout without a default branch refuses `REQUEST_INVALID` rather than fall back. Each
+  changed file's owner lists it under `files`, and every module containing that owner counts it in
+  `in_parts`. `outside` lists changed files no binding holds. `crossings` are module pairs, neither
+  containing the other, that an import edge with a changed file at either end joins, with the
+  relationships covering each (empty when undrawn). They are null with `crossings_skipped` when not
+  checked: `not-needed` (nothing to scan), `scan-failed` (with `scan_error`), or
+  `head-not-checked-out`, since the scan reads the checkout and serves only a head equal to HEAD;
+  with `--head HEAD` and a dirty tree the edges still come from the working tree. `model` is
+  `model compare` of the head's current state against the merge-base's, read from that commit's
+  tree as checkpoints are read (proposals left out; modes 100644 and 100755, anything else refuses
+  `MODEL_INVALID`), or null when the base holds no model, or null with `model_error` naming the
+  commit when its model does not load. With `--head` the model is the one committed there.

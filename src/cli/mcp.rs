@@ -161,7 +161,7 @@ fn base_commit(root: &Path, explicit: Option<&str>) -> Result<(String, String)> 
             "explicit".into(),
         ));
     }
-    for reference in ["origin/HEAD", "main", "master"] {
+    for reference in boundrail::git::DEFAULT_BRANCHES {
         if let Ok(value) = boundrail::git::text(root, &["merge-base", "HEAD", reference]) {
             return Ok((value.trim().into(), format!("merge-base HEAD {reference}")));
         }

@@ -32,6 +32,8 @@ const KIND: &str = "retain";
 const PREFIX_MIN: usize = 4;
 /// The only file mode a checkpoint tree holds.
 const MODE: &str = "100644";
+/// The mode of an executable file, which a committed vault may hold.
+const EXECUTABLE: &str = "100755";
 
 /// One checkpoint, read back from its commit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,14 +147,96 @@ pub fn load(start: &Path, which: &str) -> Result<(Checkpoint, Model)> {
     let (vault, root) = locations(start)?;
     let checkpoint = find(history(&root, None)?.1, which)?;
     let files = files(&root, &checkpoint)?;
-    // `git show` prints each blob's bytes back to back, unconverted, so one call reads them all.
-    let mut args = vec!["show", "--no-textconv", "--no-color"];
-    args.extend(files.iter().map(|(_, object, _)| object.as_str()));
-    let bytes = git::run(&root, &args)?;
     let temp = TempDir::new("checkpoint")?;
     let dir = temp.path().join("model");
+    write_blobs(&root, &files, &dir)?;
+    let place = format!(
+        "checkpoint {} (commit {})",
+        checkpoint.id, checkpoint.commit
+    );
+    let found = json!({ "checkpoint": checkpoint.id, "commit": checkpoint.commit });
+    let mut model = vault::load_dir(dir).map_err(|error| located(error, &place, &found))?;
+    model.dir = vault;
+    Ok((checkpoint, model))
+}
+
+/// A `MODEL_INVALID` refusal of a model read from a tree, renamed after `place` instead of the
+/// temporary folder it was read from, with `found` added to its details.
+fn located(mut error: anyhow::Error, place: &str, found: &serde_json::Value) -> anyhow::Error {
+    if let Some(refusal) = error.downcast_mut::<Refusal>()
+        && refusal.code == Code::ModelInvalid
+        && let (Some(details), Some(found)) = (refusal.details.as_mut(), found.as_object())
+    {
+        let count = details["problems"].as_array().map_or(0, Vec::len);
+        refusal.message = format!("the model in {place} has {count} problem(s)");
+        for (key, value) in found {
+            details[key] = value.clone();
+        }
+    }
+    error
+}
+
+/// The current state of the model committed at `commit` in the checkout around `start`, or
+/// `None` when that commit holds no manifest there. Only the files a current-state load reads
+/// are read; proposals and anything else in the committed vault are left out. Refuses
+/// `MODEL_INVALID` for a vault file that is not a regular file or is too large, as a checkpoint
+/// read does, and for a model that does not load.
+pub fn load_committed(start: &Path, commit: &str) -> Result<Option<Model>> {
+    let (vault, root) = locations(start)?;
+    let prefix = vault
+        .strip_prefix(&root)?
+        .to_string_lossy()
+        .replace('\\', "/")
+        + "/";
+    let invalid = |path: &str, reason: &str| -> anyhow::Error {
+        let message = format!("commit {commit} holds `{prefix}{path}`, which {reason}");
+        let details = json!({ "commit": commit, "path": path });
+        Refusal::new(Code::ModelInvalid, message)
+            .with_details(details)
+            .into()
+    };
+    let listing = git::run(&root, &["ls-tree", "-r", "-l", "-z", commit, "--", &prefix])?;
+    let mut files = Vec::new();
+    for entry in listing.split(|b| *b == 0).filter(|e| !e.is_empty()) {
+        let (meta, path) = tree_entry(entry)?;
+        let path = path.strip_prefix(&prefix).unwrap_or(path);
+        if !vault::is_vault_file(path) {
+            continue;
+        }
+        let [MODE | EXECUTABLE, "blob", object, size] = meta.as_slice() else {
+            return Err(invalid(path, "is not a regular file"));
+        };
+        let size: u64 = size.parse().context("parsing a git ls-tree size")?;
+        if size > INPUT_MAX {
+            return Err(invalid(path, "is too large"));
+        }
+        files.push((
+            path.to_owned(),
+            (*object).to_owned(),
+            usize::try_from(size)?,
+        ));
+    }
+    if !files.iter().any(|(path, _, _)| path == "model.json") {
+        return Ok(None);
+    }
+    let temp = TempDir::new("committed")?;
+    let dir = temp.path().join("model");
+    write_blobs(&root, &files, &dir)?;
+    let place = format!("commit {commit}");
+    let found = json!({ "commit": commit });
+    let mut model = vault::load_dir(dir).map_err(|error| located(error, &place, &found))?;
+    model.dir = vault;
+    Ok(Some(model))
+}
+
+/// Writes the blobs `files` lists as (vault-relative path, object, size) under `dir`. One
+/// `git show` prints each blob's bytes back to back, unconverted, so one call reads them all.
+fn write_blobs(root: &Path, files: &[(String, String, usize)], dir: &Path) -> Result<()> {
+    let mut args = vec!["show", "--no-textconv", "--no-color"];
+    args.extend(files.iter().map(|(_, object, _)| object.as_str()));
+    let bytes = git::run(root, &args)?;
     let mut rest = bytes.as_slice();
-    for (path, _, size) in &files {
+    for (path, _, size) in files {
         ensure!(
             rest.len() >= *size,
             "git show returned fewer bytes than the tree lists"
@@ -169,23 +253,15 @@ pub fn load(start: &Path, which: &str) -> Result<(Checkpoint, Model)> {
         rest.is_empty(),
         "git show returned more bytes than the tree lists"
     );
-    let mut model = vault::load_dir(dir).map_err(|mut error| {
-        if let Some(refusal) = error.downcast_mut::<Refusal>()
-            && refusal.code == Code::ModelInvalid
-            && let Some(details) = refusal.details.as_mut()
-        {
-            let count = details["problems"].as_array().map_or(0, Vec::len);
-            refusal.message = format!(
-                "the model in checkpoint {} (commit {}) has {count} problem(s)",
-                checkpoint.id, checkpoint.commit
-            );
-            details["checkpoint"] = json!(checkpoint.id);
-            details["commit"] = json!(checkpoint.commit);
-        }
-        error
-    })?;
-    model.dir = vault;
-    Ok((checkpoint, model))
+    Ok(())
+}
+
+/// One `git ls-tree -l -z` entry, `<mode> <type> <object> <padded size>\t<path>`, as its
+/// fields before the tab and its path.
+fn tree_entry(entry: &[u8]) -> Result<(Vec<&str>, &str)> {
+    let entry = std::str::from_utf8(entry).context("a tree path is not UTF-8")?;
+    let (meta, path) = entry.split_once('\t').context("parsing git ls-tree")?;
+    Ok((meta.split_whitespace().collect(), path))
 }
 
 /// The vault folder of the checkout around `start`, whether or not it exists, and the checkout.
@@ -196,7 +272,7 @@ fn locations(start: &Path) -> Result<(PathBuf, PathBuf)> {
 }
 
 /// The checkout of a vault folder, `<checkout>/.boundrail/model`.
-pub(super) fn checkout(vault: &Path) -> Result<PathBuf> {
+pub fn checkout(vault: &Path) -> Result<PathBuf> {
     vault
         .parent()
         .and_then(Path::parent)
@@ -293,10 +369,7 @@ fn files(root: &Path, checkpoint: &Checkpoint) -> Result<Vec<(String, String, us
     let listing = git::run(root, &["ls-tree", "-r", "-l", "-z", &checkpoint.commit])?;
     let mut files = Vec::new();
     for entry in listing.split(|b| *b == 0).filter(|e| !e.is_empty()) {
-        let entry = std::str::from_utf8(entry).context("a checkpoint path is not UTF-8")?;
-        // `<mode> <type> <object> <padded size>\t<path>`
-        let (meta, path) = entry.split_once('\t').context("parsing git ls-tree")?;
-        let meta: Vec<&str> = meta.split_whitespace().collect();
+        let (meta, path) = tree_entry(entry)?;
         let [mode, kind, object, size] = meta.as_slice() else {
             return Err(invalid(path, "is not a file"));
         };
@@ -585,6 +658,32 @@ mod tests {
 
     fn run_git(root: &Path, args: &[&str]) -> String {
         git::text(root, args).unwrap().trim().to_owned()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_committed_vault_file_must_be_a_regular_file() {
+        let temp = TempDir::new("committed-link").unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        run_git(&root, &["init", "-q"]);
+        let modules = root.join(".boundrail/model/modules");
+        fs::create_dir_all(&modules).unwrap();
+        fs::write(root.join(".boundrail/model/model.json"), "{}").unwrap();
+        let link = modules.join("Link0001.module.json");
+        std::os::unix::fs::symlink("/etc/hosts", link).unwrap();
+        run_git(&root, &["add", "-A"]);
+        let tree = run_git(&root, &["write-tree"]);
+        let commit = run_git(&root, &["commit-tree", &tree, "-m", "linked"]);
+
+        let error = load_committed(&root, &commit).unwrap_err();
+        let refusal = error.downcast_ref::<Refusal>().expect("a refusal");
+        assert_eq!(refusal.code, Code::ModelInvalid);
+        assert!(
+            refusal.message.contains("is not a regular file"),
+            "{}",
+            refusal.message
+        );
+        assert!(refusal.message.contains(&commit), "{}", refusal.message);
     }
 
     #[test]

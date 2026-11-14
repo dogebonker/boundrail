@@ -155,11 +155,7 @@ pub fn check(
     scan: Result<&Document, NoScan>,
 ) -> CodeReport {
     let index = Index::new(model, modules);
-    let (scan, failure) = match scan {
-        Ok(doc) => (Scan::new(Ok(doc)), None),
-        Err(NoScan::NotNeeded) => (Scan::new(Err(SkipReason::NotScanned)), None),
-        Err(NoScan::Failed(error)) => (Scan::new(Err(SkipReason::ScanFailed)), Some(error)),
-    };
+    let (scan, failure) = Scan::of(scan);
     let mut report = CodeReport::default();
     let status = bindings(&index, root, &scan, &mut report);
     anchors(&index, root, &scan, &mut report);
@@ -173,6 +169,139 @@ pub fn check(
     report.diagnostics.sort();
     report.skips.sort();
     report
+}
+
+/// Where the code check finds each module's code, for measures that read the same mapping.
+pub(super) struct Ownership<'d> {
+    /// Every module by qualified ID, with why its code is not judged when it is not.
+    pub(super) status: BTreeMap<String, Result<(), SkipReason>>,
+    /// Each scanned file's owner: the deepest judged binding holding it.
+    pub(super) owners: HashMap<String, String>,
+    /// The entry points of each module bound to a directory that has any.
+    pub(super) entries: BTreeMap<String, BTreeSet<String>>,
+    /// Runtime edges from outside such a module into it, past its entry points, by module.
+    pub(super) deep: Vec<(String, &'d Edge)>,
+    /// Files a symbol limitation names.
+    pub(super) limited: HashSet<&'d str>,
+}
+
+/// The code check's mapping of the modules of `index` to the code under `root`, without judging
+/// the relationships. Diagnostics are dropped: `model check` reports them.
+pub(super) fn ownership<'d>(
+    index: &Index<'_>,
+    root: &Path,
+    scan: Result<&'d Document, NoScan>,
+) -> Ownership<'d> {
+    let (scan, _) = Scan::of(scan);
+    let status = bindings(index, root, &scan, &mut CodeReport::default());
+    let owners = owners(&status)
+        .into_iter()
+        .map(|(file, id)| (file.to_owned(), id.to_owned()))
+        .collect();
+    let dirs = entry_dirs(&scan, &status);
+    let deep = deep_imports(&scan, &dirs)
+        .into_iter()
+        .map(|(dir, edge)| (dirs[dir].0.to_owned(), edge))
+        .collect();
+    let entries = dirs
+        .into_values()
+        .map(|(id, entries)| {
+            (
+                id.to_owned(),
+                entries.into_iter().map(str::to_owned).collect(),
+            )
+        })
+        .collect();
+    let status = (status.into_iter())
+        .map(|(id, found)| (id.to_owned(), found.map(|_| ())))
+        .collect();
+    Ownership {
+        status,
+        owners,
+        entries,
+        deep,
+        limited: scan.limited.clone(),
+    }
+}
+
+/// The modules whose binding alone maps paths to them, without a scan, by qualified ID with
+/// their normalized paths: those bound in this repository that are not external, less those
+/// [`symbol_bound`] leaves out.
+pub(super) fn bound_paths(model: &str, modules: &[Module]) -> BTreeMap<String, String> {
+    let bound: Vec<(String, String, bool)> = modules
+        .iter()
+        .filter(|m| m.kind != EXTERNAL_KIND)
+        .filter_map(|m| Some((m, m.binding.as_ref()?)))
+        .filter(|(_, b)| b.repo.is_none())
+        .map(|(m, b)| {
+            let id = super::ids::qualify(model, &m.id);
+            (id, segments(&b.path).join("/"), b.symbol.is_some())
+        })
+        .collect();
+    let refs: Vec<(&str, &str, bool)> = (bound.iter())
+        .map(|(id, path, symbol)| (id.as_str(), path.as_str(), *symbol))
+        .collect();
+    let left_out: HashSet<String> = symbol_bound(&refs).into_iter().map(str::to_owned).collect();
+    (bound.into_iter())
+        .filter(|(id, _, _)| !left_out.contains(id))
+        .map(|(id, path, _)| (id, path))
+        .collect()
+}
+
+/// The modules of `bound`, as (qualified ID, normalized path, bound with a symbol), that stand
+/// for a symbol in a path another of them holds: they own no file of it.
+fn symbol_bound<'i>(bound: &[(&'i str, &str, bool)]) -> HashSet<&'i str> {
+    let mut holders: HashMap<&str, usize> = HashMap::new();
+    for (_, path, _) in bound {
+        *holders.entry(path).or_default() += 1;
+    }
+    (bound.iter())
+        .filter(|(_, path, symbol)| *symbol && holders[path] > 1)
+        .map(|(id, _, _)| *id)
+        .collect()
+}
+
+/// Paths to the module whose binding holds them: the deepest binding, the first by ID among
+/// bindings of one path. A binding of the whole repository has the empty path.
+pub(super) struct PathOwners<'i, 'p> {
+    by_path: HashMap<&'p str, &'i str>,
+}
+
+impl<'i, 'p> PathOwners<'i, 'p> {
+    /// From qualified IDs with normalized binding paths, in ID order.
+    pub(super) fn new(bound: impl IntoIterator<Item = (&'i str, &'p str)>) -> Self {
+        let mut by_path = HashMap::new();
+        for (id, path) in bound {
+            by_path.entry(path).or_insert(id);
+        }
+        Self { by_path }
+    }
+
+    /// The owner of the repository path `file`: the binding of the file itself, else of its
+    /// closest folder.
+    pub(super) fn owner(&self, file: &str) -> Option<&'i str> {
+        (iter::once(file)
+            .chain(ancestors(file))
+            .chain(iter::once("")))
+        .find_map(|path| self.by_path.get(path).copied())
+    }
+}
+
+/// Each edge joining files of two different owners, through its written target, with the
+/// source's and the target's owner.
+pub(super) fn owner_pairs<'i, 'e>(
+    edges: impl IntoIterator<Item = &'e Edge>,
+    owner: impl Fn(&str) -> Option<&'i str>,
+) -> impl Iterator<Item = (&'i str, &'i str, &'e Edge)> {
+    edges.into_iter().filter_map(move |edge| {
+        let (from, to) = (owner(&edge.from)?, owner(written(edge))?);
+        (from != to).then_some((from, to, edge))
+    })
+}
+
+/// The written target of `edge`, before a facade resolves it.
+pub(super) fn written(edge: &Edge) -> &str {
+    edge.original_to.as_deref().unwrap_or(&edge.to)
 }
 
 /// `SCAN_FAILED`: the scan the check needed failed. Its subjects are what went unjudged; with
@@ -209,6 +338,15 @@ struct Scan<'d> {
 }
 
 impl<'d> Scan<'d> {
+    /// The scan the check reads, and the error of a failed scan.
+    fn of(scan: Result<&'d Document, NoScan>) -> (Self, Option<String>) {
+        match scan {
+            Ok(doc) => (Self::new(Ok(doc)), None),
+            Err(NoScan::NotNeeded) => (Self::new(Err(SkipReason::NotScanned)), None),
+            Err(NoScan::Failed(error)) => (Self::new(Err(SkipReason::ScanFailed)), Some(error)),
+        }
+    }
+
     fn new(scan: Result<&'d Document, SkipReason>) -> Self {
         let mut this = Self {
             files: Vec::new(),
@@ -290,11 +428,6 @@ impl<'d> Scan<'d> {
 /// Whether `edge` exists at run time: type-only edges do not.
 fn runtime(edge: &Edge) -> bool {
     !matches!(edge.kind, EdgeKind::Type | EdgeKind::TypeReexport)
-}
-
-/// The file `edge` names as written, before a facade resolves it.
-fn written(edge: &Edge) -> &str {
-    edge.original_to.as_deref().unwrap_or(&edge.to)
 }
 
 fn location(edge: &Edge) -> String {
@@ -449,24 +582,22 @@ fn bindings<'i, 's, 'd>(
 /// Marks `symbol-binding` the modules bound with a symbol to a path another bound module holds:
 /// they stand for part of that code, so they own no file of it.
 fn symbol_bindings(index: &Index<'_>, status: &mut Status<'_, '_, '_>) {
-    let mut holders: HashMap<&str, usize> = HashMap::new();
-    for found in status.values().flatten() {
-        *holders.entry(found.path.as_str()).or_default() += 1;
-    }
-    let tied: Vec<&str> = status
-        .iter()
-        .filter(|(id, found)| {
-            let symbol = index
-                .by_id
-                .get(**id)
+    let bound: Vec<(&str, &str, bool)> = (status.iter())
+        .filter_map(|(&id, found)| {
+            let symbol = (index.by_id.get(id))
                 .and_then(|m| m.binding.as_ref())
                 .is_some_and(|b| b.symbol.is_some());
-            symbol && found.as_ref().is_ok_and(|f| holders[f.path.as_str()] > 1)
+            Some((id, found.as_ref().ok()?.path.as_str(), symbol))
         })
-        .map(|(id, _)| *id)
+        .collect();
+    let tied: Vec<String> = symbol_bound(&bound)
+        .into_iter()
+        .map(str::to_owned)
         .collect();
     for id in tied {
-        status.insert(id, Err(SkipReason::SymbolBinding));
+        if let Some(found) = status.get_mut(id.as_str()) {
+            *found = Err(SkipReason::SymbolBinding);
+        }
     }
 }
 
@@ -496,22 +627,12 @@ fn anchors(index: &Index<'_>, root: &Path, scan: &Scan<'_>, report: &mut CodeRep
 /// bound to one path without a symbol share its files with the first by ID; the semantic check
 /// reports them as `BINDING_SHARED`.
 fn owners<'i, 'd>(status: &Status<'i, '_, 'd>) -> HashMap<&'d str, &'i str> {
-    let mut owners: HashMap<&str, (usize, &str)> = HashMap::new();
-    for (&id, found) in status {
-        let Ok(found) = found else {
-            continue;
-        };
-        let depth = found.path.split('/').filter(|s| !s.is_empty()).count();
-        for &file in found.files {
-            let owner = owners.entry(file).or_insert((depth, id));
-            if depth > owner.0 {
-                *owner = (depth, id);
-            }
-        }
-    }
-    owners
-        .into_iter()
-        .map(|(file, (_, id))| (file, id))
+    let paths = PathOwners::new(
+        (status.iter()).filter_map(|(&id, found)| Some((id, found.as_ref().ok()?.path.as_str()))),
+    );
+    (status.values().flatten())
+        .flat_map(|found| found.files.iter().copied())
+        .filter_map(|file| Some((file, paths.owner(file)?)))
         .collect()
 }
 
@@ -532,17 +653,10 @@ impl<'i, 'd> Pairs<'i, 'd> {
             runtime_reach: HashSet::new(),
             any_reach: HashSet::new(),
         };
-        for edge in scan.edges {
-            let (Some(&from), Some(&to)) =
-                (owners.get(edge.from.as_str()), owners.get(written(edge)))
-            else {
-                continue;
-            };
-            if from != to {
-                *joined.entry((from, to)).or_default() |= runtime(edge);
-                if runtime(edge) {
-                    pairs.runtime.entry((from, to)).or_insert(edge);
-                }
+        for (from, to, edge) in owner_pairs(scan.edges, |f| owners.get(f).copied()) {
+            *joined.entry((from, to)).or_default() |= runtime(edge);
+            if runtime(edge) {
+                pairs.runtime.entry((from, to)).or_insert(edge);
             }
         }
         for ((from, to), runtime) in joined {
@@ -712,6 +826,27 @@ fn entry_dirs<'i, 's>(
     dirs
 }
 
+/// Each runtime edge from outside a directory in `dirs` to a file inside it that is not one of
+/// its entry points, with that directory.
+fn deep_imports<'d>(
+    scan: &Scan<'d>,
+    dirs: &HashMap<&str, (&str, BTreeSet<&str>)>,
+) -> Vec<(&'d str, &'d Edge)> {
+    let mut deep = Vec::new();
+    for edge in scan.edges.iter().filter(|e| runtime(e)) {
+        let target = written(edge);
+        for dir in ancestors(target) {
+            if let Some((_, entries)) = dirs.get(dir)
+                && !inside(&edge.from, dir)
+                && !entries.contains(target)
+            {
+                deep.push((dir, edge));
+            }
+        }
+    }
+    deep
+}
+
 /// `ENTRY_POINT_UNEXPOSED`: code outside a module bound to a directory with entry points
 /// imports a file inside it that is not one of them. One diagnostic per module and file.
 fn entry_points(
@@ -722,35 +857,28 @@ fn entry_points(
 ) {
     let dirs = entry_dirs(scan, status);
     let mut reported = BTreeSet::new();
-    for edge in scan.edges.iter().filter(|e| runtime(e)) {
+    for (dir, edge) in deep_imports(scan, &dirs) {
+        let (id, entries) = &dirs[dir];
         let target = written(edge);
-        for dir in ancestors(target) {
-            let Some((id, entries)) = dirs.get(dir) else {
-                continue;
-            };
-            if inside(&edge.from, dir)
-                || entries.contains(target)
-                || !reported.insert((*id, target))
-            {
-                continue;
-            }
-            let message = format!(
-                "{} imports {target} inside {}, past its entry points: {}",
-                location(edge),
-                index.name(id),
-                entries.iter().copied().collect::<Vec<_>>().join(", ")
-            );
-            report.warn(
-                DiagnosticCode::EntryPointUnexposed,
-                vec![(*id).to_owned()],
-                message,
-            );
+        if !reported.insert((*id, target)) {
+            continue;
         }
+        let message = format!(
+            "{} imports {target} inside {}, past its entry points: {}",
+            location(edge),
+            index.name(id),
+            entries.iter().copied().collect::<Vec<_>>().join(", ")
+        );
+        report.warn(
+            DiagnosticCode::EntryPointUnexposed,
+            vec![(*id).to_owned()],
+            message,
+        );
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::DiagnosticCode::*;
     use super::*;
     use crate::arch::diagnostic::Severity;
@@ -763,13 +891,13 @@ mod tests {
     use crate::surface::{SymbolTarget, Symbols};
     use serde_json::json;
 
-    const M: &str = "Model001";
+    pub(in crate::arch) const M: &str = "Model001";
 
-    fn q(local: &str) -> String {
+    pub(in crate::arch) fn q(local: &str) -> String {
         ids::qualify(M, local)
     }
 
-    fn module(id: &str, parent: Option<&str>, path: Option<&str>) -> Module {
+    pub(in crate::arch) fn module(id: &str, parent: Option<&str>, path: Option<&str>) -> Module {
         Module {
             schema_version: SCHEMA_VERSION,
             id: id.to_owned(),
@@ -795,7 +923,12 @@ mod tests {
         module
     }
 
-    fn link<'m>(from: &'m mut Module, id: &str, to: &str, kind: &str) -> &'m mut Relationship {
+    pub(in crate::arch) fn link<'m>(
+        from: &'m mut Module,
+        id: &str,
+        to: &str,
+        kind: &str,
+    ) -> &'m mut Relationship {
         from.outgoing.push(Relationship {
             id: id.to_owned(),
             to: q(to),
@@ -823,7 +956,7 @@ mod tests {
         "docs/README.md",
     ];
 
-    fn edge(from: &str, to: &str, kind: EdgeKind, line: usize) -> Edge {
+    pub(in crate::arch) fn edge(from: &str, to: &str, kind: EdgeKind, line: usize) -> Edge {
         Edge {
             from: from.into(),
             to: to.into(),
@@ -834,7 +967,7 @@ mod tests {
     }
 
     /// The checkout on disk, and its scan of every file but the README.
-    fn checkout() -> (TempDir, Document) {
+    pub(in crate::arch) fn checkout() -> (TempDir, Document) {
         let dir = TempDir::new("code-check").unwrap();
         for file in FILES {
             let path = dir.path().join(file);
@@ -905,7 +1038,7 @@ mod tests {
         (dir, doc)
     }
 
-    fn shop() -> [Module; 4] {
+    pub(in crate::arch) fn shop() -> [Module; 4] {
         [
             module("App", None, Some("app")),
             module("Web", Some("App"), Some("app/web")),
@@ -1250,6 +1383,29 @@ mod tests {
             symbol: "x".to_owned(),
         });
         assert!(needs_scan(&[vendor], dir.path()));
+    }
+
+    #[test]
+    fn paths_map_to_the_deepest_binding_without_a_scan() {
+        let mut modules = shop().to_vec();
+        modules.push(module("Root", None, Some(".")));
+        modules.push(symbol(
+            module("Charge", Some("Billing"), Some("app/billing")),
+            "charge",
+        ));
+        modules.push(module("Gone", None, Some("app/gone")));
+        let mut other = module("Other", None, Some("app"));
+        other.binding.as_mut().unwrap().repo = Some("elsewhere".into());
+        modules.push(other);
+        let bound = bound_paths(M, &modules);
+        let owners = PathOwners::new(bound.iter().map(|(i, p)| (i.as_str(), p.as_str())));
+        let owner = |file| owners.owner(file);
+        // Charge stands for a symbol in Billing's path, so it owns nothing.
+        assert!(!bound.contains_key(&q("Charge")) && !bound.contains_key(&q("Other")));
+        assert_eq!(owner("app/billing/charge.ts"), Some(q("Billing").as_str()));
+        assert_eq!(owner("app/gone/old.ts"), Some(q("Gone").as_str()));
+        assert_eq!(owner("app/webby.ts"), Some(q("App").as_str()));
+        assert_eq!(owner("README.md"), Some(q("Root").as_str()));
     }
 
     #[test]

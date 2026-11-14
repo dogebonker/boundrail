@@ -7,6 +7,9 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
+/// The references naming a repository's default branch, in the order they are tried.
+pub const DEFAULT_BRANCHES: [&str; 3] = ["origin/HEAD", "main", "master"];
+
 fn subcommand<'a>(args: &[&'a str]) -> &'a str {
     args.iter().find(|arg| !arg.starts_with('-')).unwrap_or(&"")
 }

@@ -1,6 +1,6 @@
 //! The modules of one model indexed by qualified ID, shared by the semantic and code checks.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use super::ids;
 use super::types::{Anchor, Binding, Module};
@@ -21,6 +21,8 @@ pub(super) struct Index<'a> {
     /// Modules keyed by their parent's qualified ID.
     parts: BTreeMap<&'a str, Vec<(String, &'a Module)>>,
     pub(super) lines: Vec<Line<'a>>,
+    /// Indexes into `lines` by source and target.
+    drawn: HashMap<String, HashMap<&'a str, Vec<usize>>>,
 }
 
 impl<'a> Index<'a> {
@@ -30,6 +32,7 @@ impl<'a> Index<'a> {
             roots: Vec::new(),
             parts: BTreeMap::new(),
             lines: Vec::new(),
+            drawn: HashMap::new(),
         };
         for module in modules {
             let id = ids::qualify(model, &module.id);
@@ -46,6 +49,10 @@ impl<'a> Index<'a> {
                 anchor: r.anchor.as_ref(),
             }));
             index.by_id.insert(id, module);
+        }
+        for (at, line) in index.lines.iter().enumerate() {
+            let targets = index.drawn.entry(line.from.clone()).or_default();
+            targets.entry(line.to).or_default().push(at);
         }
         index
     }
@@ -108,5 +115,25 @@ impl<'a> Index<'a> {
             at = self.by_id.get(parent).and_then(|m| m.parent.as_deref());
         }
         chain
+    }
+
+    /// The relationships drawn from `from` or a module containing it to `to` or one containing it.
+    pub(super) fn covering<'s>(
+        &'s self,
+        from: &'s str,
+        to: &'s str,
+    ) -> impl Iterator<Item = &'s Line<'a>> {
+        let targets = self.chain(to);
+        (self.chain(from).into_iter())
+            .filter_map(|source| self.drawn.get(source))
+            .flat_map(move |drawn| {
+                let found: Vec<usize> = (targets.iter())
+                    .filter_map(|target| drawn.get(target))
+                    .flatten()
+                    .copied()
+                    .collect();
+                found
+            })
+            .map(|at| &self.lines[at])
     }
 }

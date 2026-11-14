@@ -168,6 +168,14 @@ fn populate(dir: &Path, name: &str, planning: bool) -> Result<()> {
     write_atomic(&dir.join(MANIFEST), file_json(&manifest)?.as_bytes())
 }
 
+/// Whether the repository path `path` lies inside the vault folder.
+pub(crate) fn in_vault(path: &str) -> bool {
+    path.strip_prefix(STATE)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .and_then(|rest| rest.strip_prefix(VAULT))
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
 /// Where the vault folder of the checkout around `start` is, whether or not it exists.
 pub fn path(start: &Path) -> Result<PathBuf> {
     Ok(checkout_root(start)?.join(STATE).join(VAULT))
