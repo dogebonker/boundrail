@@ -3,6 +3,7 @@ macro_rules! eprintln { ($($arg:tt)*) => { $crate::output::stderr(format_args!("
 
 pub mod adr;
 pub mod apply;
+pub mod arch;
 pub mod bisect;
 pub mod cochange;
 pub mod codeowners;

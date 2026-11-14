@@ -61,6 +61,8 @@ mod infer_layout_cli;
 mod init_cli;
 #[path = "cli/mcp.rs"]
 mod mcp_cli;
+#[path = "cli/model.rs"]
+mod model_cli;
 #[path = "cli/package_splits.rs"]
 mod package_splits_cli;
 #[path = "cli/provenance.rs"]
@@ -176,6 +178,8 @@ enum Cmd {
     Tour(tour_cli::TourArgs),
     /// Infer services and infrastructure, or analyze declared service dependencies
     Services(services_cli::ServicesArgs),
+    /// Create, read and describe the authored architecture model in .boundrail/model
+    Model(model_cli::ModelArgs),
     /// List default file exclusions and their categories
     ShowExcludes,
     /// Explain a file, module or finding from a saved graph
@@ -511,6 +515,7 @@ fn execute_inner(cli: Cli) -> ExitCode {
         Cmd::Context(args) => context_cli::run(args).map(|()| ExitCode::SUCCESS),
         Cmd::Tour(args) => tour_cli::run(args).map(|()| ExitCode::SUCCESS),
         Cmd::Services(args) => services_cli::run(args),
+        Cmd::Model(args) => model_cli::run(args),
         Cmd::ShowExcludes => show_excludes().map(|()| ExitCode::SUCCESS),
         Cmd::Unresolved(args) => unresolved(args).map(|()| ExitCode::SUCCESS),
     };
