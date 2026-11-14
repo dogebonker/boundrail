@@ -733,6 +733,18 @@ fn symbolic_links_in_the_vault_are_refused_not_followed() {
         "{problems:#?}"
     );
 
+    // A module file that is neither a regular file nor a folder is refused, not skipped.
+    let special = Checkout::new();
+    shop(&special);
+    let fifo = special.vault().join("modules/Fifo0001.module.json");
+    let made = Command::new("mkfifo").arg(&fifo).status().unwrap();
+    assert!(made.success());
+    let error = special.refused(&["read"], "MODEL_INVALID");
+    assert_eq!(
+        error["details"]["problems"],
+        json!([{"file": "modules/Fifo0001.module.json", "subject": "Fifo0001", "message": "is not a regular file"}])
+    );
+
     // A linked folder is refused before anything is read through it.
     let folder = Checkout::new();
     shop(&folder);
@@ -2016,6 +2028,7 @@ fn an_edit_refuses_a_file_written_while_it_was_planned() {
     let value: Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(value["error"]["code"], "STALE_REVISION");
     assert_eq!(value["error"]["details"]["paths"], json!([path]));
+    assert_eq!(value["error"]["details"]["current"], checkout.digest());
     assert_eq!(checkout.read_module("BankApi1")["order"], 1);
     let operations = checkout.path().join(".git/boundrail/operations");
     let operation = request["operation_id"].as_str().unwrap();
@@ -2282,6 +2295,16 @@ fn check_without_a_scan_keeps_the_semantic_check_and_skips_the_code() {
     assert_eq!(out["passed"], true);
     assert!(out.get("skips").is_none(), "{out:#}");
 
+    // The failed scan alone fails the check.
+    let (code, out) = checkout.run(&["check"]);
+    assert_eq!(code, 1, "{out:#}");
+    assert_eq!(found(&out), ["SCAN_FAILED Platfrm1"]);
+    let message = out["diagnostics"][0]["message"].as_str().unwrap();
+    assert!(
+        message.starts_with("the scan of the checkout failed: ") && !message.contains('\n'),
+        "{message}"
+    );
+
     bind(&checkout, "WebApp01", "web");
     let (code, out) = checkout.run(&["check"]);
     assert_eq!(code, 1, "{out:#}");
@@ -2289,10 +2312,98 @@ fn check_without_a_scan_keeps_the_semantic_check_and_skips_the_code() {
         found(&out),
         [
             "CONTAINER_PARTS_OUTSIDE Platfrm1, WebApp01",
-            "BINDING_PATH_MISSING WebApp01"
+            "BINDING_PATH_MISSING WebApp01",
+            "SCAN_FAILED Platfrm1"
         ]
     );
     let skip =
         json!({"subject": format!("{model}#Platfrm1"), "site": "binding", "reason": "scan-failed"});
     assert!(out["skips"].as_array().unwrap().contains(&skip), "{out:#}");
+}
+
+#[test]
+fn check_judges_symbols_only_where_the_scan_indexes_them() {
+    let checkout = Checkout::new();
+    typescript(&checkout);
+    let model = shop(&checkout);
+    fs::write(
+        checkout.path().join("src/bank/pay.js"),
+        "function charge(n) { return n; }\nmodule.exports = { charge };\n",
+    )
+    .unwrap();
+    let mut billing = checkout.read_module("Billing1");
+    billing["binding"] = json!({"path": "src/bank/pay.js", "symbol": "charge"});
+    checkout.module(billing);
+    let mut web = checkout.read_module("WebApp01");
+    web["binding"] = json!({"path": "src/web/index.ts", "symbol": "missing"});
+    checkout.module(web);
+
+    // CommonJS exports are not indexed, so their absence proves nothing; ES exports are.
+    let out = checkout.run(&["check", "--only", "code"]).1;
+    assert_eq!(found(&out), ["BINDING_SYMBOL_MISSING WebApp01"]);
+    let skip = json!({"subject": format!("{model}#Billing1"), "site": "binding", "reason": "symbols-incomplete"});
+    assert!(out["skips"].as_array().unwrap().contains(&skip), "{out:#}");
+}
+
+#[test]
+fn recovery_finishes_a_landed_edit_whose_result_no_longer_validates() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let request =
+        checkout.request(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 7}}]));
+    let operation = request["operation_id"].as_str().unwrap();
+    let mut record = interrupt(&checkout, &request);
+    // As if an older build planned a module kind this build's vocabulary lacks.
+    let path = "modules/BankApi1.module.json";
+    let writes = record["writes"].as_array_mut().unwrap();
+    let write = writes.iter_mut().find(|w| w["path"] == path).unwrap();
+    let mut bank: Value = serde_json::from_str(write["content"].as_str().unwrap()).unwrap();
+    bank["kind"] = "lambda".into();
+    let content = serde_json::to_string_pretty(&bank).unwrap() + "\n";
+    write["content"] = content.clone().into();
+    let files = record["output"]["after"]["files"].as_array_mut().unwrap();
+    files.iter_mut().find(|f| f["path"] == path).unwrap()["sha256"] =
+        sha256(content.as_bytes()).into();
+    let lines: String = files
+        .iter()
+        .map(|f| {
+            format!(
+                "{}\0{}\n",
+                f["path"].as_str().unwrap(),
+                f["sha256"].as_str().unwrap()
+            )
+        })
+        .collect();
+    let digest = sha256(lines.as_bytes());
+    record["output"]["after"]["digest"] = digest.clone().into();
+    record["after"] = digest.into();
+    let journal = checkout.path().join(".git/boundrail/operations");
+    let pending = journal.join(format!("pending/{operation}.json"));
+    fs::write(&pending, record.to_string()).unwrap();
+    for write in record["writes"].as_array().unwrap() {
+        let file = checkout.vault().join(write["path"].as_str().unwrap());
+        match write["content"].as_str() {
+            Some(content) => fs::write(file, content).unwrap(),
+            None => fs::remove_file(file).unwrap(),
+        }
+    }
+
+    let out = Command::new(env!("CARGO_BIN_EXE_boundrail"))
+        .args(["--no-daemon", "model", "recover"])
+        .current_dir(checkout.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let recovered: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(recovered["completed"][0]["operation_id"], operation);
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains(&format!(
+            "warning: operation {operation} is complete, but the model does not load"
+        )),
+        "{stderr}"
+    );
+    assert!(!pending.exists());
+    assert!(journal.join(format!("{operation}.json")).exists());
+    checkout.refused(&["read"], "MODEL_INVALID");
 }

@@ -4,6 +4,8 @@
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
@@ -21,6 +23,10 @@ const LOCK: &str = "model.lock";
 /// not finished. Records differ by their `kind`: `edit`, `claim` or `release`.
 const OPERATIONS: &str = "operations";
 const PENDING: &str = "pending";
+/// How long taking the vault lock retries before it refuses: long enough to outlast a reader's
+/// brief shared-lock probe, short enough that a held lock refuses promptly.
+const LOCK_WAIT: Duration = Duration::from_millis(250);
+const LOCK_RETRY: Duration = Duration::from_millis(10);
 
 /// `<git dir>/boundrail` for the vault folder `vault`, which may not exist yet.
 pub(super) fn dir(vault: &Path) -> Result<PathBuf> {
@@ -36,7 +42,8 @@ pub(super) struct Locked {
     _lock: File,
 }
 
-/// Creates the state folder and takes the vault lock, refusing when another writer holds it.
+/// Creates the state folder and takes the vault lock, retrying for [`LOCK_WAIT`] and then
+/// refusing when another writer holds it.
 pub(super) fn lock(vault: &Path) -> Result<Locked> {
     let dir = dir(vault)?;
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -51,16 +58,24 @@ pub(super) fn lock(vault: &Path) -> Result<Locked> {
     let file = options
         .open(&path)
         .with_context(|| format!("opening {}", path.display()))?;
-    match file.try_lock() {
-        Ok(()) => Ok(Locked { dir, _lock: file }),
-        Err(TryLockError::WouldBlock) => Err(Refusal::new(
-            Code::VaultLocked,
-            "another writer holds the model lock; retry when it finishes",
-        )
-        .with_details(json!({ "lock": path }))
-        .into()),
-        Err(TryLockError::Error(e)) => {
-            Err(e).with_context(|| format!("locking {}", path.display()))
+    let deadline = Instant::now() + LOCK_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(Locked { dir, _lock: file }),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                thread::sleep(LOCK_RETRY);
+            }
+            Err(TryLockError::WouldBlock) => {
+                return Err(Refusal::new(
+                    Code::VaultLocked,
+                    "another writer holds the model lock; retry when it finishes",
+                )
+                .with_details(json!({ "lock": path }))
+                .into());
+            }
+            Err(TryLockError::Error(e)) => {
+                return Err(e).with_context(|| format!("locking {}", path.display()));
+            }
         }
     }
 }

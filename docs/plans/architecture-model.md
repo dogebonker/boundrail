@@ -56,10 +56,14 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 - T5: the code check scans the checkout once with the native engine, which picks one language per
   checkout. Bound code in any other language holds no scanned file and is skipped as
   `not-scanned` (polyglot gap). The TypeScript and Python collectors scan only under `src/` when
-  it exists, so bindings outside it show as `not-scanned` too. A failed scan is a warning; paths
-  it would have judged are skipped as `scan-failed` and the semantic check still reports.
+  it exists, so bindings outside it show as `not-scanned` too. A failed scan is a warning
+  (`SCAN_FAILED`) that fails the check; paths it would have judged are skipped as `scan-failed`
+  and the semantic check still reports. `--only semantic` opts out of the scan.
 - T5: import edges stand in for call evidence until T13. Only kinds whose evidence is entirely
   import or call (`call`, `render` by default) get the strict check: no edge is unsupported, or
   backwards. A kind with other evidence too (HTTP, RPC, event, queue, data, dependency) is
   supported by an edge and otherwise skipped as `evidence-unavailable`.
-- T5: a binding or anchor symbol is the exported name, `default` for a default export.
+- T5: a binding or anchor symbol is the exported name, `default` for a default export. A file the
+  scan cannot fully index (CommonJS exports, destructured exports, syntax errors) skips a missing
+  symbol as `symbols-incomplete`. Elixir files whose definitions `use` macros generate are not
+  marked yet, so a symbol such a macro defines reports missing.

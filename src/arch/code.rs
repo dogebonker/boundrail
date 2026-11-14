@@ -13,6 +13,7 @@ use super::diagnostic::{Diagnostic, DiagnosticCode};
 use super::index::{Index, Line};
 use super::segments;
 use super::types::{EXTERNAL_KIND, Evidence, Module, VaultConfig};
+use super::vault::parse_message;
 use crate::model::{Document, Edge, EdgeKind, Language};
 use crate::modules::dir_of;
 use crate::surface::{SymbolExport, is_entry_file};
@@ -115,14 +116,25 @@ fn collected(evidence: Evidence) -> bool {
     matches!(evidence, Evidence::Import | Evidence::Call)
 }
 
-/// Whether a module that is not external has a binding or anchor naming an existing path of
+/// Why the check runs without a scan.
+#[derive(Debug, Clone)]
+pub enum NoScan {
+    /// No binding or anchor names existing code, so none was needed.
+    NotNeeded,
+    /// The scan failed with this error.
+    Failed(String),
+}
+
+/// Whether a binding of a module that is not external, or any anchor, names an existing path of
 /// this repository under `root`: without one there is no code to compare, so no scan is needed.
 pub fn needs_scan(modules: &[Module], root: &Path) -> bool {
-    let judged = || modules.iter().filter(|m| m.kind != EXTERNAL_KIND);
-    let bindings = judged()
+    let bindings = modules
+        .iter()
+        .filter(|m| m.kind != EXTERNAL_KIND)
         .filter_map(|m| m.binding.as_ref())
         .map(|b| (&b.repo, &b.path));
-    let anchors = judged()
+    let anchors = modules
+        .iter()
         .flat_map(|m| &m.outgoing)
         .filter_map(|r| r.anchor.as_ref())
         .map(|a| (&a.repo, &a.path));
@@ -132,18 +144,22 @@ pub fn needs_scan(modules: &[Module], root: &Path) -> bool {
 }
 
 /// Every code diagnostic of model `model` against the checkout at `root` and its scan, sorted,
-/// with what was not judged. Without a scan, `scan` is the reason existing paths are skipped:
-/// `not-scanned` when `needs_scan` found nothing to scan for, or `scan-failed`. The modules must
-/// have loaded, so parents and targets exist and containment has no cycle.
+/// with what was not judged. Without a scan, existing paths are skipped as `not-scanned`, or as
+/// `scan-failed` with a `SCAN_FAILED` warning. The modules must have loaded, so parents and
+/// targets exist and containment has no cycle.
 pub fn check(
     model: &str,
     modules: &[Module],
     config: &VaultConfig,
     root: &Path,
-    scan: Result<&Document, SkipReason>,
+    scan: Result<&Document, NoScan>,
 ) -> CodeReport {
     let index = Index::new(model, modules);
-    let scan = Scan::new(scan);
+    let (scan, failure) = match scan {
+        Ok(doc) => (Scan::new(Ok(doc)), None),
+        Err(NoScan::NotNeeded) => (Scan::new(Err(SkipReason::NotScanned)), None),
+        Err(NoScan::Failed(error)) => (Scan::new(Err(SkipReason::ScanFailed)), Some(error)),
+    };
     let mut report = CodeReport::default();
     let status = bindings(&index, root, &scan, &mut report);
     anchors(&index, root, &scan, &mut report);
@@ -151,9 +167,29 @@ pub fn check(
     let backwards = relationships(&index, config, &status, &pairs, &mut report);
     undrawn(&index, &pairs, &backwards, &mut report);
     entry_points(&index, &scan, &status, &mut report);
+    if let Some(error) = failure {
+        scan_failed(&error, &mut report);
+    }
     report.diagnostics.sort();
     report.skips.sort();
     report
+}
+
+/// `SCAN_FAILED`: the scan the check needed failed. Its subjects are what went unjudged; with
+/// none, every path it was needed for turned out missing and already warns.
+fn scan_failed(error: &str, report: &mut CodeReport) {
+    let subjects: BTreeSet<&str> = report
+        .skips
+        .iter()
+        .filter(|s| s.reason == SkipReason::ScanFailed)
+        .map(|s| s.subject.as_str())
+        .collect();
+    if subjects.is_empty() {
+        return;
+    }
+    let subjects = subjects.into_iter().map(str::to_owned).collect();
+    let message = format!("the scan of the checkout failed: {}", parse_message(&error));
+    report.warn(DiagnosticCode::ScanFailed, subjects, message);
 }
 
 /// The parts of a scan the check reads, empty without one.
@@ -905,6 +941,10 @@ mod tests {
             .collect()
     }
 
+    fn found_codes(report: &CodeReport) -> Vec<DiagnosticCode> {
+        report.diagnostics.iter().map(|d| d.code).collect()
+    }
+
     const NONE: [Vec<String>; 0] = [];
 
     #[test]
@@ -1107,16 +1147,33 @@ mod tests {
             [(q("Billing"), "binding", "language-unsupported")]
         );
 
-        for reason in [SkipReason::NotScanned, SkipReason::ScanFailed] {
-            let report = check(
-                M,
-                &modules,
-                &VaultConfig::default(),
-                dir.path(),
-                Err(reason),
-            );
-            assert_eq!(skips(&report), [(q("Billing"), "binding", reason.as_str())]);
-        }
+        let without = |scan| check(M, &modules, &VaultConfig::default(), dir.path(), Err(scan));
+        let report = without(NoScan::NotNeeded);
+        assert_eq!(report.diagnostics, []);
+        assert_eq!(skips(&report), [(q("Billing"), "binding", "not-scanned")]);
+
+        // A failed scan fails the check, naming what it left unjudged.
+        let report = without(NoScan::Failed(
+            "no source\nsecond line \u{1b}[31m".to_owned(),
+        ));
+        assert_eq!(skips(&report), [(q("Billing"), "binding", "scan-failed")]);
+        assert_eq!(subjects(&report, ScanFailed), [vec![q("Billing")]]);
+        assert_eq!(
+            of(&report, ScanFailed)[0].message,
+            "the scan of the checkout failed: no source"
+        );
+        let report = without(NoScan::Failed("bad \u{1b}[31m".to_owned()));
+        assert_eq!(
+            of(&report, ScanFailed)[0].message,
+            "the scan of the checkout failed: bad \\u{1b}[31m"
+        );
+        assert_eq!(of(&report, ScanFailed)[0].severity, Severity::Warning);
+
+        // Every path turned out missing: nothing went unjudged, so no SCAN_FAILED.
+        let ghost = [module("Ghost", None, Some("DOCS"))];
+        let failed = NoScan::Failed("no source".to_owned());
+        let report = check(M, &ghost, &VaultConfig::default(), dir.path(), Err(failed));
+        assert_eq!(found_codes(&report), [BindingPathMissing]);
     }
 
     #[test]
@@ -1183,6 +1240,16 @@ mod tests {
             symbol: "x".to_owned(),
         });
         assert!(needs_scan(&[remote, missing], dir.path()));
+
+        // An anchor counts whatever kind of module owns it.
+        let mut vendor = module("Vendor", None, None);
+        vendor.kind = EXTERNAL_KIND.to_owned();
+        link(&mut vendor, "R2", "Vendor", "call").anchor = Some(Anchor {
+            repo: None,
+            path: "src".to_owned(),
+            symbol: "x".to_owned(),
+        });
+        assert!(needs_scan(&[vendor], dir.path()));
     }
 
     #[test]

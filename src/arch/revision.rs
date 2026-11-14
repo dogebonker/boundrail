@@ -37,27 +37,29 @@ impl Revision {
         &self,
         changes: impl IntoIterator<Item = (&'a str, Option<&'a [u8]>)>,
     ) -> Revision {
-        let mut files: BTreeMap<&str, String> = self
+        let mut files: BTreeMap<String, String> = self
             .files
             .iter()
-            .map(|f| (f.path.as_str(), f.sha256.clone()))
+            .map(|f| (f.path.clone(), f.sha256.clone()))
             .collect();
         for (path, bytes) in changes {
             match bytes {
-                Some(bytes) => files.insert(path, hash(bytes)),
+                Some(bytes) => files.insert(path.to_owned(), hash(bytes)),
                 None => files.remove(path),
             };
         }
-        from_digests(
-            files
-                .into_iter()
-                .map(|(path, sha256)| FileDigest {
-                    path: path.to_owned(),
-                    sha256,
-                })
-                .collect(),
-        )
+        of_digests(files)
     }
+}
+
+/// The revision of the per-file digests `vault::file_digests` reads, by vault-relative path.
+pub(super) fn of_digests(files: BTreeMap<String, String>) -> Revision {
+    from_digests(
+        files
+            .into_iter()
+            .map(|(path, sha256)| FileDigest { path, sha256 })
+            .collect(),
+    )
 }
 
 fn from_digests(mut files: Vec<FileDigest>) -> Revision {

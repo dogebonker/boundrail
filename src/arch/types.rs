@@ -14,6 +14,9 @@ pub const LABEL_MAX: usize = 60;
 pub const EXTERNAL_KIND: &str = "external";
 const LOCAL_ID: &str = "^[A-Za-z0-9]{8}$";
 const QUALIFIED_ID: &str = "^[A-Za-z0-9]{8}#[A-Za-z0-9]{8}$";
+/// A path relative to the repository root, as `vault::is_repo_path` checks it: no leading `/`, no
+/// `..` segment, no backslash, and no `:` in the first segment.
+const REPO_PATH: &str = r"^(?:[^/\\.:][^/\\:]*|\.(?:[^/\\.:][^/\\:]*)?|\.\.[^/\\:]+)(?:/(?:[^/\\.][^/\\]*|\.(?:[^/\\.][^/\\]*)?|\.\.[^/\\]+)?)*$";
 
 /// `model.json`: the model's identity and its current state.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -129,6 +132,7 @@ pub struct Module {
 pub struct Binding {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
+    #[schemars(pattern(REPO_PATH))]
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub symbol: Option<String>,
@@ -170,6 +174,7 @@ pub enum Emphasis {
 pub struct Anchor {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
+    #[schemars(pattern(REPO_PATH))]
     pub path: String,
     pub symbol: String,
 }
@@ -283,6 +288,43 @@ mod tests {
             assert_eq!(
                 validator.is_valid(&Value::from(sample)),
                 crate::arch::ids::is_local(sample),
+                "{sample}"
+            );
+        }
+    }
+
+    #[test]
+    fn repo_path_pattern_agrees_with_the_path_check() {
+        let validator =
+            jsonschema::validator_for(&serde_json::json!({"type": "string", "pattern": REPO_PATH}))
+                .unwrap();
+        for sample in [
+            "src",
+            "src/a.ts",
+            "./src",
+            ".hidden/x",
+            "...",
+            "..x/y",
+            "a//b",
+            "a/./b",
+            "a/b:c",
+            "src/",
+            "",
+            "/etc",
+            "..",
+            "../a",
+            "a/../b",
+            "a/..",
+            "c:/x",
+            "C:",
+            "http://x",
+            "a\\b",
+            "\\\\server\\share",
+            "a/b\\c",
+        ] {
+            assert_eq!(
+                validator.is_valid(&Value::from(sample)),
+                crate::arch::vault::is_repo_path(sample),
                 "{sample}"
             );
         }

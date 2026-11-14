@@ -3,7 +3,7 @@ use std::io::Read as _;
 use std::iter;
 
 use boundrail::arch::claims::{self, Claim};
-use boundrail::arch::code::{self, CodeReport, Skip, SkipReason};
+use boundrail::arch::code::{self, CodeReport, NoScan, Skip};
 use boundrail::arch::diagnostic::{Diagnostic, Severity};
 use boundrail::arch::edit::{self, Receipt};
 use boundrail::arch::request::INPUT_MAX;
@@ -260,7 +260,10 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
         }
         ModelCmd::Edit { input, doing } => {
             let dir = vault::locate(root)?;
-            let receipt = edit::run(&dir, &read_request(input.as_deref())?, &doing)?;
+            let (receipt, finished) = edit::run(&dir, &read_request(input.as_deref())?, &doing)?;
+            if finished {
+                warn_unloadable(&dir, &[&receipt]);
+            }
             if markdown {
                 print_receipt(&receipt);
                 return Ok(());
@@ -305,6 +308,7 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
         ModelCmd::Recover { abandon: None } => {
             let dir = vault::locate(root)?;
             let completed = edit::recover(&dir)?;
+            warn_unloadable(&dir, &completed.iter().collect::<Vec<_>>());
             if markdown {
                 if completed.is_empty() {
                     println!("No interrupted edits");
@@ -416,7 +420,7 @@ fn check(root: &Path, markdown: bool, only: Option<CheckOnly>) -> Result<ExitCod
 }
 
 /// The code check against the model's checkout, scanning it once when a binding or anchor names
-/// code there. A failed scan is a warning on stderr: the check skips what needed it.
+/// code there. A failed scan becomes a `SCAN_FAILED` warning.
 fn code_check(model: &Model) -> Result<CodeReport> {
     // The vault is `<checkout>/.boundrail/model`.
     let checkout = model
@@ -425,18 +429,16 @@ fn code_check(model: &Model) -> Result<CodeReport> {
         .and_then(Path::parent)
         .context("the model vault has no checkout around it")?;
     let doc = if code::needs_scan(&model.modules, checkout) {
-        super::scan_cli::live(checkout, None)
-            .inspect_err(|error| eprintln!("warning: code check without a scan: {error:#}"))
-            .map_err(|_| SkipReason::ScanFailed)
+        super::scan_cli::live(checkout, None).map_err(|error| NoScan::Failed(format!("{error:#}")))
     } else {
-        Err(SkipReason::NotScanned)
+        Err(NoScan::NotNeeded)
     };
     Ok(code::check(
         &model.manifest.id,
         &model.modules,
         &model.config,
         checkout,
-        doc.as_ref().map_err(|&reason| reason),
+        doc.as_ref().map_err(Clone::clone),
     ))
 }
 
@@ -478,6 +480,22 @@ fn print_diagnostics(
     }
     let verdict = if warning == 0 { "passed" } else { "failed" };
     println!("Check {verdict}: warnings: {warning}, information: {information}");
+}
+
+/// Warns on stderr when the model no longer loads after finishing interrupted edits: a newer
+/// build may judge a record an older one planned otherwise. The edits themselves are complete.
+fn warn_unloadable(dir: &Path, finished: &[&Receipt]) {
+    if finished.is_empty() {
+        return;
+    }
+    if let Err(error) = vault::load_dir(dir.to_path_buf()) {
+        for receipt in finished {
+            eprintln!(
+                "warning: operation {} is complete, but the model does not load: {error:#}",
+                receipt.operation_id
+            );
+        }
+    }
 }
 
 /// A request from `input`, or standard input for `-` or none. One byte past the limit is enough

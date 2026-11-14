@@ -18,7 +18,7 @@ use super::request::{
     OPERATION_MAX, OPERATION_PATTERN, Target, WRITER_MAX, check_doing, check_model,
     check_operation, check_writer, invalid, parse,
 };
-use super::revision::Revision;
+use super::revision::{self, Revision};
 use super::state::{self, Locked};
 use super::types::{Anchor, Binding, Emphasis, Module, Relationship, SCHEMA_VERSION};
 use super::vault::{self, FileWrite, Model, relationships};
@@ -259,8 +259,9 @@ pub struct Interrupted {
 }
 
 /// Applies `input`, an [`EditRequest`] as JSON, to the vault folder `vault`. A repeated
-/// operation returns its stored receipt, finishing it first when it was interrupted.
-pub fn run(vault: &Path, input: &[u8], doing: &str) -> Result<Receipt> {
+/// operation returns its stored receipt, finishing it first when it was interrupted. The flag
+/// says whether this call finished an interrupted edit.
+pub fn run(vault: &Path, input: &[u8], doing: &str) -> Result<(Receipt, bool)> {
     check_doing(doing)?;
     let request: EditRequest = parse(input, "edit")?;
     check_request(&request)?;
@@ -268,8 +269,8 @@ pub fn run(vault: &Path, input: &[u8], doing: &str) -> Result<Receipt> {
     let (fingerprint, record) = journal.read(&request.operation_id, &request)?;
     if let Some(record) = record {
         return match record.status {
-            Status::Done => Ok(record.output),
-            Status::Pending => complete(vault, &journal, record),
+            Status::Done => Ok((record.output, false)),
+            Status::Pending => complete(vault, &journal, record).map(|receipt| (receipt, true)),
             Status::Abandoned => Err(Refusal::new(
                 Code::OperationAbandoned,
                 "this operation was abandoned; plan the change again with a new operation_id",
@@ -300,13 +301,14 @@ pub fn run(vault: &Path, input: &[u8], doing: &str) -> Result<Receipt> {
             .write_all(b"\n")?;
     }
     // A file written outside the lock since the model was read: the plan is stale.
-    let changed = changed(vault, &record)?;
+    let (changed, current) = changed(vault, &record)?;
     if !changed.is_empty() {
+        let current = revision::of_digests(current).digest;
         return Err(Refusal::new(
             Code::StaleRevision,
             "vault files changed while the edit was planned; read the model again and rebase the changes",
         )
-        .with_details(json!({ "paths": changed }))
+        .with_details(json!({ "paths": changed, "current": current }))
         .into());
     }
     journal.write_pending(&record)?;
@@ -314,7 +316,7 @@ pub fn run(vault: &Path, input: &[u8], doing: &str) -> Result<Receipt> {
     if std::env::var_os(STOP_AFTER_JOURNAL).is_some() {
         anyhow::bail!("stopped after writing the journal because {STOP_AFTER_JOURNAL} is set");
     }
-    apply(vault, &journal, record)
+    apply(vault, &journal, record).map(|receipt| (receipt, false))
 }
 
 /// Finishes every interrupted edit of the vault folder `vault` and returns their receipts. At
@@ -374,7 +376,8 @@ pub fn abandon(vault: &Path, operation: &str) -> Result<Abandoned> {
 }
 
 /// The edit waiting in the journal of the state folder `state` (see [`super::state_dir`]), if
-/// any. It creates nothing and holds no lock.
+/// any. It creates nothing; it probes the vault lock with a brief shared lock, which a writer
+/// taking the lock meanwhile waits out.
 pub fn interrupted(state: &Path) -> Result<Option<Interrupted>> {
     let Some(operation_id) = state::pending(state)?.into_iter().next() else {
         return Ok(None);
@@ -467,7 +470,7 @@ fn plan(
 /// Finishes a pending record, refusing `RECOVERY_CONFLICT` without writing when a vault file
 /// changed since the edit was planned: applying the plan then would overwrite that change.
 fn complete(vault: &Path, journal: &Journal, record: Record) -> Result<Receipt> {
-    let changed = changed(vault, &record)?;
+    let (changed, _) = changed(vault, &record)?;
     if !changed.is_empty() {
         let operation = &record.output.operation_id;
         return Err(Refusal::new(
@@ -483,8 +486,9 @@ fn complete(vault: &Path, journal: &Journal, record: Record) -> Result<Receipt> 
 }
 
 /// The vault paths whose current content is neither what `record` found before planning nor what
-/// it plans. Outside its writes the two agree, so any change there counts.
-fn changed(vault: &Path, record: &Record) -> Result<Vec<String>> {
+/// it plans, with the current digests they were judged by. Outside its writes the two agree, so
+/// any change there counts.
+fn changed(vault: &Path, record: &Record) -> Result<(Vec<String>, BTreeMap<String, String>)> {
     let (before, after, current) = snapshot(vault, record)?;
     let paths: BTreeSet<&str> = current
         .keys()
@@ -492,14 +496,15 @@ fn changed(vault: &Path, record: &Record) -> Result<Vec<String>> {
         .chain(before.keys().copied())
         .chain(after.keys().copied())
         .collect();
-    Ok(paths
+    let changed = paths
         .into_iter()
         .filter(|path| {
             let now = current.get(*path).map(String::as_str);
             now != before.get(path).copied() && now != after.get(path).copied()
         })
         .map(str::to_owned)
-        .collect())
+        .collect();
+    Ok((changed, current))
 }
 
 /// File digests by path: what `record` found before planning, what it plans, and what the vault
@@ -525,17 +530,21 @@ type Digests<'a> = (
     BTreeMap<String, String>,
 );
 
-/// Applies a pending record's writes, checks the vault reached its revision and marks it done.
-/// Every failure here may follow a vault write, so it is an error rather than a refusal.
+/// Applies a pending record's writes, checks every vault file reached its planned digest and
+/// marks it done, without loading the model: a newer build may judge a record an older one
+/// planned otherwise. Every failure here may follow a vault write, so it is an error rather than
+/// a refusal.
 fn apply(vault: &Path, journal: &Journal, mut record: Record) -> Result<Receipt> {
     let operation = record.output.operation_id.clone();
     let finished = (|| -> Result<()> {
         vault::apply_writes(vault, record.writes.as_deref().unwrap_or_default())?;
-        let digest = vault::load_dir(vault.to_path_buf())?.revision.digest;
-        let planned = &record.output.after.digest;
+        let reached = revision::of_digests(vault::file_digests(vault)?);
+        let planned = &record.output.after;
         ensure!(
-            digest == *planned,
-            "the vault revision is {digest} after writing, not the planned {planned}"
+            reached == *planned,
+            "the vault revision is {} after writing, not the planned {}",
+            reached.digest,
+            planned.digest
         );
         record.status = Status::Done;
         record.before = None;

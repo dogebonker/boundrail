@@ -242,6 +242,9 @@ pub fn load_dir(dir: PathBuf) -> Result<Model> {
                     problems.push(&path, file_subject(&path), LINKED);
                 } else if kind.is_file() {
                     names.push(name);
+                } else if !kind.is_dir() {
+                    // As in `file_digests`, a folder named like a module file is not a vault file.
+                    problems.push(&path, file_subject(&path), "is not a regular file");
                 }
             }
         }
@@ -656,10 +659,20 @@ fn check_module(
     }
 }
 
-/// A code path relative to the repository root: not empty, not absolute, and without a `..`
-/// segment, so it never names a file outside the repository.
+/// Whether `path` is a code path relative to the repository root on every host: not empty, not
+/// absolute, without a `..` segment, a backslash, or a `:` in its first segment (a drive or a
+/// URL scheme), so it never names a file outside the repository.
+pub(super) fn is_repo_path(path: &str) -> bool {
+    let first = path.split('/').next().unwrap_or_default();
+    !path.is_empty()
+        && !path.starts_with('/')
+        && !path.contains('\\')
+        && !first.contains(':')
+        && !path.split('/').any(|s| s == "..")
+}
+
 fn check_path(problems: &mut Problems, file: &str, subject: &str, field: &str, path: &str) {
-    if path.is_empty() || path.starts_with('/') || path.split('/').any(|s| s == "..") {
+    if !is_repo_path(path) {
         problems.push(
             file,
             subject,

@@ -20,6 +20,7 @@ pub enum DiagnosticCode {
     RelationshipUnsupported,
     RelationshipBackwards,
     EntryPointUnexposed,
+    ScanFailed,
 }
 
 impl DiagnosticCode {
@@ -41,6 +42,7 @@ impl DiagnosticCode {
             Self::RelationshipUnsupported => "RELATIONSHIP_UNSUPPORTED",
             Self::RelationshipBackwards => "RELATIONSHIP_BACKWARDS",
             Self::EntryPointUnexposed => "ENTRY_POINT_UNEXPOSED",
+            Self::ScanFailed => "SCAN_FAILED",
         }
     }
 
@@ -61,7 +63,8 @@ impl DiagnosticCode {
             | Self::AnchorSymbolMissing
             | Self::RelationshipUndrawn
             | Self::RelationshipUnsupported
-            | Self::RelationshipBackwards => Severity::Warning,
+            | Self::RelationshipBackwards
+            | Self::ScanFailed => Severity::Warning,
         }
     }
 }
