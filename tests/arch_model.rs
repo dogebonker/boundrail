@@ -7820,8 +7820,23 @@ fn import_refuses_a_bundle_whose_base_or_paths_do_not_hold() {
         );
         assert_eq!(out["error"]["details"]["path"], path, "{out:#}");
     }
-    // Paths differing only in case would land on one file on some hosts.
+    // A current-state path must name a local ID: a backslash is a separator on some hosts.
     let current = export(&checkout, &[]);
+    let escape = "modules/..\\..\\evil.module.json";
+    let (code, out) = import(
+        &checkout,
+        &with_file(&current, escape, &file("ZZZZZZZZ", "service")),
+    );
+    assert_eq!(
+        (
+            code,
+            &out["error"]["code"],
+            &out["error"]["details"]["path"]
+        ),
+        (2, &json!("BUNDLE_INVALID"), &json!(escape)),
+        "{out:#}"
+    );
+    // Paths differing only in case would land on one file on some hosts.
     let shadow = with_file(
         &current,
         "modules/BILLING1.module.json",

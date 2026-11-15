@@ -875,9 +875,10 @@ fn vault_file(path: &str) -> Option<(&'static str, &str)> {
 }
 
 /// Whether `path` names a file `load_dir` reads: the manifest, the config, or a module,
-/// collection, walkthrough or picture file directly inside its folder.
+/// collection, walkthrough or picture file named by a well-formed local ID, so a path from a
+/// bundle or a fetched checkpoint never leaves its folder on any host.
 pub(super) fn is_vault_file(path: &str) -> bool {
-    path == MANIFEST || path == CONFIG || vault_file(path).is_some_and(|(_, id)| !id.contains('/'))
+    path == MANIFEST || path == CONFIG || is_id_file(path, &FOLDERS)
 }
 
 fn file_subject(path: &str) -> &str {
