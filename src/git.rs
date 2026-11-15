@@ -43,7 +43,21 @@ pub fn run(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
 /// A disposable index permits Git's own stat cache without changing the user's staging index,
 /// so `git diff` refreshes it: an entry whose stat changed is content-checked, not listed.
 pub fn run_with_index(root: &Path, args: &[&str], index: Option<&Path>) -> Result<Vec<u8>> {
-    let out = output(root, args, index)?;
+    checked(root, args, index, &[])
+}
+
+/// `run` with `env` set for Git, such as the dates a copied commit keeps.
+pub fn run_with_env(root: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<Vec<u8>> {
+    checked(root, args, None, env)
+}
+
+fn checked(
+    root: &Path,
+    args: &[&str],
+    index: Option<&Path>,
+    env: &[(&str, &str)],
+) -> Result<Vec<u8>> {
+    let out = output(root, args, index, env)?;
     if !out.status.success() {
         bail!(
             "git {}: {}",
@@ -55,8 +69,14 @@ pub fn run_with_index(root: &Path, args: &[&str], index: Option<&Path>) -> Resul
 }
 
 /// The finished `git -C root args` process, whatever its exit status.
-fn output(root: &Path, args: &[&str], index: Option<&Path>) -> Result<Output> {
+fn output(
+    root: &Path,
+    args: &[&str],
+    index: Option<&Path>,
+    env: &[(&str, &str)],
+) -> Result<Output> {
     let mut command = Command::new("git");
+    command.envs(env.iter().copied());
     if let Some(index) = index {
         command.env("GIT_INDEX_FILE", index).args([
             "-c",
@@ -93,14 +113,19 @@ fn output(root: &Path, args: &[&str], index: Option<&Path>) -> Result<Output> {
 /// Whether the commit `ancestor` is `descendant` or one of its ancestors. Git answers with exit
 /// status 1 for no; any other failure, such as an unknown object, is an error.
 pub fn is_ancestor(root: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
-    let args = [
-        "merge-base",
-        "--is-ancestor",
-        "--end-of-options",
-        ancestor,
-        descendant,
-    ];
-    let out = output(root, &args, None)?;
+    let args = ["--is-ancestor", "--end-of-options", ancestor, descendant];
+    merge_base(root, &args)
+}
+
+/// Whether the commits `a` and `b` share an ancestor, answered like [`is_ancestor`].
+pub fn have_merge_base(root: &Path, a: &str, b: &str) -> Result<bool> {
+    merge_base(root, &["--end-of-options", a, b])
+}
+
+/// Whether `git merge-base args` answers yes (exit 0) or no (exit 1).
+fn merge_base(root: &Path, args: &[&str]) -> Result<bool> {
+    let args = [&["merge-base"][..], args].concat();
+    let out = output(root, &args, None, &[])?;
     match out.status.code() {
         Some(0) => Ok(true),
         Some(1) => Ok(false),

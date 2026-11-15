@@ -330,7 +330,7 @@ enum ModelCmd {
         #[command(flatten)]
         writing: WritingArgs,
     },
-    /// Push or fetch the checkpoint history on a configured Git remote, fast-forward only
+    /// Push (fast-forward only) or fetch the checkpoint history on a configured Git remote
     History {
         #[command(subcommand)]
         command: HistoryCmd,
@@ -439,7 +439,8 @@ enum HistoryCmd {
         #[arg(long, default_value = checkpoint::DEFAULT_REMOTE)]
         remote: String,
     },
-    /// Fetch the remote's refs/boundrail/history into the local one
+    /// Fetch the remote's refs/boundrail/history into the local one, replaying local checkpoints
+    /// the remote lacks
     Fetch {
         /// A remote `git remote` lists
         #[arg(long, default_value = checkpoint::DEFAULT_REMOTE)]
@@ -1522,6 +1523,9 @@ fn print_published(markdown: bool, pushing: bool, published: &Published) -> Resu
     );
     if !published.checkpoints.is_empty() {
         println!("checkpoints: {}", published.checkpoints.join(", "));
+    }
+    if !published.replayed.is_empty() {
+        println!("replayed: {}", published.replayed.join(", "));
     }
     Ok(())
 }

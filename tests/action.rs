@@ -126,6 +126,7 @@ fn executable(path: &Path, text: &str) {
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .args(["-c", "user.name=ci", "-c", "user.email=ci@example.invalid"])
+        .args(["-c", "commit.gpgsign=false"])
         .args(args)
         .current_dir(dir)
         .output()
@@ -200,4 +201,39 @@ fn a_token_that_cannot_write_posts_no_comment_and_fails_nothing() {
     assert!(seen.contains("github-actions[bot]"), "{seen}");
     let summary = fs::read_to_string(dir.path().join("summary.md")).unwrap();
     assert!(summary.contains("**Model check:** 1 warnings"), "{summary}");
+}
+
+/// The model script's copy of the scan mode's fail-on default is action.yml's default, which
+/// model mode reads as warnings, and an empty fail-on fails on nothing, as in scan mode.
+#[cfg(unix)]
+#[test]
+fn model_mode_reads_the_scan_default_as_warnings_and_an_empty_fail_on_as_never() {
+    let script = read("ci/model-action.sh");
+    let copy = (script.lines())
+        .find_map(|line| line.strip_prefix("scan_default="))
+        .unwrap();
+    assert_eq!(action()["inputs"]["fail-on"]["default"], copy);
+
+    let dir = TempDir::new("action-fail-on").unwrap();
+    let binary = dir.path().join("boundrail");
+    executable(
+        &binary,
+        "#!/usr/bin/env bash\ncase \"$*\" in\n  --version) echo boundrail 0 ;;\n  \
+         *'model check'*) printf '::warning file=a.ts,title=X::msg\\n'; exit 1 ;;\nesac\n",
+    );
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("ci/model-action.sh");
+    for (fail_on, status) in [("", 0), (copy, 1)] {
+        let out = Command::new("bash")
+            .arg(&script)
+            .env("RUNNER_TEMP", dir.path().join("runner"))
+            .env("GITHUB_STEP_SUMMARY", dir.path().join("summary.md"))
+            .env("INPUT_BINARY", &binary)
+            .env("INPUT_PATH", dir.path())
+            .env("INPUT_FAIL_ON", fail_on)
+            .env_remove("INPUT_BASE_REF")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        assert_eq!(out.status.code(), Some(status), "{fail_on:?}: {stdout}");
+    }
 }

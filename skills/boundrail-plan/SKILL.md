@@ -54,13 +54,20 @@ Set a plan aside with
 `boundrail model shelve <proposal> --expected-revision <proposal revision.digest> --doing "<why>" --operation-id <operation-id>`.
 It stays, reading only. List drafts and their status with `boundrail model proposals`.
 
+## Move a plan between clones
+
+`boundrail model export --proposal <proposal> --output plan.bundle.json` writes the draft as one
+file. In the other clone,
+`boundrail model import plan.bundle.json --expected-revision <current revision.digest> --doing "<why>" --operation-id <operation-id>`
+draws it as a new draft there.
+
 ## Refusals
 
 Other codes react as boundrail-model says.
 
 | Code | Reaction |
 |---|---|
-| `PREDECESSOR_MOVED` | The current state changed since the proposal was drawn. Draw a new proposal with `--from current`, apply the plan's changes to it again (use `model compare` on the old draft as the list), and shelve the old one. |
+| `PREDECESSOR_MOVED` | The current state changed since the proposal was drawn. Run `boundrail model reconcile <proposal> --expected-revision <current revision.digest> --expected-proposal-revision <proposal revision.digest> --doing "<why>" --operation-id <operation-id>`, then compare and adopt again. On `RECONCILE_CONFLICT`, edit the draft to match one side of each listed subject and reconcile again. |
 | `PROPOSAL_CLOSED` | The proposal is adopted or shelved. Draw a new one. |
 | `STALE_REVISION` on adopt | Either revision moved. Read both again and compare again before adopting. |
 | `MODEL_INVALID` on adopt | A beat or picture reads a module or flow the plan drops. Edit it first. |

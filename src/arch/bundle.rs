@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use super::edit::{self, Receipt};
 use super::proposal::{self, Writing};
-use super::request::{INPUT_MAX, parse};
+use super::request::{INPUT_MAX, check_size};
 use super::revision::Revision;
 use super::types::{Collection, Module, Predecessor, Proposal, ProposalStatus, SCHEMA_VERSION};
 use super::vault::{self, Model, Problem, Scope};
@@ -244,7 +244,7 @@ const PLACE: &str = "the bundle";
 /// The bundle `input` checked against `current`'s vault and loaded through a temporary vault, so
 /// every file passes the loader's validation.
 fn open(input: &[u8], current: &Model) -> Result<Opened> {
-    let bundle: Bundle = parse(input, "import")?;
+    let bundle = parse_bundle(input)?;
     check(&bundle, &current.manifest.id)?;
     let Bundle { source, files, .. } = bundle;
     let temp = TempDir::new("bundle")?;
@@ -267,6 +267,23 @@ fn open(input: &[u8], current: &Model) -> Result<Opened> {
         base: None,
         dropped: Vec::new(),
         drawn: None,
+    })
+}
+
+/// The bundle `input`, refused as every request is, but one that does not parse gets a fixed
+/// message, since serde quotes the bundle's own text: its text, line and column go into the
+/// details.
+fn parse_bundle(input: &[u8]) -> Result<Bundle> {
+    check_size(input, "import")?;
+    serde_json::from_slice(input).map_err(|e| {
+        let details =
+            json!({ "error": vault::parse_message(&e), "line": e.line(), "column": e.column() });
+        Refusal::new(
+            Code::RequestInvalid,
+            format!("the bundle does not parse as {SCHEMA}"),
+        )
+        .with_details(details)
+        .into()
     })
 }
 

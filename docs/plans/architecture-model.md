@@ -585,7 +585,9 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   current walkthroughs, so a beat reading a module or flow the proposal drops refuses
   `MODEL_INVALID` until it is edited. A proposal's predecessor digest leaves out the
   `walkthroughs/` files, so editing a walkthrough does not move it; `expected_revision` still
-  names the full revision.
+  names the full revision. It also hashes `model.json` with `retired_ids` emptied, since removing
+  a walkthrough or picture grows that list. A draft recorded before that change holds the digest
+  of `model.json` as it was on disk, which adoption still accepts.
 - T14: edits. `add-walkthrough` (with beats), `edit-walkthrough` (set name, order, description;
   clear description), `remove-walkthrough`, `add-beat` (walkthrough, position), `edit-beat` (set
   title, narration and any reading field; clear state, against, scope, depth, flow, focus),
@@ -771,24 +773,45 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   `PREDECESSOR_MOVED` and `model reconcile` merges the two. Walkthroughs and pictures in a
   current-state bundle are validated and not imported, since they belong to the current state. The
   fingerprint covers the writer, name, revision and the bundle's SHA-256. Claims: the model root.
-- T17: publication. `model history push [--remote origin]` pushes the object the local history
-  ref holds (`<object>:refs/boundrail/history`, with `--no-follow-tags`), without `+`, after
-  checking that the remote's tip is absent or an ancestor of it; otherwise, or when the push is
-  refused because the remote moved meanwhile, it refuses `HISTORY_DIVERGED` with the hint to
-  fetch first. `model history fetch [--remote origin]` fetches the remote ref into the scratch
-  ref `refs/boundrail/fetched`, deleted after every fetch. The fetched ref must peel to a commit,
-  and every first-parent commit from it that the local history lacks must carry checkpoint
-  trailers; otherwise it refuses `MODEL_INVALID` (`details.object`) and the local ref stays. A
-  local tip that already holds the fetched one stays; one the fetched tip does not descend from
-  refuses `HISTORY_DIVERGED`. Otherwise the local ref moves by compare-and-swap (`update-ref <new>
-  <old or absent>`); a swap lost to a concurrent retain re-reads the tip and judges again, up to
-  three times. Ancestry is `git merge-base --is-ancestor`, asked only when the other side's ref
-  exists. `--remote` must be a name `git remote` lists, never a URL or anything starting with
-  `-`, and reaches Git after `--end-of-options`; fetch passes `--no-tags`,
+- T17: publication. `model history push [--remote origin]` pushes the object the local history ref
+  holds (`<object>:refs/boundrail/history`, with `--no-follow-tags`), without `+` and with
+  `--force-with-lease=refs/boundrail/history:<remote tip or empty>`, so it moves the remote only
+  from the tip it checked: that tip must be absent or an ancestor of the local one, and every
+  first-parent commit the push adds must pass the checks a fetch applies (`MODEL_INVALID`
+  otherwise, before anything is published). When the remote holds what the local history lacks, or
+  the push is refused because the remote moved meanwhile, it fetches the remote ref onto a per-run
+  ref and refuses `HISTORY_DIVERGED`, telling a remote that is only ahead (run fetch) from
+  diverged histories, whose local-only checkpoint IDs go into `details.local_only` with the
+  recovery: fetch replays them, then push again. Histories that share no commit refuse
+  `HISTORY_DIVERGED` with `details.related: false` on push and fetch alike, since replaying would
+  join unrelated histories. `model history fetch [--remote origin]` fetches the remote ref into
+  the scratch ref `refs/boundrail/fetching/<pid>-<nanos>`, a per-run name that never collides with
+  another fetch or a leftover ref, deleted on every exit path (a failed deletion after a good
+  fetch only warns on stderr). A fetch killed by a signal leaves its ref behind; `git update-ref
+  -d refs/boundrail/fetching/<run>` removes it, and nothing cleans it up automatically. The fetch
+  passes an empty `--refmap=`, so a configured `remote.<name>.fetch` such as
+  `+refs/boundrail/*:refs/boundrail/*` cannot move `refs/boundrail/history` while it runs. The
+  fetched ref must peel to a commit, and every first-parent commit from it that the local history
+  lacks must be one retain could have written: at most one parent (a merge refuses), checkpoint
+  trailers, a Checkpoint ID that is a well-formed local ID unique in any case across the fetched
+  walk, and `--doing`, `Writer` and `Operation` values that pass retain's own checks; otherwise it
+  refuses `MODEL_INVALID` (`details.object`) and the local ref stays. A local tip that already
+  holds the fetched one stays. Diverged histories replay: the local-only first-parent commits,
+  checked the same way, are copied in order onto the fetched tip with `commit-tree`, each keeping
+  its tree, message, trailers and author and committer dates, signed as retain signs
+  (`SIGNING_FAILED` before the ref moves). A local-only ID the fetched history holds in any case
+  refuses `HISTORY_DIVERGED` with `details.clashing`. The receipt lists `replayed`. Replaying
+  replaces those commits, so stored retain receipts naming them go stale; readings name
+  checkpoints by ID and still resolve, and a retain retried with the same operation ID returns the
+  checkpoint as the history now holds it. Otherwise the local ref moves by compare-and-swap
+  (`update-ref <new> <old or absent>`); a swap lost to a concurrent retain re-reads the tip and
+  judges again, up to three times. Ancestry is `git merge-base --is-ancestor`, asked only when the
+  other side's ref exists. `--remote` must be a name `git remote` lists, never a URL or anything
+  starting with `-`, and reaches Git after `--end-of-options`; fetch passes `--no-tags`,
   `--no-recurse-submodules` and `--no-write-fetch-head`. Both print `{kind: "history-push" |
-  "history-fetch", remote, ref, before, after, updated, checkpoints}` with the IDs gained; a
-  missing local history or remote ref is no change. Once fetched, checkpoint readings resolve, so
-  CI can run `model history fetch` before `model check`.
+  "history-fetch", remote, ref, before, after, updated, checkpoints, replayed}` with the IDs
+  gained; a missing local history or remote ref is no change. Once fetched, checkpoint readings
+  resolve, so CI can run `model history fetch` before `model check`.
 
 - T16: setup is `boundrail model setup`, not a flag of `boundrail init`. `init` is the scan-era
   `layout.yaml` generator (presets, scopes, rule sync), which T18 may remove; a model command keeps

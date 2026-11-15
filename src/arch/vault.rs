@@ -881,6 +881,12 @@ pub(super) fn is_vault_file(path: &str) -> bool {
     path == MANIFEST || path == CONFIG || is_id_file(path, &FOLDERS)
 }
 
+/// Whether `path` is named like a module, collection, walkthrough or picture file directly in its
+/// folder, but not by a well-formed local ID.
+pub(super) fn is_misnamed(path: &str) -> bool {
+    vault_file(path).is_some_and(|(_, id)| !id.contains('/') && !ids::is_local(id))
+}
+
 fn file_subject(path: &str) -> &str {
     vault_file(unprefixed(path)).map_or(path, |(_, id)| id)
 }

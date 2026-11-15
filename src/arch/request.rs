@@ -29,17 +29,23 @@ pub struct Target {
 
 /// A request of at most [`INPUT_MAX`] bytes, parsed from JSON; `what` names it in a refusal.
 pub(super) fn parse<T: DeserializeOwned>(input: &[u8], what: &str) -> Result<T> {
-    if input.len() as u64 > INPUT_MAX {
-        return Err(invalid(format!(
-            "the {what} request is larger than {INPUT_MAX} bytes"
-        )));
-    }
+    check_size(input, what)?;
     serde_json::from_slice(input).map_err(|e| {
         invalid(format!(
             "the {what} request does not parse: {}",
             vault::parse_message(&e)
         ))
     })
+}
+
+/// Refuses a `what` request larger than [`INPUT_MAX`] bytes.
+pub(super) fn check_size(input: &[u8], what: &str) -> Result<()> {
+    if input.len() as u64 > INPUT_MAX {
+        return Err(invalid(format!(
+            "the {what} request is larger than {INPUT_MAX} bytes"
+        )));
+    }
+    Ok(())
 }
 
 pub(super) fn check_doing(doing: &str) -> Result<()> {

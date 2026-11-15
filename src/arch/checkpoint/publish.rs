@@ -1,22 +1,30 @@
 //! Publishing the history: `model history push` and `model history fetch` move
-//! [`HISTORY`](super::HISTORY) to or from the same ref on a configured remote, fast-forward only,
-//! so a clone or CI job that fetches it resolves checkpoint readings. Both are network operations
-//! the user starts explicitly; Git runs them with the hardening of `crate::git`.
+//! [`HISTORY`](super::HISTORY) to or from the same ref on a configured remote, so a clone or CI job
+//! that fetches it resolves checkpoint readings. A push only fast-forwards the remote; a fetch
+//! fast-forwards the local ref, or replays the local checkpoints onto the fetched history when
+//! the two diverged. Both are network operations the user starts explicitly; Git runs them with
+//! the hardening of `crate::git`.
 
+use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::json;
 
-use super::{HISTORY, history, locations, parse, ref_target, tip, update_ref, walk};
-use crate::arch::{Code, Refusal};
+use super::{
+    Checkpoint, HISTORY, commit_tree, history, locations, parse, ref_target, signing, tip,
+    update_ref, walk,
+};
+use crate::arch::request::{check_doing, check_operation, check_writer};
+use crate::arch::{Code, Refusal, ids};
 use crate::git;
 
 /// The remote `--remote` names when absent.
 pub const DEFAULT_REMOTE: &str = "origin";
-/// Where a fetch lands before it is checked; deleted after every fetch.
-const FETCHED: &str = "refs/boundrail/fetched";
+/// The namespace of the per-run refs a remote's history lands on before it is checked.
+const FETCHING: &str = "refs/boundrail/fetching";
 /// How often a fetch recomputes after a checkpoint landed locally while it ran.
 const ATTEMPTS: usize = 3;
 
@@ -34,10 +42,15 @@ pub struct Published {
     pub updated: bool,
     /// The IDs of the checkpoints it gained, newest first.
     pub checkpoints: Vec<String>,
+    /// The IDs of the local checkpoints a fetch replayed onto the fetched history, newest first.
+    pub replayed: Vec<String>,
 }
 
 /// Pushes the history ref to `remote`, a configured remote name, when the remote's ref is absent
-/// or an ancestor of the local one. Refuses `HISTORY_DIVERGED` otherwise: fetch first.
+/// or an ancestor of the local one, and every first-parent commit it adds is one a fetch takes
+/// (`MODEL_INVALID` otherwise). Refuses `HISTORY_DIVERGED` when the remote holds checkpoints this
+/// repository lacks, saying whether the remote is only ahead or the two diverged. The push
+/// leases the remote tip it checked against, so it moves only from that tip.
 pub fn push(start: &Path, remote: &str) -> Result<Published> {
     let (_, root) = locations(start)?;
     check_remote(&root, remote)?;
@@ -49,15 +62,24 @@ pub fn push(start: &Path, remote: &str) -> Result<Published> {
     if theirs.as_deref() == Some(object.as_str()) {
         return Ok(unchanged(remote, theirs));
     }
+    let known = id_counts(&list);
     if !holds(&root, &commit, theirs.as_deref())? {
-        return Err(diverged(remote, theirs.as_deref(), Some(&object), true));
+        return Err(refused_push(&root, remote, (&object, &commit), &known)?);
     }
+    let base = theirs.as_deref().and_then(|theirs| peel(&root, theirs));
+    let refuse = |object: &str, reason: &str| unpublishable(remote, object, reason);
+    since(&root, &commit, base.as_deref(), &known, refuse)?;
     // The object checked above is what lands, even if the local ref moves meanwhile.
     let refspec = refspec(&object, HISTORY);
+    let lease = format!(
+        "--force-with-lease={HISTORY}:{}",
+        theirs.as_deref().unwrap_or("")
+    );
     let args = [
         "push",
         "--no-follow-tags",
         "--recurse-submodules=no",
+        &lease,
         "--end-of-options",
         remote,
         &refspec,
@@ -66,7 +88,7 @@ pub fn push(start: &Path, remote: &str) -> Result<Published> {
         // The remote moved between the check and the push.
         let now = remote_tip(&root, remote)?;
         if !holds(&root, &commit, now.as_deref())? {
-            return Err(diverged(remote, now.as_deref(), Some(&object), true));
+            return Err(refused_push(&root, remote, (&object, &commit), &known)?);
         }
         return Err(error);
     }
@@ -79,60 +101,110 @@ pub fn push(start: &Path, remote: &str) -> Result<Published> {
     })
 }
 
-/// Fetches `remote`'s history ref into the local one when the local ref is absent or an ancestor
-/// of the remote's; a local ref already ahead stays. The remote's ref lands on a scratch ref
-/// first and must be a commit whose first-parent commits this repository lacks all carry
-/// checkpoint trailers (`MODEL_INVALID`); the local ref then moves by compare-and-swap. Refuses
-/// `HISTORY_DIVERGED` when neither holds the other.
+/// The `HISTORY_DIVERGED` refusal of a push of the local history, the ref holding `object` that
+/// peels to `commit` with the checkpoint IDs `known`, judged against the remote's history fetched
+/// onto a per-run ref: with no local checkpoints the remote lacks, it is only ahead.
+fn refused_push(
+    root: &Path,
+    remote: &str,
+    (object, commit): (&str, &str),
+    known: &BTreeMap<String, usize>,
+) -> Result<anyhow::Error> {
+    fetched(root, remote, |theirs, fetched_commit| {
+        if !git::have_merge_base(root, commit, fetched_commit)? {
+            return Ok(unrelated(remote));
+        }
+        let local = since(root, commit, Some(fetched_commit), known, |o, r| {
+            unpublishable(remote, o, r)
+        })?;
+        let local_only: Vec<&str> = local.iter().map(|c| c.id.as_str()).collect();
+        Ok(diverged(remote, theirs, object, &local_only))
+    })
+}
+
+/// Fetches `remote`'s history ref into the local one. A local ref that is absent or an ancestor
+/// of the remote's fast-forwards; one already holding it stays; one that diverged from it gets its
+/// local checkpoints replayed onto the remote's. The remote's ref lands on a per-run ref first
+/// and must be a commit whose first-parent commits this repository lacks are checkpoints `model
+/// retain` could have written (`MODEL_INVALID`); the local ref then moves by compare-and-swap.
 pub fn fetch(start: &Path, remote: &str) -> Result<Published> {
     let (_, root) = locations(start)?;
     check_remote(&root, remote)?;
     if remote_tip(&root, remote)?.is_none() {
         return Ok(unchanged(remote, tip(&root)?));
     }
+    fetched(&root, remote, |object, commit| {
+        take(&root, remote, object, commit)
+    })
+}
+
+/// Runs `then` with `remote`'s history ref fetched onto a per-run ref, given the object it holds
+/// and the commit that peels to (`MODEL_INVALID` when it is none). The ref is deleted after on
+/// every path; when only that deletion fails, a warning says so. An empty `--refmap` keeps a
+/// configured `remote.<name>.fetch` from moving any other ref.
+fn fetched<T>(root: &Path, remote: &str, then: impl FnOnce(&str, &str) -> Result<T>) -> Result<T> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let scratch = format!("{FETCHING}/{}-{nanos}", std::process::id());
     let args = [
         "fetch",
         "--no-tags",
         "--no-recurse-submodules",
         "--no-write-fetch-head",
+        "--refmap=",
         "--end-of-options",
         remote,
-        &refspec(&format!("+{HISTORY}"), FETCHED),
+        &refspec(&format!("+{HISTORY}"), &scratch),
     ];
-    let taken = git::run(&root, &args).and_then(|_| take(&root, remote));
-    git::run(&root, &["update-ref", "-d", FETCHED])?;
-    taken
+    let result = git::run(root, &args).and_then(|_| {
+        let object = ref_target(root, &scratch)?.context("the fetched history ref is missing")?;
+        let commit =
+            peel(root, &object).ok_or_else(|| foreign(remote, &object, "is not a commit"))?;
+        then(&object, &commit)
+    });
+    match git::run(root, &["update-ref", "-d", &scratch]) {
+        Err(error) if result.is_ok() => {
+            eprintln!("warning: deleting the scratch ref {scratch} failed: {error:#}");
+            result
+        }
+        _ => result,
+    }
 }
 
-/// Moves the history ref to the fetched one, after checking it, recomputing when a checkpoint
-/// landed locally meanwhile.
-fn take(root: &Path, remote: &str) -> Result<Published> {
-    let object = ref_target(root, FETCHED)?.context("the fetched history ref is missing")?;
-    let commit = peel(root, &object).ok_or_else(|| foreign(remote, &object, "is not a commit"))?;
+/// Moves the history ref to the fetched `object`, which peels to `commit`, or to the local
+/// checkpoints replayed onto it, after checking it, recomputing when a checkpoint landed locally
+/// meanwhile.
+fn take(root: &Path, remote: &str, object: &str, commit: &str) -> Result<Published> {
+    let known = id_counts(&walk(root, commit, None)?);
     let mut lost = None;
     for _ in 0..ATTEMPTS {
         let local = tip(root)?;
         let ours = local.as_deref().and_then(|o| peel(root, o));
-        if local.as_deref() == Some(object.as_str()) {
+        if local.as_deref() == Some(object) {
             return Ok(unchanged(remote, local));
         }
-        if let Some(ours) = &ours {
-            if git::is_ancestor(root, &commit, ours)? {
-                return Ok(unchanged(remote, local));
-            }
-            if !git::is_ancestor(root, ours, &commit)? {
-                return Err(diverged(remote, Some(&object), local.as_deref(), false));
-            }
+        if let Some(ours) = &ours
+            && git::is_ancestor(root, commit, ours)?
+        {
+            return Ok(unchanged(remote, local));
         }
-        refuse_foreign(root, remote, &commit, ours.as_deref())?;
+        let gained = since(root, commit, ours.as_deref(), &known, |o, r| {
+            foreign(remote, o, r)
+        })?;
+        let (new, replayed) = match &ours {
+            Some(ours) if !git::is_ancestor(root, ours, commit)? => {
+                replay(root, remote, commit, ours, &known)?
+            }
+            _ => (object.to_owned(), Vec::new()),
+        };
         let doing = format!("fetch the history from {remote}");
-        match update_ref(root, &object, local.as_deref(), &doing) {
+        match update_ref(root, &new, local.as_deref(), &doing) {
             Ok(()) => {
-                let new = walk(root, &commit, None)?;
-                let new = new.iter().take_while(|c| ours.as_ref() != Some(&c.commit));
                 return Ok(Published {
-                    checkpoints: new.map(|c| c.id.clone()).collect(),
-                    ..moved(remote, local, object)
+                    checkpoints: gained.into_iter().map(|c| c.id).collect(),
+                    replayed,
+                    ..moved(remote, local, new)
                 });
             }
             // A retain moved the ref meanwhile: judge the fetched history against it again.
@@ -148,28 +220,118 @@ fn take(root: &Path, remote: &str) -> Result<Published> {
     Err(lost.context("the history ref kept moving")?)
 }
 
-/// Refuses `MODEL_INVALID` when a first-parent commit from `commit` back to the local history
-/// `ours` lacks checkpoint trailers: the remote ref holds something `model retain` never made.
-fn refuse_foreign(root: &Path, remote: &str, commit: &str, ours: Option<&str>) -> Result<()> {
-    let exclude = ours.map(|ours| format!("^{ours}"));
-    let mut args = vec![
-        "log",
-        "--first-parent",
-        "--no-show-signature",
-        "--format=%H%x1f%cI%x1f%B%x1e",
-        "--end-of-options",
-        commit,
+/// Replays the checkpoints the local history `ours` holds and the fetched `commit` lacks onto
+/// `commit`, oldest first, keeping each one's tree, message and dates: the new tip and the IDs
+/// replayed, newest first. `theirs` counts the fetched history's checkpoint IDs. Refuses
+/// `HISTORY_DIVERGED` when the two share no commit or a replayed ID is one the fetched history
+/// holds in any case, and `MODEL_INVALID` for a local commit no fetch would take.
+fn replay(
+    root: &Path,
+    remote: &str,
+    commit: &str,
+    ours: &str,
+    theirs: &BTreeMap<String, usize>,
+) -> Result<(String, Vec<String>)> {
+    if !git::have_merge_base(root, ours, commit)? {
+        return Err(unrelated(remote));
+    }
+    let known = id_counts(&walk(root, ours, None)?);
+    let local = since(root, ours, Some(commit), &known, |o, r| {
+        unpublishable(remote, o, r)
+    })?;
+    let clashing: Vec<&str> = (local.iter())
+        .filter(|c| theirs.contains_key(&c.id.to_ascii_lowercase()))
+        .map(|c| c.id.as_str())
+        .collect();
+    if !clashing.is_empty() {
+        return Err(clash(remote, &clashing));
+    }
+    let sign = signing(root)?;
+    let mut tip = commit.to_owned();
+    for checkpoint in local.iter().rev() {
+        tip = copy(root, &checkpoint.commit, &tip, sign)?;
+    }
+    Ok((tip, local.into_iter().map(|c| c.id).collect()))
+}
+
+/// The commit `original` copied onto `parent`: its tree, message and author and committer dates,
+/// signed when `sign` says so, as `model retain` signs.
+fn copy(root: &Path, original: &str, parent: &str, sign: bool) -> Result<String> {
+    let raw = git::text(root, &["cat-file", "commit", original])?;
+    let (head, message) = raw.split_once("\n\n").context("parsing a commit")?;
+    let field = |key: &str| {
+        head.lines()
+            .find_map(|line| line.strip_prefix(key))
+            .with_context(|| format!("commit {original} has no {key}"))
+    };
+    // An identity line ends with `> <seconds> <zone>`, the date Git reads back.
+    let date = |key: &str| -> Result<String> {
+        let line = field(key)?;
+        let (_, date) = line
+            .rsplit_once("> ")
+            .context("parsing a commit identity")?;
+        Ok(date.to_owned())
+    };
+    let env = [
+        ("GIT_AUTHOR_DATE", date("author ")?),
+        ("GIT_COMMITTER_DATE", date("committer ")?),
     ];
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    commit_tree(root, field("tree ")?, message, Some(parent), sign, &env)
+}
+
+/// Each checkpoint ID of `list` in ASCII lowercase, with how many checkpoints hold it.
+fn id_counts(list: &[Checkpoint]) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for checkpoint in list {
+        *counts
+            .entry(checkpoint.id.to_ascii_lowercase())
+            .or_default() += 1;
+    }
+    counts
+}
+
+/// The checkpoints along first parents from `commit` that `base` does not reach, newest first.
+/// Each must be one `model retain` could have written, else `refuse` gets its commit and why: it
+/// has at most one parent, carries checkpoint trailers, its `--doing`, `Writer` and `Operation`
+/// pass retain's checks, and its ID is a well-formed local ID that `known`, the counts of the
+/// checkpoint IDs from `commit`, holds once in any case.
+fn since(
+    root: &Path,
+    commit: &str,
+    base: Option<&str>,
+    known: &BTreeMap<String, usize>,
+    refuse: impl Fn(&str, &str) -> anyhow::Error,
+) -> Result<Vec<Checkpoint>> {
+    let exclude = base.map(|base| format!("^{base}"));
+    let mut merges = vec!["rev-list", "--first-parent", "--min-parents=2", "-n1"];
+    merges.extend(["--end-of-options", commit]);
+    merges.extend(exclude.as_deref());
+    if let Some(merge) = git::text(root, &merges)?.lines().next() {
+        return Err(refuse(merge, "is a merge, which model retain never writes"));
+    }
+    let mut args = vec!["log", "--first-parent", "--no-show-signature"];
+    args.extend(["--format=%H%x1f%cI%x1f%B%x1e", "--end-of-options", commit]);
     args.extend(exclude.as_deref());
     let log = git::text(root, &args)?;
-    let mut entries = log.split('\x1e').filter(|e| !e.trim().is_empty());
-    match entries.find(|entry| parse(entry).is_none()) {
-        Some(entry) => {
-            let found = entry.trim_start().split('\x1f').next().unwrap_or_default();
-            Err(foreign(remote, found, "is not a checkpoint"))
+    let mut found = Vec::new();
+    for entry in log.split('\x1e').filter(|e| !e.trim().is_empty()) {
+        let object = entry.trim_start().split('\x1f').next().unwrap_or_default();
+        let checkpoint = parse(entry).ok_or_else(|| refuse(object, "is not a checkpoint"))?;
+        let id = checkpoint.id.to_ascii_lowercase();
+        if !ids::is_local(&id) || known.get(&id) != Some(&1) {
+            return Err(refuse(object, "has a malformed or repeated checkpoint ID"));
         }
-        None => Ok(()),
+        let operation = checkpoint.operation_id.as_deref();
+        if check_doing(&checkpoint.doing).is_err()
+            || check_writer(&checkpoint.writer).is_err()
+            || operation.map(check_operation).transpose().is_err()
+        {
+            return Err(refuse(object, "has a trailer value `model retain` refuses"));
+        }
+        found.push(checkpoint);
     }
+    Ok(found)
 }
 
 /// The commit `object` peels to, `None` when it is not one.
@@ -205,6 +367,7 @@ fn unchanged(remote: &str, at: Option<String>) -> Published {
         before: at,
         updated: false,
         checkpoints: Vec::new(),
+        replayed: Vec::new(),
     }
 }
 
@@ -216,6 +379,7 @@ fn moved(remote: &str, before: Option<String>, after: String) -> Published {
         after: Some(after),
         updated: true,
         checkpoints: Vec::new(),
+        replayed: Vec::new(),
     }
 }
 
@@ -254,23 +418,60 @@ fn foreign(remote: &str, object: &str, reason: &str) -> anyhow::Error {
     .into()
 }
 
-/// `HISTORY_DIVERGED` for a push (`pushing`) or fetch that cannot fast-forward.
-fn diverged(
-    remote: &str,
-    theirs: Option<&str>,
-    ours: Option<&str>,
-    pushing: bool,
-) -> anyhow::Error {
-    let message = if pushing {
+/// `MODEL_INVALID` for a local history commit `object` a fetch would refuse, so it is neither
+/// pushed nor replayed.
+fn unpublishable(remote: &str, object: &str, reason: &str) -> anyhow::Error {
+    Refusal::new(
+        Code::ModelInvalid,
         format!(
-            "the history on {remote} holds checkpoints this repository lacks; run `boundrail model history fetch --remote {remote}` first"
+            "the local history holds a commit that {reason}, which a fetch refuses; nothing moved"
+        ),
+    )
+    .with_details(json!({ "remote": remote, "object": object }))
+    .into()
+}
+
+/// `HISTORY_DIVERGED` for a push the remote's history `theirs` does not descend to: only ahead
+/// when `local`, the local checkpoint IDs it lacks, is empty.
+fn diverged(remote: &str, theirs: &str, ours: &str, local: &[&str]) -> anyhow::Error {
+    let message = if local.is_empty() {
+        format!(
+            "the history on {remote} is ahead of the local one; run `boundrail model history fetch --remote {remote}` first"
         )
     } else {
         format!(
-            "the local history and the one on {remote} each hold checkpoints the other lacks; neither can fast-forward"
+            "the local history and the one on {remote} diverged: {} local checkpoint(s) are not on {remote}; run `boundrail model history fetch --remote {remote}`, which replays them onto its history, then push again",
+            local.len()
         )
     };
+    let details =
+        json!({ "remote": remote, "remote_tip": theirs, "local_tip": ours, "local_only": local });
     Refusal::new(Code::HistoryDiverged, message)
-        .with_details(json!({ "remote": remote, "remote_tip": theirs, "local_tip": ours }))
+        .with_details(details)
         .into()
+}
+
+/// `HISTORY_DIVERGED` for a local history and the one on `remote` that share no commit, so no
+/// fetch replays one onto the other.
+fn unrelated(remote: &str) -> anyhow::Error {
+    Refusal::new(
+        Code::HistoryDiverged,
+        format!("the local history and the one on {remote} share no commit, so neither can take the other's checkpoints; the local history did not move"),
+    )
+    .with_details(json!({ "remote": remote, "related": false }))
+    .into()
+}
+
+/// `HISTORY_DIVERGED` for a fetch whose local checkpoints cannot be replayed: the fetched history
+/// holds the `clashing` IDs in some case.
+fn clash(remote: &str, clashing: &[&str]) -> anyhow::Error {
+    Refusal::new(
+        Code::HistoryDiverged,
+        format!(
+            "the local history and the one on {remote} diverged, and {} local checkpoint ID(s) are taken there, so they cannot be replayed; the local history did not move",
+            clashing.len()
+        ),
+    )
+    .with_details(json!({ "remote": remote, "clashing": clashing }))
+    .into()
 }

@@ -89,7 +89,7 @@ pub fn retain(
         Ok(history.iter().any(|h| h.commit == c.commit))
     })?;
     if let Operation::Done(checkpoint) = journal {
-        return Ok(checkpoint);
+        return Ok(as_held(&history, checkpoint));
     }
     if let Some(found) = retained_elsewhere(&history, operation, &writer, doing, expected)? {
         journal.done(&state.dir, found)?;
@@ -199,7 +199,8 @@ pub(super) fn located(
 /// `None` when that commit holds no manifest there. Only the files a current-state load reads
 /// are read; proposals and anything else in the committed vault are left out. Refuses
 /// `MODEL_INVALID` for a vault file that is not a regular file or is too large, as a checkpoint
-/// read does, and for a model that does not load.
+/// read does, for a file directly in a vault folder named like a vault file but not by a
+/// well-formed local ID, and for a model that does not load.
 pub fn load_committed(start: &Path, commit: &str) -> Result<Option<Model>> {
     let (vault, root) = locations(start)?;
     let prefix = vault
@@ -219,6 +220,9 @@ pub fn load_committed(start: &Path, commit: &str) -> Result<Option<Model>> {
     for entry in listing.split(|b| *b == 0).filter(|e| !e.is_empty()) {
         let (meta, path) = tree_entry(entry)?;
         let path = path.strip_prefix(&prefix).unwrap_or(path);
+        if vault::is_misnamed(path) {
+            return Err(invalid(path, "is not named by a well-formed local ID"));
+        }
         if !vault::is_vault_file(path) {
             continue;
         }
@@ -229,11 +233,8 @@ pub fn load_committed(start: &Path, commit: &str) -> Result<Option<Model>> {
         if size > INPUT_MAX {
             return Err(invalid(path, "is too large"));
         }
-        files.push((
-            path.to_owned(),
-            (*object).to_owned(),
-            usize::try_from(size)?,
-        ));
+        let size = usize::try_from(size)?;
+        files.push((path.to_owned(), (*object).to_owned(), size));
     }
     if !files.iter().any(|(path, _, _)| path == "model.json") {
         return Ok(None);
@@ -353,6 +354,13 @@ fn retained_elsewhere<'a>(
         .into());
     }
     Ok(Some(found))
+}
+
+/// `checkpoint`, a journaled retain's output, as `history` now holds it: a fetch that replayed
+/// it moved it to another commit with the same ID.
+fn as_held(history: &[Checkpoint], checkpoint: Checkpoint) -> Checkpoint {
+    let held = history.iter().find(|h| h.id == checkpoint.id).cloned();
+    held.unwrap_or(checkpoint)
 }
 
 fn find(history: Vec<Checkpoint>, which: &str) -> Result<Checkpoint> {
@@ -487,27 +495,40 @@ fn message(
 /// `commit.gpgSign`. Nothing points at it yet, so a failure leaves only unreachable objects.
 fn write_commit(root: &Path, model: &Model, message: &str, parent: Option<&str>) -> Result<String> {
     let tree = write_tree(root, model)?;
-    let sign = git::text(
-        root,
-        &[
-            "config",
-            "--type=bool",
-            "--default=false",
-            "--get",
-            "commit.gpgSign",
-        ],
-    )?
-    .trim()
-        == "true";
-    let mut args = vec!["commit-tree", tree.as_str(), "-m", message];
+    commit_tree(root, &tree, message, parent, signing(root)?, &[])
+}
+
+/// Whether the user set `commit.gpgSign`, so checkpoints are signed.
+fn signing(root: &Path) -> Result<bool> {
+    let args = [
+        "config",
+        "--type=bool",
+        "--default=false",
+        "--get",
+        "commit.gpgSign",
+    ];
+    Ok(git::text(root, &args)?.trim() == "true")
+}
+
+/// The commit of `tree` with `message` after the commit `parent`, with `env` set for Git, signed
+/// when `sign` says so; any failure of a signed commit refuses `SIGNING_FAILED`.
+fn commit_tree(
+    root: &Path,
+    tree: &str,
+    message: &str,
+    parent: Option<&str>,
+    sign: bool,
+    env: &[(&str, &str)],
+) -> Result<String> {
+    let mut args = vec!["commit-tree", tree, "-m", message];
     if let Some(parent) = parent {
         args.extend(["-p", parent]);
     }
     if sign {
         args.push("-S");
     }
-    match git::text(root, &args) {
-        Ok(commit) => Ok(commit.trim().to_owned()),
+    match git::run_with_env(root, &args, env) {
+        Ok(commit) => Ok(String::from_utf8_lossy(&commit).trim().to_owned()),
         // Git's wording is localized, so any failure of a signed commit counts as the signer's.
         Err(error) if sign => {
             let text = format!("{error:#}");
@@ -729,6 +750,27 @@ mod tests {
             refusal.message
         );
         assert!(refusal.message.contains(&commit), "{}", refusal.message);
+    }
+
+    #[test]
+    fn a_committed_vault_file_must_be_named_by_a_local_id() {
+        let temp = TempDir::new("committed-name").unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        run_git(&root, &["init", "-q"]);
+        let modules = root.join(".boundrail/model/modules");
+        fs::create_dir_all(modules.join("nested")).unwrap();
+        fs::write(root.join(".boundrail/model/model.json"), "{}").unwrap();
+        fs::write(modules.join("nested/Nested01.module.json"), "{}").unwrap();
+        fs::write(modules.join("bad-name.module.json"), "{}").unwrap();
+        run_git(&root, &["add", "-A"]);
+        let tree = run_git(&root, &["write-tree"]);
+        let commit = run_git(&root, &["commit-tree", &tree, "-m", "misnamed"]);
+
+        let error = load_committed(&root, &commit).unwrap_err();
+        let refusal = error.downcast_ref::<Refusal>().expect("a refusal");
+        assert_eq!(refusal.code, Code::ModelInvalid);
+        let details = refusal.details.as_ref().unwrap();
+        assert_eq!(details["path"], "modules/bad-name.module.json");
     }
 
     #[test]

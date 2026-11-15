@@ -7722,8 +7722,144 @@ fn a_pushed_history_fetched_into_another_clone_resolves_checkpoint_readings() {
     );
 }
 
+/// Two clones of one committed vault with `remote` as origin, whose histories hold one
+/// checkpoint the first retained and pushed, and its ID. The second's model is then edited, so it
+/// has a change of its own to retain.
+fn clones_on_one_checkpoint(remote: &TempDir) -> (Checkout, Checkout, String) {
+    let (first, second) = clones();
+    let url = remote.path().to_str().unwrap();
+    git(&first, &["remote", "add", "origin", url]);
+    git(&second, &["remote", "set-url", "origin", url]);
+    for (key, value) in [
+        ("user.name", "tester"),
+        ("user.email", "tester@example.com"),
+        ("commit.gpgsign", "false"),
+    ] {
+        git(&second, &["config", key, value]);
+    }
+    let base = retain(&first, "the shop as drawn");
+    first.ok(&["history", "push"]);
+    assert_eq!(
+        second.ok(&["history", "fetch"])["checkpoints"],
+        json!([base])
+    );
+    second.edited(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 4}}]));
+    (first, second, base)
+}
+
+/// `model retain` in `checkout` with the operation ID `local`: the checkpoint it returns.
+fn retain_once(checkout: &Checkout) -> Value {
+    let args = ["--doing", "a local change", "--writer", "tester"];
+    let out = checkout.ok(&[&["retain"][..], &args, &["--operation-id", "local"]].concat());
+    out["checkpoint"].clone()
+}
+
+/// The checkpoints `model checkpoints` lists in `checkout`, newest first.
+fn checkpoints(checkout: &Checkout) -> Vec<Value> {
+    checkout.ok(&["checkpoints"])["checkpoints"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+/// The commit of the checkpoint `id` in `checkout`'s history.
+fn checkpoint_commit(checkout: &Checkout, id: &str) -> String {
+    let list = checkpoints(checkout);
+    let found = list.iter().find(|c| c["id"] == id).unwrap();
+    found["commit"].as_str().unwrap().to_owned()
+}
+
+fn history_tip(checkout: &Checkout) -> String {
+    git(checkout, &["rev-parse", "refs/boundrail/history"])
+}
+
+/// The details of `checkout`'s refused push, whose message says `says`.
+fn refused_push(checkout: &Checkout, says: &str) -> Value {
+    let error = checkout.refused(&["history", "push"], "HISTORY_DIVERGED");
+    let message = error["message"].as_str().unwrap();
+    assert!(message.contains(says), "{error:#}");
+    error["details"].clone()
+}
+
 #[test]
-fn diverged_histories_refuse_to_push_or_fetch() {
+fn diverged_histories_refuse_to_push_and_replay_on_fetch() {
+    let remote = bare();
+    let (first, second, base) = clones_on_one_checkpoint(&remote);
+    first.edited(json!([{"type": "edit-module", "subject": "Web", "set": {"order": 3}}]));
+    let ahead = retain(&first, "web moves");
+    first.ok(&["history", "push"]);
+    assert_eq!(refused_push(&second, "is ahead")["local_only"], json!([]));
+
+    let retained = retain_once(&second);
+    let (local, original) = (&retained["id"], retained["commit"].as_str().unwrap());
+    assert_eq!(
+        refused_push(&second, "replays")["local_only"],
+        json!([local])
+    );
+    assert_eq!(history_tip(&second).trim(), original);
+
+    // The replayed checkpoint keeps its message, trailers, dates and tree.
+    let format = ["log", "-1", "--format=%B%x1f%ad%x1f%cd%x1f%T"];
+    let kept = git(&second, &[&format[..], &[original]].concat());
+    let out = second.ok(&["history", "fetch"]);
+    assert_eq!(out["checkpoints"], json!([ahead]));
+    assert_eq!(out["replayed"], json!([local]));
+    let replayed = checkpoint_commit(&second, local.as_str().unwrap());
+    assert_ne!(replayed, original);
+    assert_eq!(git(&second, &[&format[..], &[&replayed]].concat()), kept);
+    let ids: Vec<Value> = checkpoints(&second)
+        .iter()
+        .map(|c| c["id"].clone())
+        .collect();
+    assert_eq!(ids, [local.clone(), json!(ahead), json!(base)]);
+    // A retry of the retain returns the checkpoint as the history now holds it.
+    assert_eq!(retain_once(&second)["commit"], replayed);
+
+    let out = second.ok(&["history", "push"]);
+    assert_eq!(out["checkpoints"], json!([local]));
+    let out = first.ok(&["history", "fetch"]);
+    assert_eq!(out["checkpoints"], json!([local]));
+    assert_eq!(out["replayed"], json!([]));
+    for clone in [&first, &second] {
+        for id in [&base, &ahead, local.as_str().unwrap()] {
+            clone.ok(&["read", "--checkpoint", id]);
+        }
+    }
+}
+
+#[test]
+fn fetch_refuses_to_replay_a_checkpoint_id_the_remote_holds() {
+    let remote = bare();
+    let (first, second, base) = clones_on_one_checkpoint(&remote);
+    let local = retain(&second, "second clone's change");
+    let tip = history_tip(&second);
+    // The remote gains a checkpoint with the same ID in another case.
+    let taken: String = (local.chars())
+        .map(|c| {
+            if c.is_ascii_lowercase() {
+                c.to_ascii_uppercase()
+            } else {
+                c.to_ascii_lowercase()
+            }
+        })
+        .collect();
+    let parent = checkpoint_commit(&first, &base);
+    let tree = git(&first, &["rev-parse", &format!("{parent}^{{tree}}")]);
+    let message = format!("taken\n\nCheckpoint: {taken}\nRevision: r1\nWriter: tester\n");
+    let forged = git(
+        &first,
+        &["commit-tree", tree.trim(), "-p", &parent, "-m", &message],
+    );
+    let refspec = format!("+{}:refs/boundrail/history", forged.trim());
+    git(&first, &["push", "-q", "origin", &refspec]);
+
+    let error = second.refused(&["history", "fetch"], "HISTORY_DIVERGED");
+    assert_eq!(error["details"]["clashing"], json!([local]));
+    assert_eq!(history_tip(&second), tip);
+}
+
+#[test]
+fn histories_that_share_no_commit_refuse_to_push_or_fetch() {
     let remote = bare();
     let first = with_origin(&remote);
     shop(&first);
@@ -7732,10 +7868,78 @@ fn diverged_histories_refuse_to_push_or_fetch() {
     let second = with_origin(&remote);
     shop(&second);
     retain(&second, "second clone's history");
-    let tip = git(&second, &["rev-parse", "refs/boundrail/history"]);
-    second.refused(&["history", "push"], "HISTORY_DIVERGED");
-    second.refused(&["history", "fetch"], "HISTORY_DIVERGED");
-    assert_eq!(git(&second, &["rev-parse", "refs/boundrail/history"]), tip);
+    let tip = history_tip(&second);
+    assert_eq!(refused_push(&second, "share no commit")["related"], false);
+    let error = second.refused(&["history", "fetch"], "HISTORY_DIVERGED");
+    assert_eq!(error["details"]["related"], false);
+    assert_eq!(history_tip(&second), tip);
+}
+
+#[test]
+fn history_publication_refuses_a_merge_shaped_like_a_checkpoint() {
+    let remote = bare();
+    let checkout = with_origin(&remote);
+    shop(&checkout);
+    retain(&checkout, "drawn");
+    checkout.ok(&["history", "push"]);
+    let base = history_tip(&checkout).trim().to_owned();
+    let tree = git(&checkout, &["rev-parse", &format!("{base}^{{tree}}")]);
+    let message = "merged\n\nCheckpoint: Merge001\nRevision: r1\nWriter: tester\n";
+    let parents = ["-p", &base, "-p", "HEAD"];
+    let merge = git(
+        &checkout,
+        &[
+            &["commit-tree", tree.trim()][..],
+            &parents,
+            &["-m", message],
+        ]
+        .concat(),
+    );
+    let merge = merge.trim();
+
+    git(&checkout, &["update-ref", "refs/boundrail/history", merge]);
+    let error = checkout.refused(&["history", "push"], "MODEL_INVALID");
+    assert_eq!(error["details"]["object"], merge);
+    let remote_tip = || git_in(remote.path(), &["rev-parse", "refs/boundrail/history"]);
+    assert_eq!(remote_tip(), base);
+
+    git(&checkout, &["update-ref", "refs/boundrail/history", &base]);
+    let refspec = format!("+{merge}:refs/boundrail/history");
+    git(&checkout, &["push", "-q", "origin", &refspec]);
+    let error = checkout.refused(&["history", "fetch"], "MODEL_INVALID");
+    assert_eq!(error["details"]["object"], merge);
+    assert_eq!(history_tip(&checkout).trim(), base);
+}
+
+#[test]
+fn a_configured_fetch_refspec_never_moves_the_history_during_a_fetch() {
+    let remote = bare();
+    let checkout = with_origin(&remote);
+    shop(&checkout);
+    retain(&checkout, "drawn");
+    let tip = history_tip(&checkout);
+    git(
+        &checkout,
+        &[
+            "config",
+            "remote.origin.fetch",
+            "+refs/boundrail/*:refs/boundrail/*",
+        ],
+    );
+    // A code commit, not a checkpoint.
+    let source = committed();
+    let url = remote.path().to_str().unwrap();
+    git(
+        &source,
+        &["push", "-q", url, "+HEAD:refs/boundrail/history"],
+    );
+    checkout.refused(&["history", "fetch"], "MODEL_INVALID");
+    assert_eq!(history_tip(&checkout), tip);
+    let refs = git(
+        &checkout,
+        &["for-each-ref", "--format=%(refname)", "refs/boundrail"],
+    );
+    assert_eq!(refs.trim(), "refs/boundrail/history");
 }
 
 #[test]
@@ -7862,28 +8066,41 @@ fn import_refuses_a_bundle_whose_base_or_paths_do_not_hold() {
 fn bundle_refusals_never_print_the_bundles_own_text() {
     let checkout = Checkout::new();
     shop(&checkout);
-    let path = "\u{1b}]0;pwned\u{7}\u{1b}[31mmodules/x";
-    let bundle = with_file(&export(&checkout, &[]), path, "x");
+    let escape = "\u{1b}]0;pwned\u{7}\u{1b}[31m";
     let file = checkout.path().join("e.bundle.json");
-    fs::write(&file, bundle.to_string()).unwrap();
+    let file = file.to_str().unwrap();
     let digest = checkout.digest();
-    let (code, stdout) = checkout.run_raw(&[
-        "--format",
-        "markdown",
-        "import",
-        file.to_str().unwrap(),
-        "--expected-revision",
-        digest.as_str().unwrap(),
-        "--doing",
-        "bring it in",
-        "--writer",
-        "tester",
-        "--operation-id",
-        "escape",
-    ]);
-    assert_eq!(code, 2, "{stdout}");
-    assert!(stdout.starts_with("BUNDLE_INVALID: "), "{stdout}");
-    assert!(!stdout.contains('\u{1b}'), "{stdout:?}");
+    let digest = digest.as_str().unwrap();
+    let args = |operation: &'static str| {
+        let doing = ["--doing", "bring it in", "--writer", "tester"];
+        let rest = ["--expected-revision", digest, "--operation-id", operation];
+        [&["import", file][..], &doing, &rest].concat()
+    };
+    let markdown = |operation| {
+        let (code, stdout) =
+            checkout.run_raw(&[&["--format", "markdown"][..], &args(operation)].concat());
+        assert_eq!(code, 2, "{stdout}");
+        assert!(!stdout.contains('\u{1b}'), "{stdout:?}");
+        stdout
+    };
+    let bundle = with_file(&export(&checkout, &[]), &format!("{escape}modules/x"), "x");
+    fs::write(file, bundle.to_string()).unwrap();
+    assert!(markdown("escape").starts_with("BUNDLE_INVALID: "));
+
+    // An unknown source kind, which serde quotes, refuses with a fixed message.
+    let mut unknown = export(&checkout, &[]);
+    unknown["source"]["kind"] = format!("{escape}kind").into();
+    fs::write(file, unknown.to_string()).unwrap();
+    let message = "REQUEST_INVALID: the bundle does not parse as boundrail/bundle/v1";
+    assert_eq!(markdown("escape-md").lines().next(), Some(message));
+    let details = &checkout.refused(&args("escape-kind"), "REQUEST_INVALID")["details"];
+    let error = details["error"].as_str().unwrap();
+    assert!(
+        error.contains("unknown variant") && !error.contains('\u{1b}'),
+        "{error}"
+    );
+    assert!(details["line"].as_u64().unwrap() >= 1);
+    assert!(details["column"].as_u64().unwrap() >= 1);
 }
 
 #[test]

@@ -52,10 +52,12 @@ path=${INPUT_PATH:-.}
 # The scan mode's fail-on default; it must match the input's default in action.yml, which
 # means the model mode's default, warnings.
 scan_default=new-forbidden,new-cycles,stale-known,new-vacuous
-fail_on=${INPUT_FAIL_ON:-warnings}
+fail_on=${INPUT_FAIL_ON-warnings}
 if [[ $fail_on == "$scan_default" ]]; then
   fail_on=warnings
 fi
+# An empty fail-on fails on nothing, as in scan mode.
+fail_on=${fail_on:-never}
 case $fail_on in
   warnings | information | never) ;;
   *) die "fail-on must be warnings, information or never in model mode" ;;
@@ -133,11 +135,25 @@ if [[ -n $base_ref ]]; then
   cat "$work/comment.md" >>"$GITHUB_STEP_SUMMARY"
   # A comment cut at its size limit points at the summary, which gets the whole footprint.
   if grep -q '^_Truncated at ' "$work/comment.md"; then
+    "$boundrail" --no-daemon model footprint --root "$path" --base "$base_ref" --format markdown >"$work/footprint.md" || {
+      cat "$work/footprint.md"
+      die "model footprint failed"
+    }
+    # A fence longer than any tilde run in the text, which the repository controls.
+    fence='~~~'
+    longest=$(awk '{
+      line = $0
+      while (match(line, /~+/)) {
+        if (RLENGTH > m) m = RLENGTH
+        line = substr(line, RSTART + RLENGTH)
+      }
+    } END { print m + 0 }' "$work/footprint.md")
+    while ((${#fence} <= longest)); do fence+='~'; done
     {
       echo
-      echo '~~~~~~~~'
-      "$boundrail" --no-daemon model footprint --root "$path" --base "$base_ref" --format markdown
-      echo '~~~~~~~~'
+      echo "$fence"
+      cat "$work/footprint.md"
+      echo "$fence"
     } >>"$GITHUB_STEP_SUMMARY"
   fi
   # Best effort: a token that cannot write (a fork's pull request, a Dependabot run, a read-only
