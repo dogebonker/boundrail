@@ -128,15 +128,6 @@ fn reachable_package_policy_marks_internal_path_and_survives_move_and_diff() {
     assert_eq!(moved.external_edges[0].verdict, Some(Verdict::Forbidden));
     assert_eq!(moved.summary.forbidden, 2);
     assert_eq!(boundrail::diff::diff(&doc, &moved).new_forbidden.len(), 2);
-    let restored = boundrail::restore_scan(
-        serde_json::from_value(serde_json::to_value(&moved).unwrap()).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(restored.summary.forbidden, 2);
-    assert_eq!(
-        serde_json::to_value(&restored.external_exposure).unwrap(),
-        serde_json::to_value(&moved.external_exposure).unwrap()
-    );
 }
 
 #[test]
@@ -209,9 +200,6 @@ fn unavailable_ledger_is_not_false_zero_or_false_policy_pass() {
         .to_string()
         .contains("import accounting")
     );
-    let mut saved = serde_json::to_value(&doc).unwrap();
-    saved["config"]["rules"]["doc"]["allow"] = json!([{"from":"**","to":"pkg:*"}]);
-    assert!(boundrail::restore_scan(serde_json::from_value(saved).unwrap()).is_err());
 }
 
 #[test]
@@ -430,23 +418,6 @@ fn external_ids_cannot_spoof_ordinary_file_policy_targets_or_move_destinations()
         .unwrap_err()
         .to_string()
         .contains("collides")
-    );
-    let mut saved = serde_json::to_value(&doc).unwrap();
-    saved["files"].as_array_mut().unwrap().push(json!({"path":"external:typescript:typeorm","module":"external:typescript:typeorm","barrel":false}));
-    assert!(
-        boundrail::validate_scan(&serde_json::from_value(saved).unwrap())
-            .unwrap_err()
-            .to_string()
-            .contains("collides")
-    );
-    let mut saved = serde_json::to_value(&doc).unwrap();
-    saved["globals"] = json!([{"from":"src/domain/a.ts","name":"process","line":1}]);
-    saved["files"].as_array_mut().unwrap().push(json!({"path":"external:typescript:global:process","module":"external:typescript:global:process","barrel":false}));
-    assert!(
-        boundrail::validate_scan(&serde_json::from_value(saved).unwrap())
-            .unwrap_err()
-            .to_string()
-            .contains("collides")
     );
     let compiled = rules::compile(&doc.config).unwrap();
     assert!(

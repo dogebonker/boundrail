@@ -151,7 +151,7 @@ pub fn analyze(doc: &Document, max_symbols: usize) -> Result<SurfaceReport> {
         .collect();
     let symbols = doc.symbols.as_ref();
     let mut limitations = symbols.map(|s| s.limitations.clone()).unwrap_or_else(|| {
-        vec!["Symbol data is absent; scan with --symbols to assess exports and usage.".into()]
+        vec!["Symbol data is absent, so exports and usage are not assessed.".into()]
     });
     limitations.push("Could be internal means unused by consumers in this scan, not unused by downstream packages or runtime reflection. Review before removing public API.".into());
     let complete = symbols.is_some_and(|s| s.complete);

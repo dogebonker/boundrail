@@ -18,8 +18,7 @@ use super::types::{
     Proposal, RESPONSIBILITY_MAX, Relationship, SCHEMA_VERSION, State, VaultConfig, Walkthrough,
 };
 use super::{Code, Refusal, ids, one_line, state};
-use crate::history::{refuse_symlink, write_atomic};
-use crate::sync_rules::hash;
+use crate::files::{hash, refuse_symlink, write_atomic};
 
 mod flows;
 mod pictures;
@@ -207,12 +206,6 @@ fn vault_relative(path: &str) -> Option<&str> {
 /// Whether the repository path `path` lies inside the vault folder.
 pub(crate) fn in_vault(path: &str) -> bool {
     vault_relative(path).is_some()
-}
-
-/// Whether the repository path `path` is a vault file Boundrail writes: `config.yaml`, or a file
-/// a journaled write may write or delete.
-pub(crate) fn is_written_path(path: &str) -> bool {
-    vault_relative(path).is_some_and(|rest| rest == CONFIG || is_written(rest))
 }
 
 /// Where the vault folder of the checkout around `start` is, whether or not it exists.

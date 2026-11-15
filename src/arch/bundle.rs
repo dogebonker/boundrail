@@ -20,7 +20,7 @@ use super::types::{Collection, Module, Predecessor, Proposal, ProposalStatus, SC
 use super::vault::{self, Model, Problem, Scope};
 use super::{Code, Refusal, checkpoint, claims, ids};
 use crate::collect::TempDir;
-use crate::sync_rules::hash;
+use crate::files::hash;
 
 /// The `schema` every bundle names.
 pub const SCHEMA: &str = "boundrail/bundle/v1";

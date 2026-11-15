@@ -8,7 +8,7 @@ CLI and features.
 After publication:
 
 ```sh
-npx boundrail-cli report . --engine native --out-dir /tmp/arch
+npx boundrail-cli model setup --agent claude
 ```
 
 The package has no dependencies or install script. On first run, `bin/boundrail.js` reads the
@@ -34,8 +34,8 @@ Existing environment overrides remain supported:
   URL and redirect must use HTTPS.
 - `ARCHGRAPH_BINARY` selects an executable and skips downloading.
 
-The repository URL, `.archgraph/` state, report schemas, and ownership markers keep their existing
-names for compatibility. See the [main README](https://github.com/dogebonker/archgraph#quickstart)
-for collector requirements and [agent workflows](https://github.com/dogebonker/archgraph#give-agents-a-project-workflow).
+The repository URL and the `ARCHGRAPH_*` environment variables keep their existing names for
+compatibility. See the [main README](https://github.com/dogebonker/archgraph#quickstart) for the
+model commands.
 
 MIT OR Apache-2.0.

@@ -1,4 +1,6 @@
 use super::*;
+use clap::ValueEnum;
+use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::iter;
 
@@ -28,7 +30,6 @@ use boundrail::arch::vault::{
     WalkthroughEntry,
 };
 use boundrail::arch::{Code, Refusal};
-use boundrail::hook_agents::Agent;
 use serde_json::{Value, json};
 
 #[path = "pictures.rs"]
@@ -36,6 +37,7 @@ mod pictures;
 #[path = "setup.rs"]
 mod setup;
 pub(super) use pictures::pictures_output;
+use setup::Agent;
 
 const MODEL_SCHEMA: &str = "boundrail/model/v1";
 
@@ -1710,7 +1712,7 @@ impl Checked {
 fn scan_checkout(model: &Model) -> Result<(PathBuf, Result<Document, NoScan>)> {
     let checkout = checkpoint::checkout(&model.dir)?;
     let doc = if code::needs_scan(&model.modules, &checkout) {
-        super::scan_cli::live(&checkout, None).map_err(|error| NoScan::Failed(format!("{error:#}")))
+        super::scan_cli::live(&checkout).map_err(|error| NoScan::Failed(format!("{error:#}")))
     } else {
         Err(NoScan::NotNeeded)
     };

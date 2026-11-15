@@ -45,6 +45,18 @@ const NEXT_STEPS: [&str; 5] = [
     "boundrail model view",
 ];
 
+/// The coding agents whose project skill folders setup writes.
+#[derive(
+    clap::ValueEnum, serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq,
+)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum Agent {
+    Claude,
+    Codex,
+    Cursor,
+    Opencode,
+}
+
 /// Each agent's project skill folder.
 fn skill_dir(agent: Agent) -> &'static str {
     match agent {
@@ -68,7 +80,7 @@ impl Placed {
     /// Writes `text` to `relative` below `checkout` when the file is missing, or differs and
     /// `force` is set. Refuses a symbolic link on the way.
     fn place(&mut self, checkout: &Path, relative: &str, text: &str, force: bool) -> Result<()> {
-        let path = boundrail::hook_agents::safe_path(checkout, relative)?;
+        let path = boundrail::files::safe_path(checkout, relative)?;
         match fs::read(&path) {
             Ok(found) if found == text.as_bytes() => {
                 self.unchanged.push(relative.to_owned());
@@ -86,7 +98,7 @@ impl Placed {
             .parent()
             .with_context(|| format!("no folder holds {relative}"))?;
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-        boundrail::history::write_atomic(&path, text.as_bytes())?;
+        boundrail::files::write_atomic(&path, text.as_bytes())?;
         self.written.push(relative.to_owned());
         Ok(())
     }

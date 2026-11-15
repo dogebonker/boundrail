@@ -86,7 +86,7 @@ fn output(
         ]);
     }
     command
-        // Read-only queries must not rewrite the index and trigger the daemon watcher.
+        // Read-only queries must not rewrite the index.
         .env(
             "GIT_OPTIONAL_LOCKS",
             if index.is_some() { "1" } else { "0" },

@@ -16,6 +16,7 @@ use boundrail::arch::proposal::CURRENT;
 use boundrail::arch::vault;
 use boundrail::arch::view::{self as page, Request};
 use boundrail::arch::{Code, Refusal};
+use clap::ValueEnum as _;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde_json::{Value, json};
 
@@ -73,15 +74,8 @@ struct News {
 /// The browser opener gets a one-time launch URL instead, so the token stays out of its
 /// arguments.
 pub(super) fn run(root: &Path, args: &ViewArgs) -> Result<()> {
-    // Options and the tool timeout belong to the calling thread; connections take them along.
-    let options = globals();
-    // The URL goes to stdout, which `--brief` would capture until the server stops.
-    if options.brief {
-        return Err(invalid(
-            "--brief does not apply to model view, which serves a page",
-        ));
-    }
-    let timeout = (options.tool_timeout > 0).then(|| Duration::from_secs(options.tool_timeout));
+    // The tool timeout belongs to the calling thread; connections take it along.
+    let timeout = collect::tool_timeout();
     let vault = vault::locate(root)?;
     let listener = TcpListener::bind(("127.0.0.1", args.port))
         .with_context(|| format!("binding 127.0.0.1:{}", args.port))?;
@@ -119,11 +113,9 @@ pub(super) fn run(root: &Path, args: &ViewArgs) -> Result<()> {
             continue;
         }
         let worker = Arc::clone(&server);
-        let options = options.clone();
         let spawned = thread::Builder::new()
             .name("view-connection".into())
             .spawn(move || {
-                GLOBALS.with(|g| *g.borrow_mut() = options);
                 collect::request_timeout(timeout);
                 let connection = Release(&worker.connections);
                 if let Some(stream) = worker.serve(stream) {

@@ -1,5 +1,0 @@
-version: 1
-layers:
-  - "domain/**"
-  - "app/**"
-  - "adapters/**"

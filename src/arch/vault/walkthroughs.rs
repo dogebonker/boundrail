@@ -14,7 +14,7 @@ use crate::arch::types::{
     READING_DEPTH_MAX, ReadingState, ReadingView, Walkthrough,
 };
 use crate::arch::{Refusal, ids, one_line};
-use crate::sync_rules::hash;
+use crate::files::hash;
 
 /// The qualified IDs of `modules` and of the flows in `collections`, as readings name them.
 pub(crate) fn reading_ids<'a>(

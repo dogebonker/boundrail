@@ -77,12 +77,23 @@
 
 - Elixir source-reference collection through `Code.string_to_quoted`, including umbrella apps, aliases, static module calls and type references. Scans do not load Mix projects, evaluate source, compile or expand macros; unresolved dynamic and unavailable dependency references remain visible. Adds runtime selection, shared exclusions and live collector CI coverage.
 
+### Removed
+
+- The scan-era commands: `scan`, `report`, `check`, `render`, `simulate`, `diff`, `history`,
+  `bisect`, `hotspots`, `impact`, `surface`, `infer-layout`, `package-splits`, `context`, `tour`,
+  `services`, `show-excludes`, `explain`, `unresolved`, `adr`, `sync-rules`, `init`, `skill`,
+  `propose`, `apply` and `verify`, with the reference collectors and their scan flags
+  (`--rank`, `--all-kinds`, `--legacy-v1`, `--granularity`). `boundrail model` remains.
+- The MCP server (`mcp`, `mcp-call`, `review`), the agent hooks and edit gate (`hook`, `fires`),
+  the daemon (`serve`, `status`, `--no-daemon`) and `--brief`.
+- The GitHub Action's scan mode and its `mode` input; the action runs the model check.
+
 ### Edge quality: kinds and weights
 
 - New `archgraph/v1.1` exports distinguish runtime, lazy, type and structural re-export imports; TS/JS import tokenization supplements collector metadata, including function-local `require`.
 - Default cycles use runtime edges only. `type_only_cycles` records other cyclic components, including lazy/re-export/mixed cycles and whether they contain a runtime cycle; `--all-kinds` enables broad comparison.
 - Configurable `edge_weights` default to runtime 1.0, lazy 0.3, type 0.1 and reexport 0.0. Weighted coupling/cohesion ratios accompany retained integer counts; `forbid`, `allow` and `public` rules accept optional kind filters, including throughout reachable paths.
-- Upgraded commands read v1 and v1.1. `--legacy-v1` writes the v1 compatibility shape and old kind names for frozen consumers; analysis still uses the new methodology. See [migration details](docs/guide.md#edge-quality-and-migration).
+- Upgraded commands read v1 and v1.1. `--legacy-v1` writes the v1 compatibility shape and old kind names for frozen consumers; analysis still uses the new methodology.
 
 ### Edge quality: barrel resolution
 

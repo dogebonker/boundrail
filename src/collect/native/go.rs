@@ -16,10 +16,6 @@ use crate::surface::{SymbolImport, SymbolTarget, Symbols};
 
 use super::{named_children, self_export, text, unresolved_count};
 
-#[path = "go_app.rs"]
-mod app;
-pub(crate) use app::app_facts;
-
 #[derive(Clone, Default, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct Package {
@@ -58,104 +54,52 @@ struct Parsed {
     errors: bool,
 }
 
+/// The packages `go list` reports for the modules in `dirs`, keyed by import path.
+fn go_list(root: &Path, go: &str, dirs: &[String]) -> Result<BTreeMap<String, Package>> {
+    let go = crate::collect::resolve_executable("go", go)?;
+    let mut packages = BTreeMap::new();
+    for dir in dirs {
+        let output = crate::collect::run(
+            Command::new(&go)
+                .args(["list", "-e", "-deps", "-json", "./..."])
+                .current_dir(root.join(dir))
+                .envs(crate::collect::go::ENV.iter().copied())
+                .env("GOSUMDB", "off"),
+        )
+        .with_context(|| {
+            format!(
+                "running {} list for native Go package metadata",
+                go.display()
+            )
+        })?;
+        if !output.status.success() {
+            bail!(
+                "native Go metadata failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        for package in serde_json::Deserializer::from_slice(&output.stdout).into_iter::<Package>() {
+            let package = package.context("reading go list package metadata")?;
+            if !package.import_path.is_empty() {
+                packages.insert(package.import_path.clone(), package);
+            }
+        }
+    }
+    Ok(packages)
+}
+
 pub fn collect(root: &Path, go: &str, policy: &Policy) -> Result<super::Output> {
-    collect_cached(root, go, policy, &mut Cache::default())
-}
-#[derive(Default)]
-pub(crate) struct Cache {
-    parsed: super::ParseCache<Parsed>,
-    packages: Option<BTreeMap<String, Package>>,
-    warnings: Vec<String>,
-    dirs: Vec<String>,
-    dirty: Vec<(String, String)>,
-}
-impl Cache {
-    pub(crate) fn invalidate(&mut self, files: &[String]) {
-        self.dirty = files
-            .iter()
-            .filter_map(|file| {
-                self.parsed
-                    .entries
-                    .get(file)
-                    .map(|old| (file.clone(), old.package_name.clone()))
-            })
-            .collect();
-        self.parsed.invalidate(files);
-    }
-    pub(crate) fn counts(&self) -> (usize, usize) {
-        (self.parsed.parsed, self.parsed.reused)
-    }
-}
-pub(crate) fn collect_cached(
-    root: &Path,
-    go: &str,
-    policy: &Policy,
-    cache: &mut Cache,
-) -> Result<super::Output> {
     let root = root.canonicalize()?;
     let language = tree_sitter_go::LANGUAGE.into();
     let mut parser = Parser::new();
     parser.set_language(&language)?;
     let query = Query::new(&language, include_str!("queries/go.scm"))?;
-    for (file, previous_package) in std::mem::take(&mut cache.dirty) {
-        let info = cache.parsed.get(&file, || {
-            let source = fs::read_to_string(root.join(&file))?;
-            parse(&source, &mut parser, &query)
-        })?;
-        if info.package_name != previous_package
-            || cache.packages.as_ref().is_some_and(|packages| {
-                info.imports
-                    .iter()
-                    .any(|import| !packages.contains_key(&import.path))
-            })
-        {
-            cache.packages = None;
-        }
+    let (dirs, warnings) =
+        crate::collect::go::module_dirs(&root, &crate::collect::globset(policy.patterns())?)?;
+    if dirs.is_empty() {
+        bail!("native Go collection needs a go.mod with a module declaration");
     }
-    if cache.packages.is_none() {
-        let (dirs, warnings) =
-            crate::collect::go::module_dirs(&root, &crate::collect::globset(policy.patterns())?)?;
-        if dirs.is_empty() {
-            bail!("native Go collection needs a go.mod with a module declaration");
-        }
-        let go = crate::collect::resolve_executable("go", go)?;
-        let mut packages = BTreeMap::new();
-        for dir in &dirs {
-            let output = crate::collect::run(
-                Command::new(&go)
-                    .args(["list", "-e", "-deps", "-json", "./..."])
-                    .current_dir(root.join(dir))
-                    .envs(crate::collect::go::ENV.iter().copied())
-                    .env("GOSUMDB", "off"),
-            )
-            .with_context(|| {
-                format!(
-                    "running {} list for native Go package metadata",
-                    go.display()
-                )
-            })?;
-            if !output.status.success() {
-                bail!(
-                    "native Go metadata failed: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                );
-            }
-            for package in
-                serde_json::Deserializer::from_slice(&output.stdout).into_iter::<Package>()
-            {
-                let package = package.context("reading go list package metadata")?;
-                if !package.import_path.is_empty() {
-                    packages.insert(package.import_path.clone(), package);
-                }
-            }
-        }
-        cache.packages = Some(packages);
-        cache.warnings = warnings;
-        cache.dirs = dirs;
-    }
-    let dirs = cache.dirs.clone();
-    let packages = cache.packages.as_ref().unwrap();
-    let warnings = cache.warnings.clone();
+    let packages = &go_list(&root, go, &dirs)?;
     let mut file_packages = BTreeMap::new();
     for (identity, package) in packages {
         if package.dir.is_empty() {
@@ -191,13 +135,8 @@ pub(crate) fn collect_cached(
 
     let mut parsed = BTreeMap::new();
     for file in &all_files {
-        parsed.insert(
-            file.clone(),
-            cache.parsed.get(file, || {
-                let source = fs::read_to_string(root.join(file))?;
-                parse(&source, &mut parser, &query)
-            })?,
-        );
+        let source = fs::read_to_string(root.join(file))?;
+        parsed.insert(file.clone(), parse(&source, &mut parser, &query)?);
     }
     let mut declarations: BTreeMap<(String, String, String), Vec<String>> = BTreeMap::new();
     let mut entries: BTreeMap<String, Vec<String>> = BTreeMap::new();

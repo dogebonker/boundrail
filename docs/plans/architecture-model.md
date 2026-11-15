@@ -1,17 +1,18 @@
 # Authored architecture model
 
-Boundrail today reads import graphs and checks declared boundaries. This plan adds an
-authored architecture model that agents write and that Boundrail checks against the code:
-stable module identities, relationships with code evidence, flows, proposals drawn against
-the current architecture, and a history of why the architecture changed.
+This plan built Boundrail's authored architecture model, which agents write and Boundrail checks
+against the code: stable module identities, relationships with code evidence, flows, proposals
+drawn against the current architecture, and a history of why the architecture changed. It started
+from a tool that read import graphs and checked declared boundaries; T18 removed that tool's
+commands once the model no longer needed them.
 
-The scanned graph stays. It becomes evidence for the model: an authored relationship is
-supported, missing, or backwards according to what the code shows.
+The scanned graph is evidence for the model: an authored relationship is supported, missing, or
+backwards according to what the code shows.
 
 ## Decisions
 
 - D1. The model lives in `.boundrail/model/` at the checkout root and is committed with the code.
-  The existing `.archgraph/` state folder stays for scan-era commands until T18 retires them.
+  T18 removed the scan-era commands and their `.archgraph/` state folder.
 - D2. One JSON file per module, owning its outgoing relationships. A manifest (`model.json`)
   names the model and its current state. Vocabulary lives in `config.yaml`.
 - D3. Identities are allocated by Boundrail: 8-character base62 local IDs, qualified as
@@ -19,8 +20,7 @@ supported, missing, or backwards according to what the code shows.
 - D4. Every write names the exact revision it read (a SHA-256 over the model inputs) and an
   operation ID. A stale revision refuses; repeating an operation ID returns the same receipt.
 - D5. Writes are CLI file operations under a vault lock. No server is required to read or write.
-  The live browser view, `boundrail model view`, runs its own local read-only HTTP server; it is
-  not grafted onto the `serve` daemon, whose socket protocol forwards scan commands.
+  The live browser view, `boundrail model view`, runs its own local read-only HTTP server.
 - D6. Checkpoints are commits on a separate history branch in the source repository, never on
   the working branch.
 - D7. New code lives under `src/arch/`. Existing scan code is reused as an evidence source, and
@@ -49,7 +49,7 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 | T15 | Embedded pictures: render recipes in SVG/PNG, `check embeds`, PNG rasterize | done |
 | T16 | Agent integration: `model setup`, skills for authoring/planning/PRs, CI action with PR annotations and footprint comment | done |
 | T17 | Reconcile drafts after current changes, export/import bundles, history publication | done |
-| T18 | Remove scan-era code that the model does not use | open |
+| T18 | Remove scan-era code that the model does not use | done |
 
 ## Notes
 
@@ -94,10 +94,10 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   retry builds on the new tip. The new commit's parent and the swap's old value are the tip the
   history was read from, even a commit without checkpoint trailers. Checkpoints restore the current
   state; drafts travel with the committed vault or in bundles (T17), and `model history push` and
-  `fetch` publish the history ref (T17); once fetched, checkpoint readings resolve. A vault file larger
-  than the 4 MiB a checkpoint reader accepts refuses `MODEL_INVALID` before anything is written.
-  Retaining an unchanged model refuses `NOTHING_TO_RETAIN`. Trailers `Source` and `Operation` appear
-  only when there is a value.
+  `fetch` publish the history ref (T17); once fetched, checkpoint readings resolve. A vault file
+  larger than the 4 MiB a checkpoint reader accepts refuses `MODEL_INVALID` before anything is
+  written. Retaining an unchanged model refuses `NOTHING_TO_RETAIN`. Trailers `Source` and
+  `Operation` appear only when there is a value.
 - T7: `model retain` takes flags, not a request body. `--writer` defaults to the Git author name.
   `--expected-revision` refuses `STALE_REVISION` when the model is at another revision; agents
   should pass the revision they reviewed. Its operation fingerprint covers the writer, `--doing` and
@@ -296,8 +296,7 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   launch URL, `/launch?c=<code>`, as one argument, never through a shell string, so the token stays
   out of every process's arguments. The code is a second OS-random value, never the token. The first
   request naming it gets a 303 to `/?t=<token>` and spends it; an unknown or spent code gets 403.
-  `--brief` refuses `REQUEST_INVALID`, since it would hold the URL back. Connection threads run with
-  the invoking thread's options and tool timeout, as daemon requests do. The page
+  Connection threads run with the invoking thread's tool timeout. The page
   (`src/arch/view/index.html`, `app.js`, `style.css`) is embedded with `include_str!`, uses no
   framework and loads nothing from other origins, so it works offline.
 - T11: the API answers with the command outputs through the same functions the CLI prints:
@@ -321,8 +320,8 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   claims and checks for `state`, and nothing otherwise; `/api/model` answers are kept per state
   until the next change.
 - T11: security. The server binds the loopback interface only. Each run's token is 256 bits from the
-  operating system's random source (`/dev/urandom`, or the system RNG on Windows), the helper the
-  daemon's token uses; a target with neither refuses to start. Every `/api/` request carries it as
+  operating system's random source (`/dev/urandom`, or the system RNG on Windows), from
+  `lib::token`; a target with neither refuses to start. Every `/api/` request carries it as
   `t` or the `X-Boundrail-Token` header, compared in constant time, or gets 403. The page drops the
   token from the address bar once read and keeps it in the tab's session storage, so a reload works.
   The page and its two assets carry no data and need no token. Every request must name exactly one
@@ -505,38 +504,38 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   (`--tool-timeout`, 600 s by default), or 600 s when it is 0; a request past either fails the
   session, and dropping the session kills the server.
 - T13: evidence. Files map to modules exactly as the code check maps scanned files. A module's
-  interface symbols are those of `model inspect` (exports of its entry points, or of every file
-  it owns), asked about at their definition (the export's target): `workspace/symbol` finds the
+  interface symbols are those of `model inspect` (exports of its entry points, or of every file it
+  owns), asked about at their definition (the export's target): `workspace/symbol` finds the
   declaration of that name in that file, and references are asked at the name's first whole-word
-  occurrence from the declaration's start, since a range may begin at a keyword. A reference from
-  a scanned file of one module into another, as credited below, is a call hop. A module is served
-  when every file it owns is covered by one server that answered, no file it owns is named by a
-  symbol limitation, it has at most 64 interface symbols, and the server found every one of them;
-  a container is served only when every judged part below it is. A served module counts as a
-  call target only when it, or a judged part below it, has an interface symbol a server located,
-  and every judged module in that subtree owning a file, itself included, has one; into any other
-  module imports stand in. A reference belongs to the module of the file its use
-  site imports the symbol through (the written target of an import edge from the use-site file
-  to the definition file, or to a file exporting the symbol), and to the defining module only
-  without such an edge, as import edges are credited. Between two served modules,
-  call evidence is the references, replacing the import approximation: a hop from the source or a
-  part of it into the target or a part of it supports a kind accepting `call`; under the T5
-  strictness rules a hop only the other way is `RELATIONSHIP_BACKWARDS` (`only Web calls Bank`)
-  and none is `RELATIONSHIP_UNSUPPORTED` (`never calls`). Elsewhere the import approximation
-  stays. Import evidence (`dependency`) is still import edges. `RELATIONSHIP_UNDRAWN` gains call
-  hops between modules no relationship covers (`src/web/index.ts:2 calls pay`), once per pair and
-  not when an import edge already reports it. For binding and anchor symbols, where the scan
-  cannot tell (no symbol data, or a file a limitation names), the servers decide: a declaration
-  of that name in one of the files, from `workspace/symbol` or a symbol list, confirms it; a
-  binding or anchor of one file whose `textDocument/documentSymbol` list is not empty and lacks
-  the name refutes it, `BINDING_SYMBOL_MISSING`/`ANCHOR_SYMBOL_MISSING` (`no file there declares
-  refund`), but only when the name is not `default` (a default export lists under its own name),
-  the file's text does not hold it as a whole word, and no server found it declared anywhere. An empty answer refutes nothing, since a server may not have indexed the file, so
-  such a symbol, and any symbol of a folder the servers do not find, keeps its
-  `symbols-incomplete` or `language-unsupported` skip. A complete scan's verdict stands. `model
-  inspect` counts `used` from references for served modules, lists `unused` even when the scan's
-  coverage is incomplete, and adds `source: "language-server" | "scan"` to `symbols`; its
-  `language_servers` key lists the language-server skips, empty when none.
+  occurrence from the declaration's start, since a range may begin at a keyword. A reference from a
+  scanned file of one module into another, as credited below, is a call hop. A module is served when
+  every file it owns is covered by one server that answered, no file it owns is named by a symbol
+  limitation, it has at most 64 interface symbols, and the server found every one of them; a
+  container is served only when every judged part below it is. A served module counts as a call
+  target only when it, or a judged part below it, has an interface symbol a server located, and
+  every judged module in that subtree owning a file, itself included, has one; into any other module
+  imports stand in. A reference belongs to the module of the file its use site imports the symbol
+  through (the written target of an import edge from the use-site file to the definition file, or to
+  a file exporting the symbol), and to the defining module only without such an edge, as import
+  edges are credited. Between two served modules, call evidence is the references, replacing the
+  import approximation: a hop from the source or a part of it into the target or a part of it
+  supports a kind accepting `call`; under the T5 strictness rules a hop only the other way is
+  `RELATIONSHIP_BACKWARDS` (`only Web calls Bank`) and none is `RELATIONSHIP_UNSUPPORTED` (`never
+  calls`). Elsewhere the import approximation stays. Import evidence (`dependency`) is still import
+  edges. `RELATIONSHIP_UNDRAWN` gains call hops between modules no relationship covers
+  (`src/web/index.ts:2 calls pay`), once per pair and not when an import edge already reports it.
+  For binding and anchor symbols, where the scan cannot tell (no symbol data, or a file a limitation
+  names), the servers decide: a declaration of that name in one of the files, from
+  `workspace/symbol` or a symbol list, confirms it; a binding or anchor of one file whose
+  `textDocument/documentSymbol` list is not empty and lacks the name refutes it,
+  `BINDING_SYMBOL_MISSING`/`ANCHOR_SYMBOL_MISSING` (`no file there declares refund`), but only when
+  the name is not `default` (a default export lists under its own name), the file's text does not
+  hold it as a whole word, and no server found it declared anywhere. An empty answer refutes
+  nothing, since a server may not have indexed the file, so such a symbol, and any symbol of a
+  folder the servers do not find, keeps its `symbols-incomplete` or `language-unsupported` skip. A
+  complete scan's verdict stands. `model inspect` counts `used` from references for served modules,
+  lists `unused` even when the scan's coverage is incomplete, and adds `source: "language-server" |
+  "scan"` to `symbols`; its `language_servers` key lists the language-server skips, empty when none.
 - T13: failures. A missing program, a crash, a protocol error or a timeout prints `warning:
   language server <name> failed: <reason>; stderr: <last lines>` and adds the skip `{subject:
   <name>, site: "language-server", reason: "language-server-failed"}`; the check never fails for
@@ -621,20 +620,20 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   and follows the playback; a live update reads the walkthrough again and stays on the same beat
   number. `/api/walkthrough?id=` is `model read --walkthrough`.
 - T15: a picture is `pictures/<id>.picture.json` (schema `model-picture`): `{schema_version, id,
-  name, order, description?, output, reading}`, the reading a walkthrough beat's, validated the
-  same way (render rules, newer state in `state`, current-state references must exist). `output`
-  is a repository path (`is_repo_path`, no empty or `.` segment) ending in `.svg` or `.png`
-  (lowercase), not below `.boundrail` and with no `.git` segment, compared as Windows resolves
-  names (any case, trailing dots and spaces dropped, `git~1` naming `.git`); no two pictures share
-  an output, compared without case. Pictures belong to the current state as walkthroughs do: its revision,
+  name, order, description?, output, reading}`, the reading a walkthrough beat's, validated the same
+  way (render rules, newer state in `state`, current-state references must exist). `output` is a
+  repository path (`is_repo_path`, no empty or `.` segment) ending in `.svg` or `.png` (lowercase),
+  not below `.boundrail` and with no `.git` segment, compared as Windows resolves names (any case,
+  trailing dots and spaces dropped, `git~1` naming `.git`); no two pictures share an output,
+  compared without case. Pictures belong to the current state as walkthroughs do: its revision,
   `file_digests`, the journal's write allow-list, checkpoints and committed reads cover them,
   proposal loads never read a `pictures` folder, a proposal edit with a picture change refuses
   `REQUEST_INVALID`, and a proposal's predecessor digest leaves `pictures/` out. Picture IDs come
   from the model-wide allocator and are retired on removal. Edits: `add-picture`, `edit-picture`
   (set name, order, description, output and any reading field; clear description and the reading
   fields as `edit-beat` does), `remove-picture`, which leaves the drawn file in place. A picture
-  resolves by ID or unique name. Removing a module or flow a current-state picture the batch did
-  not edit reads refuses `REFERENCED_BY_PICTURE` with `details.pictures`, after
+  resolves by ID or unique name. Removing a module or flow a current-state picture the batch did not
+  edit reads refuses `REFERENCED_BY_PICTURE` with `details.pictures`, after
   `REFERENCED_BY_WALKTHROUGH`. A claim on a picture holds it; adding or removing one touches the
   model ID. Adoption checks the adopted state with the current pictures, as with walkthroughs.
 - T15: `model pictures [--write] [--only <id|name>]` lists each picture in order with `id`,
@@ -693,14 +692,14 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   skipped. A missing rasterizer never reaches the check.
   Each proposal or checkpoint a beat or picture reads loads once per run (`semantic::States`),
   shared by the target check and every picture drawn, and the current state loads once.
-- T15: the browser lists the recipes in the sidebar from `/api/pictures`, which without
-  `status=1` lists them as `model read` does and draws nothing; with it, it is `model pictures`.
-  The Pictures list asks for per-file statuses only through the section's `Check files` button,
-  so reloads never ask for them, and drops them on each reload. The Warnings panel's
-  `/api/check` runs the embeds part as `model check` does, so picture warnings show without it. Clicking a picture applies its reading to
-  the active pane and draws it through `/api/render?picture=`, the beat path, so the server
-  applies the focus; after a reload a pane showing a picture follows its recipe, or keeps what it
-  shows once the picture is gone.
+- T15: the browser lists the recipes in the sidebar from `/api/pictures`, which without `status=1`
+  lists them as `model read` does and draws nothing; with it, it is `model pictures`. The Pictures
+  list asks for per-file statuses only through the section's `Check files` button, so reloads never
+  ask for them, and drops them on each reload. The Warnings panel's `/api/check` runs the embeds
+  part as `model check` does, so picture warnings show without it. Clicking a picture applies its
+  reading to the active pane and draws it through `/api/render?picture=`, the beat path, so the
+  server applies the focus; after a reload a pane showing a picture follows its recipe, or keeps
+  what it shows once the picture is gone.
 - T15: limits. ponytail: every check and listing renders each picture once; cache renders per
   reading if checks over many pictures get slow. Output folders are checked, then used, not
   opened relative to a folder handle, so a link swapped in between is followed; open each
@@ -719,28 +718,28 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   never leave the folder. ponytail: each draft stores a second full copy of the model it was
   drawn from, and every proposal load reads and hashes it for the revision; hash the base lazily
   (only for writes and reconcile) if drafts of large models make reads slow.
-- T17: `model reconcile <proposal> --expected-revision --expected-proposal-revision
-  --operation-id --doing [--writer] [--claim]` merges base, draft and current state
-  (`src/arch/merge.rs`). Granularity: a module's own fields (all but `outgoing`) are one subject
-  and each relationship another, with its owning module as a field, so a relationship added on
-  one side to a module renamed on the other merges, and a moved relationship is one change. A
-  collection is its whole file, flows and steps included: flows and steps move between lists and
-  collections, and a finer merge would need those moves as subjects of their own. A subject one
-  side changed takes that side; both sides making the same change merge. Different changes are
-  `both-changed`, a change against a removal `changed-removed`, a relationship whose owner the
-  other side removed `changed-removed` (unless the owner is in conflict already), and an ID the
-  current state retired that the merged draft holds `retired`. Any of them refuses
-  `RECONCILE_CONFLICT` with `details.conflicts` (`subject`, `kind`), writing nothing; the user
-  edits the draft to match one side and reconciles again. A merged module equal to one side's
-  (relationship order aside) is that side's file, so unchanged files are not rewritten.
-  Refusals in order: `PROPOSAL_CLOSED`, `STALE_REVISION` for either revision,
-  `RECONCILE_NO_BASE`, `RECONCILE_CONFLICT`, claims, `MODEL_INVALID` for a merged draft that does
-  not load, saying the problems come from merging the draft with the current state (`details.cause:
-  "merge"`) and that the draft needs editing. The write is one journaled operation of scope `reconcile` (the current state and the
-  proposal, like adoption, writing only the proposal): the merged files, a base equal to the
-  current state, the predecessor set to the current state and its normalized predecessor digest,
-  and the dropped list grown by the IDs the merge removed, less those the current state retired.
-  Claims cover what the merge changes in the draft, as an edit would, plus the proposal.
+- T17: `model reconcile <proposal> --expected-revision --expected-proposal-revision --operation-id
+  --doing [--writer] [--claim]` merges base, draft and current state (`src/arch/merge.rs`).
+  Granularity: a module's own fields (all but `outgoing`) are one subject and each relationship
+  another, with its owning module as a field, so a relationship added on one side to a module
+  renamed on the other merges, and a moved relationship is one change. A collection is its whole
+  file, flows and steps included: flows and steps move between lists and collections, and a finer
+  merge would need those moves as subjects of their own. A subject one side changed takes that side;
+  both sides making the same change merge. Different changes are `both-changed`, a change against a
+  removal `changed-removed`, a relationship whose owner the other side removed `changed-removed`
+  (unless the owner is in conflict already), and an ID the current state retired that the merged
+  draft holds `retired`. Any of them refuses `RECONCILE_CONFLICT` with `details.conflicts`
+  (`subject`, `kind`), writing nothing; the user edits the draft to match one side and reconciles
+  again. A merged module equal to one side's (relationship order aside) is that side's file, so
+  unchanged files are not rewritten. Refusals in order: `PROPOSAL_CLOSED`, `STALE_REVISION` for
+  either revision, `RECONCILE_NO_BASE`, `RECONCILE_CONFLICT`, claims, `MODEL_INVALID` for a merged
+  draft that does not load, saying the problems come from merging the draft with the current state
+  (`details.cause: "merge"`) and that the draft needs editing. The write is one journaled operation
+  of scope `reconcile` (the current state and the proposal, like adoption, writing only the
+  proposal): the merged files, a base equal to the current state, the predecessor set to the current
+  state and its normalized predecessor digest, and the dropped list grown by the IDs the merge
+  removed, less those the current state retired. Claims cover what the merge changes in the draft,
+  as an edit would, plus the proposal.
 - T17: bundles. `model export [--proposal P | --checkpoint C] [--output FILE]` prints one JSON
   bundle (`model schema model-bundle`): `{schema: "boundrail/bundle/v1", model: {id, name},
   source, files, digests}`. `source` is `{kind: "current", state, revision}`, `{kind:
@@ -813,38 +812,28 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   gained; a missing local history or remote ref is no change. Once fetched, checkpoint readings
   resolve, so CI can run `model history fetch` before `model check`.
 
-- T16: setup is `boundrail model setup`, not a flag of `boundrail init`. `init` is the scan-era
-  `layout.yaml` generator (presets, scopes, rule sync), which T18 may remove; a model command keeps
-  the two apart. `model setup [--name N] [--agent A]... [--language-servers] [--force]` creates the
-  vault through `vault::init` when absent (named after the checkout folder unless `--name`), installs
-  the `boundrail-model`, `boundrail-plan` and `boundrail-pr` skills, embedded with `include_str!`
-  from `skills/`, into each agent's project skill folder (`.claude/skills`, `.agents/skills` for
-  Codex as the project skill already uses, `.cursor/skills`, `.opencode/skills`), and with
-  `--language-servers` writes `.boundrail/language-servers.json` naming the allowlisted server of
-  each language a project file at the checkout root shows (`package.json` or `tsconfig.json`,
-  `pyproject.toml`, `setup.py`, `setup.cfg` or `requirements.txt` for `pyright-langserver`,
-  `Cargo.toml`, `go.mod`, `pom.xml` or Gradle files), nothing when none does. A file equal to what
-  setup writes is `unchanged`, a missing one `written`, and a different one `kept` unless `--force`
-  replaces it; no symbolic link on the way is followed. JSON lists `created`, `written`,
-  `unchanged`, `kept`, `language_servers` (null without the flag), `notes` (what setup left alone and
-  why, such as a `--name` unused because the vault exists) and `next_steps`. `boundrail
-  skill` drafts and adopts the scan-era project skill and installs nothing shipped, so the model
-  skills are not wired into it. ponytail: languages come from root project files only; a polyglot
-  monorepo with nested manifests gets fewer servers than it could use.
-- T16: the vault files Boundrail writes are always in scope for scoped agent hooks:
-  `edit_gate::check` never reports a changed `.boundrail/model/config.yaml`, or a file a journaled
-  write may write or delete (`vault::is_written_path`), as a scope violation, whatever `--scope`
-  says. Agents edit the vault through `boundrail model edit`, so leaving it out of a scope would
-  block authoring the model. Any other file under `.boundrail/model/`, `.boundrail/language-servers.json`
-  and the rest of `.boundrail` stay subject to the scope.
+- T16: setup is `boundrail model setup`. `model setup [--name N] [--agent A]... [--language-servers]
+  [--force]` creates the vault through `vault::init` when absent (named after the checkout folder
+  unless `--name`), installs the `boundrail-model`, `boundrail-plan` and `boundrail-pr` skills,
+  embedded with `include_str!` from `skills/`, into each agent's project skill folder
+  (`.claude/skills`, `.agents/skills` for Codex as the project skill already uses, `.cursor/skills`,
+  `.opencode/skills`), and with `--language-servers` writes `.boundrail/language-servers.json`
+  naming the allowlisted server of each language a project file at the checkout root shows
+  (`package.json` or `tsconfig.json`, `pyproject.toml`, `setup.py`, `setup.cfg` or
+  `requirements.txt` for `pyright-langserver`, `Cargo.toml`, `go.mod`, `pom.xml` or Gradle files),
+  nothing when none does. A file equal to what setup writes is `unchanged`, a missing one `written`,
+  and a different one `kept` unless `--force` replaces it; no symbolic link on the way is followed.
+  JSON lists `created`, `written`, `unchanged`, `kept`, `language_servers` (null without the flag),
+  `notes` (what setup left alone and why, such as a `--name` unused because the vault exists) and
+  `next_steps`. ponytail: languages come from root project files only; a polyglot monorepo with
+  nested manifests gets fewer servers than it could use.
 - T16: `model check` diagnostics gain `file` and `line` (absent when unknown): the binding or anchor
   path for `BINDING_*` and `ANCHOR_*` warnings, and the file and line of the evidence for
   `RELATIONSHIP_UNDRAWN` (the import, call reference or configured address) and
-  `ENTRY_POINT_UNEXPOSED`. Semantic diagnostics carry none. `--format annotations` (model check only)
-  prints one GitHub workflow command per diagnostic, `::warning` for a warning and `::notice` for
-  information, with `file`, `line` and the code as `title`; data escapes `%`, CR and LF, and
-  properties also `:` and `,`. Either format on another command refuses `REQUEST_INVALID`. The model
-  commands' `--format` is their own enum, so the scan commands' formats do not change.
+  `ENTRY_POINT_UNEXPOSED`. Semantic diagnostics carry none. `--format annotations` (model check
+  only) prints one GitHub workflow command per diagnostic, `::warning` for a warning and `::notice`
+  for information, with `file`, `line` and the code as `title`; data escapes `%`, CR and LF, and
+  properties also `:` and `,`. Either format on another command refuses `REQUEST_INVALID`.
 - T16: `--format pr-comment` (model footprint only) prints a Markdown comment whose first line is
   the marker `<!-- boundrail:footprint -->`: the touched modules, files outside every binding, the
   crossings with the relationships drawn for them or `undrawn`, the `crossings_skipped` reason with
@@ -857,22 +846,42 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   entity. Each list shows at most 50 rows, and a comment over 60,000 bytes is cut at a line and
   ends saying so and pointing at the job summary. It renders from the command's JSON output
   (`src/arch/github.rs`), as the annotations do.
-- T16: the action's `mode` input is `scan` (the default, unchanged) or `model`, which runs
-  `ci/model-action.sh`. It keeps the token in a script variable, unsets `INPUT_TOKEN`, and gives it
-  to `gh` as `GH_TOKEN` only while posting. It installs the binary as scan mode does, runs `model
+- T16: the action is one step that runs `ci/model-action.sh` (T18 removed its scan mode and the
+  `mode` input). It keeps the token in a script variable, unsets `INPUT_TOKEN`, and gives it to `gh`
+  as `GH_TOKEN` only while posting. It installs the release binary, or uses `binary`, runs `model
   check --format annotations`, replays only its `::warning` and `::notice` lines with workflow
   commands on (every other output runs under `::stop-commands::`), and adds the counts to the job
   summary, since GitHub shows at most 10 annotations of each kind. With a base (`base-ref`, else the
   pull request's base, refused when it starts with `-`) it unshallows a shallow checkout, writes
-  `model footprint --base <base> --format pr-comment` to the job summary (plus the whole
-  `--format markdown` footprint in a fenced block when the comment was cut), and on `pull_request`
-  with a `token` replaces the comment that starts with the marker, taken from the comment's first
-  line, and that the token's account wrote: the login `gh api user` names, else
-  `github-actions[bot]` for `GITHUB_TOKEN`. Posting is best effort: when the token cannot write (a
-  fork's pull request, a Dependabot run, a read-only token) the step leaves a notice and goes on.
-  `fail-on` takes `warnings` (the model default; the scan default list counts as it), `information`
-  or `never`. It never passes `--language-servers`: language servers run code from the checkout,
-  and a pull request head is untrusted. `tests/action.rs` checks that, that its commands, flags and
-  formats exist, and the best-effort post with stub `boundrail` and `gh` programs. T18 can delete
-  scan mode by removing the `scan` step, `ci/action.sh` and the scan inputs, then making `fail-on`
-  default to `warnings`.
+  `model footprint --base <base> --format pr-comment` to the job summary (plus the whole `--format
+  markdown` footprint in a fenced block when the comment was cut), and on `pull_request` with a
+  `token` replaces the comment that starts with the marker, taken from the comment's first line, and
+  that the token's account wrote: the login `gh api user` names, else `github-actions[bot]` for
+  `GITHUB_TOKEN`. Posting is best effort: when the token cannot write (a fork's pull request, a
+  Dependabot run, a read-only token) the step leaves a notice and goes on. `fail-on` takes
+  `warnings` (the default), `information` or `never`; an empty one means `never`. It never passes
+  `--language-servers`: language servers run code from the checkout, and a pull request head is
+  untrusted. `tests/action.rs` checks that, that its commands, flags and formats exist, and the
+  best-effort post with stub `boundrail` and `gh` programs.
+- T18: the binary has one command, `model`, and one global flag, `--tool-timeout`. The scan-era
+  commands, the daemon, MCP, agent hooks and the edit gate, the reference collectors and their
+  helpers, the action's scan mode and their docs are gone. `model check`, `inspect` and
+  `footprint` read code from `scan::live`, which runs the native collector with the default
+  excludes and no layout rules, then `lib::analyze`. The model reads only the document's files,
+  edges, package entries, language and symbols; `live` leaves the provenance fields (`git`,
+  `generated_at`, `scan_root`) and CODEOWNERS out, and no longer prints the scan-era warnings for
+  unresolved collector references and CODEOWNERS problems; the collector's own limitations still
+  go to stderr. Kept: `.archgraphignore`, the `archgraph-` temporary-file prefix and the
+  `ARCHGRAPH_*` install variables.
+- T18 follow-up (A7, not done): a lean scan. `lib::analyze` still runs the scan-era pipeline
+  (layout rules, findings, recipes, targets, exposure, grab-bags, cycles and metrics), and the
+  `Document` types keep modules such as these alive: `rules`, `findings`, `recipes`, `target`,
+  `known`, `exposure`, `grabbag`, `quality`, `graph`, `resolution`, `simulate`, `codeowners`,
+  `bisect`, `early_smells` and `diff`. A collector-to-model path that builds only files, edges,
+  package entries and symbols could delete them. It could also drop the parameters every caller
+  now passes the same value: `native::typescript::collect`'s `scan_all` (always false),
+  `native::python::collect`'s `package` (always none) and `python_paths` (always empty),
+  `native::go::collect`'s `go` (always `go`), `grimp::package`'s `explicit`, `analyze`'s
+  `cochange` (always none), the constant `Config` fields `live` fills (`granularity`, `includes`,
+  `all_kinds`, `no_default_excludes`, `include_generated`, `explicit_excludes`, `rules`,
+  `codeowners`), and `CollectionOptions::engine`, which has one variant.

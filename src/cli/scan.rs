@@ -1,332 +1,42 @@
+//! The live native scan the model commands read code evidence from.
 use super::*;
-use boundrail::cochange;
-use boundrail::collect::{depcruise, elixir, go, grimp, java};
-use boundrail::model::Config;
+use boundrail::collect::excludes::{self, Policy};
+use boundrail::model::{CollectionOptions, Config};
 
-#[derive(Args)]
-pub(super) struct Scan {
-    /// Repository root
-    pub(super) root: PathBuf,
-    #[command(flatten)]
-    pub(super) opts: ScanOpts,
-    #[command(flatten)]
-    hotspots: HotspotOpts,
-    #[command(flatten)]
-    pub(super) collector: CollectorOpts,
-    /// Write the document here instead of stdout
-    #[arg(short, long)]
-    output: Option<PathBuf>,
-}
-
-impl Scan {
-    pub(super) fn document(&self) -> Result<Document> {
-        let outputs: Vec<&Path> = self.output.as_deref().into_iter().collect();
-        scan_doc(
-            &self.root,
-            &self.opts,
-            &self.hotspots,
-            &self.collector,
-            self.opts.rules.as_deref(),
-            &outputs,
-        )
-    }
-}
-
-pub(super) fn run(args: Scan) -> Result<()> {
-    let doc = args.document()?;
-    write(args.output.as_deref(), &doc)
-}
-
-/// Live native evidence shared by first-run setup and directory checks.
-pub(super) fn live(root: &Path, rules: Option<&Path>) -> Result<Document> {
-    let mut argv = vec![
-        "boundrail".into(),
-        "scan".into(),
-        root.to_string_lossy().into_owned(),
-        "--engine".into(),
-        "native".into(),
-        "--symbols".into(),
-    ];
-    if let Some(rules) = rules {
-        argv.extend(["--rules".into(), rules.to_string_lossy().into_owned()]);
-    }
-    let Cmd::Scan(args) = Cli::try_parse_from(argv)?.command else {
-        unreachable!()
-    };
-    scan_doc(
-        &args.root,
-        &args.opts,
-        &args.hotspots,
-        &args.collector,
-        args.opts.rules.as_deref(),
-        &[],
-    )
-}
-
-/// Runs the collector under `root` and analyzes its output with `rules`. `outputs` are the
-/// files this run writes, which do not make the checkout dirty.
-pub(super) fn scan_doc(
-    root: &Path,
-    args: &ScanOpts,
-    hotspots: &HotspotOpts,
-    collector: &CollectorOpts,
-    rules: Option<&Path>,
-    outputs: &[&Path],
-) -> Result<Document> {
-    if let Some(mut doc) = daemon_cli::cached_scan(root, args, hotspots, collector, rules, outputs)
-    {
-        boundrail::recipes::rank(&mut doc, globals().rank);
-        return Ok(doc);
-    }
-    // Resolved here: a relative program path is not reliably resolved against the child's
-    // working directory.
-    let depcruise = (args.engine != collect::Engine::Native)
-        .then_some(collector.depcruise.as_ref())
-        .flatten()
-        .map(|p| collect::resolve_executable("depcruise", p))
-        .transpose()?;
+/// Live native evidence for `model check`, `inspect` and `footprint`: files, edges, package
+/// entries, the language and symbols of the checkout at `root`, under the default excludes.
+pub(super) fn live(root: &Path) -> Result<Document> {
     let source_dir = collect::source_dir(root);
-    let loaded_rules = rules.map(rules::load).transpose()?;
-    let layout = loaded_rules.as_ref().map(|r| &r.doc);
-    let includes: Vec<_> = layout
-        .into_iter()
-        .flat_map(|r| r.include.iter().cloned())
-        .chain(args.collection_includes.iter().cloned())
-        .collect();
-    let selection = collect::excludes::Options {
-        no_defaults: args.no_default_excludes,
-        include_tests: args.include_tests,
-        include_generated: args.include_generated,
-        cli_excludes: args.exclude.clone(),
-        excludes: layout.map(|r| r.exclude.clone()).unwrap_or_default(),
-        includes: includes.clone(),
+    let language =
+        collect::detect_language_with_options(root, source_dir, excludes::Options::default())?;
+    let policy = Policy::new(root, language, excludes::Options::default())?;
+    let (output, python_package) = collect_native(root, source_dir, language, &policy)?;
+    let (mut raw, symbols) = (output.raw, output.symbols);
+    let excluded_files = keep_selected(&mut raw, &policy)?;
+    let mut config = config(language, &mut raw, output.source_root, python_package);
+    config.excludes = policy.patterns().to_vec();
+    config.excluded_files = excluded_files;
+    // The model reads none of the provenance fields.
+    let source = Source {
+        language,
+        collector: raw.collector,
+        git: None,
+        generated_at: String::new(),
+        scan_root: None,
     };
-    let language = match args.language {
-        Some(language) => language,
-        None => collect::detect_language_with_options(root, source_dir, selection.clone())?,
+    let entries = match language {
+        Language::Typescript => collect::depcruise::package_entries(root, &raw.files),
+        _ => Vec::new(),
     };
-    let policy = collect::excludes::Policy::new(root, language, selection)?;
-    let excludes = policy.patterns().to_vec();
-    // Discovery must retain candidates that layout includes can restore after collection.
-    let discovery_excludes = args
-        .exclude
-        .iter()
-        .cloned()
-        .chain(layout.into_iter().flat_map(|r| r.exclude.iter().cloned()))
-        .collect::<Vec<_>>();
+    let mut doc = boundrail::analyze(source, config, raw.files, raw.edges, entries, None)?;
+    attach_symbols(&mut doc, symbols)?;
+    Ok(doc)
+}
 
-    let input = args
-        .collector_input
-        .as_ref()
-        .map(|p| fs::read(p).with_context(|| format!("reading {}", p.display())))
-        .transpose()?;
-    if args.engine == collect::Engine::Depcruise && language != Language::Typescript {
-        bail!(
-            "--engine depcruise supports TypeScript/JavaScript; use --engine reference for {language:?}"
-        );
-    }
-    if args.engine == collect::Engine::Native && input.is_some() {
-        bail!("--engine native reads source; --collector-input belongs to the reference engine");
-    }
-    let mut native_symbols = None;
-    let excludes_set = collect::globset(&discovery_excludes)?;
-    // Go: files that cannot be split across packages, in pairs.
-    let mut bound = Vec::new();
-    let mut generated = Vec::new();
-    let mut test_support = Vec::new();
-    let mut python_package = None;
-    let (raw, source_root) = if args.engine == collect::Engine::Native {
-        let mut output = match language {
-            Language::Typescript => collect::native::typescript::collect(
-                root,
-                source_dir,
-                &policy,
-                args.include_tests
-                    || args.include_generated
-                    || args.no_default_excludes
-                    || !includes.is_empty(),
-            )?,
-            Language::Python => {
-                let output = collect::native::python::collect(
-                    root,
-                    source_dir,
-                    args.package.as_deref(),
-                    &args.python_path,
-                    &policy,
-                )?;
-                python_package = Some(
-                    output
-                        .source_root
-                        .strip_prefix(&format!("{source_dir}/"))
-                        .unwrap_or(&output.source_root)
-                        .replace('/', "."),
-                );
-                output
-            }
-            Language::Go => collect::native::go::collect(root, &collector.go, &policy)?,
-            Language::Rust => collect::native::rust::collect(root, &policy)?,
-            Language::Java => collect::native::java::collect(root, &policy)?,
-            Language::Elixir => collect::native::elixir::collect(root, &policy)?,
-        };
-        if output
-            .raw
-            .imports
-            .as_ref()
-            .is_some_and(|imports| imports.iter().any(|import| import.unresolved.is_some()))
-        {
-            output.symbols.complete = false;
-            output.symbols.limitations.push("Unresolved requests can hide local symbol consumers; unused-export suggestions are withheld.".into());
-        }
-        if output.raw.globals.is_some() && layout.is_some_and(rules::Rules::names_globals) {
-            output
-                .symbols
-                .limitations
-                .push(collect::native::typescript::GLOBALS_LIMITATION.into());
-        }
-        output.symbols.limitations.sort();
-        output.symbols.limitations.dedup();
-        output
-            .raw
-            .collector
-            .limitations
-            .clone_from(&output.symbols.limitations);
-        for limit in output.raw.collector.limitations.iter().take(10) {
-            eprintln!("warning: {limit}");
-        }
-        native_symbols = Some(output.symbols);
-        (output.raw, output.source_root)
-    } else {
-        match language {
-            Language::Typescript => {
-                let (json, type_marking) = match input {
-                    Some(json) => (json, None),
-                    None => depcruise::run(
-                        root,
-                        if args.include_tests
-                            || args.include_generated
-                            || args.no_default_excludes
-                            || !includes.is_empty()
-                        {
-                            "."
-                        } else {
-                            source_dir
-                        },
-                        depcruise.as_deref(),
-                    )?,
-                };
-                let mut sources = collect::imports::Sources::new(root)?;
-                let (json, imports) = collect::typescript_resolution::enrich(&json, &mut sources)?;
-                let mut raw = depcruise::parse_at(&json, &mut sources)?;
-                raw.imports = imports;
-                for warning in collect::barrels::typescript(&json, &mut raw, &mut sources)? {
-                    eprintln!("warning: {warning}");
-                }
-                raw.collector.type_marking = type_marking.map(str::to_owned);
-                (raw, source_dir.to_owned())
-            }
-            Language::Python => {
-                let package = grimp::package(
-                    root,
-                    source_dir,
-                    args.package.as_deref(),
-                    &collect::globset(&excludes)?,
-                )?;
-                python_package = Some(package.clone());
-                let json = match input {
-                    Some(json) => json,
-                    None => grimp::run(
-                        root,
-                        source_dir,
-                        &package,
-                        &collector.python,
-                        args.include_tests || args.no_default_excludes || !includes.is_empty(),
-                        &args.python_path,
-                    )?,
-                };
-                (
-                    grimp::parse(&json, root, source_dir)?,
-                    modules::join(source_dir, &package),
-                )
-            }
-            // Package paths are what the go command reports, from the scan root, `src/` or not.
-            Language::Go => {
-                let json = match input {
-                    Some(json) => json,
-                    None => {
-                        let (dirs, warnings) = go::module_dirs(root, &excludes_set)?;
-                        for w in warnings {
-                            eprintln!("warning: {w}");
-                        }
-                        if dirs.is_empty() {
-                            bail!("no go.mod with a module line under {}", root.display());
-                        }
-                        go::run(root, &collector.go, &dirs)?
-                    }
-                };
-                let parsed = go::parse(&json)?;
-                if !args.include_tests
-                    && !args.no_default_excludes
-                    && includes.is_empty()
-                    && !parsed.left_out.is_empty()
-                {
-                    eprintln!(
-                        "warning: left out as test support (--include-tests keeps them): {}",
-                        parsed.left_out.join(", ")
-                    );
-                }
-                generated = parsed.generated;
-                test_support = parsed.test_support;
-                bound = parsed.bound;
-                (parsed.raw, ".".to_owned())
-            }
-            Language::Rust => {
-                let json = match input {
-                    Some(json) => json,
-                    None => rust::run(
-                        root,
-                        &rust::Options {
-                            rust_analyzer: collector.rust_analyzer.as_deref(),
-                            features: args.rust_features,
-                            build_scripts: collector.rust_build_scripts,
-                        },
-                    )?,
-                };
-                (rust::parse(&json)?, ".".to_owned())
-            }
-            Language::Elixir => {
-                let json = match input {
-                    Some(json) => json,
-                    None => elixir::run(root, &collector.elixir, &policy)?,
-                };
-                (elixir::parse(&json)?, ".".to_owned())
-            }
-            Language::Java => {
-                let json = match input {
-                    Some(json) => json,
-                    None => java::run(root, &collector.java, &excludes_set)?,
-                };
-                (java::parse(&json)?, ".".to_owned())
-            }
-        }
-    };
-    let mut raw = raw;
-    let kept: std::collections::HashSet<_> = policy
-        .select(&raw.files)?
-        .into_iter()
-        .filter(|path| {
-            (args.no_default_excludes
-                || args.include_generated
-                || !generated.contains(path)
-                || policy.included(path))
-                && (args.no_default_excludes
-                    || args.include_tests
-                    || !test_support.contains(path)
-                    || policy.included(path))
-        })
-        .collect();
-    let excluded_files = raw
-        .files
-        .iter()
+/// Keeps what the exclude policy selects, and returns the files it left out.
+fn keep_selected(raw: &mut collect::RawGraph, policy: &Policy) -> Result<Vec<String>> {
+    let kept: std::collections::HashSet<_> = policy.select(&raw.files)?.into_iter().collect();
+    let excluded = (raw.files.iter())
         .filter(|p| !kept.contains(*p))
         .cloned()
         .collect();
@@ -339,166 +49,95 @@ pub(super) fn scan_doc(
     if let Some(globals) = &mut raw.globals {
         globals.retain(|g| kept.contains(&g.from));
     }
-    if args.engine != collect::Engine::Native {
-        let all = bound.len();
-        raw.collector.bound = go::bound_pairs(bound, &raw.files);
-        if raw.collector.bound.len() < all {
-            raw.collector.limitations.push(format!(
-                "Go: {} with an excluded file (a test, generated code) are left out, so moving their other file may need more names exported",
-                crate::diff::count(all - raw.collector.bound.len(), "bound pair")
-            ));
-        }
-    }
-    if let Some(n) = raw.collector.unresolved.filter(|&n| n > 0) {
-        if raw.imports.is_some() {
-            eprintln!(
-                "warning: {n} unresolved collector reference(s) reported by {}; explicit import accounting is reported separately",
-                raw.collector.name
-            );
-        } else {
-            eprintln!(
-                "warning: {n} unresolved import(s) reported by {}; their edges are missing",
-                raw.collector.name
-            );
-        }
-    }
-
-    let source = Source {
-        language,
-        collector: raw.collector,
-        git: git(root, outputs),
-        generated_at: source_time(root)?,
-        scan_root: git_scan_root(root),
-    };
-    // Java keeps package directories intact unless a depth is explicitly requested: its source
-    // root is the scan root, so depth 2 would put a Maven tree in `src/main`.
-    let package_modules = language == Language::Java && args.depth.is_none();
-    let config = Config {
-        depth: args.depth.unwrap_or(if package_modules { 0 } else { 2 }),
-        granularity: globals().granularity.unwrap_or_default(),
-        package_modules,
-        source_root,
-        excludes,
-        include_tests: args.include_tests
-            || args.no_default_excludes
-            || raw.files.iter().any(|p| collect::excludes::is_test(p)),
-        include_generated: args.include_generated || args.no_default_excludes,
-        includes,
-        excluded_files,
-        explicit_excludes: Some(args.exclude.clone()),
-        all_kinds: globals().all_kinds,
-        no_default_excludes: args.no_default_excludes,
-        rules: loaded_rules,
-        codeowners: codeowners::load(root)?,
-        collection: (args.engine == collect::Engine::Native
-            || matches!(language, Language::Python | Language::Rust))
-        .then_some(boundrail::model::CollectionOptions {
-            engine: args.engine,
-            python_package,
-            python_paths: args
-                .python_path
-                .iter()
-                .map(|p| p.to_string_lossy().into_owned())
-                .collect(),
-            rust_features: (language == Language::Rust && args.engine != collect::Engine::Native)
-                .then_some(args.rust_features),
-            rust_build_scripts: language == Language::Rust
-                && args.engine != collect::Engine::Native
-                && collector.rust_build_scripts,
-        }),
-        file_metadata: raw.metadata,
-        legacy_module_classes: false,
-        import_records: raw.imports,
-        globals: raw.globals,
-    };
-    if let Some(owners) = &config.codeowners {
-        for warning in &owners.warnings {
-            eprintln!(
-                "warning: {}:{}: {}",
-                owners.path, warning.line, warning.message
-            );
-        }
-    }
-    let cochange = args
-        .cochange
-        .map(|n| cochange::collect(root, n, &raw.files))
-        .transpose()?;
-    let entries = match language {
-        Language::Typescript => depcruise::package_entries(root, &raw.files),
-        Language::Python | Language::Go | Language::Rust | Language::Java | Language::Elixir => {
-            Vec::new()
-        }
-    };
-    let mut doc = boundrail::analyze(source, config, raw.files, raw.edges, entries, cochange)?;
-    if args.symbols {
-        let symbols = if let Some(mut symbols) = native_symbols {
-            let kept: std::collections::BTreeSet<_> =
-                doc.files.iter().map(|file| file.path.as_str()).collect();
-            symbols.exports.retain(|export| {
-                kept.contains(export.file.as_str()) && kept.contains(export.target.file.as_str())
-            });
-            symbols.imports.retain(|import| {
-                kept.contains(import.from.as_str())
-                    && kept.contains(import.to.as_str())
-                    && import
-                        .target
-                        .as_ref()
-                        .is_none_or(|target| kept.contains(target.file.as_str()))
-            });
-            symbols
-        } else {
-            boundrail::symbols::collect(
-                root,
-                &doc,
-                boundrail::symbols::Options {
-                    depcruise: depcruise.as_deref(),
-                    python: &collector.python,
-                    go: &collector.go,
-                },
-            )?
-        };
-        boundrail::surface::attach(&mut doc, symbols, boundrail::surface::DEFAULT_MAX_SYMBOLS)?;
-    }
-    if let Some(since) = &hotspots.hotspots {
-        let report = boundrail::hotspots::collect(
-            root,
-            &doc,
-            &boundrail::hotspots::Options {
-                since: since.clone(),
-                max_files: hotspots.hotspot_max_files,
-                authors: hotspots.hotspot_authors,
-            },
-        )?;
-        boundrail::apply_hotspots(&mut doc, report);
-    }
-    boundrail::recipes::rank(&mut doc, globals().rank);
-    Ok(doc)
+    Ok(excluded)
 }
 
-/// RFC 3339 UTC, whole seconds; the civil date is Howard Hinnant's civil_from_days.
-pub(super) fn source_time(root: &Path) -> Result<String> {
-    let secs = match std::env::var("SOURCE_DATE_EPOCH") {
-        Ok(value) => value.parse::<i64>().ok().filter(|value| (0..=253_402_300_799).contains(value))
-            .ok_or_else(|| anyhow::anyhow!("invalid SOURCE_DATE_EPOCH; set an integer Unix timestamp between 0 and 253402300799, or unset it to use Git HEAD time"))?,
-        Err(std::env::VarError::NotPresent) => boundrail::git::text(root, &["show", "-s", "--format=%ct", "HEAD"])
-            .ok().and_then(|value| value.trim().parse::<i64>().ok())
-            .filter(|value| (0..=253_402_300_799).contains(value)).unwrap_or(0),
-        Err(error) => return Err(anyhow::anyhow!("cannot read SOURCE_DATE_EPOCH: {error}; unset it or provide an integer Unix timestamp")),
+/// The scan configuration of a native collection, taking the collector's metadata, import
+/// records and globals from `raw`; excludes are the caller's to fill.
+fn config(
+    language: Language,
+    raw: &mut collect::RawGraph,
+    source_root: String,
+    python_package: Option<String>,
+) -> Config {
+    // Java keeps package directories intact: its source root is the scan root, so depth 2 would
+    // put a Maven tree in `src/main`.
+    let package_modules = language == Language::Java;
+    Config {
+        depth: if package_modules { 0 } else { 2 },
+        granularity: Granularity::default(),
+        package_modules,
+        source_root,
+        excludes: Vec::new(),
+        include_tests: raw.files.iter().any(|p| excludes::is_test(p)),
+        include_generated: false,
+        includes: Vec::new(),
+        excluded_files: Vec::new(),
+        explicit_excludes: Some(Vec::new()),
+        all_kinds: false,
+        no_default_excludes: false,
+        rules: None,
+        codeowners: None,
+        collection: Some(CollectionOptions {
+            engine: collect::Engine::Native,
+            python_package,
+            python_paths: Vec::new(),
+        }),
+        file_metadata: std::mem::take(&mut raw.metadata),
+        legacy_module_classes: false,
+        import_records: raw.imports.take(),
+        globals: raw.globals.take(),
+    }
+}
+
+/// Attaches the symbols whose files the scan kept.
+fn attach_symbols(doc: &mut Document, mut symbols: boundrail::surface::Symbols) -> Result<()> {
+    let kept: std::collections::BTreeSet<_> = doc.files.iter().map(|f| f.path.as_str()).collect();
+    symbols.exports.retain(|export| {
+        kept.contains(export.file.as_str()) && kept.contains(export.target.file.as_str())
+    });
+    symbols.imports.retain(|import| {
+        kept.contains(import.from.as_str())
+            && kept.contains(import.to.as_str())
+            && (import.target.as_ref()).is_none_or(|target| kept.contains(target.file.as_str()))
+    });
+    boundrail::surface::attach(doc, symbols, boundrail::surface::DEFAULT_MAX_SYMBOLS)
+}
+
+/// The native collector's output for `language`, its limitations warned and recorded, and the
+/// Python package it scanned.
+fn collect_native(
+    root: &Path,
+    source_dir: &str,
+    language: Language,
+    policy: &Policy,
+) -> Result<(collect::native::Output, Option<String>)> {
+    let mut output = match language {
+        Language::Typescript => {
+            collect::native::typescript::collect(root, source_dir, policy, false)?
+        }
+        Language::Python => collect::native::python::collect(root, source_dir, None, &[], policy)?,
+        Language::Go => collect::native::go::collect(root, "go", policy)?,
+        Language::Rust => collect::native::rust::collect(root, policy)?,
+        Language::Java => collect::native::java::collect(root, policy)?,
+        Language::Elixir => collect::native::elixir::collect(root, policy)?,
     };
-    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    Ok(format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-        rem / 3600,
-        rem % 3600 / 60,
-        rem % 60
-    ))
+    let python_package = (language == Language::Python).then(|| {
+        (output.source_root)
+            .strip_prefix(&format!("{source_dir}/"))
+            .unwrap_or(&output.source_root)
+            .replace('/', ".")
+    });
+    let imports = output.raw.imports.as_ref();
+    if imports.is_some_and(|imports| imports.iter().any(|import| import.unresolved.is_some())) {
+        output.symbols.complete = false;
+        output.symbols.limitations.push("Unresolved requests can hide local symbol consumers; unused-export suggestions are withheld.".into());
+    }
+    output.symbols.limitations.sort();
+    output.symbols.limitations.dedup();
+    (output.raw.collector.limitations).clone_from(&output.symbols.limitations);
+    for limit in output.raw.collector.limitations.iter().take(10) {
+        eprintln!("warning: {limit}");
+    }
+    Ok((output, python_package))
 }

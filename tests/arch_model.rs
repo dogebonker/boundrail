@@ -47,7 +47,6 @@ impl Checkout {
     }
     fn run_raw(&self, args: &[&str]) -> (i32, String) {
         let out = Command::new(env!("CARGO_BIN_EXE_boundrail"))
-            .arg("--no-daemon")
             .arg("model")
             .args(args)
             .current_dir(self.path())
@@ -69,7 +68,7 @@ impl Checkout {
         let dirs = dirs.iter().map(|d| d.to_path_buf());
         let path = std::env::join_paths(dirs.chain(std::env::split_paths(&path))).unwrap();
         let out = Command::new(env!("CARGO_BIN_EXE_boundrail"))
-            .args(["--no-daemon", "model"])
+            .args(["model"])
             .args(args)
             .current_dir(self.path())
             .env("PATH", path)
@@ -137,7 +136,7 @@ impl Checkout {
     /// A model command with `input` on standard input: exit code and stdout parsed as JSON.
     fn pipe(&self, args: &[&str], input: &Value) -> (i32, Value) {
         let mut child = Command::new(env!("CARGO_BIN_EXE_boundrail"))
-            .args(["--no-daemon", "model"])
+            .args(["model"])
             .args(args)
             .current_dir(self.path())
             .stdin(Stdio::piped())
@@ -197,7 +196,7 @@ impl Checkout {
     /// `model edit` with `request` on standard input.
     fn edit_with(&self, request: &Value, doing: &str, env: &[(&str, &str)]) -> (i32, String) {
         let mut child = Command::new(env!("CARGO_BIN_EXE_boundrail"))
-            .args(["--no-daemon", "model", "edit", "--doing", doing])
+            .args(["model", "edit", "--doing", doing])
             .envs(env.iter().copied())
             .current_dir(self.path())
             .stdin(Stdio::piped())
@@ -1563,7 +1562,7 @@ fn claims_round_trip_and_show_in_the_reading() {
     )
     .unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_boundrail"))
-        .args(["--no-daemon", "model", "read"])
+        .args(["model", "read"])
         .current_dir(checkout.path())
         .output()
         .unwrap();
@@ -1988,7 +1987,7 @@ fn reads_point_to_an_interrupted_edit() {
     shop(&checkout);
     let read = |args: &[&str]| {
         let out = Command::new(env!("CARGO_BIN_EXE_boundrail"))
-            .args(["--no-daemon", "model"])
+            .args(["model"])
             .args(args)
             .current_dir(checkout.path())
             .output()
@@ -2568,7 +2567,7 @@ fn recovery_finishes_a_landed_edit_whose_result_no_longer_validates() {
     }
 
     let out = Command::new(env!("CARGO_BIN_EXE_boundrail"))
-        .args(["--no-daemon", "model", "recover"])
+        .args(["model", "recover"])
         .current_dir(checkout.path())
         .output()
         .unwrap();
@@ -4216,7 +4215,7 @@ fn an_interrupted_adoption_is_one_journaled_write_that_recovery_finishes() {
     let (id, _) = next(&checkout);
     let compared = proposal_digest(&checkout, &id);
     let out = Command::new(env!("CARGO_BIN_EXE_boundrail"))
-        .args(["--no-daemon", "model", "adopt", &id, "--expected-revision"])
+        .args(["model", "adopt", &id, "--expected-revision"])
         .arg(expected.as_str().unwrap())
         .args(["--expected-proposal-revision", &compared])
         .args([
@@ -4648,6 +4647,71 @@ fn measured() -> (Checkout, String) {
     (checkout, model)
 }
 
+/// A committed checkout of `files` with Web and Billing bound to `web` and `billing`, and
+/// `model inspect`'s Billing entry, so the live scan of that language runs end to end.
+fn inspect_billing(files: &[(&str, &str)], web: &str, billing: &str) -> Value {
+    let checkout = committed();
+    sources(&checkout, files);
+    checkout.init();
+    for (id, name, path, order) in [
+        ("WebApp01", "Web", web, 0),
+        ("Billing1", "Billing", billing, 1),
+    ] {
+        let mut value = module(id, name, "module", order);
+        value["binding"] = json!({"path": path});
+        checkout.module(value);
+    }
+    git(&checkout, &["add", "-A"]);
+    git(&checkout, &["commit", "-q", "-m", "shop"]);
+    let out = checkout.ok(&["inspect", "Billing"]);
+    assert_eq!(out["skips"], json!([]), "{out:#}");
+    out["modules"][0].clone()
+}
+
+#[test]
+fn inspect_scans_a_python_package_under_src() {
+    let billing = inspect_billing(
+        &[
+            ("pyproject.toml", "[project]\nname = \"shop\"\n"),
+            ("src/shop/__init__.py", ""),
+            (
+                "src/shop/web/__init__.py",
+                "from shop.billing.charge import charge\n",
+            ),
+            ("src/shop/billing/__init__.py", ""),
+            (
+                "src/shop/billing/charge.py",
+                "def charge(n):\n    return n\n",
+            ),
+        ],
+        "src/shop/web",
+        "src/shop/billing",
+    );
+    assert_eq!(billing["files"], 2, "{billing:#}");
+    assert_eq!(billing["incoming"][0]["edges"], 1, "{billing:#}");
+}
+
+#[test]
+fn inspect_scans_java_packages() {
+    let billing = inspect_billing(
+        &[
+            ("pom.xml", "<project></project>\n"),
+            (
+                "src/main/java/com/shop/web/Page.java",
+                "package com.shop.web;\nimport com.shop.billing.Charge;\npublic class Page { Charge c; }\n",
+            ),
+            (
+                "src/main/java/com/shop/billing/Charge.java",
+                "package com.shop.billing;\npublic class Charge {}\n",
+            ),
+        ],
+        "src/main/java/com/shop/web",
+        "src/main/java/com/shop/billing",
+    );
+    assert_eq!(billing["files"], 1, "{billing:#}");
+    assert_eq!(billing["incoming"][0]["edges"], 1, "{billing:#}");
+}
+
 #[test]
 fn inspect_counts_entry_points_deep_imports_and_unused_exports() {
     let (checkout, model) = measured();
@@ -5010,7 +5074,7 @@ impl View {
     fn start(checkout: &Checkout) -> Self {
         use std::io::BufRead as _;
         let mut child = Command::new(env!("CARGO_BIN_EXE_boundrail"))
-            .args(["--no-daemon", "model", "view", "--no-open", "--port", "0"])
+            .args(["model", "view", "--no-open", "--port", "0"])
             .current_dir(checkout.path())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -5143,19 +5207,6 @@ fn view_serves_the_page_and_the_model_to_its_token_only() {
     );
     assert_eq!(status, 405, "{response}");
     assert!(response.contains("Allow: GET"));
-
-    // `--brief` would hold the URL back until the server stops.
-    let brief = Command::new(env!("CARGO_BIN_EXE_boundrail"))
-        .args(["--no-daemon", "--brief", "model", "view", "--no-open"])
-        .current_dir(checkout.path())
-        .output()
-        .unwrap();
-    assert_eq!(brief.status.code(), Some(2));
-    let brief: Value = serde_json::from_slice(&brief.stdout).unwrap();
-    assert_eq!(
-        brief["result"]["error"]["code"], "REQUEST_INVALID",
-        "{brief:#}"
-    );
 }
 
 #[test]
@@ -6816,7 +6867,7 @@ fn add_picture(checkout: &Checkout, output: &str) -> String {
 /// `model` with `path` as PATH: exit code and stdout as JSON.
 fn run_on_path(checkout: &Checkout, path: &std::ffi::OsStr, args: &[&str]) -> (i32, Value) {
     let out = Command::new(env!("CARGO_BIN_EXE_boundrail"))
-        .args(["--no-daemon", "model"])
+        .args(["model"])
         .args(args)
         .current_dir(checkout.path())
         .env("PATH", path)

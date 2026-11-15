@@ -598,50 +598,6 @@ pub(crate) fn components<'a>(pairs: &[(&'a str, &'a str)]) -> Vec<BTreeSet<&'a s
         .collect()
 }
 
-/// The condensation of `adjacency`: its SCCs, each node's SCC, and the acyclic graph between
-/// SCCs.
-pub(crate) fn condense(
-    adjacency: &[Vec<usize>],
-) -> (Vec<Vec<usize>>, Vec<usize>, Vec<BTreeSet<usize>>) {
-    let components = sccs(adjacency);
-    let mut component_of = vec![0; adjacency.len()];
-    for (i, component) in components.iter().enumerate() {
-        for &node in component {
-            component_of[node] = i;
-        }
-    }
-    let mut dag = vec![BTreeSet::new(); components.len()];
-    for (from, targets) in adjacency.iter().enumerate() {
-        for &to in targets {
-            let (from, to) = (component_of[from], component_of[to]);
-            if from != to {
-                dag[from].insert(to);
-            }
-        }
-    }
-    (components, component_of, dag)
-}
-
-/// Each node's longest path from a node with no incoming edge in the acyclic `dag`.
-pub(crate) fn depths(dag: &[BTreeSet<usize>]) -> Vec<usize> {
-    let mut indegree = vec![0; dag.len()];
-    for &to in dag.iter().flatten() {
-        indegree[to] += 1;
-    }
-    let mut ready: Vec<usize> = (0..dag.len()).filter(|&v| indegree[v] == 0).collect();
-    let mut depth = vec![0; dag.len()];
-    while let Some(from) = ready.pop() {
-        for &to in &dag[from] {
-            depth[to] = depth[to].max(depth[from] + 1);
-            indegree[to] -= 1;
-            if indegree[to] == 0 {
-                ready.push(to);
-            }
-        }
-    }
-    depth
-}
-
 /// Tarjan's algorithm with an explicit call stack, so import chains of any depth fit.
 pub(crate) fn sccs(adjacency: &[Vec<usize>]) -> Vec<Vec<usize>> {
     const UNSEEN: usize = usize::MAX;

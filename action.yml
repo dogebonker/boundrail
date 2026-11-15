@@ -1,112 +1,45 @@
 name: Boundrail
 description: >-
-  Check a repository's imports against its layout rules, and fail a pull request that adds forbidden imports or cycles;
-  with mode model, check the authored architecture model, annotate its findings and comment the branch's footprint.
+  Check the repository's authored architecture model, annotate its findings and comment the branch's footprint on a
+  pull request.
 author: dogebonker
 branding:
   icon: git-pull-request
   color: blue
 
 inputs:
-  mode:
+  path:
     description: >-
-      scan checks imports against layout.yaml. model runs boundrail model check, annotates its warnings and information,
-      and with a base posts boundrail model footprint as one pull request comment. Model mode never passes
-      --language-servers: language servers run code from the checkout, and a pull request head is untrusted. It needs
-      the history down to the base: it unshallows a shallow checkout, or check out with fetch-depth: 0
-    default: scan
+      Repository root holding .boundrail/model, relative to the workspace. The step runs boundrail model check and
+      annotates its warnings and information. It never passes --language-servers: language servers run code from the
+      checkout, and a pull request head is untrusted
+    default: "."
+  fail-on:
+    description: "warnings (the default; any warning fails), information (any finding fails) or never"
+    default: warnings
   token:
     description: >-
-      Model mode: a token that may comment on the pull request (github.token with pull-requests: write). Comments are
-      posted on pull_request events only, and best effort: without a token, and where the token cannot write (pull
-      requests from forks, Dependabot runs, read-only tokens), the step posts no comment and leaves a notice
+      A token that may comment on the pull request (github.token with pull-requests: write). Comments are posted on
+      pull_request events only, and best effort: without a token, and where the token cannot write (pull requests from
+      forks, Dependabot runs, read-only tokens), the step posts no comment and leaves a notice
     default: ""
-  path:
-    description: Repository root to scan, relative to the workspace
-    default: "."
-  rules:
-    description: layout.yaml with the rules, relative to the workspace (default <path>/layout.yaml when it exists)
+  base-ref:
+    description: >-
+      Commit to compare HEAD against for boundrail model footprint (default the pull request's base commit on
+      pull_request). The footprint needs the history down to the base: the step unshallows a shallow checkout, or check
+      out with fetch-depth: 0
     default: ""
-  depth:
-    description: Directory segments below the source root that form a module (default 2; Java, each package)
-    default: ""
-  language:
-    description: typescript, python, go, rust, java or elixir (default detected; Elixir needs a preinstalled runtime)
-    default: ""
-  engine:
-    description: reference (default), experimental native (all supported languages; Go needs go list), or depcruise (TypeScript/JavaScript)
-    default: reference
-  package:
-    description: Python package to scan (default the single package under the source root)
-    default: ""
-  exclude:
-    description: Additional globs to exclude, one per line or comma-separated
-    default: ""
-  fail-on:
-    description: "Scan pull requests: comma list of new-forbidden, new-cycles, new-unplanned, stale-known, new-vacuous that fail the step. Model mode: warnings (the default; any warning fails), information (any finding fails) or never"
-    default: new-forbidden,new-cycles,stale-known,new-vacuous
-  fail-on-rules-change:
-    description: "Pull requests: true fails the step when the rules file differs from the base commit's"
-    default: "false"
   version:
     description: boundrail release to install (default the version in this action's own Cargo.toml)
     default: ""
   binary:
     description: Path to a boundrail executable to use instead of downloading a release
     default: ""
-  base-ref:
-    description: Commit to compare HEAD against (default the pull request's base commit on pull_request)
-    default: ""
-  artifact-name:
-    description: Name of the uploaded artifact with archgraph.html and archgraph.json; set a unique one per matrix job
-    default: boundrail-${{ github.job }}
-
-outputs:
-  json:
-    description: Path of archgraph.json, the HEAD scan document
-    value: ${{ steps.boundrail.outputs.json }}
-  html:
-    description: Path of archgraph.html, the HEAD graph page
-    value: ${{ steps.boundrail.outputs.html }}
-  sarif:
-    description: Path of archgraph.sarif, the HEAD forbidden imports and broken claims for github/codeql-action/upload-sarif; empty without rules
-    value: ${{ steps.boundrail.outputs.sarif }}
-  forbidden:
-    description: Number of forbidden imports at HEAD
-    value: ${{ steps.boundrail.outputs.forbidden }}
-  new-forbidden:
-    description: Number of forbidden imports HEAD adds over the base (pull requests only)
-    value: ${{ steps.boundrail.outputs.new-forbidden }}
-  new-cycles:
-    description: Number of cycles HEAD adds over the base (pull requests only)
-    value: ${{ steps.boundrail.outputs.new-cycles }}
-  rules-changed:
-    description: true when the rules file differs from the base commit's (pull requests only)
-    value: ${{ steps.boundrail.outputs.rules-changed }}
 
 runs:
   using: composite
   steps:
-    - id: boundrail
-      if: inputs.mode != 'model'
-      shell: bash
-      env:
-        INPUT_MODE: ${{ inputs.mode }}
-        INPUT_PATH: ${{ inputs.path }}
-        INPUT_RULES: ${{ inputs.rules }}
-        INPUT_DEPTH: ${{ inputs.depth }}
-        INPUT_LANGUAGE: ${{ inputs.language }}
-        INPUT_ENGINE: ${{ inputs.engine }}
-        INPUT_PACKAGE: ${{ inputs.package }}
-        INPUT_EXCLUDE: ${{ inputs.exclude }}
-        INPUT_FAIL_ON: ${{ inputs.fail-on }}
-        INPUT_FAIL_ON_RULES_CHANGE: ${{ inputs.fail-on-rules-change }}
-        INPUT_VERSION: ${{ inputs.version }}
-        INPUT_BINARY: ${{ inputs.binary }}
-        INPUT_BASE_REF: ${{ inputs.base-ref || github.event.pull_request.base.sha }}
-      run: '"$GITHUB_ACTION_PATH/ci/action.sh"'
     - id: model
-      if: inputs.mode == 'model'
       shell: bash
       env:
         INPUT_PATH: ${{ inputs.path }}
@@ -117,10 +50,3 @@ runs:
         INPUT_TOKEN: ${{ inputs.token }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
       run: '"$GITHUB_ACTION_PATH/ci/model-action.sh"'
-    - if: always() && inputs.mode != 'model'
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-      with:
-        name: ${{ inputs.artifact-name }}
-        path: |
-          ${{ runner.temp }}/boundrail/head/archgraph.json
-          ${{ runner.temp }}/boundrail/head/archgraph.html

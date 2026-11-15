@@ -1,5 +1,5 @@
-//! The GitHub Action's metadata parses, its model mode runs model commands with flags and
-//! formats the binary accepts, and posting the comment is best effort.
+//! The GitHub Action's metadata parses, its one step runs model commands with flags and formats
+//! the binary accepts, and posting the comment is best effort.
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -20,31 +20,30 @@ fn steps(action: &Value) -> &[Value] {
 }
 
 #[test]
-fn scan_stays_the_default_and_model_mode_is_its_own_step() {
+fn the_action_is_one_model_step() {
     let action = action();
     assert_eq!(action["runs"]["using"], "composite");
-    assert_eq!(action["inputs"]["mode"]["default"], "scan");
+    assert_eq!(action["inputs"]["fail-on"]["default"], "warnings");
     assert_eq!(action["inputs"]["token"]["default"], "");
-    let mode = action["inputs"]["mode"]["description"].as_str().unwrap();
-    assert!(mode.contains("never passes --language-servers"), "{mode}");
-    let conditions: Vec<&str> = steps(&action)
-        .iter()
-        .map(|s| s["if"].as_str().unwrap_or_default())
+    let path = action["inputs"]["path"]["description"].as_str().unwrap();
+    assert!(path.contains("never passes --language-servers"), "{path}");
+    let inputs: Vec<&str> = (action["inputs"].as_mapping().unwrap().keys())
+        .map(|k| k.as_str().unwrap())
         .collect();
     assert_eq!(
-        conditions,
-        [
-            "inputs.mode != 'model'",
-            "inputs.mode == 'model'",
-            "always() && inputs.mode != 'model'"
-        ]
+        inputs,
+        ["path", "fail-on", "token", "base-ref", "version", "binary"]
     );
+    assert!(action.get("outputs").is_none());
+    let steps = steps(&action);
+    assert_eq!(steps.len(), 1);
+    assert!(steps[0].get("if").is_none());
 }
 
 /// Each `boundrail model` invocation of the model script, as its words from the subcommand on.
 fn invocations(code: &[&str]) -> Vec<Vec<String>> {
     (code.iter())
-        .filter(|line| line.contains("\"$boundrail\" --no-daemon model "))
+        .filter(|line| line.contains("\"$boundrail\" model "))
         .map(|line| {
             let words: Vec<&str> = line.split_whitespace().collect();
             let start = words.iter().position(|w| *w == "model").unwrap() + 1;
@@ -57,9 +56,9 @@ fn invocations(code: &[&str]) -> Vec<Vec<String>> {
 }
 
 #[test]
-fn model_mode_runs_real_commands_and_flags_and_never_language_servers() {
+fn the_step_runs_real_commands_and_flags_and_never_language_servers() {
     let action = action();
-    let step = &steps(&action)[1];
+    let step = &steps(&action)[0];
     let run = step["run"].as_str().unwrap();
     assert_eq!(run, "\"$GITHUB_ACTION_PATH/ci/model-action.sh\"");
     let script = read("ci/model-action.sh");
@@ -69,14 +68,14 @@ fn model_mode_runs_real_commands_and_flags_and_never_language_servers() {
         .collect();
     assert!(
         code.iter().all(|line| !line.contains("--language-servers")),
-        "model mode must never run language servers"
+        "the action must never run language servers"
     );
 
     // Every INPUT_* the script reads, the step sets.
     let env = step["env"].as_mapping().unwrap();
     for word in script.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
         if word.len() > "INPUT_".len() && word.starts_with("INPUT_") {
-            assert!(env.contains_key(word), "the model step does not set {word}");
+            assert!(env.contains_key(word), "the step does not set {word}");
         }
     }
 
@@ -98,13 +97,7 @@ fn model_mode_runs_real_commands_and_flags_and_never_language_servers() {
         // outside Git does not have.
         let at = words.iter().position(|w| w == "--format").unwrap();
         let out = Command::new(env!("CARGO_BIN_EXE_boundrail"))
-            .args([
-                "--no-daemon",
-                "model",
-                &words[0],
-                "--format",
-                &words[at + 1],
-            ])
+            .args(["model", &words[0], "--format", &words[at + 1]])
             .current_dir(outside.path())
             .output()
             .unwrap();
@@ -203,17 +196,11 @@ fn a_token_that_cannot_write_posts_no_comment_and_fails_nothing() {
     assert!(summary.contains("**Model check:** 1 warnings"), "{summary}");
 }
 
-/// The model script's copy of the scan mode's fail-on default is action.yml's default, which
-/// model mode reads as warnings, and an empty fail-on fails on nothing, as in scan mode.
+/// fail-on defaults to warnings, an empty fail-on fails on nothing, and any other value is an
+/// error.
 #[cfg(unix)]
 #[test]
-fn model_mode_reads_the_scan_default_as_warnings_and_an_empty_fail_on_as_never() {
-    let script = read("ci/model-action.sh");
-    let copy = (script.lines())
-        .find_map(|line| line.strip_prefix("scan_default="))
-        .unwrap();
-    assert_eq!(action()["inputs"]["fail-on"]["default"], copy);
-
+fn fail_on_defaults_to_warnings_and_an_empty_fail_on_is_never() {
     let dir = TempDir::new("action-fail-on").unwrap();
     let binary = dir.path().join("boundrail");
     executable(
@@ -222,17 +209,20 @@ fn model_mode_reads_the_scan_default_as_warnings_and_an_empty_fail_on_as_never()
          *'model check'*) printf '::warning file=a.ts,title=X::msg\\n'; exit 1 ;;\nesac\n",
     );
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("ci/model-action.sh");
-    for (fail_on, status) in [("", 0), (copy, 1)] {
-        let out = Command::new("bash")
+    for (fail_on, status) in [(None, 1), (Some(""), 0), (Some("new-forbidden"), 2)] {
+        let mut command = Command::new("bash");
+        command
             .arg(&script)
             .env("RUNNER_TEMP", dir.path().join("runner"))
             .env("GITHUB_STEP_SUMMARY", dir.path().join("summary.md"))
             .env("INPUT_BINARY", &binary)
             .env("INPUT_PATH", dir.path())
-            .env("INPUT_FAIL_ON", fail_on)
-            .env_remove("INPUT_BASE_REF")
-            .output()
-            .unwrap();
+            .env_remove("INPUT_FAIL_ON")
+            .env_remove("INPUT_BASE_REF");
+        if let Some(fail_on) = fail_on {
+            command.env("INPUT_FAIL_ON", fail_on);
+        }
+        let out = command.output().unwrap();
         let stdout = String::from_utf8(out.stdout).unwrap();
         assert_eq!(out.status.code(), Some(status), "{fail_on:?}: {stdout}");
     }

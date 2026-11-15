@@ -1,11 +1,10 @@
 //! Files that change together in git history.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::HashSet;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
-use crate::model::{Cochange, CochangePair};
 use crate::{git, hotspots};
 
 /// A commit touching more files is a sweep (formatting, renames, vendoring) and says nothing
@@ -20,40 +19,6 @@ pub(crate) const MIN_COMMITS: usize = 3;
 /// edges, so only direct imports count.
 pub(crate) fn linked(edges: &HashSet<(&str, &str)>, [a, b]: &[String; 2]) -> bool {
     edges.contains(&(a.as_str(), b.as_str())) || edges.contains(&(b.as_str(), a.as_str()))
-}
-
-/// Pairs of `files` changed together in the last `limit` commits, following renames.
-pub fn collect(root: &Path, limit: usize, files: &[String]) -> Result<Cochange> {
-    let (commits, skipped) =
-        history(root, &["HEAD"], limit, true).context("--cochange needs git history")?;
-    let scanned: HashSet<&str> = files.iter().map(String::as_str).collect();
-    let mut counts: BTreeMap<(&str, &str), usize> = BTreeMap::new();
-    for commit in &commits {
-        let kept: BTreeSet<&str> = commit
-            .iter()
-            .map(String::as_str)
-            .filter(|p| scanned.contains(p))
-            .collect();
-        let kept: Vec<&str> = kept.into_iter().collect();
-        for (i, a) in kept.iter().enumerate() {
-            for b in &kept[i + 1..] {
-                *counts.entry((a, b)).or_default() += 1;
-            }
-        }
-    }
-    Ok(Cochange {
-        limit,
-        commits: commits.len(),
-        skipped,
-        pairs: counts
-            .into_iter()
-            .filter(|&(_, n)| n >= MIN_COMMITS)
-            .map(|((a, b), commits)| CochangePair {
-                files: [a.to_owned(), b.to_owned()],
-                commits,
-            })
-            .collect(),
-    })
 }
 
 /// The paths each non-merge commit of `revs` changed, newest first, at most `limit` commits,

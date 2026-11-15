@@ -13,10 +13,6 @@ use crate::surface::{SymbolExport, SymbolImport, SymbolTarget, Symbols};
 
 use super::{named_children, self_export, text, unresolved_count};
 
-#[path = "python_app.rs"]
-mod app;
-pub(crate) use app::app_facts;
-
 #[derive(Clone)]
 struct Import {
     module: String,
@@ -45,41 +41,6 @@ pub fn collect(
     python_paths: &[PathBuf],
     policy: &Policy,
 ) -> Result<super::Output> {
-    collect_cached(
-        root,
-        source_dir,
-        package,
-        python_paths,
-        policy,
-        &mut Cache::default(),
-    )
-}
-
-#[derive(Default)]
-pub(crate) struct Cache {
-    parsed: super::ParseCache<Parsed>,
-    external_roots: Option<BTreeSet<String>>,
-    metadata_files: BTreeSet<PathBuf>,
-}
-impl Cache {
-    pub(crate) fn invalidate(&mut self, files: &[String]) {
-        self.parsed.invalidate(files);
-    }
-    pub(crate) fn metadata_files(&self) -> Vec<PathBuf> {
-        self.metadata_files.iter().cloned().collect()
-    }
-    pub(crate) fn counts(&self) -> (usize, usize) {
-        (self.parsed.parsed, self.parsed.reused)
-    }
-}
-pub(crate) fn collect_cached(
-    root: &Path,
-    source_dir: &str,
-    package: Option<&str>,
-    python_paths: &[PathBuf],
-    policy: &Policy,
-    cache: &mut Cache,
-) -> Result<super::Output> {
     let root = root
         .canonicalize()
         .context("resolving native Python root")?;
@@ -91,7 +52,7 @@ pub(crate) fn collect_cached(
         } else {
             root.join(path)
         };
-        let path = contained_directory(&root, &path).context("resolving --python-path")?;
+        let path = contained_directory(&root, &path).context("resolving a Python search path")?;
         if !search.contains(&path) {
             search.push(path);
         }
@@ -101,10 +62,7 @@ pub(crate) fn collect_cached(
             search.push(path);
         }
     }
-    if cache.external_roots.is_none() {
-        cache.external_roots = Some(installed_roots(&root, &search, &mut cache.metadata_files)?);
-    }
-    let external_roots = cache.external_roots.as_ref().unwrap();
+    let external_roots = &installed_roots(&root, &search)?;
     let all_files = super::source_files(&root, &["py"])?;
     let mut modules = BTreeMap::new();
     for base in search.iter().rev() {
@@ -179,10 +137,7 @@ pub(crate) fn collect_cached(
         let file = files[index].clone();
         index += 1;
         if !parsed.contains_key(&file) {
-            match cache
-                .parsed
-                .get(&file, || parse_file(&root, &file, &mut parser, &query))
-            {
+            match parse_file(&root, &file, &mut parser, &query) {
                 Ok(info) => {
                     parsed.insert(file.clone(), info);
                 }
@@ -211,12 +166,7 @@ pub(crate) fn collect_cached(
                 && selected.contains(base)
                 && !parsed.contains_key(base)
             {
-                parsed.insert(
-                    base.clone(),
-                    cache
-                        .parsed
-                        .get(base, || parse_file(&root, base, &mut parser, &query))?,
-                );
+                parsed.insert(base.clone(), parse_file(&root, base, &mut parser, &query)?);
             }
             let targets: Vec<_> = if import.from && !import.wildcard {
                 import
@@ -936,15 +886,10 @@ fn defining(
 }
 
 /// Installed metadata is evidence of import roots; distribution names alone are not.
-fn installed_roots(
-    root: &Path,
-    search: &[PathBuf],
-    metadata: &mut BTreeSet<PathBuf>,
-) -> Result<BTreeSet<String>> {
+fn installed_roots(root: &Path, search: &[PathBuf]) -> Result<BTreeSet<String>> {
     let mut paths = search.to_vec();
     for environment in [root.join(".venv"), root.join("venv")] {
         let lib = environment.join("lib");
-        metadata.extend([environment, lib.clone()]);
         if !lib.is_dir() {
             continue;
         }
@@ -961,7 +906,6 @@ fn installed_roots(
     }
     let mut found = BTreeSet::new();
     for path in paths {
-        metadata.insert(path.clone());
         if !path.is_dir() {
             continue;
         }
@@ -976,10 +920,8 @@ fn installed_roots(
             {
                 continue;
             }
-            metadata.insert(entry.path());
             for filename in ["top_level.txt", "RECORD"] {
                 let file = entry.path().join(filename);
-                metadata.insert(file.clone());
                 if !file.is_file() || fs::symlink_metadata(&file)?.file_type().is_symlink() {
                     continue;
                 }
@@ -996,7 +938,7 @@ fn installed_roots(
                 } else if let Some(rows) = record_rows(&contents) {
                     for row in rows {
                         if row.len() == 3
-                            && let Some(name) = installed_record_root(&path, &row[0], metadata)?
+                            && let Some(name) = installed_record_root(&path, &row[0])?
                         {
                             found.insert(name);
                         }
@@ -1016,11 +958,7 @@ fn import_identifier(name: &str) -> bool {
         && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
-fn installed_record_root(
-    site: &Path,
-    written: &str,
-    metadata: &mut BTreeSet<PathBuf>,
-) -> Result<Option<String>> {
+fn installed_record_root(site: &Path, written: &str) -> Result<Option<String>> {
     // RECORD paths are slash-separated; installation scripts and .data payloads are not imports.
     let parts: Vec<_> = written.split('/').collect();
     if parts
@@ -1045,7 +983,6 @@ fn installed_record_root(
         return Ok(None);
     }
     let file = site.join(written);
-    metadata.insert(file.clone());
     if !file.is_file() {
         return Ok(None);
     }
@@ -1053,7 +990,6 @@ fn installed_record_root(
     if !actual.starts_with(site) {
         return Ok(None);
     }
-    metadata.insert(actual);
     Ok(Some(
         if parts.len() == 1 { stem } else { parts[0] }.to_owned(),
     ))

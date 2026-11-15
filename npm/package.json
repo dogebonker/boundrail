@@ -1,7 +1,7 @@
 {
   "name": "boundrail-cli",
   "version": "0.1.0",
-  "description": "Runs the boundrail CLI: import-graph evidence for architecture decisions",
+  "description": "Runs the boundrail CLI: an authored architecture model checked against the code",
   "license": "MIT OR Apache-2.0",
   "repository": {
     "type": "git",

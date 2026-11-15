@@ -2,15 +2,11 @@
 
 pub mod barrels;
 pub mod depcruise;
-pub mod elixir;
 pub mod excludes;
 pub mod go;
 pub mod grimp;
 pub mod imports;
-pub mod incremental;
-pub mod java;
 pub mod native;
-pub mod rust;
 pub mod typescript_resolution;
 
 use std::collections::HashSet;
@@ -28,29 +24,11 @@ use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 
 use crate::model::{Collector, Edge, Language, NodeMetadata};
 
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    Default,
-    PartialEq,
-    Eq,
-    serde::Serialize,
-    serde::Deserialize,
-    clap::ValueEnum,
-)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Engine {
     #[default]
-    Reference,
     Native,
-    Depcruise,
-}
-
-impl Engine {
-    pub fn is_reference(&self) -> bool {
-        *self == Self::Reference
-    }
 }
 
 pub struct RawGraph {
@@ -63,12 +41,8 @@ pub struct RawGraph {
     pub globals: Option<Vec<crate::model::GlobalUse>>,
 }
 
-/// Extensions dependency-cruiser files must have to count as source; imports of anything else
-/// (stylesheets, JSON, images) are dropped.
+/// Extensions of TypeScript and JavaScript source files, which package entries map back to.
 pub const TS_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "mjs", "cjs"];
-
-// Kept for callers constructing collector-specific discovery globs.
-pub use excludes::{GENERATED_EXCLUDES as DEFAULT_EXCLUDES, TEST_EXCLUDES};
 
 /// Files a root marker makes count for Go in language detection.
 const GO_MARKERS: &[&str] = &["go.mod", "go.work"];
@@ -226,7 +200,7 @@ pub fn is_relative_path(path: &str, allow_root: bool) -> bool {
 
 /// The program `--<flag> <value>` names: a path made absolute, so it does not depend on the
 /// working directory a child runs in, else a name the spawn looks up on PATH.
-pub fn resolve_executable(flag: &str, value: impl AsRef<Path>) -> Result<PathBuf> {
+pub fn resolve_executable(name: &str, value: impl AsRef<Path>) -> Result<PathBuf> {
     let value = value.as_ref();
     if !value
         .to_string_lossy()
@@ -235,7 +209,7 @@ pub fn resolve_executable(flag: &str, value: impl AsRef<Path>) -> Result<PathBuf
         return Ok(value.to_owned());
     }
     fs::canonicalize(value)
-        .with_context(|| format!("--{flag} {}: no such executable", value.display()))
+        .with_context(|| format!("{name} executable {}: not found", value.display()))
 }
 
 /// The absolute folders of `PATH`.
@@ -405,7 +379,7 @@ pub fn detect_language_with_options(
     }
     match (ts, py, go, rust, java, elixir) {
         (0, 0, 0, 0, 0, 0) => bail!(
-            "no .ts/.js, .py, .java, .ex/.exs, .rs (with Cargo.toml) or .go (with go.mod) files under {}; pass --language",
+            "no .ts/.js, .py, .java, .ex/.exs, .rs (with Cargo.toml) or .go (with go.mod) files under {}",
             root.join(source_dir).display()
         ),
         _ if elixir > ts && elixir > py && elixir > go && elixir > rust && elixir > java => {

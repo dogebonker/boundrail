@@ -14,8 +14,7 @@ use serde_json::{Value, json};
 
 use super::request::INPUT_MAX;
 use super::{Code, Refusal};
-use crate::history::{refuse_symlink, write_atomic};
-use crate::sync_rules::hash;
+use crate::files::{hash, refuse_symlink, write_atomic};
 
 const STATE: &str = "boundrail";
 const LOCK: &str = "model.lock";

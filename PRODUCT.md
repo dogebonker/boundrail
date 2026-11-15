@@ -4,78 +4,53 @@
 
 ## Platform
 
-web
+CLI, with a local read-only browser view
 
 ## Users
 
-Developers and coding agents inspecting a repository, changing its structure, or checking that
-architecture rules still hold. These users need source evidence and repeatable checks.
+Developers and coding agents who describe a repository's architecture, plan changes to it, and
+check that the code still matches. They need source evidence and repeatable checks.
 
 ## Product Purpose
 
-Boundrail reads source relationships and checks architecture rules. Its service model infers
-application boundaries, infrastructure client usage, and supported HTTP and queue relationships.
-An offline service catalog and graph make that model explorable.
+Boundrail keeps an authored architecture model in `.boundrail/model/`, committed with the code:
+modules bound to code, relationships, collections, flows, walkthroughs, proposals and checkpoints.
+`boundrail model check` compares the model with the code, and `boundrail model footprint` shows
+what a branch changes. The browser view (`boundrail model view`) makes the model explorable.
 
 ## Positioning
 
-Local, source-based architecture evidence without requiring an application SDK or running the
-application. The service model is incomplete static evidence, not a runtime traffic trace.
+A model written by people and agents, checked against local source evidence, without an
+application SDK or running the application. Code evidence is static and incomplete; the model is
+the stated intent.
 
 ## Operating Context
 
-Rust CLI, JSON and Markdown reports, self-contained browser reports, and read-only MCP tools.
-Repositories can supply a service manifest to declare relationships or override boundaries.
-Existing import collectors have their own tooling and safety constraints documented in the guide.
+Rust CLI with JSON, Markdown and SVG output, a local browser view on the loopback interface, a
+GitHub Action that annotates `model check` findings and comments the footprint, and agent skills
+that `model setup` installs. Language servers run only on explicit opt-in, on trusted checkouts.
 
 ## Capabilities and Constraints
 
-- Native service facts cover TypeScript, JavaScript, Go, and Python.
-- Rules can judge service calls and explicit package targets for infrastructure clients.
-- Confidence, source locations, caveats, and omitted evidence must remain visible.
-- Resources describe per-service client usage. They do not establish physical database ownership.
-- Service inference and report viewing do not provision, deploy, or contact infrastructure.
-- Configuration, indirect wrappers, and unsupported transports can hide real relationships.
-- The HTML artifact works offline and does not fetch source code or third-party assets.
-
-## Architecture workflow
-
-The [architecture workflow plan](docs/plans/architecture-workflow.md) records the delivered increments
-and their limits. Service-report diffs distinguish newly observed violations from existing ones
-under the later policy. Project skills have separate inactive drafting and explicit adoption.
-Import comparison pages show module, dependency, rule, and source-evidence changes.
-
-Visual diffs cover modules, imports, and code-rule violations. Service and infrastructure visual
-diffs remain a later extension. Missing provenance and incomplete static evidence stay visible.
-
-Existing code structure is evidence for a draft. Authored policy defines the intended architecture.
-Generated skills must preserve that distinction and reference the policy files.
+- Built-in collectors read TypeScript and JavaScript, Python, Go, Rust, Java and Elixir; one
+  language per checkout.
+- Every edit names the revision it read and an operation ID; a stale edit refuses.
+- Source locations, skips and limitations stay visible in every output.
+- The view reads only, works offline and loads nothing from other origins.
 
 ## Brand Commitments
 
-The product is Boundrail and its executable is `boundrail`. The user selected the name on
-2026-10-25. Keep the established report palette and use direct technical copy. Distinguish inferred
-evidence from declared evidence and measured outcomes. Historical captures retain their original name.
-
-Existing report schemas, project state, owned markers, finding IDs, and environment overrides
-retain their compatibility identities. Repository and package publication are separate operations.
-The README explains current capabilities with an illustrative overview and actual report captures.
-
-## Evidence on Hand
-
-README.md, docs/guide.md, docs/plans/app-model.md, docs/plans/service-experience.md, services-report
-schema and fixtures, and the existing assets/graph.html report. The pinned real-application sample
-has no inferred service edges. New labelled cohorts must report that limitation rather than imply
-whole-repository accuracy from reference examples.
+The product is Boundrail and its executable is `boundrail`. Use direct technical copy.
+Distinguish the authored model from code evidence. The repository URL, `.archgraphignore` and the
+`ARCHGRAPH_*` install variables keep their earlier names for compatibility.
 
 ## Product Principles
 
-- Show the source location behind a relationship.
-- Measure labelled evidence and disclose unresolved or unreviewed cases.
-- Preserve existing manifest output and import-report behaviour.
-- Reuse the analyzer across the CLI, browser report, and MCP.
+- Show the source location behind a finding.
+- Never let code evidence silently rewrite the authored model.
+- Refuse rather than guess: stale revisions, unknown subjects and invalid requests fail loudly.
 
 ## Accessibility & Inclusion
 
-Browser reports support keyboard navigation, visible focus, readable contrast, narrow screens,
-and reduced-motion preferences. Essential evidence remains available outside the diagram.
+The browser view supports keyboard focus, light and dark schemes, narrow screens and
+reduced-motion preferences. The sidebar and detail panel list in text what the drawing shows.

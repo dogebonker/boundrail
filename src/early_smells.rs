@@ -249,9 +249,9 @@ fn single_implementations(
 ) {
     report.limitations.push("Single-implementation candidates count only resolved explicit TypeScript class implements clauses in scanned production files; structural typing, inheritance, declaration merging and unscanned implementations remain unknown. Candidates are advisory.".into());
     let Some(symbols) = &doc.symbols else {
-        report
-            .limitations
-            .push("Single-implementation evidence unavailable: scan with --symbols.".into());
+        report.limitations.push(
+            "Single-implementation evidence unavailable: the scan has no symbol data.".into(),
+        );
         return;
     };
     if syntax.is_empty() {

@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# The model mode of the boundrail GitHub Action (action.yml, mode: model). Every input arrives
-# as an INPUT_* environment variable, so this runs outside Actions too, given RUNNER_TEMP and
-# GITHUB_STEP_SUMMARY:
+# The boundrail GitHub Action (action.yml). Every input arrives as an INPUT_* environment
+# variable, so this runs outside Actions too, given RUNNER_TEMP and GITHUB_STEP_SUMMARY:
 #
 #   INPUT_PATH INPUT_FAIL_ON INPUT_VERSION INPUT_BINARY INPUT_BASE_REF INPUT_TOKEN   as in action.yml
 #   PR_NUMBER   the pull request's number, on pull_request events
@@ -49,18 +48,12 @@ here=$(cd "$(dirname "$0")/.." && pwd)
 
 path=${INPUT_PATH:-.}
 [[ -d $path ]] || die "path $path is not a directory"
-# The scan mode's fail-on default; it must match the input's default in action.yml, which
-# means the model mode's default, warnings.
-scan_default=new-forbidden,new-cycles,stale-known,new-vacuous
 fail_on=${INPUT_FAIL_ON-warnings}
-if [[ $fail_on == "$scan_default" ]]; then
-  fail_on=warnings
-fi
-# An empty fail-on fails on nothing, as in scan mode.
+# An empty fail-on fails on nothing.
 fail_on=${fail_on:-never}
 case $fail_on in
   warnings | information | never) ;;
-  *) die "fail-on must be warnings, information or never in model mode" ;;
+  *) die "fail-on must be warnings, information or never" ;;
 esac
 base_ref=${INPUT_BASE_REF:-}
 work=$RUNNER_TEMP/boundrail-model
@@ -79,7 +72,7 @@ fi
 "$boundrail" --version
 
 check=0
-"$boundrail" --no-daemon model check --root "$path" --format annotations >"$work/check.txt" || check=$?
+"$boundrail" model check --root "$path" --format annotations >"$work/check.txt" || check=$?
 if ((check > 1)); then
   cat "$work/check.txt"
   die "model check failed with exit $check"
@@ -128,14 +121,14 @@ if [[ -n $base_ref ]]; then
     git -C "$path" fetch --no-tags origin "$base_ref" ||
       die "could not fetch $base_ref; check out with fetch-depth: 0"
   fi
-  "$boundrail" --no-daemon model footprint --root "$path" --base "$base_ref" --format pr-comment >"$work/comment.md" || {
+  "$boundrail" model footprint --root "$path" --base "$base_ref" --format pr-comment >"$work/comment.md" || {
     cat "$work/comment.md"
     die "model footprint failed"
   }
   cat "$work/comment.md" >>"$GITHUB_STEP_SUMMARY"
   # A comment cut at its size limit points at the summary, which gets the whole footprint.
   if grep -q '^_Truncated at ' "$work/comment.md"; then
-    "$boundrail" --no-daemon model footprint --root "$path" --base "$base_ref" --format markdown >"$work/footprint.md" || {
+    "$boundrail" model footprint --root "$path" --base "$base_ref" --format markdown >"$work/footprint.md" || {
       cat "$work/footprint.md"
       die "model footprint failed"
     }

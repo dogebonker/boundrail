@@ -80,7 +80,6 @@ pub struct Policy {
     includes: GlobSet,
     patterns: Vec<String>,
     archignore: Option<String>,
-    settings_key: String,
     include_tests: bool,
 }
 
@@ -152,7 +151,6 @@ pub fn is_rust_test(path: &str) -> bool {
 
 impl Policy {
     pub fn new(root: &Path, language: Language, options: Options) -> Result<Self> {
-        let settings_key = format!("{language:?}:{options:?}");
         let defaults = if options.no_defaults {
             Vec::new()
         } else {
@@ -190,7 +188,6 @@ impl Policy {
             includes: globset(&options.includes)?,
             patterns,
             archignore,
-            settings_key,
             include_tests: options.include_tests || options.no_defaults,
         })
     }
@@ -202,66 +199,6 @@ impl Policy {
     }
     pub fn patterns(&self) -> &[String] {
         &self.patterns
-    }
-    /// Semantic selection identity; contents, rather than mtimes, detect ignore-file rewrites.
-    pub fn cache_key(&self, paths: &[String]) -> Result<Vec<u8>> {
-        use sha2::{Digest, Sha256};
-        let mut digest = Sha256::new();
-        let mut part = |bytes: &[u8]| {
-            digest.update((bytes.len() as u64).to_le_bytes());
-            digest.update(bytes);
-        };
-        part(self.root.to_string_lossy().as_bytes());
-        part(self.settings_key.as_bytes());
-        part(self.archignore.as_deref().unwrap_or_default().as_bytes());
-        let mut ignore_files = BTreeSet::new();
-        for path in paths.iter().filter(|path| {
-            !self.explicit.is_match(path)
-                && (!self.defaults.is_match(path) || self.includes.is_match(path))
-        }) {
-            let absolute = self.root.join(path);
-            for parent in absolute.parent().into_iter().flat_map(Path::ancestors) {
-                if !ignore_files.insert(parent.join(".gitignore")) {
-                    break;
-                }
-                if parent.join(".git").exists() {
-                    break;
-                }
-            }
-        }
-        if let Ok(path) = crate::git::text(&self.root, &["rev-parse", "--git-path", "info/exclude"])
-        {
-            let path = PathBuf::from(path.trim_end_matches(['\n', '\r']));
-            ignore_files.insert(if path.is_absolute() {
-                path
-            } else {
-                self.root.join(path)
-            });
-        }
-        for path in ignore_files {
-            part(path.to_string_lossy().as_bytes());
-            match std::fs::symlink_metadata(&path) {
-                Ok(metadata) if metadata.is_file() => {
-                    part(&[1]);
-                    part(
-                        &std::fs::read(&path)
-                            .with_context(|| format!("reading ignore policy {}", path.display()))?,
-                    );
-                }
-                Ok(metadata) if metadata.file_type().is_symlink() => {
-                    // Git does not follow symlinked ignore files; neither should a cache key.
-                    part(&[2]);
-                    part(std::fs::read_link(&path)?.to_string_lossy().as_bytes());
-                }
-                Ok(_) => part(&[3]),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => part(&[0]),
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("reading ignore policy {}", path.display()));
-                }
-            }
-        }
-        Ok(digest.finalize().to_vec())
     }
 
     pub fn select(&self, paths: &[String]) -> Result<Vec<String>> {

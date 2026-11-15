@@ -18,7 +18,7 @@ use super::{
 };
 use crate::arch::types::{Collection, DESCRIPTION_MAX, Module, Proposal, ProposalStatus};
 use crate::arch::{Code, Refusal, ids, state};
-use crate::history::refuse_symlink;
+use crate::files::refuse_symlink;
 
 /// The folder of proposals, one folder per proposal ID, and the file each one holds.
 pub(super) const PROPOSALS: &str = "proposals";

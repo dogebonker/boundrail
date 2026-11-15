@@ -21,7 +21,7 @@ use serde::Serialize;
 use super::render::GENERATOR;
 use super::vault::output_problems;
 use crate::collect::{self, TempDir};
-use crate::history::write_atomic;
+use crate::files::write_atomic;
 
 /// The `tEXt` keyword whose text is the SHA-256 of the SVG a PNG was rasterized from.
 const SOURCE_KEY: &[u8] = b"boundrail-source";
@@ -69,7 +69,7 @@ pub struct Drawing {
 
 impl Drawing {
     pub fn new(svg: String) -> Self {
-        let digest = crate::sync_rules::hash(svg.as_bytes());
+        let digest = crate::files::hash(svg.as_bytes());
         Self { svg, digest }
     }
 
