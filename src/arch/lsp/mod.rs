@@ -273,7 +273,7 @@ fn ask<'a>(roots: Roots<'_>, server: &Server, asks: &Asks<'a>) -> Result<Found<'
     let program = if server.command.contains(['/', '\\']) {
         PathBuf::from(&server.command)
     } else {
-        client::resolve(&server.command)?
+        crate::collect::resolve_program(&server.command, roots.canonical)?
     };
     let line = (std::iter::once(program.display().to_string()))
         .chain(server.args.iter().map(|a| quoted(a)))

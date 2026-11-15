@@ -16,6 +16,10 @@ pub enum DiagnosticCode {
     MessageUndrawn,
     WalkthroughTargetMissing,
     WalkthroughEmpty,
+    PictureTargetMissing,
+    PictureStale,
+    PictureMissing,
+    PictureUnrenderable,
     BindingPathMissing,
     BindingSymbolMissing,
     AnchorPathMissing,
@@ -42,6 +46,10 @@ impl DiagnosticCode {
             Self::MessageUndrawn => "MESSAGE_UNDRAWN",
             Self::WalkthroughTargetMissing => "WALKTHROUGH_TARGET_MISSING",
             Self::WalkthroughEmpty => "WALKTHROUGH_EMPTY",
+            Self::PictureTargetMissing => "PICTURE_TARGET_MISSING",
+            Self::PictureStale => "PICTURE_STALE",
+            Self::PictureMissing => "PICTURE_MISSING",
+            Self::PictureUnrenderable => "PICTURE_UNRENDERABLE",
             Self::BindingPathMissing => "BINDING_PATH_MISSING",
             Self::BindingSymbolMissing => "BINDING_SYMBOL_MISSING",
             Self::AnchorPathMissing => "ANCHOR_PATH_MISSING",
@@ -69,6 +77,10 @@ impl DiagnosticCode {
             | Self::RelationshipRepeated
             | Self::ContainerLineToOwnPart
             | Self::WalkthroughTargetMissing
+            | Self::PictureTargetMissing
+            | Self::PictureStale
+            | Self::PictureMissing
+            | Self::PictureUnrenderable
             | Self::BindingPathMissing
             | Self::BindingSymbolMissing
             | Self::AnchorPathMissing
@@ -99,8 +111,8 @@ pub enum Severity {
 pub struct Diagnostic {
     pub code: DiagnosticCode,
     pub severity: Severity,
-    /// Qualified IDs of the modules, relationships, flows, steps, walkthroughs or beats the
-    /// diagnostic concerns.
+    /// Qualified IDs of the modules, relationships, flows, steps, walkthroughs, beats or pictures
+    /// the diagnostic concerns.
     pub subjects: Vec<String>,
     pub message: String,
     /// For `CONTAINER_UNBOUND`: the directory its bound parts share.

@@ -15,6 +15,8 @@ pub const LABEL_MAX: usize = 60;
 pub const EXTERNAL_KIND: &str = "external";
 const LOCAL_ID: &str = "^[A-Za-z0-9]{8}$";
 const QUALIFIED_ID: &str = "^[A-Za-z0-9]{8}#[A-Za-z0-9]{8}$";
+/// A repository path ending in `.svg` or `.png`; `vault` checks the rest of the output rules.
+const PICTURE_OUTPUT: &str = r"^[^/\\:]+(?:/[^\\]*)?\.(?:svg|png)$";
 /// A path relative to the repository root, as `vault::is_repo_path` checks it: no leading `/`, no
 /// `..` segment, no backslash, and no `:` in the first segment.
 const REPO_PATH: &str = r"^(?:[^/\\.:][^/\\:]*|\.(?:[^/\\.:][^/\\:]*)?|\.\.[^/\\:]+)(?:/(?:[^/\\.][^/\\]*|\.(?:[^/\\.][^/\\]*)?|\.\.[^/\\]+)?)*$";
@@ -494,6 +496,27 @@ impl ReadingState {
     }
 }
 
+/// `pictures/<id>.picture.json`: a picture documentation embeds, drawn from the current state's
+/// model as its reading says and kept in the repository at `output`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Picture {
+    #[schemars(range(min = 1, max = 1))]
+    pub schema_version: u32,
+    #[schemars(pattern(LOCAL_ID))]
+    pub id: String,
+    pub name: String,
+    pub order: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = DESCRIPTION_MAX))]
+    pub description: Option<String>,
+    /// The file Boundrail writes, relative to the repository root, ending in `.svg` or `.png`;
+    /// never inside `.boundrail` or `.git`.
+    #[schemars(pattern(PICTURE_OUTPUT))]
+    pub output: String,
+    pub reading: BeatReading,
+}
+
 impl Walkthrough {
     /// The walkthrough's ID and those of its beats.
     pub fn ids(&self) -> impl Iterator<Item = &str> {
@@ -666,11 +689,12 @@ impl Default for VaultConfig {
 pub type SchemaFn = fn() -> Schema;
 
 /// Every vault file format and request, by its `model schema` name.
-pub const SCHEMAS: [(&str, SchemaFn); 9] = [
+pub const SCHEMAS: [(&str, SchemaFn); 10] = [
     ("model-claim", root::<super::claims::ClaimRequest>),
     ("model-collection", root::<Collection>),
     ("model-edit", root::<super::edit::EditRequest>),
     ("model-manifest", root::<Manifest>),
+    ("model-picture", root::<Picture>),
     ("model-proposal", root::<Proposal>),
     ("model-release", root::<super::claims::ReleaseRequest>),
     ("model-walkthrough", root::<Walkthrough>),

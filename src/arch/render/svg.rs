@@ -6,6 +6,9 @@ use std::fmt::Write as _;
 use super::{INK, MARGIN};
 
 pub(super) const FONT_SIZE: f64 = 12.0;
+/// The mark on every drawing's root element, by which `model pictures` knows a file it may
+/// overwrite.
+pub(crate) const GENERATOR: &str = r#"data-generator="boundrail""#;
 const FONT_FAMILY: &str = "sans-serif";
 pub(super) const BACKGROUND: &str = "#ffffff";
 /// Estimated width of one character at the base font size.
@@ -265,7 +268,7 @@ impl Svg {
             out,
             "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w:.0}\" height=\"{h:.0}\" \
              viewBox=\"{left:.0} {top:.0} {w:.0} {h:.0}\" font-family=\"{FONT_FAMILY}\" \
-             font-size=\"{FONT_SIZE:.1}\" color=\"{INK}\">"
+             font-size=\"{FONT_SIZE:.1}\" color=\"{INK}\" {GENERATOR}>"
         );
         let _ = writeln!(
             out,

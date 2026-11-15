@@ -14,6 +14,7 @@ pub mod infra;
 pub mod inspect;
 pub mod locality;
 pub mod lsp;
+pub mod picture;
 pub mod proposal;
 pub mod render;
 pub mod request;
@@ -73,6 +74,7 @@ pub enum Code {
     ChildrenOrphaned,
     ReferencedByFlow,
     ReferencedByWalkthrough,
+    ReferencedByPicture,
     VaultLocked,
     OperationReused,
     RecoveryRequired,
@@ -110,6 +112,7 @@ impl Code {
             Code::ChildrenOrphaned => "CHILDREN_ORPHANED",
             Code::ReferencedByFlow => "REFERENCED_BY_FLOW",
             Code::ReferencedByWalkthrough => "REFERENCED_BY_WALKTHROUGH",
+            Code::ReferencedByPicture => "REFERENCED_BY_PICTURE",
             Code::VaultLocked => "VAULT_LOCKED",
             Code::OperationReused => "OPERATION_REUSED",
             Code::RecoveryRequired => "RECOVERY_REQUIRED",

@@ -3,9 +3,8 @@
 //! that stops reading never blocks the client past its timeouts.
 
 use std::collections::VecDeque;
-use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -56,7 +55,7 @@ impl Session {
         let mut child = Command::new(program)
             .args(args)
             .current_dir(root)
-            .env("PATH", absolute_path())
+            .env("PATH", crate::collect::absolute_path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -245,49 +244,6 @@ pub(super) fn answer(message: &Value) -> Option<Value> {
     Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
 }
 
-/// The absolute folders of `PATH`.
-fn absolute_dirs() -> Vec<PathBuf> {
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    (std::env::split_paths(&path))
-        .filter(|dir| dir.is_absolute())
-        .collect()
-}
-
-/// `PATH` without its relative folders.
-fn absolute_path() -> OsString {
-    std::env::join_paths(absolute_dirs()).unwrap_or_default()
-}
-
-/// The program a bare `command` names: the first executable file of that name in an absolute
-/// folder of `PATH`, `.exe` added on Windows. Relative folders are skipped, so a checkout cannot
-/// plant the program.
-pub(super) fn resolve(command: &str) -> Result<PathBuf> {
-    let name = if cfg!(windows) {
-        format!("{command}.exe")
-    } else {
-        command.to_owned()
-    };
-    (absolute_dirs().into_iter())
-        .map(|dir| dir.join(&name))
-        .find(|candidate| executable(candidate))
-        .ok_or_else(|| anyhow!("{command} is not on PATH"))
-}
-
-fn executable(path: &Path) -> bool {
-    let Ok(metadata) = path.metadata() else {
-        return false;
-    };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        metadata.is_file()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,14 +267,5 @@ mod tests {
             );
         }
         assert_eq!(answer(&json!({"method": "window/logMessage"})), None);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn programs_resolve_only_in_absolute_path_folders() {
-        assert!(resolve("sh").unwrap().is_absolute());
-        assert!(resolve("boundrail-no-such-program").is_err());
-        let path = absolute_path();
-        assert!(std::env::split_paths(&path).all(|dir| dir.is_absolute()));
     }
 }

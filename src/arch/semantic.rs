@@ -271,13 +271,100 @@ fn relationship_ends(index: &Index<'_>, out: &mut Vec<Diagnostic>) {
     }
 }
 
-/// `WALKTHROUGH_EMPTY` for a walkthrough without beats, and `WALKTHROUGH_TARGET_MISSING` for a
-/// beat whose proposal or checkpoint does not load, or whose scope, focus or flow the state it
-/// draws lacks. `model` is the current state; each other state a beat names is loaded once, through
-/// the loaders `model read` uses, and only when a beat names it.
-pub fn walkthroughs(model: &Model) -> Vec<Diagnostic> {
-    let mut loaded: BTreeMap<&ReadingState, Result<Model, String>> = BTreeMap::new();
+/// The current state and every proposal or checkpoint a reading names, each loaded once per run
+/// through the loaders `model read` uses, and only when a reading names it.
+pub struct States<'m> {
+    current: &'m Model,
+    /// Each model with how a title names it: `proposal <name>` or `checkpoint <ID>`.
+    loaded: BTreeMap<ReadingState, anyhow::Result<(Model, String)>>,
+}
+
+impl<'m> States<'m> {
+    pub fn new(current: &'m Model) -> Self {
+        Self {
+            current,
+            loaded: BTreeMap::new(),
+        }
+    }
+
+    pub fn current(&self) -> &'m Model {
+        self.current
+    }
+
+    /// Loads `state` unless it is the current state or already loaded.
+    pub fn load(&mut self, state: &ReadingState) {
+        if state.is_current() || self.loaded.contains_key(state) {
+            return;
+        }
+        let dir = &self.current.dir;
+        let loaded = match state {
+            ReadingState::Current => unreachable!("the current state is never loaded again"),
+            ReadingState::Proposal(p) => vault::load_proposal(dir.clone(), p).map(|m| {
+                let name = m.proposal.as_ref().map_or(p.as_str(), |p| &p.name);
+                let name = format!("proposal {name}");
+                (m, name)
+            }),
+            ReadingState::Checkpoint(c) => {
+                checkpoint::load(dir, c).map(|(c, m)| (m, format!("checkpoint {}", c.id)))
+            }
+        };
+        self.loaded.insert(state.clone(), loaded);
+    }
+
+    /// The model `state` holds, with how a title names it (`None` for the current state), or why
+    /// it does not load. `load` must have been called for it.
+    pub fn get(&self, state: &ReadingState) -> Result<(&Model, Option<&str>), &anyhow::Error> {
+        if state.is_current() {
+            return Ok((self.current, None));
+        }
+        match self.loaded.get(state).expect("`load` comes before `get`") {
+            Ok((model, name)) => Ok((model, Some(name))),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// One reading a check judges: the code it raises, its subjects, and how a message names it.
+pub struct Judged<'a> {
+    pub code: DiagnosticCode,
+    pub subjects: Vec<String>,
+    pub label: String,
+    pub reading: &'a BeatReading,
+}
+
+/// `code` for each reading whose proposal or checkpoint does not load, or whose scope, focus or
+/// flow the state it draws lacks.
+pub fn targets<'a>(
+    states: &mut States<'_>,
+    readings: impl IntoIterator<Item = Judged<'a>>,
+) -> Vec<Diagnostic> {
     let mut out = Vec::new();
+    for judged in readings {
+        let reading = judged.reading;
+        let named =
+            iter::once((&reading.state, true)).chain(reading.against.iter().map(|a| (a, false)));
+        for (state, drawn) in named.filter(|(s, _)| !s.is_current()) {
+            states.load(state);
+            let missing = match states.get(state) {
+                Err(error) => vec![format!("{} does not load: {error:#}", state.text())],
+                Ok((target, _)) if drawn => lacks(target, reading, state),
+                Ok(_) => Vec::new(),
+            };
+            out.extend(missing.into_iter().map(|why| {
+                let message = format!("{}: {why}", judged.label);
+                Diagnostic::new(judged.code, judged.subjects.clone(), message)
+            }));
+        }
+    }
+    out
+}
+
+/// `WALKTHROUGH_EMPTY` for a walkthrough without beats, and `WALKTHROUGH_TARGET_MISSING` for a
+/// beat whose target the current state's `states` cannot draw, as `targets` judges it.
+pub fn walkthroughs(states: &mut States<'_>) -> Vec<Diagnostic> {
+    let model = states.current();
+    let mut out = Vec::new();
+    let mut beats = Vec::new();
     for walkthrough in &model.walkthroughs {
         let id = model.qualify(&walkthrough.id);
         let name = &walkthrough.name;
@@ -289,40 +376,15 @@ pub fn walkthroughs(model: &Model) -> Vec<Diagnostic> {
                 message,
             ));
         }
-        for (n, beat) in (1..).zip(&walkthrough.beats) {
-            let reading = &beat.reading;
-            let states = iter::once((&reading.state, true))
-                .chain(reading.against.iter().map(|a| (a, false)));
-            for (state, drawn) in states.filter(|(s, _)| !s.is_current()) {
-                let target = loaded.entry(state).or_insert_with(|| load(model, state));
-                let missing = match target {
-                    Err(why) => vec![why.clone()],
-                    Ok(target) if drawn => lacks(target, reading, state),
-                    Ok(_) => Vec::new(),
-                };
-                let subjects = vec![id.clone(), model.qualify(&beat.id)];
-                out.extend(missing.into_iter().map(|why| {
-                    let message = format!("{name}, beat {n} ({}): {why}", beat.title);
-                    Diagnostic::new(
-                        DiagnosticCode::WalkthroughTargetMissing,
-                        subjects.clone(),
-                        message,
-                    )
-                }));
-            }
-        }
+        beats.extend((1..).zip(&walkthrough.beats).map(|(n, beat)| Judged {
+            code: DiagnosticCode::WalkthroughTargetMissing,
+            subjects: vec![id.clone(), model.qualify(&beat.id)],
+            label: format!("{name}, beat {n} ({})", beat.title),
+            reading: &beat.reading,
+        }));
     }
+    out.extend(targets(states, beats));
     out
-}
-
-/// The proposal or checkpoint `state` names, or why it does not load.
-fn load(model: &Model, state: &ReadingState) -> Result<Model, String> {
-    let loaded = match state {
-        ReadingState::Current => unreachable!("`walkthroughs` loads only other states"),
-        ReadingState::Proposal(p) => vault::load_proposal(model.dir.clone(), p),
-        ReadingState::Checkpoint(c) => checkpoint::load(&model.dir, c).map(|(_, m)| m),
-    };
-    loaded.map_err(|error| format!("{} does not load: {error:#}", state.text()))
 }
 
 /// The scope, focus and flow of `reading` that `target`, the state named `state`, does not hold.

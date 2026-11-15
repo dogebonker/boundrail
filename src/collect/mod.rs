@@ -238,6 +238,57 @@ pub fn resolve_executable(flag: &str, value: impl AsRef<Path>) -> Result<PathBuf
         .with_context(|| format!("--{flag} {}: no such executable", value.display()))
 }
 
+/// The absolute folders of `PATH`.
+fn absolute_dirs() -> Vec<PathBuf> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    (std::env::split_paths(&path))
+        .filter(|dir| dir.is_absolute())
+        .collect()
+}
+
+/// `PATH` without its relative folders, for a child that must not find a program the checkout
+/// plants.
+pub fn absolute_path() -> std::ffi::OsString {
+    std::env::join_paths(absolute_dirs()).unwrap_or_default()
+}
+
+/// The program a bare `command` names: the first executable file of that name in an absolute
+/// folder of `PATH`, `.exe` added on Windows, that does not lie inside `checkout` once links are
+/// resolved. Relative folders and folders inside the checkout are skipped, so a checkout cannot
+/// plant the program.
+pub fn resolve_program(command: &str, checkout: &Path) -> Result<PathBuf> {
+    program_in(absolute_dirs(), command, checkout)
+        .ok_or_else(|| anyhow!("{command} is not on PATH outside the checkout"))
+}
+
+fn program_in(dirs: Vec<PathBuf>, command: &str, checkout: &Path) -> Option<PathBuf> {
+    let name = if cfg!(windows) {
+        format!("{command}.exe")
+    } else {
+        command.to_owned()
+    };
+    let checkout = fs::canonicalize(checkout).unwrap_or_else(|_| checkout.to_path_buf());
+    let outside = |path: &Path| fs::canonicalize(path).is_ok_and(|p| !p.starts_with(&checkout));
+    (dirs.into_iter())
+        .map(|dir| dir.join(&name))
+        .find(|candidate| executable(candidate) && outside(candidate))
+}
+
+fn executable(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        metadata.is_file()
+    }
+}
+
 /// `src` when the root has one, else the root itself.
 pub fn source_dir(root: &Path) -> &'static str {
     if root.join("src").is_dir() {
@@ -355,6 +406,36 @@ pub fn detect_language_with_options(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn programs_resolve_in_absolute_path_folders_outside_the_checkout() {
+        use std::os::unix::fs::PermissionsExt;
+        let elsewhere = TempDir::new("resolve-elsewhere").unwrap();
+        assert!(
+            resolve_program("sh", elsewhere.path())
+                .unwrap()
+                .is_absolute()
+        );
+        assert!(resolve_program("boundrail-no-such-program", elsewhere.path()).is_err());
+        let path = absolute_path();
+        assert!(std::env::split_paths(&path).all(|dir| dir.is_absolute()));
+
+        let checkout = TempDir::new("resolve-checkout").unwrap();
+        let (inside, outside) = (checkout.path().join("bin"), elsewhere.path().join("bin"));
+        for dir in [&inside, &outside] {
+            fs::create_dir(dir).unwrap();
+            fs::write(dir.join("tool"), "#!/bin/sh\n").unwrap();
+            fs::set_permissions(dir.join("tool"), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let found = program_in(
+            vec![inside.clone(), outside.clone()],
+            "tool",
+            checkout.path(),
+        );
+        assert_eq!(found, Some(outside.join("tool")));
+        assert_eq!(program_in(vec![inside], "tool", checkout.path()), None);
+    }
 
     #[test]
     fn a_tool_exiting_before_reading_its_input_reports_its_own_error() {

@@ -699,6 +699,7 @@ fn schemas_describe_the_vault_files() {
             "model-collection",
             "model-edit",
             "model-manifest",
+            "model-picture",
             "model-proposal",
             "model-release",
             "model-walkthrough",
@@ -6518,4 +6519,497 @@ fn walkthrough_edits_leave_a_draft_adoptable() {
     let (code, out) = adopt(&checkout, &id, &checkout.digest());
     assert_eq!(code, 0, "{out:#}");
     assert_eq!(out["kind"], "adopt");
+}
+
+/// Adds the picture Shop: the architecture with Billing in focus, drawn to `output`. Returns its
+/// qualified ID.
+fn add_picture(checkout: &Checkout, output: &str) -> String {
+    let out = checkout.edited(json!([{"type": "add-picture", "picture": {
+        "name": "Shop", "order": 0, "description": "The whole shop", "output": output,
+        "reading": {"view": "architecture", "focus": ["Billing"]}}}]));
+    out["allocated"][0]["id"].as_str().unwrap().to_owned()
+}
+
+/// `model` with `path` as PATH: exit code and stdout as JSON.
+fn run_on_path(checkout: &Checkout, path: &std::ffi::OsStr, args: &[&str]) -> (i32, Value) {
+    let out = Command::new(env!("CARGO_BIN_EXE_boundrail"))
+        .args(["--no-daemon", "model"])
+        .args(args)
+        .current_dir(checkout.path())
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let value = serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
+    (out.status.code().unwrap(), value)
+}
+
+/// The codes and subjects of the `PICTURE_` diagnostics of `model check --only embeds`, with its
+/// exit code.
+fn embeds(checkout: &Checkout) -> (i32, Vec<(String, Value)>) {
+    let (code, out) = checkout.run(&["check", "--only", "embeds"]);
+    let found = (out["diagnostics"].as_array().unwrap().iter())
+        .map(|d| {
+            (
+                d["code"].as_str().unwrap().to_owned(),
+                d["subjects"].clone(),
+            )
+        })
+        .collect();
+    (code, found)
+}
+
+#[test]
+fn an_svg_picture_is_written_checked_and_goes_stale_after_an_edit() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let id = add_picture(&checkout, "docs/shop.svg");
+    let read = checkout.ok(&["read", "--picture", "Shop"]);
+    assert_eq!(read["kind"], "read-picture");
+    let entry = json!({"id": id, "name": "Shop", "order": 0, "description": "The whole shop",
+        "output": "docs/shop.svg", "reading": {"view": "architecture", "focus": [format!("{model}#Billing1")]}});
+    assert_eq!(read["picture"], entry);
+    assert_eq!(checkout.ok(&["read", local(&id)])["picture"], entry);
+    assert_eq!(checkout.ok(&["read"])["pictures"], json!([entry]));
+    let (_, text) = checkout.run_raw(&["read", "--picture", &id, "--format", "markdown"]);
+    assert_eq!(
+        text,
+        format!(
+            "Picture Shop {id}\nThe whole shop\nWrites: docs/shop.svg\n\
+             Shows: architecture in the current state, focus on Billing\n"
+        )
+    );
+    let path = format!("pictures/{}.picture.json", local(&id));
+    let file: Value =
+        serde_json::from_str(&fs::read_to_string(checkout.vault().join(&path)).unwrap()).unwrap();
+    let (_, schema) = checkout.run(&["schema", "model-picture"]);
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    assert!(validator.is_valid(&file));
+    let mut bad = file.clone();
+    bad["output"] = "docs/shop.gif".into();
+    assert!(!validator.is_valid(&bad));
+
+    let missing = json!([("PICTURE_MISSING", json!([id]))]);
+    let (code, found) = embeds(&checkout);
+    assert_eq!((code, json!(found)), (1, missing));
+    let listed = checkout.ok(&["pictures"]);
+    assert_eq!(listed["kind"], "pictures");
+    assert_eq!(
+        listed["pictures"],
+        json!([{"id": id, "name": "Shop", "output": "docs/shop.svg", "format": "svg",
+                "reading": entry["reading"], "status": "missing", "written": false}])
+    );
+
+    let revision = checkout.digest();
+    let written = checkout.ok(&["pictures", "--write"]);
+    assert_eq!(written["pictures"][0]["status"], "fresh");
+    assert_eq!(written["pictures"][0]["written"], true);
+    assert_eq!(
+        checkout.digest(),
+        revision,
+        "writing pictures leaves the vault alone"
+    );
+    let svg = fs::read_to_string(checkout.path().join("docs/shop.svg")).unwrap();
+    assert_eq!(svg, checkout.render(&["--picture", "Shop"]));
+    assert!(svg.contains("class=\"dimmed\""), "the focus dims the rest");
+    assert!(
+        svg.lines()
+            .next()
+            .unwrap()
+            .ends_with(" data-generator=\"boundrail\">")
+    );
+    assert_eq!(embeds(&checkout), (0, Vec::new()));
+    // A checkout that stores text with CRLF line endings keeps the picture fresh.
+    let crlf = svg.replace('\n', "\r\n");
+    fs::write(checkout.path().join("docs/shop.svg"), &crlf).unwrap();
+    assert_eq!(embeds(&checkout), (0, Vec::new()));
+    let again = checkout.ok(&["pictures", "--write"]);
+    assert_eq!(again["pictures"][0]["written"], false);
+
+    checkout.edited(
+        json!([{"type": "add-module", "module": {"name": "Audit", "kind": "service", "order": 2}}]),
+    );
+    let stale = json!([("PICTURE_STALE", json!([id]))]);
+    let (code, found) = embeds(&checkout);
+    assert_eq!((code, json!(found)), (1, stale));
+    let (_, text) = checkout.run_raw(&["check", "--only", "embeds", "--format", "markdown"]);
+    assert!(
+        text.contains("PICTURE_STALE Shop: docs/shop.svg does not match the model"),
+        "{text}"
+    );
+    let (_, text) = checkout.run_raw(&["pictures", "--format", "markdown"]);
+    assert_eq!(text, format!("- Shop {id}: docs/shop.svg stale\n"));
+    checkout.ok(&["pictures", "--write", "--only", "Shop"]);
+    assert_eq!(embeds(&checkout), (0, Vec::new()));
+    checkout.refused(&["pictures", "--only", "Nothing"], "SUBJECT_NOT_FOUND");
+    checkout.refused(
+        &["render", "--picture", "Shop", "--view", "sequence"],
+        "REQUEST_INVALID",
+    );
+
+    fs::remove_file(checkout.path().join("docs/shop.svg")).unwrap();
+    let (code, found) = embeds(&checkout);
+    assert_eq!((code, found[0].0.as_str()), (1, "PICTURE_MISSING"));
+}
+
+#[test]
+fn removing_a_module_a_picture_reads_refuses() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let id = add_picture(&checkout, "docs/shop.svg");
+    // A claim on the picture holds it.
+    let claim = checkout.claim("alice", json!([id]));
+    let edit = json!([{"type": "edit-picture", "subject": "Shop", "set": {"name": "Store"}}]);
+    let request = checkout.request_by("bob", None, edit);
+    checkout.edit_refused(&request, "CLAIM_CONFLICT");
+    assert_eq!(checkout.release(&claim, "alice").0, 0);
+    let error = checkout.edit_refused(
+        &checkout.request(json!([{"type": "remove-module", "subject": "Billing"}])),
+        "REFERENCED_BY_PICTURE",
+    );
+    assert_eq!(error["details"]["pictures"], json!([id]));
+    assert_eq!(error["details"]["change"], 0);
+    checkout.edited(json!([
+        {"type": "edit-picture", "subject": "Shop", "clear": ["focus"]},
+        {"type": "remove-module", "subject": "Billing"},
+    ]));
+
+    // Proposals hold no pictures.
+    let proposal = propose(&checkout, "Next", "current");
+    let request = proposal_request(
+        &checkout,
+        &proposal,
+        "tester",
+        json!([{"type": "remove-picture", "subject": "Shop"}]),
+    );
+    let (code, out) = edit_proposal(&checkout, &proposal, &request);
+    assert_eq!(code, 2, "{out:#}");
+    assert_eq!(out["error"]["code"], "REQUEST_INVALID");
+}
+
+#[test]
+fn picture_outputs_stay_in_the_repository_outside_boundrail_and_git() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    for output in [
+        ".boundrail/shop.svg",
+        ".git/shop.svg",
+        "/tmp/shop.svg",
+        "../shop.svg",
+        "docs/../../shop.svg",
+        "docs/shop.jpg",
+    ] {
+        let request = checkout.request(json!([{"type": "add-picture", "picture": {
+            "name": "Shop", "order": 0, "output": output, "reading": {"view": "architecture"}}}]));
+        let error = checkout.edit_refused(&request, "MODEL_INVALID");
+        let problems = error["details"]["problems"].to_string();
+        assert!(problems.contains("output"), "{output}: {problems}");
+    }
+}
+
+#[test]
+fn a_picture_whose_state_is_gone_cannot_be_checked() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let proposal = propose(&checkout, "Next", "current");
+    let out = checkout.edited(json!([{"type": "add-picture", "picture": {
+        "name": "Plan", "order": 0, "output": "docs/plan.svg",
+        "reading": {"view": "architecture", "state": {"proposal": proposal}}}}]));
+    let id = out["allocated"][0]["id"].as_str().unwrap();
+    checkout.ok(&["pictures", "--write"]);
+    assert_eq!(embeds(&checkout), (0, Vec::new()));
+    fs::remove_dir_all(checkout.vault().join("proposals").join(&proposal)).unwrap();
+    let (code, out) = checkout.run(&["check", "--only", "embeds"]);
+    assert_eq!(code, 1, "{out:#}");
+    let diagnostics = out["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics.len(), 1, "{out:#}");
+    assert_eq!(diagnostics[0]["code"], "PICTURE_TARGET_MISSING");
+    assert_eq!(diagnostics[0]["severity"], "warning");
+    let message = diagnostics[0]["message"].as_str().unwrap();
+    assert!(
+        message.starts_with(&format!("Plan: proposal {model}#{proposal} does not load")),
+        "{message}"
+    );
+    assert_eq!(
+        out["skips"],
+        json!([{"subject": id, "site": "picture", "reason": "unrenderable"}])
+    );
+    let listed = checkout.ok(&["pictures"]);
+    assert_eq!(listed["pictures"][0]["reason"], "render-failed");
+    checkout.refused(
+        &["check", "--only", "embeds", "--proposal", &proposal],
+        "REQUEST_INVALID",
+    );
+}
+
+#[test]
+fn a_picture_whose_proposal_drops_its_focus_reports_a_missing_target() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let proposal = propose(&checkout, "Next", "current");
+    let out = checkout.edited(json!([{"type": "add-picture", "picture": {
+        "name": "Plan", "order": 0, "output": "docs/plan.svg",
+        "reading": {"view": "architecture", "state": {"proposal": proposal}, "focus": ["BankApi1"]}}}]));
+    let id = out["allocated"][0]["id"].as_str().unwrap().to_owned();
+    edited_proposal(
+        &checkout,
+        &proposal,
+        json!([{"type": "remove-module", "subject": "Bank"}]),
+    );
+    checkout.ok(&["pictures", "--write"]);
+    let (code, out) = checkout.run(&["check", "--only", "embeds"]);
+    assert_eq!(code, 1, "{out:#}");
+    assert_eq!(out["diagnostics"][0]["code"], "PICTURE_TARGET_MISSING");
+    assert_eq!(out["diagnostics"][0]["subjects"], json!([id]));
+    assert_eq!(
+        out["diagnostics"][0]["message"],
+        format!("Plan: focus {model}#BankApi1 is not a module of proposal {model}#{proposal}")
+    );
+}
+
+#[test]
+fn pictures_overwrite_only_files_boundrail_drew() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let favicon = "<svg xmlns=\"http://www.w3.org/2000/svg\"><circle r=\"4\"/></svg>\n";
+    fs::create_dir_all(checkout.path().join("public")).unwrap();
+    fs::write(checkout.path().join("public/favicon.svg"), favicon).unwrap();
+    add_picture(&checkout, "public/favicon.svg");
+    checkout.edited(json!([{"type": "add-picture", "picture": {
+        "name": "Plain", "order": 1, "output": "docs/plain.svg", "reading": {"view": "architecture"}}}]));
+    let (code, out) = checkout.run(&["pictures", "--write"]);
+    assert_eq!(code, 1, "a blocked picture fails the write: {out:#}");
+    let blocked = &out["pictures"][0];
+    assert_eq!(blocked["reason"], "output-blocked", "{out:#}");
+    let message = blocked["message"].as_str().unwrap();
+    assert!(
+        message.contains("was not drawn by Boundrail; delete it to draw it here"),
+        "{message}"
+    );
+    assert_eq!(
+        fs::read_to_string(checkout.path().join("public/favicon.svg")).unwrap(),
+        favicon
+    );
+    // The missing file was written anyway.
+    assert_eq!(out["pictures"][1]["written"], true);
+    let (code, found) = embeds(&checkout);
+    assert_eq!((code, found[0].0.as_str()), (1, "PICTURE_UNRENDERABLE"));
+
+    // A picture Boundrail drew is redrawn over.
+    checkout.edited(
+        json!([{"type": "add-module", "module": {"name": "Audit", "kind": "service", "order": 2}}]),
+    );
+    let before = fs::read_to_string(checkout.path().join("docs/plain.svg")).unwrap();
+    let out = checkout.ok(&["pictures", "--write", "--only", "Plain"]);
+    assert_eq!(out["pictures"][0]["written"], true);
+    assert_ne!(
+        fs::read_to_string(checkout.path().join("docs/plain.svg")).unwrap(),
+        before
+    );
+}
+
+/// A valid 1x1 grayscale PNG, as a rasterizer would write one.
+fn tiny_png() -> Vec<u8> {
+    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut chunk = |kind: &[u8], data: &[u8]| {
+        out.extend(u32::try_from(data.len()).unwrap().to_be_bytes());
+        out.extend(kind);
+        out.extend(data);
+        let crc = boundrail::arch::picture::crc32(&[kind, data]);
+        out.extend(crc.to_be_bytes());
+    };
+    chunk(b"IHDR", &[0, 0, 0, 1, 0, 0, 0, 1, 8, 0, 0, 0, 0]);
+    chunk(
+        b"IDAT",
+        &[0x78, 0x01, 0x63, 0x60, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01],
+    );
+    chunk(b"IEND", &[]);
+    out
+}
+
+/// A folder holding a fake `resvg` that writes `tiny_png` to its second argument once its first,
+/// the SVG, exists; and PATH with that folder first.
+#[cfg(unix)]
+fn fake_rasterizer() -> (TempDir, std::ffi::OsString) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new("fake-resvg").unwrap();
+    let png = dir.path().join("tiny.png");
+    fs::write(&png, tiny_png()).unwrap();
+    let script = dir.path().join("resvg");
+    let body = format!(
+        "#!/bin/sh\ntest -s \"$1\" || exit 3\ncat '{}' > \"$2\"\n",
+        png.display()
+    );
+    fs::write(&script, body).unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let dirs = std::iter::once(dir.path().to_path_buf()).chain(std::env::split_paths(&path));
+    let path = std::env::join_paths(dirs).unwrap();
+    (dir, path)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_png_picture_carries_the_digest_of_the_svg_it_was_drawn_from() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let id = add_picture(&checkout, "docs/shop.png");
+    let (_bin, path) = fake_rasterizer();
+    let (code, out) = run_on_path(&checkout, &path, &["pictures", "--write"]);
+    assert_eq!(code, 0, "{out:#}");
+    assert_eq!(out["pictures"][0]["format"], "png");
+    assert_eq!(out["pictures"][0]["status"], "fresh", "{out:#}");
+    assert_eq!(out["pictures"][0]["written"], true);
+    let png = fs::read(checkout.path().join("docs/shop.png")).unwrap();
+    assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+    let svg = checkout.render(&["--picture", "Shop"]);
+    assert_eq!(
+        boundrail::arch::picture::source(&png),
+        Some(sha256(svg.as_bytes()))
+    );
+    // Checking reads the digest; it needs no rasterizer.
+    assert_eq!(embeds(&checkout), (0, Vec::new()));
+    checkout.edited(
+        json!([{"type": "add-module", "module": {"name": "Audit", "kind": "service", "order": 2}}]),
+    );
+    let (code, found) = embeds(&checkout);
+    assert_eq!(
+        (code, json!(found)),
+        (1, json!([("PICTURE_STALE", json!([id]))]))
+    );
+    let (code, out) = run_on_path(&checkout, &path, &["pictures", "--write"]);
+    assert_eq!((code, &out["pictures"][0]["written"]), (0, &json!(true)));
+    assert_eq!(embeds(&checkout), (0, Vec::new()));
+    // A PNG without the chunk was not drawn by Boundrail: it is never overwritten.
+    fs::write(checkout.path().join("docs/shop.png"), tiny_png()).unwrap();
+    assert_eq!(embeds(&checkout).1[0].0, "PICTURE_UNRENDERABLE");
+    let (code, out) = run_on_path(&checkout, &path, &["pictures", "--write"]);
+    assert_eq!(
+        (code, &out["pictures"][0]["reason"]),
+        (1, &json!("output-blocked"))
+    );
+    assert_eq!(
+        fs::read(checkout.path().join("docs/shop.png")).unwrap(),
+        tiny_png()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn without_a_rasterizer_png_pictures_are_unrenderable_and_svgs_still_written() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    add_picture(&checkout, "docs/shop.png");
+    checkout.edited(json!([{"type": "add-picture", "picture": {
+        "name": "Plain", "order": 1, "output": "docs/plain.svg", "reading": {"view": "architecture"}}}]));
+    // PATH holds Git alone.
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let git = (std::env::split_paths(&path))
+        .map(|dir| dir.join("git"))
+        .find(|candidate| candidate.is_file())
+        .unwrap();
+    let bin = TempDir::new("git-only").unwrap();
+    std::os::unix::fs::symlink(git, bin.path().join("git")).unwrap();
+    let only_git = bin.path().as_os_str();
+
+    let (code, out) = run_on_path(&checkout, only_git, &["pictures", "--write"]);
+    assert_eq!(code, 1, "an unrenderable picture fails the write: {out:#}");
+    let png = &out["pictures"][0];
+    assert_eq!(png["status"], "unrenderable", "{out:#}");
+    assert_eq!(png["reason"], "no-rasterizer");
+    assert!(
+        png["message"]
+            .as_str()
+            .unwrap()
+            .contains("resvg, rsvg-convert, magick"),
+        "{png}"
+    );
+    assert_eq!(out["pictures"][1]["status"], "fresh");
+    assert_eq!(out["pictures"][1]["written"], true);
+    assert!(checkout.path().join("docs/plain.svg").is_file());
+    assert!(!checkout.path().join("docs/shop.png").exists());
+    // The check needs no rasterizer: the PNG is missing, not unrenderable.
+    let (code, out) = run_on_path(&checkout, only_git, &["check", "--only", "embeds"]);
+    assert_eq!(code, 1, "{out:#}");
+    assert_eq!(out["diagnostics"][0]["code"], "PICTURE_MISSING");
+}
+
+#[cfg(unix)]
+#[test]
+fn pictures_never_write_through_a_linked_folder() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let elsewhere = TempDir::new("picture-elsewhere").unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), checkout.path().join("docs")).unwrap();
+    add_picture(&checkout, "docs/shop.svg");
+    let (code, out) = checkout.run(&["pictures", "--write"]);
+    assert_eq!(code, 1, "{out:#}");
+    assert_eq!(out["pictures"][0]["status"], "unrenderable");
+    assert_eq!(out["pictures"][0]["reason"], "output-blocked");
+    assert_eq!(fs::read_dir(elsewhere.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn view_lists_pictures_and_draws_one_with_its_focus() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let id = add_picture(&checkout, "docs/shop.svg");
+    let view = View::start(&checkout);
+    let t = &view.token;
+    let (status, listed) = view.get(&format!("/api/pictures?t={t}"));
+    assert_eq!(status, 200, "{listed}");
+    let listed: Value = serde_json::from_str(View::body(&listed)).unwrap();
+    // Without `status` the recipes alone come back, nothing drawn.
+    assert_eq!(listed["pictures"], checkout.ok(&["read"])["pictures"]);
+    let (status, checked) = view.get(&format!("/api/pictures?t={t}&status=1"));
+    assert_eq!(status, 200, "{checked}");
+    let checked: Value = serde_json::from_str(View::body(&checked)).unwrap();
+    assert_eq!(checked, checkout.ok(&["pictures"]));
+    assert_eq!(view.get("/api/pictures").0, 403);
+    let (status, svg) = view.get(&format!(
+        "/api/render?t={t}&picture={}",
+        id.replace('#', "%23")
+    ));
+    assert_eq!(status, 200, "{svg}");
+    let bank = format!("<g class=\"module\" data-id=\"{model}#BankApi1\">");
+    assert!(
+        View::body(&svg).contains(&format!("<g class=\"dimmed\" opacity=\"0.3\">\n{bank}")),
+        "{svg}"
+    );
+    let (_, page) = view.get("/");
+    assert!(page.contains("id=\"pictures\""));
+    let (_, script) = view.get("/app.js");
+    for control in [
+        "api('pictures')",
+        "api('pictures', { status: 1 })",
+        "showPicture",
+        "{ picture: id }",
+    ] {
+        assert!(script.contains(control), "{control}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_write_blocks_only_its_own_picture() {
+    use std::os::unix::fs::PermissionsExt;
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let locked = checkout.path().join("locked");
+    fs::create_dir(&locked).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+    add_picture(&checkout, "locked/shop.svg");
+    checkout.edited(json!([{"type": "add-picture", "picture": {
+        "name": "Plain", "order": 1, "output": "docs/plain.svg", "reading": {"view": "architecture"}}}]));
+    let (code, out) = checkout.run(&["pictures", "--write"]);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(code, 1, "{out:#}");
+    assert_eq!(out["pictures"][0]["reason"], "output-blocked", "{out:#}");
+    assert!(
+        out["pictures"][0]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("writing locked/shop.svg")
+    );
+    assert_eq!(out["pictures"][1]["written"], true);
 }

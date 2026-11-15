@@ -46,7 +46,7 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 | T12 | Infrastructure evidence: docker-compose, Kubernetes, Terraform bindings and configured-address hops between modules | done |
 | T13 | Language-server evidence: call-level references through configured language servers | done |
 | T14 | Walkthroughs: ordered beats over readings, playback in the browser | done |
-| T15 | Embedded pictures: render recipes in SVG/PNG, `check embeds`, PNG rasterize | open |
+| T15 | Embedded pictures: render recipes in SVG/PNG, `check embeds`, PNG rasterize | done |
 | T16 | Agent integration: `init`, skills for authoring/planning/PRs, CI action with PR annotations and footprint comment | open |
 | T17 | Reconcile drafts after current changes, export/import bundles, history publication | open |
 | T18 | Remove scan-era code that the model does not use | open |
@@ -471,8 +471,9 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   `initialization_options`), an entry naming a server neither allowlisted nor defined by the
   user (the refusal names the allowlist and the user's config path), or a user command that is
   empty or a relative path refuses `REQUEST_INVALID` before any server starts. A program name is
-  looked up in the absolute folders of `PATH` only and must be an executable file, and the
-  server's own `PATH` holds only those folders, so neither Boundrail nor the server (an `env
+  looked up in the absolute folders of `PATH` only (`collect::resolve_program`) and must be an
+  executable file that, once links are resolved, lies outside the checkout; the server's own
+  `PATH` holds only the absolute folders, so neither Boundrail nor the server (an `env
   node` launcher, say) finds a program a relative entry would reach in the checkout. `boundrail:
   starting language server <name>: <program> <args>` goes to stderr before it starts, with the
   resolved program path and shell-quoted arguments. It runs in the checkout root. This is the
@@ -611,3 +612,81 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   change made by hand drops the beat from the pane. `#walkthrough=<id>&beat=<n>` opens a beat
   and follows the playback; a live update reads the walkthrough again and stays on the same beat
   number. `/api/walkthrough?id=` is `model read --walkthrough`.
+- T15: a picture is `pictures/<id>.picture.json` (schema `model-picture`): `{schema_version, id,
+  name, order, description?, output, reading}`, the reading a walkthrough beat's, validated the
+  same way (render rules, newer state in `state`, current-state references must exist). `output`
+  is a repository path (`is_repo_path`, no empty or `.` segment) ending in `.svg` or `.png`
+  (lowercase), not below `.boundrail` and with no `.git` segment, compared as Windows resolves
+  names (any case, trailing dots and spaces dropped, `git~1` naming `.git`); no two pictures share
+  an output, compared without case. Pictures belong to the current state as walkthroughs do: its revision,
+  `file_digests`, the journal's write allow-list, checkpoints and committed reads cover them,
+  proposal loads never read a `pictures` folder, a proposal edit with a picture change refuses
+  `REQUEST_INVALID`, and a proposal's predecessor digest leaves `pictures/` out. Picture IDs come
+  from the model-wide allocator and are retired on removal. Edits: `add-picture`, `edit-picture`
+  (set name, order, description, output and any reading field; clear description and the reading
+  fields as `edit-beat` does), `remove-picture`, which leaves the drawn file in place. A picture
+  resolves by ID or unique name. Removing a module or flow a current-state picture the batch did
+  not edit reads refuses `REFERENCED_BY_PICTURE` with `details.pictures`, after
+  `REFERENCED_BY_WALKTHROUGH`. A claim on a picture holds it; adding or removing one touches the
+  model ID. Adoption checks the adopted state with the current pictures, as with walkthroughs.
+- T15: `model pictures [--write] [--only <id|name>]` lists each picture in order with `id`,
+  `name`, `output`, `format` (`svg`|`png`), `reading`, `status` (`fresh`, `stale`, `missing`,
+  `unrenderable`), `reason` and `message` when unrenderable, and `written`. Reasons:
+  `render-failed` (the reading's proposal or checkpoint does not load, or the render refuses),
+  `output-blocked` (a symbolic link or non-folder on the way, an output that is not a regular
+  file or fails the output rules, a file Boundrail did not draw, or a failed write), and with
+  `--write` only `no-rasterizer` (naming the tools tried) and `rasterizer-failed`. `--write`
+  draws every stale or missing picture and leaves fresh ones untouched; one picture's failure
+  never stops the others, and the command exits 1 when any picture is still unrenderable
+  afterwards (0 otherwise, and always 0 without `--write`). It writes only the declared output
+  files, never the vault, so it takes no revision, operation ID or journal: each file is replaced
+  through a temporary file and a rename, missing folders are created one at a time inside the
+  checkout, and no symbolic link is followed or written through. Boundrail overwrites only a file
+  it drew: an SVG whose root element carries `data-generator="boundrail"`, which every render
+  now has, or a PNG with its source chunk. Any other existing file blocks the picture (`exists and
+  was not drawn by Boundrail; delete it to draw it here`); a missing file is always written. `model
+  render --picture <id>` draws a picture's reading with its focus through the beat path, refusing
+  any other flag that says what to draw; `model read` lists pictures, and `model read --picture
+  <id>` (or `model read <picture ID>`) prints one with qualified IDs, or in Markdown its file and a
+  `Shows:` line.
+- T15: freshness. An SVG is fresh when the file's bytes equal the deterministic render, or do once
+  CRLF line endings become LF, as a checkout may store text. A PNG carries a `tEXt` chunk
+  `boundrail-source` right after `IHDR` whose text is the SHA-256 (lowercase hex) of the SVG it
+  was rasterized from; Boundrail inserts it after rasterizing, replacing any it held and copying
+  the other chunks byte for byte, with chunk parsing and CRC-32 written by hand
+  (`src/arch/picture.rs`). A check reads the first 4096 bytes of a PNG and walks its chunks from
+  `IHDR` to the source chunk, stopping at `IDAT`. A PNG is fresh when that chunk names the digest
+  of the SVG the picture draws now, and stale when it names another; a PNG without it, or whose
+  chunk fails its CRC, was not drawn by Boundrail. Checking never rasterizes, so rasterizer output
+  may differ between machines and versions without making a picture stale.
+- T15: rasterizing. Boundrail picks the rasterizer, never the repository: the first of
+  `RASTERIZERS` in `src/arch/picture.rs`, `resvg` (`in.svg out.png`), `rsvg-convert` (`-o out.png
+  in.svg`) and `magick` (`in.svg out.png`), found by bare name as an executable file in the
+  absolute folders of `PATH` and lying outside the checkout once links are resolved, the
+  language servers' lookup (`collect::resolve_program`). It runs with `PATH` holding only the
+  absolute folders, in a private temporary folder (mode 0700) holding only the SVG, under the tool
+  timeout. The SVG is Boundrail's own render; the repository supplies only the model text it
+  draws.
+- T15: `model check` gains an embeds part, `--only embeds`, run only when the current state has
+  pictures, so models without pictures see no change; with `--proposal` it refuses
+  `REQUEST_INVALID`, since pictures belong to the current state. `PICTURE_TARGET_MISSING`
+  (warning) comes from the walkthrough target check, fed the picture readings: the proposal or
+  checkpoint does not load, or lacks the scope, focus or flow; a render failing for another
+  reason reports it too. `PICTURE_STALE`, `PICTURE_MISSING` and `PICTURE_UNRENDERABLE` (an
+  `output-blocked` file) are warnings. A picture whose freshness is unknown adds a skip
+  `{subject: <picture>, site: "picture", reason: "unrenderable"}`, so `skips` appears when the
+  code check ran or a picture could not be checked. A missing rasterizer never reaches the check.
+  Each proposal or checkpoint a beat or picture reads loads once per run (`semantic::States`),
+  shared by the target check and every picture drawn, and the current state loads once.
+- T15: the browser lists the recipes in the sidebar from `/api/pictures`, which without
+  `status=1` lists them as `model read` does and draws nothing; with it, it is `model pictures`.
+  The page asks for statuses only through the section's `Check files` button, so reloads never
+  draw every picture, and drops them on each reload. Clicking a picture applies its reading to
+  the active pane and draws it through `/api/render?picture=`, the beat path, so the server
+  applies the focus; after a reload a pane showing a picture follows its recipe, or keeps what it
+  shows once the picture is gone.
+- T15: limits. ponytail: every check and listing renders each picture once; cache renders per
+  reading if checks over many pictures get slow. Output folders are checked, then used, not
+  opened relative to a folder handle, so a link swapped in between is followed; open each
+  segment without following links if outputs land where others write. No test runs a real
+  rasterizer (none was installed here); a fake `resvg` script stands in.

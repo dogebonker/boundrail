@@ -8,7 +8,7 @@ use serde_json::json;
 use super::{Model, Problems, check_file, check_name, check_text};
 use crate::arch::types::{
     BRANCHES_MIN, Collection, DESCRIPTION_MAX, FLOW_STEPS_MAX, Flow, LABEL_MAX, Module,
-    NESTING_MAX, REPEAT_MIN, SUMMARY_MAX, Step, Walkthrough, walk,
+    NESTING_MAX, Picture, REPEAT_MIN, SUMMARY_MAX, Step, Walkthrough, walk,
 };
 use crate::arch::{Code, Refusal, ids, one_line};
 
@@ -305,11 +305,12 @@ pub struct FlowView<'a> {
     pub steps: Vec<Step>,
 }
 
-/// A collection, a flow with the collection holding it, or a walkthrough.
+/// A collection, a flow with the collection holding it, a walkthrough or a picture.
 pub enum Found<'a> {
     Collection(&'a Collection),
     Flow(&'a Collection, &'a Flow),
     Walkthrough(&'a Walkthrough),
+    Picture(&'a Picture),
 }
 
 impl Model {
@@ -356,13 +357,19 @@ impl Model {
         }
     }
 
-    /// The collection, flow or walkthrough whose qualified or local ID is `subject`.
+    /// The collection, flow, walkthrough or picture whose qualified or local ID is `subject`.
     pub fn find_grouping(&self, subject: &str) -> Option<Found<'_>> {
         let local = ids::local(&self.manifest.id, subject);
         let walkthrough = || {
             (self.walkthroughs.iter())
                 .find(|w| w.id == local)
                 .map(Found::Walkthrough)
+                .or_else(|| {
+                    self.pictures
+                        .iter()
+                        .find(|p| p.id == local)
+                        .map(Found::Picture)
+                })
         };
         self.collections
             .iter()
@@ -459,6 +466,7 @@ mod tests {
             None,
             &modules(),
             &[collection],
+            &[],
             &[],
         )
         .into_iter()
@@ -567,6 +575,7 @@ mod tests {
             None,
             &modules(),
             &[collection],
+            &[],
             &[],
         )
         .into_iter()

@@ -50,6 +50,8 @@ pub enum SkipReason {
     LanguageServersNotEnabled,
     /// The language server failed; the check went without it.
     LanguageServerFailed,
+    /// The picture could not be drawn or its file read, so its freshness is unknown.
+    Unrenderable,
 }
 
 impl SkipReason {
@@ -69,12 +71,13 @@ impl SkipReason {
             Self::InfraUnbound => "infra-unbound",
             Self::LanguageServersNotEnabled => "language-servers-not-enabled",
             Self::LanguageServerFailed => "language-server-failed",
+            Self::Unrenderable => "unrenderable",
         }
     }
 }
 
-/// What a skip concerns: a module's binding, a relationship's anchor, the relationship, or a
-/// language server (its name, or the config file).
+/// What a skip concerns: a module's binding, a relationship's anchor, the relationship, a
+/// language server (its name, or the config file), or a picture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SkipSite {
@@ -82,6 +85,7 @@ pub enum SkipSite {
     Anchor,
     Relationship,
     LanguageServer,
+    Picture,
 }
 
 impl SkipSite {
@@ -91,13 +95,14 @@ impl SkipSite {
             Self::Anchor => "anchor",
             Self::Relationship => "relationship",
             Self::LanguageServer => "language-server",
+            Self::Picture => "picture",
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct Skip {
-    /// Qualified ID of the module or relationship.
+    /// Qualified ID of the module, relationship or picture, or a language server's name.
     pub subject: String,
     pub site: SkipSite,
     pub reason: SkipReason,

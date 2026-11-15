@@ -6,15 +6,18 @@
 //! running code, so neither widens what a repository can do. The third exception is outside Git:
 //! language servers, which run only when `model check` or `model inspect` gets
 //! `--language-servers`. The committed `.boundrail/language-servers.json` only names them: an
-//! allowlisted server runs its own name, found in an absolute `PATH` folder, with fixed
-//! arguments, and any other program, argument or initialization option comes from the user's
-//! config outside the checkout. Each command line is printed to stderr before it starts, and
+//! allowlisted server runs its own name, found in an absolute `PATH` folder outside the checkout,
+//! with fixed arguments, and any other program, argument or initialization option comes from the
+//! user's config outside the checkout. Each command line is printed to stderr before it starts, and
 //! the server sees only the absolute folders of `PATH`. A server still runs code from the
 //! checkout it opens: the TypeScript server runs the workspace's `tsserver.js` under
 //! `node_modules` and its `tsconfig.json` plugins, rust-analyzer runs build scripts and proc
 //! macros and reads a committed `rust-analyzer.toml`, and jdtls runs Gradle and Maven imports.
 //! So `--language-servers` is a per-run opt-in for trusted checkouts only, never for untrusted
-//! pull request heads in CI.
+//! pull request heads in CI. The rasterizers `model pictures --write` runs for PNG pictures are no
+//! exception: Boundrail picks them from a fixed list (`resvg`, `rsvg-convert`, `magick`), finds
+//! them in absolute `PATH` folders outside the checkout, and runs them in a private temporary
+//! folder holding only the SVG it drew; the repository names none of them.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

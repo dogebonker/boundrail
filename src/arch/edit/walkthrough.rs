@@ -104,7 +104,7 @@ impl WalkthroughField {
 }
 
 impl BeatField {
-    fn is_set(self, set: &BeatSet) -> bool {
+    pub(super) fn is_set(self, set: &BeatSet) -> bool {
         match self {
             Self::State => set.state.is_some(),
             Self::Against => set.against.is_some(),
@@ -123,9 +123,20 @@ impl Batch<'_> {
         index: usize,
         change: impl FnOnce(&mut Self) -> Result<()>,
     ) -> Result<()> {
+        self.apply_current(index, "walkthroughs", change)
+    }
+
+    /// Applies `change` to what only the current state holds, `what`, refusing it in a proposal.
+    pub(super) fn apply_current(
+        &mut self,
+        index: usize,
+        what: &str,
+        change: impl FnOnce(&mut Self) -> Result<()>,
+    ) -> Result<()> {
         if self.in_proposal {
-            let message = "walkthroughs belong to the current state; edit them without --proposal";
-            return Err(request_invalid(index, message.to_owned()));
+            let message =
+                format!("{what} belong to the current state; edit them without --proposal");
+            return Err(request_invalid(index, message));
         }
         change(self)
     }
@@ -192,7 +203,7 @@ impl Batch<'_> {
         Ok(out)
     }
 
-    fn build_reading(&self, index: usize, new: NewReading) -> Result<BeatReading> {
+    pub(super) fn build_reading(&self, index: usize, new: NewReading) -> Result<BeatReading> {
         let state = self.reading_state(new.state);
         let current = state.is_current();
         let module = |s: String| self.reading_module(index, current, &s);
@@ -349,7 +360,7 @@ impl Batch<'_> {
 
     /// Sets and clears the reading's fields. References already stored are kept as they are, so a
     /// reference the batch broke in an edited beat fails validation, naming this change.
-    fn apply_reading(
+    pub(super) fn apply_reading(
         &self,
         index: usize,
         reading: &mut BeatReading,
@@ -398,16 +409,34 @@ impl Batch<'_> {
     /// removed. Stored references held before the batch, so whatever no longer holds, it broke.
     /// A beat the batch edited is judged by validation instead.
     pub(super) fn refuse_walkthrough_references(&self) -> Result<()> {
-        if self.walkthroughs.is_empty() {
+        let beats = self.walkthroughs.iter().flat_map(|w| &w.beats);
+        let readings = beats.map(|b| (b.id.as_str(), &b.reading));
+        let refused = Refused {
+            code: Code::ReferencedByWalkthrough,
+            what: "walkthrough beat(s)",
+            key: "beats",
+        };
+        self.refuse_reading_references(readings, &refused)
+    }
+
+    /// Refuses `refused.code` when a current-state reading among `readings` (by the local ID of
+    /// what holds it) that the batch did not edit names a module or flow the batch removed,
+    /// listing the holders in `details[refused.key]`.
+    pub(super) fn refuse_reading_references<'r>(
+        &self,
+        readings: impl Iterator<Item = (&'r str, &'r BeatReading)>,
+        refused: &Refused,
+    ) -> Result<()> {
+        let mut readings = readings.peekable();
+        if readings.peek().is_none() {
             return Ok(());
         }
         let model = self.model;
         let (modules, flows) = vault::reading_ids(model, &self.modules, &self.collections);
         let mut causes: BTreeSet<usize> = BTreeSet::new();
-        let mut beats = Vec::new();
-        for beat in self.walkthroughs.iter().flat_map(|w| &w.beats) {
-            let reading = &beat.reading;
-            if !reading.state.is_current() || self.edited.contains(&beat.id) {
+        let mut holders = Vec::new();
+        for (id, reading) in readings {
+            if !reading.state.is_current() || self.edited.contains(id) {
                 continue;
             }
             let named = reading.scope.iter().chain(&reading.focus);
@@ -419,19 +448,20 @@ impl Batch<'_> {
             }
             let cause = |s: &&String| self.touched.get(ids::local(model, s)).copied();
             causes.extend(broken.iter().filter_map(cause));
-            beats.push(ids::qualify(model, &beat.id));
+            holders.push(ids::qualify(model, id));
         }
-        if beats.is_empty() {
+        if holders.is_empty() {
             return Ok(());
         }
         let refusal = Refusal::new(
-            Code::ReferencedByWalkthrough,
+            refused.code,
             format!(
-                "{} walkthrough beat(s) read modules or flows the batch removes; edit or remove them in the same batch",
-                beats.len()
+                "{} {} read modules or flows the batch removes; edit or remove them in the same batch",
+                holders.len(),
+                refused.what,
             ),
         )
-        .with_details(json!({ "beats": beats }));
+        .with_details(json!({ refused.key: holders }));
         Err(match causes.into_iter().collect::<Vec<_>>().as_slice() {
             [index] => at(*index)(refusal),
             _ => refusal,
@@ -440,21 +470,56 @@ impl Batch<'_> {
     }
 }
 
-/// Adds to `diff` what the batch changed in the walkthroughs: files to write and remove,
-/// walkthrough subjects and retired IDs. It adds to `touched` the subjects a claim must cover: a
-/// walkthrough that changes, its beats included, the root level when one comes or goes, and every
-/// walkthrough whose name an added or renamed one takes.
-pub(super) fn diff_walkthroughs<'a>(
-    model: &'a Model,
-    new: &'a [Walkthrough],
-    diff: &mut Diff<'a>,
+/// How `refuse_reading_references` refuses: its code, what the count counts, and the details key
+/// listing them.
+pub(super) struct Refused {
+    pub(super) code: Code,
+    pub(super) what: &'static str,
+    pub(super) key: &'static str,
+}
+
+/// What the batch diff needs of the files only the current state holds: walkthroughs and
+/// pictures.
+pub(super) trait CurrentOnly: PartialEq {
+    fn id(&self) -> &str;
+    fn name(&self) -> &str;
+    /// Its own ID and those of the items inside it.
+    fn ids(&self) -> Vec<&str>;
+    /// Its vault-relative file.
+    fn file(id: &str) -> String;
+}
+
+impl CurrentOnly for Walkthrough {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn ids(&self) -> Vec<&str> {
+        Walkthrough::ids(self).collect()
+    }
+    fn file(id: &str) -> String {
+        vault::walkthrough_file(id)
+    }
+}
+
+/// Adds to `diff` what the batch changed from `old` to `new`, walkthroughs or pictures: files to
+/// remove, subjects and retired IDs, and returns the files to write. It adds to `touched` the
+/// subjects a claim must cover: one that changes, what is inside it included, the root level when
+/// one comes or goes, and every one whose name an added or renamed one takes.
+pub(super) fn diff_current_only<'a, T: CurrentOnly>(
+    model: &Model,
+    old: &'a [T],
+    new: &'a [T],
+    diff: &mut Diff<'_>,
     touched: &mut Vec<Option<String>>,
-) {
-    let by_id = |list: &'a [Walkthrough]| -> BTreeMap<&'a str, &'a Walkthrough> {
-        list.iter().map(|w| (w.id.as_str(), w)).collect()
-    };
-    let (old, now) = (by_id(&model.walkthroughs), by_id(new));
-    let live: BTreeSet<&str> = new.iter().flat_map(Walkthrough::ids).collect();
+) -> Vec<&'a T> {
+    let by_id =
+        |list: &'a [T]| -> BTreeMap<&'a str, &'a T> { list.iter().map(|w| (w.id(), w)).collect() };
+    let (old, now) = (by_id(old), by_id(new));
+    let live: BTreeSet<&str> = new.iter().flat_map(T::ids).collect();
+    let mut write = Vec::new();
     for id in old.keys().chain(now.keys()).collect::<BTreeSet<_>>() {
         let (before, after) = (old.get(id), now.get(id));
         if before == after {
@@ -468,23 +533,24 @@ pub(super) fn diff_walkthroughs<'a>(
         }
         touched.push(Some(subject));
         match (before, after) {
-            (_, Some(after)) => diff.write_walkthroughs.push(after),
-            (Some(_), None) => diff.remove.push(vault::walkthrough_file(id)),
+            (_, Some(after)) => write.push(*after),
+            (Some(_), None) => diff.remove.push(T::file(id)),
             (None, None) => {}
         }
         if before.is_none() || after.is_none() {
             touched.push(None);
         }
         if let Some(gone) = before {
-            diff.retired
-                .extend(gone.ids().filter(|i| !live.contains(i)).map(str::to_owned));
+            let retired = gone.ids().into_iter().filter(|i| !live.contains(i));
+            diff.retired.extend(retired.map(str::to_owned));
         }
-        // A name an added or renamed walkthrough takes would stop naming another alone.
-        if let Some(named) = after.filter(|a| before.is_none_or(|b| b.name != a.name)) {
-            let same = old.values().filter(|w| w.name == named.name);
-            touched.extend(same.map(|w| Some(model.qualify(&w.id))));
+        // A name an added or renamed one takes would stop naming another alone.
+        if let Some(named) = after.filter(|a| before.is_none_or(|b| b.name() != a.name())) {
+            let same = old.values().filter(|w| w.name() == named.name());
+            touched.extend(same.map(|w| Some(model.qualify(w.id()))));
         }
     }
+    write
 }
 
 #[cfg(test)]
@@ -544,6 +610,7 @@ mod tests {
             modules: vec![module("WebApp01", "Web"), module("ApiSrv01", "Api")],
             collections,
             walkthroughs,
+            pictures: Vec::new(),
             revision: revision::of(std::iter::empty()),
             proposal: None,
         }

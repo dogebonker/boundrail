@@ -6,8 +6,8 @@ use std::collections::BTreeSet;
 
 use serde::Serialize;
 
+use super::{CURRENT_ONLY, revision};
 use super::{Contents, Model, Problems, check_file, check_text, pick};
-use super::{WALKTHROUGHS, revision};
 use crate::arch::types::{
     BEATS_MAX, Beat, BeatReading, Collection, DESCRIPTION_MAX, LABEL_MAX, Module, NARRATION_MAX,
     READING_DEPTH_MAX, ReadingState, ReadingView, Walkthrough,
@@ -31,24 +31,32 @@ pub(crate) fn reading_ids<'a>(
 }
 
 /// The qualified module and flow IDs of the current state, which current-state readings name.
-struct Known {
+pub(super) struct Known {
     model: String,
     modules: BTreeSet<String>,
     flows: BTreeSet<String>,
 }
 
+impl Known {
+    /// What the readings of `contents` may name; `None` without the model ID, when references
+    /// are not judged.
+    pub(super) fn new(model: Option<&str>, contents: Contents<'_>) -> Option<Self> {
+        model.map(|model| {
+            let modules = contents.modules.iter().map(|(_, m)| *m);
+            let collections = contents.collections.iter().map(|(_, c)| *c);
+            let (modules, flows) = reading_ids(model, modules, collections);
+            Known {
+                model: model.to_owned(),
+                modules,
+                flows,
+            }
+        })
+    }
+}
+
 /// Every walkthrough's own fields and beats. References are judged only with the model ID.
 pub(super) fn check(model: Option<&str>, contents: Contents<'_>, problems: &mut Problems) {
-    let known = model.map(|model| {
-        let modules = contents.modules.iter().map(|(_, m)| *m);
-        let collections = contents.collections.iter().map(|(_, c)| *c);
-        let (modules, flows) = reading_ids(model, modules, collections);
-        Known {
-            model: model.to_owned(),
-            modules,
-            flows,
-        }
-    });
+    let known = Known::new(model, contents);
     for (file, walkthrough) in contents.walkthroughs {
         let id = walkthrough.id.as_str();
         let (version, name) = (walkthrough.schema_version, &walkthrough.name);
@@ -97,7 +105,7 @@ fn check_beat(file: &str, beat: &Beat, known: Option<&Known>, problems: &mut Pro
 /// Why a reading does not hold: fields that do not go together, as `model render` refuses them,
 /// a focus listed twice, and references. Into the current state they must exist; into a proposal
 /// or checkpoint they must be well formed.
-fn reading_problems(reading: &BeatReading, known: Option<&Known>) -> Vec<String> {
+pub(super) fn reading_problems(reading: &BeatReading, known: Option<&Known>) -> Vec<String> {
     let mut out = shape_problems(reading);
     let mut seen = BTreeSet::new();
     for module in &reading.focus {
@@ -239,11 +247,15 @@ pub struct BeatView<'a> {
 
 impl Model {
     /// The digest a proposal drawn from this current state records as its predecessor: the
-    /// revision without the walkthrough files, which a proposal neither holds nor replaces.
+    /// revision without the walkthrough and picture files, which a proposal neither holds nor
+    /// replaces.
     pub fn predecessor_digest(&self) -> String {
-        let prefix = format!("{WALKTHROUGHS}/");
+        let own = |path: &str| {
+            let folder = path.split_once('/').map(|(f, _)| f);
+            folder.is_some_and(|f| CURRENT_ONLY.contains(&f))
+        };
         let files = (self.revision.files.iter())
-            .filter(|f| !f.path.starts_with(&prefix))
+            .filter(|f| !own(&f.path))
             .map(|f| (f.path.clone(), f.sha256.clone()))
             .collect();
         revision::of_digests(files).digest
@@ -318,6 +330,7 @@ mod tests {
             &[],
             &[],
             &[walkthrough],
+            &[],
         );
         found.into_iter().map(|p| p.message).collect()
     }
@@ -348,6 +361,7 @@ mod tests {
             &[module("WebApp01"), module("ApiSrv01")],
             &[collection],
             &[walkthrough],
+            &[],
         )
         .into_iter()
         .map(|p| {

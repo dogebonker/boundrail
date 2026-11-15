@@ -50,6 +50,10 @@ const app = {
   ticket: 0, // drops answers to requests a newer load replaced
   // The walkthrough being played: `{ id, walkthrough, index, error }`, null when none is.
   play: null,
+  pictures: [], // the current state's picture recipes
+  picturesError: null,
+  // Each picture's `model pictures` entry by ID, null until asked for: checking draws them all.
+  pictureStatus: null,
 };
 
 // ---------------------------------------------------------------- helpers
@@ -223,6 +227,32 @@ async function loadLists() {
   renderLists();
 }
 
+/** Reads the picture recipes again, without drawing them. A pane showing a picture follows its
+ * recipe, or keeps what it shows once the picture is gone. Statuses are dropped: they may be out
+ * of date. */
+async function loadPictures() {
+  const [data, error] = await attempt(api('pictures'));
+  app.pictures = data?.pictures ?? [];
+  app.picturesError = error;
+  app.pictureStatus = null;
+  for (const pane of app.panes) {
+    const id = pane.beat?.picture;
+    if (!id) continue;
+    const picture = app.pictures.find((p) => p.id === id);
+    if (picture) applyReading(pane, picture.reading, { picture: id });
+    else pane.beat = null;
+  }
+  renderPictures();
+}
+
+/** Asks the server to draw every picture and compare it with its file. */
+async function checkPictures() {
+  const [data, error] = await attempt(api('pictures', { status: 1 }));
+  app.picturesError = error;
+  app.pictureStatus = data ? new Map(data.pictures.map((p) => [p.id, p])) : null;
+  renderPictures();
+}
+
 /** Loads `pane`'s state and draws it. */
 async function loadPane(pane) {
   const ticket = ++pane.loads;
@@ -239,7 +269,7 @@ async function loadPane(pane) {
 async function loadAll() {
   forget();
   app.currentFailed = false;
-  await refreshPlay();
+  await Promise.all([refreshPlay(), loadPictures()]);
   await Promise.all([loadLists(), ...app.panes.map(loadPane)]);
   showActive();
   renderPlay();
@@ -481,6 +511,44 @@ async function renderWalkthroughs() {
   });
 }
 
+/** The current state's pictures, with whether each file still matches what the model draws once
+ * checked. */
+function renderPictures() {
+  const box = $('#pictures');
+  keepFocus(box, () => {
+    box.replaceChildren();
+    if (app.picturesError) box.append(note(app.picturesError));
+    if (!app.pictures.length) {
+      return box.append(note('No pictures yet. A picture draws a reading to a file documentation embeds.'));
+    }
+    for (const p of app.pictures) {
+      const status = app.pictureStatus?.get(p.id);
+      box.append(item({
+        'data-key': p.id,
+        title: status?.message ?? p.output,
+        onclick: () => showPicture(p.id),
+      }, p.name, status?.status));
+    }
+    box.append(h('button', { class: 'link', 'data-key': 'check', onclick: checkPictures }, 'Check files'));
+  });
+}
+
+/** Shows what picture `id` draws in the active pane, as the server draws it, focus included. */
+async function showPicture(id) {
+  const picture = app.pictures.find((p) => p.id === id);
+  if (!picture) return;
+  if (app.play) {
+    app.play = null;
+    history.replaceState(null, '', location.pathname);
+    renderPlay();
+  }
+  const pane = activePane();
+  applyReading(pane, picture.reading, { picture: id });
+  await loadPane(pane);
+  fit(pane);
+  showActive();
+}
+
 function renderWarnings() {
   const box = $('#warnings');
   box.replaceChildren();
@@ -639,7 +707,7 @@ function interfaceBody(report, id) {
 // ---------------------------------------------------------------- canvas
 
 /** A pane's own state, view and model; `box` is its zoom, `base` the drawing's bounds, `beat`
- * the walkthrough beat it draws, null when the pane was set by hand. */
+ * the walkthrough beat or picture it draws, null when the pane was set by hand. */
 function newPane(from) {
   const { state = { kind: 'current' }, against = '', view = 'architecture', flow = null, scope = null, depth = 2 } = from ?? {};
   return { state: { ...state }, against, view, flow, scope, depth, beat: null, model: from?.model ?? null, loads: 0, ticket: 0 };
@@ -1038,7 +1106,11 @@ function applyBeat() {
     pane.beat = null;
     return;
   }
-  const { reading } = beat;
+  applyReading(pane, beat.reading, { walkthrough: walkthrough.id, beat: index + 1 });
+}
+
+/** Sets `pane` to what `reading` shows; `drawn` names it to `/api/render`, which applies the focus. */
+function applyReading(pane, reading, drawn) {
   Object.assign(pane, {
     state: readingState(reading.state),
     against: readingAgainst(reading.against),
@@ -1046,7 +1118,7 @@ function applyBeat() {
     flow: reading.flow ?? null,
     scope: reading.scope ?? null,
     depth: reading.depth ?? 2,
-    beat: { walkthrough: walkthrough.id, beat: index + 1 },
+    beat: drawn,
   });
 }
 

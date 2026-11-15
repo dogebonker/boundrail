@@ -16,15 +16,21 @@ use boundrail::arch::lsp::{self, Facts};
 use boundrail::arch::proposal::{self, CURRENT, Writing};
 use boundrail::arch::render::{self, View};
 use boundrail::arch::request::INPUT_MAX;
-use boundrail::arch::semantic;
+use boundrail::arch::semantic::{self, States};
 use boundrail::arch::types::{
-    self, BeatReading, Collection, Flow, ReadingState, ReadingView, SCHEMAS, Step, Walkthrough,
+    self, BeatReading, Collection, Flow, Picture, ReadingState, ReadingView, SCHEMAS, Step,
+    Walkthrough,
 };
 use boundrail::arch::vault::{
-    self, CollectionView, Found, Model, ModuleView, RelationshipView, Scope, WalkthroughEntry,
+    self, CollectionView, Found, Model, ModuleView, PictureEntry, RelationshipView, Scope,
+    WalkthroughEntry,
 };
 use boundrail::arch::{Code, Refusal};
 use serde_json::{Value, json};
+
+#[path = "pictures.rs"]
+mod pictures;
+pub(super) use pictures::pictures_output;
 
 const MODEL_SCHEMA: &str = "boundrail/model/v1";
 
@@ -45,9 +51,11 @@ pub(super) struct ModelArgs {
 enum Command {
     #[command(flatten)]
     Model(ModelCmd),
-    /// Check the model's own shape and compare it with the code; exits 1 when any warning is found
+    /// Check the model's own shape, compare it with the code, and check that embedded pictures
+    /// still match the model; exits 1 when any warning is found
     Check {
-        /// Run one check only; the code check scans the checkout
+        /// Run one check only; the code check scans the checkout, the embeds check draws every
+        /// picture
         #[arg(long, value_enum)]
         only: Option<CheckOnly>,
         /// Check this proposal instead of the current state
@@ -67,6 +75,19 @@ enum Command {
     Render(RenderArgs),
     /// Serve a live, read-only view of the model in the browser on a local port
     View(super::view_cli::ViewArgs),
+    /// List the picture recipes with whether each file still matches what the model draws:
+    /// fresh, stale, missing or unrenderable
+    Pictures {
+        /// Draw every stale or missing picture to its output file, creating its folders; exits 1
+        /// when a picture stays unrenderable. Writes only the files the recipes declare, never
+        /// the vault, and overwrites only files Boundrail drew; PNGs need resvg, rsvg-convert or
+        /// magick on PATH outside the checkout
+        #[arg(long)]
+        write: bool,
+        /// Only this picture: its ID or unique name
+        #[arg(long)]
+        only: Option<String>,
+    },
 }
 
 #[derive(Args)]
@@ -88,6 +109,10 @@ pub(super) struct RenderSpec {
     /// The beat of --walkthrough to draw: its number, from 1, or its ID
     #[arg(long, requires = "walkthrough")]
     pub(super) beat: Option<String>,
+    /// Draw what this picture's recipe reads: its ID or unique name; needs no other flag that
+    /// says what to draw
+    #[arg(long, conflicts_with = "walkthrough")]
+    pub(super) picture: Option<String>,
     /// Draw this proposal, marked against the current state unless --against names another
     #[arg(long)]
     pub(super) proposal: Option<String>,
@@ -125,6 +150,7 @@ pub(super) enum RenderView {
 pub(super) enum CheckOnly {
     Semantic,
     Code,
+    Embeds,
 }
 
 #[derive(Subcommand)]
@@ -137,20 +163,23 @@ enum ModelCmd {
         #[arg(long)]
         planning: bool,
     },
-    /// Print the model, one module with its parts and relationships, a collection, a flow, or a
-    /// walkthrough
+    /// Print the model, one module with its parts and relationships, a collection, a flow, a
+    /// walkthrough, or a picture recipe
     Read {
         /// Qualified ID, local ID, or a unique current or former module name; or a collection,
-        /// flow or walkthrough ID
-        #[arg(conflicts_with_all = ["flow", "walkthrough"])]
+        /// flow, walkthrough or picture ID
+        #[arg(conflicts_with_all = ["flow", "walkthrough", "picture"])]
         subject: Option<String>,
         /// Print one flow with its steps: its qualified or local ID, or its unique name
-        #[arg(long, conflicts_with = "walkthrough")]
+        #[arg(long, conflicts_with_all = ["walkthrough", "picture"])]
         flow: Option<String>,
         /// Print one walkthrough with its beats: its qualified or local ID, or its unique name;
         /// Markdown prints it as a script
-        #[arg(long)]
+        #[arg(long, conflicts_with = "picture")]
         walkthrough: Option<String>,
+        /// Print one picture recipe: its qualified or local ID, or its unique name
+        #[arg(long)]
+        picture: Option<String>,
         /// Read the model a checkpoint holds: its ID or a unique commit prefix
         #[arg(long)]
         checkpoint: Option<String>,
@@ -160,7 +189,7 @@ enum ModelCmd {
     },
     /// List the vault file and request schemas, or print one as JSON Schema
     Schema { name: Option<String> },
-    /// Apply a batch of module, relationship, collection, flow, step, walkthrough and beat changes (schema `model-edit`)
+    /// Apply a batch of module, relationship, collection, flow, step, walkthrough, beat and picture changes (schema `model-edit`)
     Edit {
         /// Request file; `-` or absent reads standard input
         #[arg(long)]
@@ -362,6 +391,9 @@ pub(super) fn run(args: ModelArgs) -> Result<ExitCode> {
             render_model(&args.root, args.format, &render).map(|()| ExitCode::SUCCESS)
         }
         Command::View(view) => super::view_cli::run(&args.root, &view).map(|()| ExitCode::SUCCESS),
+        Command::Pictures { write, only } => {
+            pictures::list(&args.root, markdown, only.as_deref(), write)
+        }
         Command::Model(command) => {
             execute(&args.root, markdown, command).map(|()| ExitCode::SUCCESS)
         }
@@ -408,6 +440,7 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
             subject: None,
             flow: None,
             walkthrough: None,
+            picture: None,
             checkpoint,
             proposal,
         } => {
@@ -428,6 +461,7 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
             print_reading(&model, &model.read());
             print_collections(&model.collection_views());
             print_walkthroughs(&model.walkthrough_entries());
+            print_pictures(&model.picture_entries());
             print_claims(state.as_deref().and_then(active_claims).as_deref());
             Ok(())
         }
@@ -435,6 +469,7 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
             subject,
             flow,
             walkthrough,
+            picture,
             checkpoint,
             proposal,
         } => {
@@ -444,15 +479,16 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
                 pending,
                 checkpoint,
             } = load_reading(root, checkpoint.as_deref(), proposal.as_deref())?;
-            let found = match (&flow, &walkthrough) {
-                (Some(flow), _) => {
+            let found = match (&flow, &walkthrough, &picture) {
+                (Some(flow), _, _) => {
                     let (collection, flow) = model.flow(flow)?;
                     Some(Found::Flow(collection, flow))
                 }
-                (None, Some(walkthrough)) => {
+                (None, Some(walkthrough), _) => {
                     Some(Found::Walkthrough(model.walkthrough(walkthrough)?))
                 }
-                (None, None) => subject.as_deref().and_then(|s| model.find_grouping(s)),
+                (None, None, Some(picture)) => Some(Found::Picture(model.picture(picture)?)),
+                (None, None, None) => subject.as_deref().and_then(|s| model.find_grouping(s)),
             };
             if let Some(found) = found {
                 let read = GroupingRead {
@@ -793,6 +829,7 @@ pub(super) fn read_output(
         "relationships": reading.relationships,
         "collections": model.collection_views(),
         "walkthroughs": model.walkthrough_entries(),
+        "pictures": model.picture_entries(),
         "revision": model.revision,
     });
     extend(&mut output, json!({ "proposal": model.proposal }))?;
@@ -862,6 +899,16 @@ impl GroupingRead<'_> {
                 let view = model.walkthrough_view(walkthrough);
                 let id = view.id.clone();
                 (id, json!({"kind": "read-walkthrough", "walkthrough": view}))
+            }
+            Found::Picture(picture) => {
+                if self.markdown {
+                    print_picture(model, picture);
+                }
+                let entry = model.picture_entry(picture);
+                (
+                    entry.id.clone(),
+                    json!({"kind": "read-picture", "picture": entry}),
+                )
             }
         };
         let active = self
@@ -939,45 +986,95 @@ fn render_model(root: &Path, format: Option<Format>, args: &RenderArgs) -> Resul
 }
 
 /// The SVG of what `spec` asks for, with the name of the view drawn, refusing an `output` it
-/// could not write to. A walkthrough beat is drawn as its reading says, with its focus.
+/// could not write to. A walkthrough beat or a picture is drawn as its reading says, with its
+/// focus.
 pub(super) fn render_svg(
     root: &Path,
     spec: &RenderSpec,
     output: Option<&Path>,
 ) -> Result<(String, &'static str)> {
-    if spec.walkthrough.is_none() && spec.beat.is_none() {
-        return draw(root, spec, &[], output, None);
+    if spec.walkthrough.is_none() && spec.beat.is_none() && spec.picture.is_none() {
+        return draw(root, spec, output);
     }
-    let current = load_state(root, RenderState::Current)?;
-    let (reading, focus) = spec.beat(&current.0)?;
-    draw(root, &reading, &focus, output, Some(current))
+    let (current, _) = load_state(root, RenderState::Current)?;
+    let reading = match &spec.picture {
+        Some(picture) => {
+            let why = "--picture draws what its recipe reads";
+            if spec.walkthrough.is_some() || spec.beat.is_some() {
+                let message = format!("{why}; leave out --walkthrough and --beat");
+                return Err(Refusal::new(Code::RequestInvalid, message).into());
+            }
+            spec.refuse_drawing_flags(why)?;
+            &current.picture(picture)?.reading
+        }
+        None => spec.beat(&current)?,
+    };
+    draw_reading(root, reading, output, &mut States::new(&current))
 }
 
-/// The SVG of what `spec` asks for with `focus` highlighted, and the name of the view drawn.
-/// `current` is the current state when the caller already loaded it.
-fn draw(
-    root: &Path,
-    spec: &RenderSpec,
-    focus: &[String],
-    output: Option<&Path>,
-    mut current: Option<(Model, Option<String>)>,
-) -> Result<(String, &'static str)> {
+/// The SVG of what the flags of `spec` ask for, and the name of the view drawn.
+fn draw(root: &Path, spec: &RenderSpec, output: Option<&Path>) -> Result<(String, &'static str)> {
     let view = spec.view()?;
     let (drawn, base) = spec.states()?;
-    let mut load = |state: RenderState<'_>| match (state, current.take()) {
-        (RenderState::Current, Some(loaded)) => Ok(loaded),
-        (_, loaded) => {
-            current = loaded;
-            load_state(root, state)
+    let (model, name) = load_state(root, drawn)?;
+    let base = base.map(|b| load_state(root, b)).transpose()?;
+    let base = (base.as_ref()).map(|(model, name)| (model, name.as_deref()));
+    paint(root, &view, &[], (&model, name.as_deref()), base, output)
+}
+
+/// The SVG of what `reading` draws with its focus, and the name of the view drawn. Each state it
+/// reads loads once into `states`.
+fn draw_reading(
+    root: &Path,
+    reading: &BeatReading,
+    output: Option<&Path>,
+    states: &mut States<'_>,
+) -> Result<(String, &'static str)> {
+    let spec = reading_spec(reading);
+    let view = spec.view()?;
+    let (drawn, base) = spec.states()?;
+    let (drawn, base) = (drawn.reading(), base.map(RenderState::reading));
+    states.load(&drawn);
+    if let Some(base) = &base {
+        states.load(base);
+    }
+    let drawn = states.get(&drawn).map_err(again)?;
+    let base = (base.as_ref())
+        .map(|b| states.get(b))
+        .transpose()
+        .map_err(again)?;
+    paint(root, &view, &reading.focus, drawn, base, output)
+}
+
+/// A load error kept in a cache, as a new error: a refusal stays one.
+fn again(error: &anyhow::Error) -> anyhow::Error {
+    match error.downcast_ref::<Refusal>() {
+        Some(refusal) => {
+            let copy = Refusal::new(refusal.code, refusal.message.clone());
+            match &refusal.details {
+                Some(details) => copy.with_details(details.clone()).into(),
+                None => copy.into(),
+            }
         }
-    };
-    let (model, name) = load(drawn)?;
-    let base = base.map(load).transpose()?;
+        None => anyhow::anyhow!("{error:#}"),
+    }
+}
+
+/// Draws `view` of the state `drawn` (its model and title name) with `focus`, compared with
+/// `base` when given, refusing an `output` it could not write to.
+fn paint<'m>(
+    root: &Path,
+    view: &View<'_>,
+    focus: &[String],
+    drawn: (&'m Model, Option<&str>),
+    base: Option<(&'m Model, Option<&str>)>,
+    output: Option<&Path>,
+) -> Result<(String, &'static str)> {
     // A proposal's local and qualified IDs name the same state.
     let id = |model: &Model| model.proposal.as_ref().map(|p| p.id.clone());
-    if let Some((base, _)) = &base
-        && id(&model).is_some()
-        && id(&model) == id(base)
+    if let Some((base, _)) = base
+        && id(drawn.0).is_some()
+        && id(drawn.0) == id(base)
     {
         let message = "--against names the state being drawn";
         return Err(Refusal::new(Code::RequestInvalid, message).into());
@@ -985,15 +1082,12 @@ fn draw(
     if let Some(output) = output {
         check_output(root, output)?;
     }
-    let drawn = render::Side {
-        model: &model,
-        name,
-    };
-    let base = (base.as_ref()).map(|(model, name)| render::Side {
+    let side = |(model, name): (&'m Model, Option<&str>)| render::Side {
         model,
-        name: name.clone(),
-    });
-    let svg = render::render(&drawn, base.as_ref(), &view, focus)?;
+        name: name.map(str::to_owned),
+    };
+    let base = base.map(side);
+    let svg = render::render(&side(drawn), base.as_ref(), view, focus)?;
     Ok((svg, view.name()))
 }
 
@@ -1033,6 +1127,17 @@ enum RenderState<'a> {
     Proposal(&'a str),
 }
 
+impl RenderState<'_> {
+    /// The state as a reading names it.
+    fn reading(self) -> ReadingState {
+        match self {
+            Self::Checkpoint(c) => ReadingState::Checkpoint(c.to_owned()),
+            Self::Current => ReadingState::Current,
+            Self::Proposal(p) => ReadingState::Proposal(p.to_owned()),
+        }
+    }
+}
+
 /// The model `state` holds, and how a title names it: `None` for the current state.
 fn load_state(root: &Path, state: RenderState<'_>) -> Result<(Model, Option<String>)> {
     let (checkpoint, proposal) = match state {
@@ -1052,28 +1157,16 @@ fn load_state(root: &Path, state: RenderState<'_>) -> Result<(Model, Option<Stri
 }
 
 impl RenderSpec {
-    /// What the beat `--beat` of `--walkthrough` reads in `model`, the current state, as flags,
-    /// with its focus. Refuses `REQUEST_INVALID` without both flags or with any other flag that
-    /// says what to draw.
-    fn beat(&self, model: &Model) -> Result<(RenderSpec, Vec<String>)> {
+    /// What the beat `--beat` of `--walkthrough` reads in `model`, the current state. Refuses
+    /// `REQUEST_INVALID` without both flags or with any other flag that says what to draw.
+    fn beat<'m>(&self, model: &'m Model) -> Result<&'m BeatReading> {
         let invalid = |message: &str| Refusal::new(Code::RequestInvalid, message);
         let (walkthrough, beat) = match (&self.walkthrough, &self.beat) {
             (Some(walkthrough), Some(beat)) => (walkthrough, beat),
             (None, _) => return Err(invalid("--beat needs --walkthrough").into()),
             (_, None) => return Err(invalid("--walkthrough needs --beat").into()),
         };
-        let drawing = [
-            &self.proposal,
-            &self.checkpoint,
-            &self.flow,
-            &self.scope,
-            &self.against,
-        ];
-        if drawing.iter().any(|flag| flag.is_some()) || self.view.is_some() || self.depth.is_some()
-        {
-            let message = "--walkthrough draws what its beat reads; leave out the other flags";
-            return Err(invalid(message).into());
-        }
+        self.refuse_drawing_flags("--walkthrough draws what its beat reads")?;
         let walkthrough = model.walkthrough(walkthrough)?;
         let by_number = (beat.parse::<usize>().ok())
             .and_then(|n| n.checked_sub(1))
@@ -1087,7 +1180,24 @@ impl RenderSpec {
                 format!("walkthrough {id} has no beat `{beat}`; name one by number or ID");
             Refusal::new(Code::SubjectNotFound, message)
         })?;
-        Ok((reading_spec(&found.reading), found.reading.focus.clone()))
+        Ok(&found.reading)
+    }
+
+    /// Refuses `REQUEST_INVALID` with `why` when a flag says what to draw.
+    fn refuse_drawing_flags(&self, why: &str) -> Result<()> {
+        let drawing = [
+            &self.proposal,
+            &self.checkpoint,
+            &self.flow,
+            &self.scope,
+            &self.against,
+        ];
+        if drawing.iter().any(|flag| flag.is_some()) || self.view.is_some() || self.depth.is_some()
+        {
+            let message = format!("{why}; leave out the other flags");
+            return Err(Refusal::new(Code::RequestInvalid, message).into());
+        }
+        Ok(())
     }
 
     /// The state to draw and the one to compare it with. The newer of the two is drawn; of two
@@ -1179,7 +1289,7 @@ fn check_output(root: &Path, output: &Path) -> Result<()> {
 }
 
 /// `model check`: exit 0 without warnings, 1 with any. Like `model read`, it names a pending edit.
-/// The skips are reported only when the code check ran.
+/// The skips are reported only when the code check ran or a picture could not be checked.
 fn check(
     root: &Path,
     markdown: bool,
@@ -1215,7 +1325,7 @@ fn check(
 pub(super) struct Checked {
     model: Model,
     diagnostics: Vec<Diagnostic>,
-    /// `None` when the code check did not run.
+    /// `None` when the code check did not run and every picture was checked.
     skips: Option<Vec<Skip>>,
     /// The infrastructure units with their owners; `None` when the code check did not run.
     units: Option<Vec<UnitStatus>>,
@@ -1232,21 +1342,36 @@ pub(super) fn run_check(
     proposal: Option<&str>,
     language_servers: bool,
 ) -> Result<Checked> {
+    if proposal.is_some() && only == Some(CheckOnly::Embeds) {
+        let message = "pictures belong to the current state; check embeds without --proposal";
+        return Err(Refusal::new(Code::RequestInvalid, message).into());
+    }
     let (model, _, pending) = load_for_read(root, proposal)?;
-    let mut diagnostics = if only == Some(CheckOnly::Code) {
-        Vec::new()
-    } else {
+    let runs = |part: CheckOnly| only.is_none_or(|o| o == part);
+    // Each proposal or checkpoint a beat or picture reads loads once for the whole check.
+    let mut states = States::new(&model);
+    let mut diagnostics = if runs(CheckOnly::Semantic) {
         let mut found = semantic::check(&model.manifest.id, &model.modules, &model.collections);
-        found.extend(semantic::walkthroughs(&model));
+        found.extend(semantic::walkthroughs(&mut states));
         found
+    } else {
+        Vec::new()
     };
     let (mut skips, mut units) = (None, None);
-    if only != Some(CheckOnly::Semantic) {
+    if runs(CheckOnly::Code) {
         let report = code_check(&model, language_servers)?;
         diagnostics.extend(report.diagnostics);
         skips = Some(report.skips);
         units = Some(report.units);
     }
+    if runs(CheckOnly::Embeds) && !model.pictures.is_empty() {
+        let (found, skipped) = pictures::check(root, &mut states)?;
+        diagnostics.extend(found);
+        if !skipped.is_empty() {
+            skips.get_or_insert_with(Vec::new).extend(skipped);
+        }
+    }
+    drop(states);
     diagnostics.sort();
     let warning = diagnostics
         .iter()
@@ -2243,6 +2368,27 @@ fn print_collections(collections: &[CollectionView<'_>]) {
     }
 }
 
+fn print_pictures(pictures: &[PictureEntry<'_>]) {
+    if pictures.is_empty() {
+        return;
+    }
+    println!("Pictures:");
+    for picture in pictures {
+        println!("- {} {}: {}", picture.name, picture.id, picture.output);
+    }
+}
+
+/// The picture recipe: its file and one line saying what it shows.
+fn print_picture(model: &Model, picture: &Picture) {
+    println!("Picture {} {}", picture.name, model.qualify(&picture.id));
+    if let Some(description) = &picture.description {
+        println!("{description}");
+    }
+    println!("Writes: {}", picture.output);
+    let shows = describe(&names(model), &flow_names(model), &picture.reading);
+    println!("Shows: {shows}");
+}
+
 fn print_walkthroughs(walkthroughs: &[WalkthroughEntry<'_>]) {
     if walkthroughs.is_empty() {
         return;
@@ -2263,10 +2409,7 @@ fn print_walkthrough(model: &Model, walkthrough: &Walkthrough) {
         println!("{description}");
     }
     let names = names(model);
-    let flows: BTreeMap<String, &str> = (model.collections.iter())
-        .flat_map(|c| &c.flows)
-        .map(|f| (model.qualify(&f.id), f.name.as_str()))
-        .collect();
+    let flows = flow_names(model);
     for (n, beat) in (1..).zip(&walkthrough.beats) {
         println!("{n}. {}", beat.title);
         for line in beat.narration.lines() {
@@ -2274,6 +2417,14 @@ fn print_walkthrough(model: &Model, walkthrough: &Walkthrough) {
         }
         println!("   Shows: {}", describe(&names, &flows, &beat.reading));
     }
+}
+
+/// Flow names by qualified ID.
+fn flow_names(model: &Model) -> BTreeMap<String, &str> {
+    (model.collections.iter())
+        .flat_map(|c| &c.flows)
+        .map(|f| (model.qualify(&f.id), f.name.as_str()))
+        .collect()
 }
 
 /// One line saying what a reading shows, naming modules and flows by `names` and `flows`.

@@ -18,6 +18,7 @@ use super::index::Index;
 use super::types::{Dash, EXTERNAL_KIND, Emphasis, Flow, Module, Step, VaultConfig, walk};
 use super::vault::{self, Model};
 use super::{Code, Refusal, ids};
+pub(crate) use svg::GENERATOR;
 use svg::{Font, Style, Svg, text_width};
 
 /// What to draw.
@@ -624,6 +625,7 @@ mod tests {
             modules,
             collections,
             walkthroughs: Vec::new(),
+            pictures: Vec::new(),
             revision: Revision {
                 digest: "x".into(),
                 files: Vec::new(),

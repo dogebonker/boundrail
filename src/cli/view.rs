@@ -430,6 +430,7 @@ impl Server {
                 let id = param("id").ok_or_else(|| invalid("walkthrough needs id"))?;
                 model_cli::walkthrough_output(root, id)?
             }
+            "/api/pictures" => model_cli::pictures_output(root, param("status").is_some())?,
             _ => return Ok(None),
         }))
     }
@@ -448,6 +449,7 @@ impl Server {
         let spec = RenderSpec {
             walkthrough: owned("walkthrough"),
             beat: owned("beat"),
+            picture: owned("picture"),
             proposal: owned("proposal"),
             checkpoint: owned("checkpoint"),
             view,
