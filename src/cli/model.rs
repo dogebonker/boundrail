@@ -27,7 +27,7 @@ use boundrail::arch::types::{
 };
 use boundrail::arch::vault::{
     self, CollectionView, Found, Model, ModuleView, PictureEntry, RelationshipView, Scope,
-    WalkthroughEntry,
+    WalkthroughEntry, escape_controls,
 };
 use boundrail::arch::{Code, Refusal};
 use serde_json::{Value, json};
@@ -436,6 +436,8 @@ enum ModelCmd {
 #[derive(Subcommand)]
 enum HistoryCmd {
     /// Push refs/boundrail/history to the same ref on the remote
+    ///
+    /// The history has one authoritative remote: push to and fetch from only that one.
     Push {
         /// A remote `git remote` lists
         #[arg(long, default_value = checkpoint::DEFAULT_REMOTE)]
@@ -443,6 +445,8 @@ enum HistoryCmd {
     },
     /// Fetch the remote's refs/boundrail/history into the local one, replaying local checkpoints
     /// the remote lacks
+    ///
+    /// The history has one authoritative remote: push to and fetch from only that one.
     Fetch {
         /// A remote `git remote` lists
         #[arg(long, default_value = checkpoint::DEFAULT_REMOTE)]
@@ -2344,14 +2348,20 @@ fn print_claim(claim: &Claim) {
     }
 }
 
+/// Prints `checkpoint`, whose ID, writer, doing and revision are history text a commit made
+/// outside `model retain` may fill with control characters, so those are escaped.
 fn print_checkpoint(checkpoint: &Checkpoint) {
     println!(
         "Checkpoint {} by {} at {}: {}",
-        checkpoint.id, checkpoint.writer, checkpoint.time, checkpoint.doing
+        escape_controls(&checkpoint.id),
+        escape_controls(&checkpoint.writer),
+        checkpoint.time,
+        escape_controls(&checkpoint.doing)
     );
     println!(
         "  commit {} revision {}",
-        checkpoint.commit, checkpoint.revision
+        checkpoint.commit,
+        escape_controls(&checkpoint.revision)
     );
 }
 

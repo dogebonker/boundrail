@@ -793,16 +793,25 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   fetched ref must peel to a commit, and every first-parent commit from it that the local history
   lacks must be one retain could have written: at most one parent (a merge refuses), checkpoint
   trailers, a Checkpoint ID that is a well-formed local ID unique in any case across the fetched
-  walk, and `--doing`, `Writer` and `Operation` values that pass retain's own checks; otherwise it
-  refuses `MODEL_INVALID` (`details.object`) and the local ref stays. A local tip that already
+  walk, `--doing`, `Writer` and `Operation` values that pass retain's own checks, a `Revision` of
+  exactly 64 lowercase hex characters, and a `Source`, when present, that is a full 40- or 64-hex
+  commit hash; otherwise it refuses `MODEL_INVALID` (`details.object`) and the local ref stays. A local tip that already
   holds the fetched one stays. Diverged histories replay: the local-only first-parent commits,
   checked the same way, are copied in order onto the fetched tip with `commit-tree`, each keeping
   its tree, message, trailers and author and committer dates, signed as retain signs
   (`SIGNING_FAILED` before the ref moves). A local-only ID the fetched history holds in any case
-  refuses `HISTORY_DIVERGED` with `details.clashing`. The receipt lists `replayed`. Replaying
-  replaces those commits, so stored retain receipts naming them go stale; readings name
-  checkpoints by ID and still resolve, and a retain retried with the same operation ID returns the
-  checkpoint as the history now holds it. Otherwise the local ref moves by compare-and-swap
+  refuses `HISTORY_DIVERGED` with `details.clashing`: the remote holds earlier copies of those
+  checkpoints, as when they were replayed from another remote. The history has one authoritative
+  remote; the publication commands assume it, and their help says so. Publishing one history to
+  two remotes that each take replays never converges, so the clash message names the recovery
+  that does: make the non-authoritative remote's ref match the authoritative history (a forced
+  update or a deletion outside Boundrail), or stop publishing to it. T7 lets retain build on a
+  history tip that is not a checkpoint, but such a commit cannot be pushed or replayed: the push
+  and the replay refuse `MODEL_INVALID` ("is not a checkpoint"), and the manual recovery, which
+  the message names, is to rewrite the local history without that commit. The receipt lists
+  `replayed`. Replaying replaces those commits, so stored retain receipts naming them go stale;
+  readings name checkpoints by ID and still resolve, and a retain retried with the same operation
+  ID returns the checkpoint as the history now holds it. Otherwise the local ref moves by compare-and-swap
   (`update-ref <new> <old or absent>`); a swap lost to a concurrent retain re-reads the tip and
   judges again, up to three times. Ancestry is `git merge-base --is-ancestor`, asked only when the
   other side's ref exists. `--remote` must be a name `git remote` lists, never a URL or anything
@@ -884,4 +893,8 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   `native::go::collect`'s `go` (always `go`), `grimp::package`'s `explicit`, `analyze`'s
   `cochange` (always none), the constant `Config` fields `live` fills (`granularity`, `includes`,
   `all_kinds`, `no_default_excludes`, `include_generated`, `explicit_excludes`, `rules`,
-  `codeowners`), and `CollectionOptions::engine`, which has one variant.
+  `codeowners`), and `CollectionOptions::engine`, which has one variant. Also on the list:
+  `rules::load`, which has no callers; `package_splits`, which is partly live through the infra
+  workspaces and `simulate`, so only its scan-era parts go; and the validators that can raise
+  `SCAN_FAILED`, which a lean path must keep or replace. Before switching, compare the lean path's
+  output with the current one on the same checkouts.

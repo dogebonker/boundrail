@@ -68,7 +68,7 @@ pub fn push(start: &Path, remote: &str) -> Result<Published> {
     }
     let base = theirs.as_deref().and_then(|theirs| peel(&root, theirs));
     let refuse = |object: &str, reason: &str| unpublishable(remote, object, reason);
-    since(&root, &commit, base.as_deref(), &known, refuse)?;
+    let new = since(&root, &commit, base.as_deref(), &known, refuse)?;
     // The object checked above is what lands, even if the local ref moves meanwhile.
     let refspec = refspec(&object, HISTORY);
     let lease = format!(
@@ -92,11 +92,8 @@ pub fn push(start: &Path, remote: &str) -> Result<Published> {
         }
         return Err(error);
     }
-    let new = list
-        .iter()
-        .take_while(|c| theirs.as_ref() != Some(&c.commit));
     Ok(Published {
-        checkpoints: new.map(|c| c.id.clone()).collect(),
+        checkpoints: new.into_iter().map(|c| c.id).collect(),
         ..moved(remote, theirs, object)
     })
 }
@@ -294,8 +291,9 @@ fn id_counts(list: &[Checkpoint]) -> BTreeMap<String, usize> {
 /// The checkpoints along first parents from `commit` that `base` does not reach, newest first.
 /// Each must be one `model retain` could have written, else `refuse` gets its commit and why: it
 /// has at most one parent, carries checkpoint trailers, its `--doing`, `Writer` and `Operation`
-/// pass retain's checks, and its ID is a well-formed local ID that `known`, the counts of the
-/// checkpoint IDs from `commit`, holds once in any case.
+/// pass retain's checks, its `Revision` is a SHA-256 digest in lowercase hex and its `Source`,
+/// when present, a full commit hash, and its ID is a well-formed local ID that `known`, the
+/// counts of the checkpoint IDs from `commit`, holds once in any case.
 fn since(
     root: &Path,
     commit: &str,
@@ -326,12 +324,22 @@ fn since(
         if check_doing(&checkpoint.doing).is_err()
             || check_writer(&checkpoint.writer).is_err()
             || operation.map(check_operation).transpose().is_err()
+            || !is_digest(&checkpoint.revision)
+            || checkpoint
+                .source
+                .as_deref()
+                .is_some_and(|s| !git::is_full_hash(s))
         {
             return Err(refuse(object, "has a trailer value `model retain` refuses"));
         }
         found.push(checkpoint);
     }
     Ok(found)
+}
+
+/// Whether `text` is a SHA-256 digest as `model retain` writes one: 64 lowercase hex characters.
+fn is_digest(text: &str) -> bool {
+    text.len() == 64 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// The commit `object` peels to, `None` when it is not one.
@@ -424,7 +432,7 @@ fn unpublishable(remote: &str, object: &str, reason: &str) -> anyhow::Error {
     Refusal::new(
         Code::ModelInvalid,
         format!(
-            "the local history holds a commit that {reason}, which a fetch refuses; nothing moved"
+            "the local history holds a commit that {reason}, which a fetch refuses; nothing moved. To push or replay the history, rewrite {HISTORY} without that commit"
         ),
     )
     .with_details(json!({ "remote": remote, "object": object }))
@@ -463,12 +471,14 @@ fn unrelated(remote: &str) -> anyhow::Error {
 }
 
 /// `HISTORY_DIVERGED` for a fetch whose local checkpoints cannot be replayed: the fetched history
-/// holds the `clashing` IDs in some case.
+/// holds the `clashing` IDs in some case, earlier copies of them, as when the local ones were
+/// replayed from another remote. The history has one authoritative remote, so the message names
+/// the recovery that converges.
 fn clash(remote: &str, clashing: &[&str]) -> anyhow::Error {
     Refusal::new(
         Code::HistoryDiverged,
         format!(
-            "the local history and the one on {remote} diverged, and {} local checkpoint ID(s) are taken there, so they cannot be replayed; the local history did not move",
+            "the local history and the one on {remote} diverged, and {remote} holds earlier copies of {} local checkpoint(s), so they cannot be replayed; the local history did not move. The history has one authoritative remote: if {remote} is not it, make its {HISTORY} match the authoritative history (a forced update or a deletion outside Boundrail), or stop publishing to {remote}",
             clashing.len()
         ),
     )

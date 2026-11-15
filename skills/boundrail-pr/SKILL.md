@@ -35,5 +35,7 @@ touches, which relationships its changed imports cross, and what it changes in t
    It records the model on `refs/boundrail/history`, never on the working branch. On
    `NOTHING_TO_RETAIN` the model did not change since the last checkpoint: skip it. On
    `HISTORY_MOVED` another checkpoint landed first: retry. Then publish it with
-   `boundrail model history push`. On `HISTORY_DIVERGED` run `boundrail model history fetch`
-   first, then push again. List checkpoints with `boundrail model checkpoints`.
+   `boundrail model history push`. On `HISTORY_DIVERGED` with `details.related: false` or
+   `details.clashing`, stop and report the message: no fetch converges those. On any other
+   `HISTORY_DIVERGED` run `boundrail model history fetch`, then push again. List checkpoints with
+   `boundrail model checkpoints`.

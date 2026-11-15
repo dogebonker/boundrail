@@ -1,8 +1,9 @@
 //! Every Git subprocess boundrail runs, hardened so a repository's config never names a program
 //! Git would run on our behalf (fsmonitor, hooks). The exceptions are the signing program, which
-//! signs `model retain`'s checkpoints when the user opts into `commit.gpgSign`, and the clean and
-//! process filter drivers repository config defines, which run when Git content-checks a
-//! working-tree entry, for example in `model footprint`. Writing `.git/config` already allows
+//! signs the checkpoints `model retain` writes and those `model history fetch` replays when the
+//! user opts into `commit.gpgSign`, and the clean and process filter drivers repository config
+//! defines, which run when Git content-checks a working-tree entry, for example in `model
+//! footprint`. Writing `.git/config` already allows
 //! running code, so neither widens what a repository can do. The third exception is outside Git:
 //! language servers, which run only when `model check` or `model inspect` gets
 //! `--language-servers`. The committed `.boundrail/language-servers.json` only names them: an

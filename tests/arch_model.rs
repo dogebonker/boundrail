@@ -3292,6 +3292,10 @@ fn retain_refuses_a_vault_file_too_large_to_read_back() {
     assert_eq!(checkout.ok(&["checkpoints"])["checkpoints"], json!([]));
 }
 
+/// A `Revision` trailer in the shape `model retain` writes, for forged checkpoints that must pass
+/// the checks of a fetch.
+const FORGED_REVISION: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
 /// Puts a checkpoint on the history ref whose tree is the tree of `base` plus `extra` files as
 /// (path, blob), and returns its ID.
 fn forge(checkout: &Checkout, id: &str, base: &str, extra: &[(&str, &str)]) -> String {
@@ -3308,7 +3312,8 @@ fn forge(checkout: &Checkout, id: &str, base: &str, extra: &[(&str, &str)]) -> S
         );
     }
     let tree = git_with(checkout, &env, &["write-tree"]);
-    let message = format!("forged\n\nCheckpoint: {id}\nRevision: forged\nWriter: forger\n");
+    let message =
+        format!("forged\n\nCheckpoint: {id}\nRevision: {FORGED_REVISION}\nWriter: forger\n");
     let commit = git(
         checkout,
         &[
@@ -7865,6 +7870,15 @@ fn diverged_histories_refuse_to_push_and_replay_on_fetch() {
     assert_eq!(ids, [local.clone(), json!(ahead), json!(base)]);
     // A retry of the retain returns the checkpoint as the history now holds it.
     assert_eq!(retain_once(&second)["commit"], replayed);
+    // So does a retry whose record a crash left pending on the commit the fetch replayed.
+    let record = second.path().join(".git/boundrail/operations/local.json");
+    let pending = fs::read_to_string(&record)
+        .unwrap()
+        .replace(r#""status": "done""#, r#""status": "pending""#);
+    assert!(pending.contains(original), "{pending}");
+    assert!(pending.contains(r#""status": "pending""#), "{pending}");
+    fs::write(&record, pending).unwrap();
+    assert_eq!(retain_once(&second)["commit"], replayed);
 
     let out = second.ok(&["history", "push"]);
     assert_eq!(out["checkpoints"], json!([local]));
@@ -7896,7 +7910,8 @@ fn fetch_refuses_to_replay_a_checkpoint_id_the_remote_holds() {
         .collect();
     let parent = checkpoint_commit(&first, &base);
     let tree = git(&first, &["rev-parse", &format!("{parent}^{{tree}}")]);
-    let message = format!("taken\n\nCheckpoint: {taken}\nRevision: r1\nWriter: tester\n");
+    let message =
+        format!("taken\n\nCheckpoint: {taken}\nRevision: {FORGED_REVISION}\nWriter: tester\n");
     let forged = git(
         &first,
         &["commit-tree", tree.trim(), "-p", &parent, "-m", &message],
@@ -7935,14 +7950,15 @@ fn history_publication_refuses_a_merge_shaped_like_a_checkpoint() {
     checkout.ok(&["history", "push"]);
     let base = history_tip(&checkout).trim().to_owned();
     let tree = git(&checkout, &["rev-parse", &format!("{base}^{{tree}}")]);
-    let message = "merged\n\nCheckpoint: Merge001\nRevision: r1\nWriter: tester\n";
+    let message =
+        format!("merged\n\nCheckpoint: Merge001\nRevision: {FORGED_REVISION}\nWriter: tester\n");
     let parents = ["-p", &base, "-p", "HEAD"];
     let merge = git(
         &checkout,
         &[
             &["commit-tree", tree.trim()][..],
             &parents,
-            &["-m", message],
+            &["-m", &message],
         ]
         .concat(),
     );
@@ -8215,4 +8231,75 @@ fn fetch_refuses_a_remote_history_that_retain_never_wrote() {
     );
     assert_eq!(local_refs(), "");
     retain(&checkout, "still retains");
+}
+
+#[test]
+fn fetch_refuses_remote_checkpoint_trailers_retain_never_writes() {
+    let remote = bare();
+    let checkout = with_origin(&remote);
+    shop(&checkout);
+    let base = retain(&checkout, "drawn");
+    checkout.ok(&["history", "push"]);
+    let tip = history_tip(&checkout);
+    let tree = git(
+        &checkout,
+        &["rev-parse", &format!("{}^{{tree}}", tip.trim())],
+    );
+    let trailers = |id: &str, revision: &str| {
+        format!("Checkpoint: {id}\nRevision: {revision}\nWriter: tester\n")
+    };
+    let cases = [
+        format!("escaped\n\n{}", trailers("Esc00001", "\u{1b}[31mred")),
+        format!(
+            "bad source\n\n{}Source: main\n",
+            trailers("Src00001", FORGED_REVISION)
+        ),
+        format!("malformed\n\n{}", trailers("bad/id01", FORGED_REVISION)),
+        format!("repeated\n\n{}", trailers(&base, FORGED_REVISION)),
+        format!(
+            "\u{1b}[2Jcleared\n\n{}",
+            trailers("Doing001", FORGED_REVISION)
+        ),
+    ];
+    for message in cases {
+        let args = ["commit-tree", tree.trim(), "-p", tip.trim(), "-m", &message];
+        let forged = git(&checkout, &args);
+        let refspec = format!("+{}:refs/boundrail/history", forged.trim());
+        git(&checkout, &["push", "-q", "origin", &refspec]);
+        let error = checkout.refused(&["history", "fetch"], "MODEL_INVALID");
+        assert_eq!(error["details"]["object"], forged.trim(), "{message:?}");
+        assert_eq!(history_tip(&checkout), tip, "{message:?}");
+    }
+}
+
+#[test]
+fn checkpoints_in_markdown_escape_control_characters_from_history_text() {
+    let checkout = committed();
+    shop(&checkout);
+    checkout.ok(&["retain", "--doing", "drawn"]);
+    let tree = git(&checkout, &["rev-parse", "refs/boundrail/history^{tree}"]);
+    let message = format!(
+        "\u{1b}[2J\"quoted\" C:\\path\n\nCheckpoint: Ctrl0001\nRevision: {FORGED_REVISION}\nWriter: a\u{7}b\n"
+    );
+    let args = [
+        "commit-tree",
+        tree.trim(),
+        "-p",
+        "refs/boundrail/history",
+        "-m",
+        &message,
+    ];
+    let commit = git(&checkout, &args);
+    git(
+        &checkout,
+        &["update-ref", "refs/boundrail/history", commit.trim()],
+    );
+    let (code, text) = checkout.run_raw(&["checkpoints", "--format", "markdown"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        !text.contains('\u{1b}') && !text.contains('\u{7}'),
+        "{text:?}"
+    );
+    assert!(text.contains(r#"by a\u{7}b at"#), "{text}");
+    assert!(text.contains(r#": \u{1b}[2J"quoted" C:\path"#), "{text}");
 }

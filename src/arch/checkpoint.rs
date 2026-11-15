@@ -358,10 +358,15 @@ fn retained_elsewhere<'a>(
 }
 
 /// `checkpoint`, a journaled retain's output, as `history` now holds it: a fetch that replayed
-/// it moved it to another commit with the same ID.
+/// it moved it to another commit with the same ID, operation and revision. Any other match is
+/// not this checkpoint, so the recorded one stands.
 fn as_held(history: &[Checkpoint], checkpoint: Checkpoint) -> Checkpoint {
-    let held = history.iter().find(|h| h.id == checkpoint.id).cloned();
-    held.unwrap_or(checkpoint)
+    let held = history.iter().find(|h| {
+        h.id == checkpoint.id
+            && h.operation_id == checkpoint.operation_id
+            && h.revision == checkpoint.revision
+    });
+    held.cloned().unwrap_or(checkpoint)
 }
 
 fn find(history: Vec<Checkpoint>, which: &str) -> Result<Checkpoint> {

@@ -68,11 +68,21 @@ branch's footprint:
 - uses: dogebonker/archgraph@main
   with:
     token: ${{ github.token }}
+    # A release that includes `boundrail model` (default: the action's Cargo.toml version),
+    # or an executable you built:
+    # version: <release>
+    # binary: path/to/boundrail
 ```
 
-`fail-on` is `warnings` (the default), `information` or `never`. The action never passes
-`--language-servers`, since language servers run code from the checkout. Commenting is best
-effort: a token that cannot write leaves a notice instead.
+The action needs a `boundrail` that includes `boundrail model`: set `version` to a release that
+does, or `binary` to an executable you built. `fail-on` is `warnings` (the default),
+`information` or `never`. The action never passes `--language-servers`, since language servers
+run code from the checkout. Commenting is best effort: a token that cannot write leaves a notice
+instead.
+
+Checkpoint readings resolve only against a fetched history. To judge them, run `boundrail model
+history fetch` in a step before the action, so `model check` sees `refs/boundrail/history`. The
+history has one authoritative remote: push to and fetch from only that one.
 
 ## Language coverage
 
@@ -87,7 +97,24 @@ it on trusted checkouts only: the servers run code from the repository.
 
 The code check reads one language per checkout, the one detected at its root. Bound code in
 another language is skipped as `not-scanned`, and the TypeScript and Python collectors read only
-under `src/` when it exists. The code evidence is **at least these relationships** within the
+under `src/` when it exists.
+
+The scan leaves out, by default:
+
+- tests: `tests/`, `test/`, `__tests__/`, `*.test.*`, `*.spec.*`, `*_test.go`, `*_test.exs`,
+  `test_helper.exs`, `test_*.py`, `*_test.py`, `conftest.py`, `*Test.java`, `*Tests.java`, and
+  in Rust `tests.rs`, `*_tests.rs`, `*_test.rs`, `test_support.rs` and `test_support/`;
+- generated, vendored and build output: `generated/`, `__generated__/`, `*.generated.*`,
+  `*.gen.*`, `*_pb.*`, `*_pb2.py`, `*_pb2_grpc.py`, `*.pb.go`, `*.pb.gw.go`, `zz_generated*.go`,
+  `*.d.ts`, `dist/`, `build/`, `node_modules/`, `vendor/`, `.venv/`, and `target/` (Rust,
+  Java), `out/` (Java), `_build/` and `deps/` (Elixir);
+- support files: `testdata/`, `fixtures/`, `fixture/`, `__fixtures__/`, `stories/`, `story/`,
+  `*.stories.*`, `*.story.*`, `examples/` and `example/`;
+- paths the checkout's `.gitignore` files ignore, and those a `.archgraphignore` at the root
+  ignores, in the same syntax.
+
+Each pattern matches at any depth. Code bound under an excluded path is skipped as
+`not-scanned`. The code evidence is **at least these relationships** within the
 collected scope. Rust relationships describe source coupling, and Elixir macros and dynamic
 references can hide dependencies. A finding is evidence to review, not proof: semantic changes
 still need the project's build and tests.

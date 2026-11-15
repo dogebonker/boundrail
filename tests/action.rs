@@ -227,3 +227,43 @@ fn fail_on_defaults_to_warnings_and_an_empty_fail_on_is_never() {
         assert_eq!(out.status.code(), Some(status), "{fail_on:?}: {stdout}");
     }
 }
+
+/// A footprint cut at the comment limit goes whole into the summary, inside a tilde fence longer
+/// than any tilde run the repository put in it.
+#[cfg(unix)]
+#[test]
+fn the_summary_fence_outgrows_tilde_runs_in_the_footprint() {
+    let dir = TempDir::new("action-fence").unwrap();
+    let repo = dir.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "base"]);
+    let base = git(&repo, &["rev-parse", "HEAD"]);
+    let binary = dir.path().join("boundrail");
+    executable(
+        &binary,
+        "#!/usr/bin/env bash\ncase \"$*\" in\n  --version) echo boundrail 0 ;;\n  \
+         *pr-comment*) printf 'cut\\n_Truncated at 60,000 characters._\\n' ;;\n  \
+         *'model footprint'*) printf 'before\\n~~~~~~~~\\nafter\\n' ;;\nesac\n",
+    );
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("ci/model-action.sh");
+    let out = Command::new("bash")
+        .arg(script)
+        .env("RUNNER_TEMP", dir.path().join("runner"))
+        .env("GITHUB_STEP_SUMMARY", dir.path().join("summary.md"))
+        .env("INPUT_BINARY", &binary)
+        .env("INPUT_PATH", &repo)
+        .env("INPUT_BASE_REF", base.trim())
+        .env("INPUT_FAIL_ON", "never")
+        .env("GITHUB_EVENT_NAME", "push")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    let summary = fs::read_to_string(dir.path().join("summary.md")).unwrap();
+    let fence = "~".repeat(9);
+    assert!(
+        summary.contains(&format!("\n{fence}\nbefore\n~~~~~~~~\nafter\n{fence}\n")),
+        "{summary}"
+    );
+}

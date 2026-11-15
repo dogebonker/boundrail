@@ -527,18 +527,20 @@ pub(super) fn invalid(dir: &Path, problems: Vec<Problem>) -> anyhow::Error {
 /// never replays file content into a terminal.
 pub(super) fn parse_message(error: &impl std::fmt::Display) -> String {
     let text = error.to_string();
-    text.lines()
-        .next()
-        .unwrap_or_default()
-        .chars()
-        .fold(String::new(), |mut out, c| {
-            if c.is_control() {
-                out.extend(c.escape_debug());
-            } else {
-                out.push(c);
-            }
-            out
-        })
+    escape_controls(text.lines().next().unwrap_or_default())
+}
+
+/// `text` with its control characters escaped and everything else, quotes and backslashes
+/// included, kept as is, so repository text never drives a terminal.
+pub fn escape_controls(text: &str) -> String {
+    text.chars().fold(String::new(), |mut out, c| {
+        if c.is_control() {
+            out.extend(c.escape_debug());
+        } else {
+            out.push(c);
+        }
+        out
+    })
 }
 
 /// The per-ID files of one load, each with its vault-relative path.
