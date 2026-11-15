@@ -105,15 +105,7 @@ pub fn compare(checkout: &Path, output: &str, drawing: &Drawing) -> Found {
         Err(why) => return Found::Blocked(why),
     };
     let format = Format::of(output);
-    let read = File::open(&path).and_then(|file| {
-        let mut bytes = Vec::new();
-        match format {
-            Format::Svg => file.take(u64::MAX).read_to_end(&mut bytes),
-            Format::Png => file.take(PNG_PREFIX).read_to_end(&mut bytes),
-        }
-        .map(|_| bytes)
-    });
-    let bytes = match read {
+    let bytes = match read(&path, format) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == ErrorKind::NotFound => return Found::Missing,
         Err(error) => return Found::Blocked(format!("{output} cannot be read: {error}")),
@@ -126,9 +118,42 @@ pub fn compare(checkout: &Path, output: &str, drawing: &Drawing) -> Found {
     match fresh {
         Some(true) => Found::Fresh,
         Some(false) => Found::Stale,
-        None => Found::Blocked(format!(
-            "{output} exists and was not drawn by Boundrail; delete it to draw it here"
-        )),
+        None => Found::Blocked(not_drawn(output)),
+    }
+}
+
+/// The file at `path`: all of an SVG, or a PNG as far as its source chunk can sit.
+fn read(path: &Path, format: Format) -> std::io::Result<Vec<u8>> {
+    let limit = match format {
+        Format::Svg => u64::MAX,
+        Format::Png => PNG_PREFIX,
+    };
+    let mut bytes = Vec::new();
+    File::open(path)?.take(limit).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn not_drawn(output: &str) -> String {
+    format!("{output} exists and was not drawn by Boundrail; delete it to draw it here")
+}
+
+/// Why the file at `path` may not be replaced: it exists and carries neither the generator mark
+/// nor a valid source chunk, or cannot be read.
+fn refuse_foreign(path: &Path, output: &str) -> Result<(), String> {
+    let format = Format::of(output);
+    let bytes = match read(path, format) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("{output} cannot be read: {error}")),
+    };
+    let drawn = match format {
+        Format::Svg => marked(&bytes),
+        Format::Png => source(&bytes).is_some(),
+    };
+    if drawn {
+        Ok(())
+    } else {
+        Err(not_drawn(output))
     }
 }
 
@@ -153,9 +178,11 @@ fn marked(bytes: &[u8]) -> bool {
 
 /// Writes `bytes` to `output` atomically, creating its missing folders, all inside `checkout`;
 /// why not otherwise. Refuses an output a picture may not name, a symbolic link or a non-folder
-/// on the way, and an output that is not a regular file.
+/// on the way, an output that is not a regular file, and a file Boundrail did not draw, judged
+/// again right before the write since the file may have changed after the comparison.
 pub fn write(checkout: &Path, output: &str, bytes: &[u8]) -> Result<(), String> {
     let path = locate(checkout, output, true)?.ok_or("a created path is located")?;
+    refuse_foreign(&path, output)?;
     write_atomic(&path, bytes).map_err(|error| format!("writing {output}: {error:#}"))
 }
 
@@ -222,7 +249,7 @@ pub fn rasterize(drawing: &Drawing, checkout: &Path) -> Result<Vec<u8>, Unrender
     command
         .args(args)
         .current_dir(dir.path())
-        .env("PATH", collect::absolute_path());
+        .env("PATH", collect::path_outside(checkout));
     let out = collect::run(&mut command).map_err(|e| failed(format!("{e:#}")))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -474,5 +501,27 @@ mod tests {
         let foreign = compare(root, "docs/deep/a.svg", &other);
         assert!(matches!(foreign, Found::Blocked(why) if why.contains("not drawn by Boundrail")));
         assert_eq!(compare(root, "docs/deep/b.svg", &other), Found::Missing);
+    }
+
+    #[test]
+    fn a_write_refuses_a_file_that_turned_foreign_after_the_comparison() {
+        let temp = TempDir::new("picture-write").unwrap();
+        let root = temp.path();
+        let ours = format!("<svg {GENERATOR}/>");
+        // Compared as missing, then another program writes its own file there.
+        assert_eq!(write(root, "docs/a.svg", ours.as_bytes()), Ok(()));
+        fs::write(root.join("docs/a.svg"), "<svg/>").unwrap();
+        let refused = write(root, "docs/a.svg", ours.as_bytes()).unwrap_err();
+        assert!(refused.contains("not drawn by Boundrail"), "{refused}");
+        assert_eq!(
+            fs::read_to_string(root.join("docs/a.svg")).unwrap(),
+            "<svg/>"
+        );
+        // A PNG is ours only with a valid source chunk.
+        let tagged = with_source(&png(&[]), "abc").unwrap();
+        fs::write(root.join("docs/a.png"), png(&[])).unwrap();
+        assert!(write(root, "docs/a.png", &tagged).is_err());
+        fs::write(root.join("docs/a.png"), &tagged).unwrap();
+        assert_eq!(write(root, "docs/a.png", &tagged), Ok(()));
     }
 }

@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::iter;
 
 use super::checkpoint;
+use super::code::{Skip, SkipReason, SkipSite};
 use super::diagnostic::{Diagnostic, DiagnosticCode};
 use super::index::Index;
 use super::types::{BeatReading, Binding, Collection, Module, ReadingState, Step, walk};
@@ -277,6 +278,8 @@ pub struct States<'m> {
     current: &'m Model,
     /// Each model with how a title names it: `proposal <name>` or `checkpoint <ID>`.
     loaded: BTreeMap<ReadingState, anyhow::Result<(Model, String)>>,
+    /// Whether the history ref is in this repository, looked up with the first checkpoint loaded.
+    history: Option<bool>,
 }
 
 impl<'m> States<'m> {
@@ -284,6 +287,7 @@ impl<'m> States<'m> {
         Self {
             current,
             loaded: BTreeMap::new(),
+            history: None,
         }
     }
 
@@ -305,10 +309,19 @@ impl<'m> States<'m> {
                 (m, name)
             }),
             ReadingState::Checkpoint(c) => {
+                // A failed lookup counts as present, so the load's own error explains it.
+                let history = checkpoint::history_is_local(dir).unwrap_or(true);
+                self.history.get_or_insert(history);
                 checkpoint::load(dir, c).map(|(c, m)| (m, format!("checkpoint {}", c.id)))
             }
         };
         self.loaded.insert(state.clone(), loaded);
+    }
+
+    /// Whether a checkpoint was loaded and the history ref is not in this repository, as in a
+    /// clone that did not fetch it.
+    pub fn history_missing(&self) -> bool {
+        self.history == Some(false)
     }
 
     /// The model `state` holds, with how a title names it (`None` for the current state), or why
@@ -324,27 +337,35 @@ impl<'m> States<'m> {
     }
 }
 
-/// One reading a check judges: the code it raises, its subjects, and how a message names it.
+/// One reading a check judges: the code it raises, its subjects (the reading's owner last), how a
+/// message names it, and the site a skip of it reports.
 pub struct Judged<'a> {
     pub code: DiagnosticCode,
     pub subjects: Vec<String>,
     pub label: String,
+    pub site: SkipSite,
     pub reading: &'a BeatReading,
 }
 
 /// `code` for each reading whose proposal or checkpoint does not load, or whose scope, focus or
-/// flow the state it draws lacks.
+/// flow the state it draws lacks. A reading of a checkpoint is skipped as `history-not-local`
+/// instead when the history ref is not in this repository.
 pub fn targets<'a>(
     states: &mut States<'_>,
     readings: impl IntoIterator<Item = Judged<'a>>,
-) -> Vec<Diagnostic> {
-    let mut out = Vec::new();
+) -> (Vec<Diagnostic>, Vec<Skip>) {
+    let (mut out, mut skips) = (Vec::new(), Vec::new());
     for judged in readings {
         let reading = judged.reading;
         let named =
             iter::once((&reading.state, true)).chain(reading.against.iter().map(|a| (a, false)));
+        let mut skipped = false;
         for (state, drawn) in named.filter(|(s, _)| !s.is_current()) {
             states.load(state);
+            if matches!(state, ReadingState::Checkpoint(_)) && states.history_missing() {
+                skipped = true;
+                continue;
+            }
             let missing = match states.get(state) {
                 Err(error) => vec![format!("{} does not load: {error:#}", state.text())],
                 Ok((target, _)) if drawn => lacks(target, reading, state),
@@ -355,13 +376,21 @@ pub fn targets<'a>(
                 Diagnostic::new(judged.code, judged.subjects.clone(), message)
             }));
         }
+        if skipped {
+            skips.push(Skip {
+                subject: judged.subjects.last().cloned().unwrap_or_default(),
+                site: judged.site,
+                reason: SkipReason::HistoryNotLocal,
+            });
+        }
     }
-    out
+    (out, skips)
 }
 
 /// `WALKTHROUGH_EMPTY` for a walkthrough without beats, and `WALKTHROUGH_TARGET_MISSING` for a
-/// beat whose target the current state's `states` cannot draw, as `targets` judges it.
-pub fn walkthroughs(states: &mut States<'_>) -> Vec<Diagnostic> {
+/// beat whose target the current state's `states` cannot draw, as `targets` judges it, with its
+/// skips.
+pub fn walkthroughs(states: &mut States<'_>) -> (Vec<Diagnostic>, Vec<Skip>) {
     let model = states.current();
     let mut out = Vec::new();
     let mut beats = Vec::new();
@@ -380,11 +409,13 @@ pub fn walkthroughs(states: &mut States<'_>) -> Vec<Diagnostic> {
             code: DiagnosticCode::WalkthroughTargetMissing,
             subjects: vec![id.clone(), model.qualify(&beat.id)],
             label: format!("{name}, beat {n} ({})", beat.title),
+            site: SkipSite::Walkthrough,
             reading: &beat.reading,
         }));
     }
-    out.extend(targets(states, beats));
-    out
+    let (found, skips) = targets(states, beats);
+    out.extend(found);
+    (out, skips)
 }
 
 /// The scope, focus and flow of `reading` that `target`, the state named `state`, does not hold.

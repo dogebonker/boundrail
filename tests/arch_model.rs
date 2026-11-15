@@ -3903,7 +3903,8 @@ fn a_copy_of_a_proposal_keeps_its_predecessor() {
     let (code, out) = adopt(&checkout, &next, &checkout.digest());
     assert_eq!(code, 0, "{out:#}");
     let again = propose(&checkout, "Again", &next);
-    assert_eq!(drawn(&again)["revision"], checkout.digest());
+    let fresh = propose(&checkout, "Fresh", "current");
+    assert_eq!(drawn(&again), drawn(&fresh));
     checkout.edited(json!([{"type": "edit-module", "subject": "Web", "set": {"order": 4}}]));
     checkout.refused(
         &[
@@ -5492,6 +5493,41 @@ fn kubernetes_service_names_support_http_and_show_in_inspect() {
         let skip = json!({"subject": q(subject), "site": site, "reason": "not-scanned"});
         assert!(skips.contains(&skip), "{skip} in {out:#}");
     }
+
+    // A manifest with no document that parses was not read; one declaring only a Namespace was,
+    // and a binding to it finds the units of its folder.
+    source(
+        &checkout,
+        &[
+            (
+                "deploy/web.yaml",
+                "kind: Deployment\nmetadata: {name: web\n",
+            ),
+            ("k8s/ns.yaml", "kind: Namespace\nmetadata: {name: shop}\n"),
+        ],
+    );
+    for (id, name, path) in [
+        ("Broken01", "Broken", "deploy/web.yaml"),
+        ("Spaced01", "Spaced", "k8s/ns.yaml"),
+    ] {
+        let mut bound = module(id, name, "app", 4);
+        bound["binding"] = json!({"path": path, "symbol": "web"});
+        checkout.module(bound);
+    }
+    let (code, out) = checkout.run(&["check", "--only", "code"]);
+    assert_eq!(code, 1, "{out:#}");
+    // Spaced stands for the web unit, so web's hop to Api is its own.
+    assert_eq!(
+        found(&out),
+        [
+            "BINDING_SYMBOL_MISSING Ghost001",
+            "RELATIONSHIP_UNDRAWN Spaced01, ApiSvc01"
+        ]
+    );
+    let skips = out["skips"].as_array().unwrap();
+    let skip = json!({"subject": q("Broken01"), "site": "binding", "reason": "not-scanned"});
+    assert!(skips.contains(&skip), "{skip} in {out:#}");
+    assert!(!out["skips"].to_string().contains("Spaced01"), "{out:#}");
 }
 
 /// The fake language server's program name.
@@ -6349,9 +6385,40 @@ fn rendering_a_beat_with_focus_dims_the_other_modules() {
 }
 
 #[test]
-fn check_warns_about_beats_whose_target_state_is_missing() {
+fn readings_of_checkpoints_skip_without_the_history_ref() {
     let checkout = Checkout::new();
+    checkout.init();
+    let then = json!({"view": "architecture", "state": {"checkpoint": "Check001"}});
+    let out = checkout.edited(json!([
+        {"type": "add-walkthrough", "walkthrough": {"name": "Past", "order": 0, "beats": [
+            {"title": "Then", "narration": "How it was.", "reading": then}]}},
+        {"type": "add-picture", "picture": {"name": "Old", "order": 0, "output": "docs/old.svg",
+            "reading": then}},
+    ]));
+    let ids: Vec<&str> = (out["allocated"].as_array().unwrap().iter())
+        .map(|a| a["id"].as_str().unwrap())
+        .collect();
+    let (beat, picture) = (ids[1], ids[2]);
+    for (part, subject, site) in [
+        ("semantic", beat, "walkthrough"),
+        ("embeds", picture, "picture"),
+    ] {
+        let (code, out) = checkout.run(&["check", "--only", part]);
+        assert_eq!(code, 0, "{out:#}");
+        assert_eq!(
+            out["skips"],
+            json!([{"subject": subject, "site": site, "reason": "history-not-local"}]),
+            "{out:#}"
+        );
+    }
+}
+
+#[test]
+fn check_warns_about_beats_whose_target_state_is_missing() {
+    let checkout = committed();
     let model = shop(&checkout);
+    // With the history ref present, an unknown checkpoint warns.
+    checkout.ok(&["retain", "--doing", "the shop as built"]);
     let proposal = propose(&checkout, "Next", "current");
     let out = checkout.edited(json!([
         {"type": "add-walkthrough", "walkthrough": {"name": "Plans", "order": 0, "beats": [
@@ -6519,6 +6586,67 @@ fn walkthrough_edits_leave_a_draft_adoptable() {
     let (code, out) = adopt(&checkout, &id, &checkout.digest());
     assert_eq!(code, 0, "{out:#}");
     assert_eq!(out["kind"], "adopt");
+}
+
+#[test]
+fn removing_a_beat_after_drawing_a_draft_leaves_it_adoptable() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let out = checkout.edited(json!([{"type": "add-walkthrough", "walkthrough": {
+        "name": "Tour", "order": 0, "beats": [
+            {"title": "The web", "narration": "Where it starts.", "reading": {"view": "architecture"}},
+            {"title": "Again", "narration": "Once more.", "reading": {"view": "architecture"}}]}}]));
+    let beat = out["allocated"][2]["id"].as_str().unwrap().to_owned();
+    let (id, _) = next(&checkout);
+    checkout.edited(json!([{"type": "remove-beat", "subject": beat}]));
+    let retired = checkout.ok(&["read"])["manifest"]["retired_ids"].clone();
+    assert!(
+        retired.as_array().unwrap().contains(&json!(local(&beat))),
+        "{retired}"
+    );
+    let (code, out) = adopt(&checkout, &id, &checkout.digest());
+    assert_eq!(code, 0, "{out:#}");
+    assert_eq!(out["kind"], "adopt");
+}
+
+#[test]
+fn a_draft_recording_the_earlier_predecessor_digest_still_adopts() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let out = checkout.edited(json!([{"type": "add-module", "module":
+        {"name": "Spare", "kind": "service", "order": 9}}]));
+    let spare = out["allocated"][0]["id"].as_str().unwrap().to_owned();
+    checkout.edited(json!([{"type": "remove-module", "subject": spare}]));
+    let (id, _) = next(&checkout);
+    // With no walkthrough or picture files, the earlier digest is the whole revision's, model.json
+    // with its retired IDs included.
+    let file = format!("proposals/{id}/proposal.json");
+    let mut proposal: Value =
+        serde_json::from_str(&fs::read_to_string(checkout.vault().join(&file)).unwrap()).unwrap();
+    let earlier = checkout.digest();
+    assert_ne!(proposal["predecessor"]["revision"], earlier);
+    proposal["predecessor"]["revision"] = earlier;
+    checkout.write(
+        &file,
+        &(serde_json::to_string_pretty(&proposal).unwrap() + "\n"),
+    );
+    let (code, out) = adopt(&checkout, &id, &checkout.digest());
+    assert_eq!(code, 0, "{out:#}");
+    assert_eq!(out["kind"], "adopt");
+}
+
+#[test]
+fn removing_a_module_after_drawing_a_draft_refuses_predecessor_moved() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let out = checkout.edited(json!([{"type": "add-module", "module":
+        {"name": "Spare", "kind": "service", "order": 9}}]));
+    let spare = out["allocated"][0]["id"].as_str().unwrap().to_owned();
+    let (id, _) = next(&checkout);
+    checkout.edited(json!([{"type": "remove-module", "subject": spare}]));
+    let (code, out) = adopt(&checkout, &id, &checkout.digest());
+    assert_eq!(code, 2, "{out:#}");
+    assert_eq!(out["error"]["code"], "PREDECESSOR_MOVED");
 }
 
 /// Adds the picture Shop: the architecture with Billing in focus, drawn to `output`. Returns its
@@ -6778,7 +6906,10 @@ fn pictures_overwrite_only_files_boundrail_drew() {
     checkout.edited(json!([{"type": "add-picture", "picture": {
         "name": "Plain", "order": 1, "output": "docs/plain.svg", "reading": {"view": "architecture"}}}]));
     let (code, out) = checkout.run(&["pictures", "--write"]);
-    assert_eq!(code, 1, "a blocked picture fails the write: {out:#}");
+    assert_eq!(
+        code, 0,
+        "a blocked picture still prints its status: {out:#}"
+    );
     let blocked = &out["pictures"][0];
     assert_eq!(blocked["reason"], "output-blocked", "{out:#}");
     let message = blocked["message"].as_str().unwrap();
@@ -6886,7 +7017,7 @@ fn a_png_picture_carries_the_digest_of_the_svg_it_was_drawn_from() {
     let (code, out) = run_on_path(&checkout, &path, &["pictures", "--write"]);
     assert_eq!(
         (code, &out["pictures"][0]["reason"]),
-        (1, &json!("output-blocked"))
+        (0, &json!("output-blocked"))
     );
     assert_eq!(
         fs::read(checkout.path().join("docs/shop.png")).unwrap(),
@@ -6913,7 +7044,10 @@ fn without_a_rasterizer_png_pictures_are_unrenderable_and_svgs_still_written() {
     let only_git = bin.path().as_os_str();
 
     let (code, out) = run_on_path(&checkout, only_git, &["pictures", "--write"]);
-    assert_eq!(code, 1, "an unrenderable picture fails the write: {out:#}");
+    assert_eq!(
+        code, 0,
+        "an unrenderable picture still prints its status: {out:#}"
+    );
     let png = &out["pictures"][0];
     assert_eq!(png["status"], "unrenderable", "{out:#}");
     assert_eq!(png["reason"], "no-rasterizer");
@@ -6943,7 +7077,7 @@ fn pictures_never_write_through_a_linked_folder() {
     std::os::unix::fs::symlink(elsewhere.path(), checkout.path().join("docs")).unwrap();
     add_picture(&checkout, "docs/shop.svg");
     let (code, out) = checkout.run(&["pictures", "--write"]);
-    assert_eq!(code, 1, "{out:#}");
+    assert_eq!(code, 0, "{out:#}");
     assert_eq!(out["pictures"][0]["status"], "unrenderable");
     assert_eq!(out["pictures"][0]["reason"], "output-blocked");
     assert_eq!(fs::read_dir(elsewhere.path()).unwrap().count(), 0);
@@ -7003,7 +7137,7 @@ fn a_failed_write_blocks_only_its_own_picture() {
         "name": "Plain", "order": 1, "output": "docs/plain.svg", "reading": {"view": "architecture"}}}]));
     let (code, out) = checkout.run(&["pictures", "--write"]);
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
-    assert_eq!(code, 1, "{out:#}");
+    assert_eq!(code, 0, "{out:#}");
     assert_eq!(out["pictures"][0]["reason"], "output-blocked", "{out:#}");
     assert!(
         out["pictures"][0]["message"]

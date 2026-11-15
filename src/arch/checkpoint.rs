@@ -140,6 +140,13 @@ pub fn list(start: &Path, limit: Option<usize>) -> Result<Vec<Checkpoint>> {
     Ok(history(&root, limit)?.1)
 }
 
+/// Whether the repository around `start` holds the history ref. A clone does not fetch it unless
+/// asked to.
+pub fn history_is_local(start: &Path) -> Result<bool> {
+    let (_, root) = locations(start)?;
+    Ok(tip(&root)?.is_some())
+}
+
 /// The checkpoint `which` names (its ID, else a unique commit prefix of at least 4 hex digits)
 /// and the model it holds, loaded from its tree without touching the checkout, which needs no
 /// vault. The model's `dir` is where the checkout's vault folder is.

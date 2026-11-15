@@ -58,7 +58,7 @@ impl Entry<'_> {
     }
 }
 
-/// `model pictures`: exits 1 when `write` leaves any picture unrenderable.
+/// `model pictures`: exits 0 once it prints the statuses, an unrenderable picture among them.
 pub(super) fn list(
     root: &Path,
     markdown: bool,
@@ -67,11 +67,9 @@ pub(super) fn list(
 ) -> Result<ExitCode> {
     let (model, _, pending) = load_for_read(root, None)?;
     let entries = survey(root, &mut States::new(&model), only, write)?;
-    let stuck = entries.iter().any(|e| e.status == Status::Unrenderable);
-    let code = ExitCode::from(u8::from(write && stuck));
     if !markdown {
         super::write(None, &output(&model, pending, json!(entries)))?;
-        return Ok(code);
+        return Ok(ExitCode::SUCCESS);
     }
     if entries.is_empty() {
         println!("No pictures");
@@ -84,7 +82,7 @@ pub(super) fn list(
         let status = e.status.as_str();
         println!("- {} {}: {} {status}{why}{written}", e.name, e.id, e.output);
     }
-    Ok(code)
+    Ok(ExitCode::SUCCESS)
 }
 
 /// The JSON output of `model pictures` without writing. Without `status` it lists the recipes
@@ -187,7 +185,7 @@ fn judge<'m>(
 /// The embeds part of `model check` on the current state in `states`: `PICTURE_TARGET_MISSING`
 /// for a picture whose proposal or checkpoint is gone or lacks what it reads, `PICTURE_STALE` and
 /// `PICTURE_MISSING` for its file, and `PICTURE_UNRENDERABLE` when the output is blocked, with a
-/// skip for each picture whose freshness is unknown. A PNG is checked by its source digest, so no
+/// skip for each picture whose freshness is unknown or whose checkpoint the clone lacks. A PNG is checked by its source digest, so no
 /// rasterizer is needed.
 pub(super) fn check(root: &Path, states: &mut States<'_>) -> Result<(Vec<Diagnostic>, Vec<Skip>)> {
     let model = states.current();
@@ -195,11 +193,13 @@ pub(super) fn check(root: &Path, states: &mut States<'_>) -> Result<(Vec<Diagnos
         code: DiagnosticCode::PictureTargetMissing,
         subjects: vec![model.qualify(&p.id)],
         label: p.name.clone(),
+        site: code::SkipSite::Picture,
         reading: &p.reading,
     });
-    let mut found = semantic::targets(states, readings);
+    let (mut found, mut skips) = semantic::targets(states, readings);
     let missing: BTreeSet<String> = (found.iter()).flat_map(|d| d.subjects.clone()).collect();
-    let mut skips = Vec::new();
+    // A picture reading a checkpoint the clone lacks is skipped, its freshness check with it.
+    let unread: BTreeSet<String> = (skips.iter()).map(|s| s.subject.clone()).collect();
     for e in survey(root, states, None, false)? {
         let (code, message) = match e.status {
             Status::Fresh => continue,
@@ -217,6 +217,9 @@ pub(super) fn check(root: &Path, states: &mut States<'_>) -> Result<(Vec<Diagnos
                     e.name, e.output
                 ),
             ),
+            Status::Unrenderable if e.reason == Some(RENDER_FAILED) && unread.contains(&e.id) => {
+                continue;
+            }
             Status::Unrenderable => {
                 skips.push(Skip {
                     subject: e.id.clone(),

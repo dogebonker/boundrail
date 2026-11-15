@@ -308,7 +308,10 @@ pub fn read(root: &Path) -> Result<Infra> {
                 declared.compose.push((path.clone(), services));
             }
             Some(FileKind::Kubernetes) => {
-                declared.kubernetes.extend(kubernetes::parse(path, &text))
+                let Some(objects) = kubernetes::parse(path, &text) else {
+                    continue;
+                };
+                declared.kubernetes.extend(objects);
             }
             Some(FileKind::Terraform) => {
                 let resources = terraform::parse(path, &text).into_iter();

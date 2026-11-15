@@ -52,6 +52,8 @@ pub enum SkipReason {
     LanguageServerFailed,
     /// The picture could not be drawn or its file read, so its freshness is unknown.
     Unrenderable,
+    /// The beat or picture reads a checkpoint, and the history ref is not in this repository.
+    HistoryNotLocal,
 }
 
 impl SkipReason {
@@ -72,12 +74,13 @@ impl SkipReason {
             Self::LanguageServersNotEnabled => "language-servers-not-enabled",
             Self::LanguageServerFailed => "language-server-failed",
             Self::Unrenderable => "unrenderable",
+            Self::HistoryNotLocal => "history-not-local",
         }
     }
 }
 
 /// What a skip concerns: a module's binding, a relationship's anchor, the relationship, a
-/// language server (its name, or the config file), or a picture.
+/// language server (its name, or the config file), a walkthrough's beat, or a picture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SkipSite {
@@ -85,6 +88,7 @@ pub enum SkipSite {
     Anchor,
     Relationship,
     LanguageServer,
+    Walkthrough,
     Picture,
 }
 
@@ -95,6 +99,7 @@ impl SkipSite {
             Self::Anchor => "anchor",
             Self::Relationship => "relationship",
             Self::LanguageServer => "language-server",
+            Self::Walkthrough => "walkthrough",
             Self::Picture => "picture",
         }
     }
@@ -102,7 +107,7 @@ impl SkipSite {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct Skip {
-    /// Qualified ID of the module, relationship or picture, or a language server's name.
+    /// Qualified ID of the module, relationship, beat or picture, or a language server's name.
     pub subject: String,
     pub site: SkipSite,
     pub reason: SkipReason,
@@ -252,7 +257,7 @@ pub fn check(
     let joined = joined(&index, &status, infra, &paths);
     let owners = owners(&status, &paths);
     let served = served(&index, &status, lsp);
-    let targets = targets(&index, &status, &served, lsp);
+    let targets = targets(&index, &status, &owners, &served, lsp);
     let mut pairs = Pairs::new(
         &index,
         &scan,
@@ -924,18 +929,27 @@ fn served<'i>(index: &'i Index<'_>, status: &Status<'i, '_, '_>, lsp: &Facts) ->
     served
 }
 
-/// The `served` modules language servers judge calls into: those that, or a judged part below
-/// them, have an interface symbol a server located. Into the others imports stand in.
+/// The `served` modules language servers judge calls into: those with a judged module in their
+/// subtree, themselves included, that has an interface symbol a server located, while every
+/// judged module there owning a file has one. Into the others imports stand in, so a part with
+/// no located symbol never leaves its container's calls unsupported.
 fn targets<'i>(
     index: &'i Index<'_>,
     status: &Status<'i, '_, '_>,
+    owners: &HashMap<&str, &'i str>,
     served: &HashSet<&'i str>,
     lsp: &Facts,
 ) -> HashSet<&'i str> {
-    (status.iter())
-        .filter(|(id, found)| found.is_ok() && lsp.located.contains(**id))
-        .flat_map(|(&id, _)| index.chain(id))
-        .filter(|id| served.contains(id))
+    let owning: HashSet<&str> = owners.values().copied().collect();
+    let judged = |id: &&str| status.get(*id).is_some_and(Result::is_ok);
+    (served.iter().copied())
+        .filter(|&id| {
+            let parts = index.descendants(id).into_iter().map(|(part, _)| part);
+            let (located, unlocated): (Vec<&str>, Vec<&str>) = (iter::once(id).chain(parts))
+                .filter(judged)
+                .partition(|m| lsp.located.contains(*m));
+            !located.is_empty() && unlocated.iter().all(|m| !owning.contains(m))
+        })
         .collect()
 }
 
@@ -1631,6 +1645,56 @@ pub(super) mod tests {
                 .filter(|(_, site, _)| *site == "relationship")
                 .collect::<Vec<_>>(),
             [(q("Unproven"), "relationship", "evidence-unavailable")]
+        );
+    }
+
+    #[test]
+    fn a_container_with_a_file_owning_part_no_server_located_keeps_import_evidence() {
+        let (dir, mut doc) = checkout();
+        // Bank imports only Web, a part of App whose file has no symbol a server located.
+        doc.edges.push(edge(
+            "bank/index.ts",
+            "app/web/index.ts",
+            EdgeKind::Static,
+            1,
+        ));
+        let [app, web, billing, mut bank] = shop();
+        link(&mut bank, "ToApp", "App", "call");
+        let modules = [app, web, billing, bank];
+        let all = ["App", "Web", "Billing", "Bank"].map(q);
+        let facts = Facts {
+            queried: all.iter().cloned().collect(),
+            located: [q("App"), q("Billing")].into_iter().collect(),
+            ..Facts::default()
+        };
+        let report = check(
+            M,
+            &modules,
+            &VaultConfig::default(),
+            dir.path(),
+            Ok(&doc),
+            &Infra::default(),
+            &facts,
+        );
+        assert_eq!(subjects(&report, RelationshipUnsupported), NONE);
+        assert_eq!(subjects(&report, RelationshipBackwards), NONE);
+        // Once Web has a located symbol too, the references judge calls into App.
+        let facts = Facts {
+            located: all.iter().cloned().collect(),
+            ..facts
+        };
+        let report = check(
+            M,
+            &modules,
+            &VaultConfig::default(),
+            dir.path(),
+            Ok(&doc),
+            &Infra::default(),
+            &facts,
+        );
+        assert_eq!(
+            subjects(&report, RelationshipUnsupported),
+            [vec![q("ToApp")]]
         );
     }
 

@@ -4,15 +4,17 @@
 
 use std::collections::BTreeSet;
 
+use anyhow::Result;
 use serde::Serialize;
 
-use super::{CURRENT_ONLY, revision};
+use super::{CURRENT_ONLY, MANIFEST, file_json, revision};
 use super::{Contents, Model, Problems, check_file, check_text, pick};
 use crate::arch::types::{
     BEATS_MAX, Beat, BeatReading, Collection, DESCRIPTION_MAX, LABEL_MAX, Module, NARRATION_MAX,
     READING_DEPTH_MAX, ReadingState, ReadingView, Walkthrough,
 };
 use crate::arch::{Refusal, ids, one_line};
+use crate::sync_rules::hash;
 
 /// The qualified IDs of `modules` and of the flows in `collections`, as readings name them.
 pub(crate) fn reading_ids<'a>(
@@ -248,15 +250,35 @@ pub struct BeatView<'a> {
 impl Model {
     /// The digest a proposal drawn from this current state records as its predecessor: the
     /// revision without the walkthrough and picture files, which a proposal neither holds nor
-    /// replaces.
-    pub fn predecessor_digest(&self) -> String {
+    /// replaces, and with `model.json` in canonical form without its retired IDs, which removing a
+    /// beat, walkthrough or picture grows.
+    pub fn predecessor_digest(&self) -> Result<String> {
+        let mut manifest = self.manifest.clone();
+        manifest.retired_ids.clear();
+        let canonical = hash(file_json(&manifest)?.as_bytes());
+        Ok(self.digest_without_current_only(Some(canonical)))
+    }
+
+    /// The predecessor digest drafts drawn before `predecessor_digest` left out retired IDs record:
+    /// `model.json` as it is on disk.
+    pub fn earlier_predecessor_digest(&self) -> String {
+        self.digest_without_current_only(None)
+    }
+
+    fn digest_without_current_only(&self, manifest: Option<String>) -> String {
         let own = |path: &str| {
             let folder = path.split_once('/').map(|(f, _)| f);
             folder.is_some_and(|f| CURRENT_ONLY.contains(&f))
         };
         let files = (self.revision.files.iter())
             .filter(|f| !own(&f.path))
-            .map(|f| (f.path.clone(), f.sha256.clone()))
+            .map(|f| {
+                let sha256 = match &manifest {
+                    Some(canonical) if f.path == MANIFEST => canonical.clone(),
+                    _ => f.sha256.clone(),
+                };
+                (f.path.clone(), sha256)
+            })
             .collect();
         revision::of_digests(files).digest
     }

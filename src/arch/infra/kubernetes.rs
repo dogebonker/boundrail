@@ -51,8 +51,9 @@ enum Env {
     ConfigMap(String, String, String),
 }
 
-/// The workloads, Services and ConfigMaps of the multi-document manifest `file`.
-pub(super) fn parse(file: &str, text: &str) -> Vec<Object> {
+/// The workloads, Services and ConfigMaps of the multi-document manifest `file`; `None` when no
+/// non-empty document in it parses as YAML, so the file was not read.
+pub(super) fn parse(file: &str, text: &str) -> Option<Vec<Object>> {
     let lines = Lines::new(text);
     let mut starts = vec![0];
     starts.extend(
@@ -60,15 +61,18 @@ pub(super) fn parse(file: &str, text: &str) -> Vec<Object> {
             .filter(|(_, l)| l.starts_with("---"))
             .map(|(at, _)| at + 1),
     );
-    let mut objects = Vec::new();
+    let (mut objects, mut read) = (Vec::new(), false);
     for (n, &start) in starts.iter().enumerate() {
         let end = starts.get(n + 1).map_or(lines.0.len(), |next| next - 1);
         let doc = lines.0[start..end.max(start)].join("\n");
-        if let Ok(value) = serde_yaml_ng::from_str::<Value>(&doc) {
+        if let Ok(value) = serde_yaml_ng::from_str::<Value>(&doc)
+            && !value.is_null()
+        {
+            read = true;
             objects.extend(object(file, &lines, start + 1, &value));
         }
     }
-    objects
+    read.then_some(objects)
 }
 
 /// The object a manifest document starting on line `at` declares, if the collector reads it.
@@ -350,7 +354,7 @@ spec:
 
     #[test]
     fn config_maps_and_service_dns_names_resolve_to_selected_workloads() {
-        let objects = parse("k8s/app.yaml", MANIFEST);
+        let objects = parse("k8s/app.yaml", MANIFEST).unwrap();
         let kinds: Vec<(ObjectKind, &str)> = (objects.iter())
             .map(|o| (o.kind, o.name.as_str()))
             .collect();
@@ -393,10 +397,10 @@ spec:
                     .map(|n| format!(", namespace: {n}"))
                     .unwrap_or_default()
             );
-            parse(file, &env)
+            parse(file, &env).unwrap()
         };
         let service = "kind: Service\nmetadata: {name: api}\nspec: {selector: {app: api}}\n";
-        let mut objects = parse("k8s/a/service.yaml", service);
+        let mut objects = parse("k8s/a/service.yaml", service).unwrap();
         objects.extend(workload("k8s/a/api.yaml", "api", None, "none"));
         objects.extend(workload(
             "k8s/a/web.yaml",

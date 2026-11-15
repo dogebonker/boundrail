@@ -86,7 +86,7 @@ fn inherited(current: &Model, source: Option<&Model>) -> Result<(Predecessor, Ve
     let state = current.manifest.current.as_ref().map(|c| c.id.clone());
     let of_current = Predecessor {
         state: state.clone(),
-        revision: current.predecessor_digest(),
+        revision: current.predecessor_digest()?,
     };
     let Some((source, drawn)) = source.and_then(|s| Some((s, s.proposal.as_ref()?))) else {
         return Ok((of_current, Vec::new()));
@@ -444,9 +444,11 @@ fn refuse_moved(current: &Model, proposal: &Proposal, expected: &str) -> Result<
         .into());
     }
     // Walkthroughs and pictures change on their own beside a proposal, so its predecessor leaves
-    // them out.
-    let drawn_from = current.predecessor_digest();
-    if proposal.predecessor.revision != drawn_from {
+    // them out, and the retired IDs their removal grows. Drafts drawn before retired IDs were left
+    // out record model.json as it was on disk.
+    let drawn_from = current.predecessor_digest()?;
+    let recorded = &proposal.predecessor.revision;
+    if *recorded != drawn_from && *recorded != current.earlier_predecessor_digest() {
         return Err(Refusal::new(
             Code::PredecessorMoved,
             format!(

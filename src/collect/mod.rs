@@ -267,11 +267,27 @@ fn program_in(dirs: Vec<PathBuf>, command: &str, checkout: &Path) -> Option<Path
     } else {
         command.to_owned()
     };
-    let checkout = fs::canonicalize(checkout).unwrap_or_else(|_| checkout.to_path_buf());
-    let outside = |path: &Path| fs::canonicalize(path).is_ok_and(|p| !p.starts_with(&checkout));
+    let outside = outside_of(checkout);
     (dirs.into_iter())
         .map(|dir| dir.join(&name))
         .find(|candidate| executable(candidate) && outside(candidate))
+}
+
+/// Whether a path exists and lies outside `checkout` once links are resolved.
+fn outside_of(checkout: &Path) -> impl Fn(&Path) -> bool {
+    let checkout = fs::canonicalize(checkout).unwrap_or_else(|_| checkout.to_path_buf());
+    move |path| fs::canonicalize(path).is_ok_and(|p| !p.starts_with(&checkout))
+}
+
+/// `PATH` holding only its absolute folders outside `checkout`, as `resolve_program` judges them,
+/// for a child that must find no program the checkout plants.
+pub fn path_outside(checkout: &Path) -> std::ffi::OsString {
+    std::env::join_paths(dirs_outside(absolute_dirs(), checkout)).unwrap_or_default()
+}
+
+fn dirs_outside(dirs: Vec<PathBuf>, checkout: &Path) -> Vec<PathBuf> {
+    let outside = outside_of(checkout);
+    dirs.into_iter().filter(|dir| outside(dir)).collect()
 }
 
 fn executable(path: &Path) -> bool {
@@ -435,6 +451,25 @@ mod tests {
         );
         assert_eq!(found, Some(outside.join("tool")));
         assert_eq!(program_in(vec![inside], "tool", checkout.path()), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_child_path_keeps_only_folders_outside_the_checkout() {
+        let (checkout, elsewhere) = (
+            TempDir::new("path-checkout").unwrap(),
+            TempDir::new("path-elsewhere").unwrap(),
+        );
+        let inside = checkout.path().join("node_modules/.bin");
+        fs::create_dir_all(&inside).unwrap();
+        let linked = elsewhere.path().join("linked");
+        std::os::unix::fs::symlink(&inside, &linked).unwrap();
+        let gone = elsewhere.path().join("gone");
+        let dirs = vec![inside, elsewhere.path().to_path_buf(), linked, gone];
+        assert_eq!(
+            dirs_outside(dirs, checkout.path()),
+            [elsewhere.path().to_path_buf()]
+        );
     }
 
     #[test]

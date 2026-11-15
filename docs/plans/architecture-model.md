@@ -474,7 +474,11 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   looked up in the absolute folders of `PATH` only (`collect::resolve_program`) and must be an
   executable file that, once links are resolved, lies outside the checkout; the server's own
   `PATH` holds only the absolute folders, so neither Boundrail nor the server (an `env
-  node` launcher, say) finds a program a relative entry would reach in the checkout. `boundrail:
+  node` launcher, say) finds a program a relative entry would reach in the checkout. A server
+  installed inside the checkout, such as `node_modules/.bin/typescript-language-server`, is
+  therefore no longer found by name; an absolute `command` in the user's config is the
+  workaround. The server's `PATH` still keeps absolute folders inside the checkout, unlike the
+  rasterizer's. `boundrail:
   starting language server <name>: <program> <args>` goes to stderr before it starts, with the
   resolved program path and shell-quoted arguments. It runs in the checkout root. This is the
   third stated exception in `src/git.rs`'s hardening header, gated by the flag. The servers may
@@ -508,8 +512,9 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   when every file it owns is covered by one server that answered, no file it owns is named by a
   symbol limitation, it has at most 64 interface symbols, and the server found every one of them;
   a container is served only when every judged part below it is. A served module counts as a
-  call target only when it, or a judged part below it, has an interface symbol a server located;
-  into any other module imports stand in. A reference belongs to the module of the file its use
+  call target only when it, or a judged part below it, has an interface symbol a server located,
+  and every judged module in that subtree owning a file, itself included, has one; into any other
+  module imports stand in. A reference belongs to the module of the file its use
   site imports the symbol through (the written target of an import edge from the use-site file
   to the definition file, or to a file exporting the symbol), and to the defining module only
   without such an edge, as import edges are credited. Between two served modules,
@@ -637,8 +642,8 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   file or fails the output rules, a file Boundrail did not draw, or a failed write), and with
   `--write` only `no-rasterizer` (naming the tools tried) and `rasterizer-failed`. `--write`
   draws every stale or missing picture and leaves fresh ones untouched; one picture's failure
-  never stops the others, and the command exits 1 when any picture is still unrenderable
-  afterwards (0 otherwise, and always 0 without `--write`). It writes only the declared output
+  never stops the others, and the command exits 0 once it prints the statuses, an unrenderable
+  picture among them; a refusal still exits 2. It writes only the declared output
   files, never the vault, so it takes no revision, operation ID or journal: each file is replaced
   through a temporary file and a rename, missing folders are created one at a time inside the
   checkout, and no symbolic link is followed or written through. Boundrail overwrites only a file
@@ -664,7 +669,8 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   in.svg`) and `magick` (`in.svg out.png`), found by bare name as an executable file in the
   absolute folders of `PATH` and lying outside the checkout once links are resolved, the
   language servers' lookup (`collect::resolve_program`). It runs with `PATH` holding only the
-  absolute folders, in a private temporary folder (mode 0700) holding only the SVG, under the tool
+  absolute folders that lie outside the checkout by the same test (`collect::path_outside`), in a
+  private temporary folder (mode 0700) holding only the SVG, under the tool
   timeout. The SVG is Boundrail's own render; the repository supplies only the model text it
   draws.
 - T15: `model check` gains an embeds part, `--only embeds`, run only when the current state has
@@ -674,14 +680,20 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   checkpoint does not load, or lacks the scope, focus or flow; a render failing for another
   reason reports it too. `PICTURE_STALE`, `PICTURE_MISSING` and `PICTURE_UNRENDERABLE` (an
   `output-blocked` file) are warnings. A picture whose freshness is unknown adds a skip
-  `{subject: <picture>, site: "picture", reason: "unrenderable"}`, so `skips` appears when the
-  code check ran or a picture could not be checked. A missing rasterizer never reaches the check.
+  `{subject: <picture>, site: "picture", reason: "unrenderable"}`. When the history ref is not in
+  the repository, as in a clone that did not fetch it, every beat or picture reading a checkpoint
+  adds a skip `{subject: <beat or picture>, site: "walkthrough" or "picture", reason:
+  "history-not-local"}` instead of a warning, and such a picture skips its freshness check too; a
+  ref that lacks the checkpoint, or a checkpoint lacking the scope, focus or flow, still warns. So
+  `skips` appears when the code check ran, a picture could not be checked, or a reading was
+  skipped. A missing rasterizer never reaches the check.
   Each proposal or checkpoint a beat or picture reads loads once per run (`semantic::States`),
   shared by the target check and every picture drawn, and the current state loads once.
 - T15: the browser lists the recipes in the sidebar from `/api/pictures`, which without
   `status=1` lists them as `model read` does and draws nothing; with it, it is `model pictures`.
-  The page asks for statuses only through the section's `Check files` button, so reloads never
-  draw every picture, and drops them on each reload. Clicking a picture applies its reading to
+  The Pictures list asks for per-file statuses only through the section's `Check files` button,
+  so reloads never ask for them, and drops them on each reload. The Warnings panel's
+  `/api/check` runs the embeds part as `model check` does, so picture warnings show without it. Clicking a picture applies its reading to
   the active pane and draws it through `/api/render?picture=`, the beat path, so the server
   applies the focus; after a reload a pane showing a picture follows its recipe, or keeps what it
   shows once the picture is gone.

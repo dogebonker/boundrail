@@ -78,10 +78,10 @@ enum Command {
     /// List the picture recipes with whether each file still matches what the model draws:
     /// fresh, stale, missing or unrenderable
     Pictures {
-        /// Draw every stale or missing picture to its output file, creating its folders; exits 1
-        /// when a picture stays unrenderable. Writes only the files the recipes declare, never
-        /// the vault, and overwrites only files Boundrail drew; PNGs need resvg, rsvg-convert or
-        /// magick on PATH outside the checkout
+        /// Draw every stale or missing picture to its output file, creating its folders; a
+        /// picture left unrenderable shows in its status. Writes only the files the recipes
+        /// declare, never the vault, and overwrites only files Boundrail drew; PNGs need resvg,
+        /// rsvg-convert or magick on PATH outside the checkout
         #[arg(long)]
         write: bool,
         /// Only this picture: its ID or unique name
@@ -1289,7 +1289,8 @@ fn check_output(root: &Path, output: &Path) -> Result<()> {
 }
 
 /// `model check`: exit 0 without warnings, 1 with any. Like `model read`, it names a pending edit.
-/// The skips are reported only when the code check ran or a picture could not be checked.
+/// The skips are reported only when the code check ran, a picture could not be checked, or a
+/// reading was skipped.
 fn check(
     root: &Path,
     markdown: bool,
@@ -1325,7 +1326,7 @@ fn check(
 pub(super) struct Checked {
     model: Model,
     diagnostics: Vec<Diagnostic>,
-    /// `None` when the code check did not run and every picture was checked.
+    /// `None` when the code check did not run, every picture was checked and no reading skipped.
     skips: Option<Vec<Skip>>,
     /// The infrastructure units with their owners; `None` when the code check did not run.
     units: Option<Vec<UnitStatus>>,
@@ -1350,18 +1351,22 @@ pub(super) fn run_check(
     let runs = |part: CheckOnly| only.is_none_or(|o| o == part);
     // Each proposal or checkpoint a beat or picture reads loads once for the whole check.
     let mut states = States::new(&model);
+    let (mut skips, mut units) = (None, None);
     let mut diagnostics = if runs(CheckOnly::Semantic) {
         let mut found = semantic::check(&model.manifest.id, &model.modules, &model.collections);
-        found.extend(semantic::walkthroughs(&mut states));
+        let (judged, skipped) = semantic::walkthroughs(&mut states);
+        found.extend(judged);
+        if !skipped.is_empty() {
+            skips = Some(skipped);
+        }
         found
     } else {
         Vec::new()
     };
-    let (mut skips, mut units) = (None, None);
     if runs(CheckOnly::Code) {
         let report = code_check(&model, language_servers)?;
         diagnostics.extend(report.diagnostics);
-        skips = Some(report.skips);
+        skips.get_or_insert_with(Vec::new).extend(report.skips);
         units = Some(report.units);
     }
     if runs(CheckOnly::Embeds) && !model.pictures.is_empty() {
