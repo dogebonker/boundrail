@@ -209,7 +209,8 @@ pub fn load_committed(start: &Path, commit: &str) -> Result<Option<Model>> {
         .replace('\\', "/")
         + "/";
     let invalid = |path: &str, reason: &str| -> anyhow::Error {
-        let message = format!("commit {commit} holds `{prefix}{path}`, which {reason}");
+        let shown = path.escape_debug();
+        let message = format!("commit {commit} holds `{prefix}{shown}`, which {reason}");
         let details = json!({ "commit": commit, "path": path });
         Refusal::new(Code::ModelInvalid, message)
             .with_details(details)
@@ -410,8 +411,10 @@ fn files(root: &Path, checkpoint: &Checkpoint) -> Result<Vec<(String, String, us
         Refusal::new(
             Code::ModelInvalid,
             format!(
-                "checkpoint {} (commit {}) holds `{path}`, which {reason}",
-                checkpoint.id, checkpoint.commit
+                "checkpoint {} (commit {}) holds `{}`, which {reason}",
+                checkpoint.id,
+                checkpoint.commit,
+                path.escape_debug()
             ),
         )
         .with_details(
@@ -761,7 +764,7 @@ mod tests {
         fs::create_dir_all(modules.join("nested")).unwrap();
         fs::write(root.join(".boundrail/model/model.json"), "{}").unwrap();
         fs::write(modules.join("nested/Nested01.module.json"), "{}").unwrap();
-        fs::write(modules.join("bad-name.module.json"), "{}").unwrap();
+        fs::write(modules.join("bad\u{1b}[31mname.module.json"), "{}").unwrap();
         run_git(&root, &["add", "-A"]);
         let tree = run_git(&root, &["write-tree"]);
         let commit = run_git(&root, &["commit-tree", &tree, "-m", "misnamed"]);
@@ -770,7 +773,8 @@ mod tests {
         let refusal = error.downcast_ref::<Refusal>().expect("a refusal");
         assert_eq!(refusal.code, Code::ModelInvalid);
         let details = refusal.details.as_ref().unwrap();
-        assert_eq!(details["path"], "modules/bad-name.module.json");
+        assert_eq!(details["path"], "modules/bad\u{1b}[31mname.module.json");
+        assert!(!refusal.message.contains('\u{1b}'), "{}", refusal.message);
     }
 
     #[test]
