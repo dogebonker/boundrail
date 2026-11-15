@@ -9,6 +9,7 @@ pub mod compare;
 pub mod diagnostic;
 pub mod edit;
 pub mod footprint;
+pub mod github;
 pub mod ids;
 mod index;
 pub mod infra;

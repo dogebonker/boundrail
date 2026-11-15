@@ -92,7 +92,7 @@ jobs:
           name: boundrail-binary
           path: ${{ runner.temp }}/bin
       - run: chmod +x "$RUNNER_TEMP/bin/boundrail"
-      - run: shellcheck install.sh ci/action.sh skills/boundrail-guard/scripts/guard.sh ci/test-install.sh ci/test-elixir-action.sh ci/test-native-action.sh ci/bench-daemon.sh
+      - run: shellcheck install.sh ci/action.sh ci/model-action.sh skills/boundrail-guard/scripts/guard.sh ci/test-install.sh ci/test-elixir-action.sh ci/test-native-action.sh ci/bench-daemon.sh
       - run: bash ci/test-elixir-action.sh
       - run: bash ci/test-native-action.sh
       - name: npm/package.json version is Cargo.toml's

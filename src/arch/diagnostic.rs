@@ -118,6 +118,13 @@ pub struct Diagnostic {
     /// For `CONTAINER_UNBOUND`: the directory its bound parts share.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suggested_binding: Option<String>,
+    /// The repository file the evidence points at: a binding or anchor path, or the file an
+    /// undrawn import, call or configured address is written in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// The 1-based line in `file`, when the evidence has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
 }
 
 impl Diagnostic {
@@ -128,6 +135,15 @@ impl Diagnostic {
             subjects,
             message,
             suggested_binding: None,
+            file: None,
+            line: None,
         }
+    }
+
+    /// The diagnostic pointing at `file`, and at `line` in it when known.
+    pub fn at(mut self, file: &str, line: Option<usize>) -> Self {
+        self.file = Some(file.to_owned());
+        self.line = line;
+        self
     }
 }

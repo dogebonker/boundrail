@@ -10,6 +10,7 @@ use boundrail::arch::compare::{self, Comparison};
 use boundrail::arch::diagnostic::{Diagnostic, Severity};
 use boundrail::arch::edit::{self, Receipt};
 use boundrail::arch::footprint::{self, CrossingsSkipped, FootprintReport, Range};
+use boundrail::arch::github;
 use boundrail::arch::infra::{self, Infra};
 use boundrail::arch::inspect::{self, InspectReport};
 use boundrail::arch::locality::{self, History, LocalityReport};
@@ -27,10 +28,13 @@ use boundrail::arch::vault::{
     WalkthroughEntry,
 };
 use boundrail::arch::{Code, Refusal};
+use boundrail::hook_agents::Agent;
 use serde_json::{Value, json};
 
 #[path = "pictures.rs"]
 mod pictures;
+#[path = "setup.rs"]
+mod setup;
 pub(super) use pictures::pictures_output;
 
 const MODEL_SCHEMA: &str = "boundrail/model/v1";
@@ -40,9 +44,11 @@ pub(super) struct ModelArgs {
     /// Directory inside the Git checkout that holds the model
     #[arg(long, global = true, default_value = ".")]
     root: PathBuf,
-    /// Output format; JSON when absent, except `model render`, which then prints the SVG
+    /// Output format; JSON when absent, except `model render`, which then prints the SVG.
+    /// `annotations` (model check only) prints GitHub workflow commands, and `pr-comment`
+    /// (model footprint only) a Markdown pull request comment
     #[arg(long, global = true, value_enum)]
-    format: Option<Format>,
+    format: Option<ModelFormat>,
     #[command(subcommand)]
     command: Command,
 }
@@ -71,6 +77,17 @@ enum Command {
         #[arg(long)]
         language_servers: bool,
     },
+    /// Report the modules a branch changes, the relationships its changed imports cross, and
+    /// what it changes in the model
+    Footprint {
+        /// The revision the branch starts from [default: the merge-base of HEAD with
+        /// origin/HEAD, main or master, else HEAD]
+        #[arg(long)]
+        base: Option<String>,
+        /// The branch's last commit [default: HEAD with the working tree]
+        #[arg(long)]
+        head: Option<String>,
+    },
     /// Draw the model as SVG: the architecture, or a flow as a sequence diagram or flowchart,
     /// optionally marked with what it changes against another state
     Render(RenderArgs),
@@ -89,6 +106,14 @@ enum Command {
         #[arg(long)]
         only: Option<String>,
     },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ModelFormat {
+    Json,
+    Markdown,
+    Annotations,
+    PrComment,
 }
 
 #[derive(Args)]
@@ -163,6 +188,25 @@ enum ModelCmd {
         /// Start without a current state: plan in proposals until the first adoption
         #[arg(long)]
         planning: bool,
+    },
+    /// Set a repository up for the model: create the vault when absent, install the model
+    /// skills for the agents named, and optionally write a starter language-server list.
+    /// Running it again changes nothing; files you edited stay unless --force replaces them
+    Setup {
+        /// The model's name when the vault is created [default: the checkout folder's name]
+        #[arg(long)]
+        name: Option<String>,
+        /// Install the boundrail-model, boundrail-plan and boundrail-pr skills into this agent's
+        /// project skill folder (repeatable)
+        #[arg(long, value_enum)]
+        agent: Vec<Agent>,
+        /// Write .boundrail/language-servers.json naming the allowlisted servers of the
+        /// languages the checkout root's project files show
+        #[arg(long)]
+        language_servers: bool,
+        /// Replace skill and language-server files that differ from what setup writes
+        #[arg(long)]
+        force: bool,
     },
     /// Print the model, one module with its parts and relationships, a collection, a flow, a
     /// walkthrough, or a picture recipe
@@ -385,17 +429,6 @@ enum ModelCmd {
         #[arg(long, default_value_t = boundrail::cochange::HISTORY_LIMIT)]
         limit: usize,
     },
-    /// Report the modules a branch changes, the relationships its changed imports cross, and
-    /// what it changes in the model
-    Footprint {
-        /// The revision the branch starts from [default: the merge-base of HEAD with
-        /// origin/HEAD, main or master, else HEAD]
-        #[arg(long)]
-        base: Option<String>,
-        /// The branch's last commit [default: HEAD with the working tree]
-        #[arg(long)]
-        head: Option<String>,
-    },
 }
 
 #[derive(Subcommand)]
@@ -441,15 +474,15 @@ impl WritingArgs {
 
 /// A refusal is printed on stdout and exits with code 2; other errors go to main's handler.
 pub(super) fn run(args: ModelArgs) -> Result<ExitCode> {
-    let markdown = matches!(args.format, Some(Format::Markdown));
-    let result = match args.command {
+    let markdown = matches!(args.format, Some(ModelFormat::Markdown));
+    let result = refuse_format(args.format, &args.command).and_then(|()| match args.command {
         Command::Check {
             only,
             proposal,
             language_servers,
         } => check(
             &args.root,
-            markdown,
+            args.format,
             only,
             proposal.as_deref(),
             language_servers,
@@ -461,10 +494,14 @@ pub(super) fn run(args: ModelArgs) -> Result<ExitCode> {
         Command::Pictures { write, only } => {
             pictures::list(&args.root, markdown, only.as_deref(), write)
         }
+        Command::Footprint { base, head } => {
+            let (base, head) = (base.as_deref(), head.as_deref());
+            model_footprint(&args.root, args.format, base, head).map(|()| ExitCode::SUCCESS)
+        }
         Command::Model(command) => {
             execute(&args.root, markdown, command).map(|()| ExitCode::SUCCESS)
         }
-    };
+    });
     match result {
         Ok(code) => Ok(code),
         Err(error) => match error.downcast_ref::<Refusal>() {
@@ -475,6 +512,24 @@ pub(super) fn run(args: ModelArgs) -> Result<ExitCode> {
             None => Err(error),
         },
     }
+}
+
+/// Refuses `REQUEST_INVALID` a format the command does not print: `annotations` belongs to
+/// `model check` and `pr-comment` to `model footprint`.
+fn refuse_format(format: Option<ModelFormat>, command: &Command) -> Result<()> {
+    let printed = match format {
+        Some(ModelFormat::Annotations) => matches!(command, Command::Check { .. }),
+        Some(ModelFormat::PrComment) => {
+            matches!(command, Command::Footprint { .. })
+        }
+        _ => true,
+    };
+    if printed {
+        return Ok(());
+    }
+    let message =
+        "--format annotations is for model check, --format pr-comment for model footprint";
+    Err(Refusal::new(Code::RequestInvalid, message).into())
 }
 
 fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
@@ -908,9 +963,19 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
         ModelCmd::Locality { since, limit } => {
             model_locality(root, markdown, since.as_deref(), limit)
         }
-        ModelCmd::Footprint { base, head } => {
-            model_footprint(root, markdown, base.as_deref(), head.as_deref())
-        }
+        ModelCmd::Setup {
+            name,
+            agent,
+            language_servers,
+            force,
+        } => setup::run(
+            root,
+            markdown,
+            name.as_deref(),
+            &agent,
+            language_servers,
+            force,
+        ),
         ModelCmd::Checkpoints { limit } => {
             if !markdown {
                 return write(None, &checkpoints_output(root, limit)?);
@@ -1083,14 +1148,14 @@ pub(super) fn walkthrough_output(root: &Path, subject: &str) -> Result<Value> {
 
 /// `model render`: the SVG on stdout or in `--output`; with `--format json`, inside the output
 /// envelope.
-fn render_model(root: &Path, format: Option<Format>, args: &RenderArgs) -> Result<()> {
-    if matches!(format, Some(Format::Markdown)) {
+fn render_model(root: &Path, format: Option<ModelFormat>, args: &RenderArgs) -> Result<()> {
+    if matches!(format, Some(ModelFormat::Markdown)) {
         let message = "model render prints SVG, or JSON with --format json";
         return Err(Refusal::new(Code::RequestInvalid, message).into());
     }
     let output = args.output.as_deref();
     let (svg, view) = render_svg(root, &args.spec, output)?;
-    if matches!(format, Some(Format::Json)) {
+    if matches!(format, Some(ModelFormat::Json)) {
         let envelope = json!({
             "schema": MODEL_SCHEMA,
             "kind": "render",
@@ -1505,14 +1570,18 @@ fn check_output(root: &Path, output: &Path) -> Result<()> {
 /// reading was skipped.
 fn check(
     root: &Path,
-    markdown: bool,
+    format: Option<ModelFormat>,
     only: Option<CheckOnly>,
     proposal: Option<&str>,
     language_servers: bool,
 ) -> Result<ExitCode> {
     let checked = run_check(root, only, proposal, language_servers)?;
     let code = ExitCode::from(u8::from(checked.warning > 0));
-    if markdown {
+    if format == Some(ModelFormat::Annotations) {
+        print!("{}", github::annotations(&checked.output()?));
+        return Ok(code);
+    }
+    if format == Some(ModelFormat::Markdown) {
         let Checked {
             model,
             diagnostics,
@@ -1939,7 +2008,7 @@ fn print_locality(model: &Model, history: &History, report: &LocalityReport) {
 /// that does not load leaves `model` null with `model_error`.
 fn model_footprint(
     root: &Path,
-    markdown: bool,
+    format: Option<ModelFormat>,
     base: Option<&str>,
     head: Option<&str>,
 ) -> Result<()> {
@@ -1972,7 +2041,7 @@ fn model_footprint(
     let base_state = (before.as_ref()).map(|m| (&m.modules[..], &m.collections[..]));
     let (id, scan) = (&model.manifest.id, doc.as_ref().map_err(|s| *s));
     let report = footprint::measure(id, head_state, base_state, &files, scan, &infra);
-    if markdown {
+    if format == Some(ModelFormat::Markdown) {
         print_footprint(&model, &range, &report, model_error.as_deref());
         return Ok(());
     }
@@ -1992,6 +2061,14 @@ fn model_footprint(
     output["model"] = json!(report.model);
     output["model_error"] = json!(model_error);
     output["scan_error"] = json!(scan_error);
+    if format == Some(ModelFormat::PrComment) {
+        let mut names: BTreeMap<String, String> = (names(&model).into_iter())
+            .map(|(id, name)| (id, name.to_owned()))
+            .collect();
+        names.extend(relationship_names(&model));
+        print!("{}", github::pr_comment(&output, &names));
+        return Ok(());
+    }
     write(None, &output)
 }
 

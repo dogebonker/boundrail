@@ -47,13 +47,12 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 | T13 | Language-server evidence: call-level references through configured language servers | done |
 | T14 | Walkthroughs: ordered beats over readings, playback in the browser | done |
 | T15 | Embedded pictures: render recipes in SVG/PNG, `check embeds`, PNG rasterize | done |
-| T16 | Agent integration: `init`, skills for authoring/planning/PRs, CI action with PR annotations and footprint comment | open |
+| T16 | Agent integration: `model setup`, skills for authoring/planning/PRs, CI action with PR annotations and footprint comment | done |
 | T17 | Reconcile drafts after current changes, export/import bundles, history publication | done |
 | T18 | Remove scan-era code that the model does not use | open |
 
 ## Notes
 
-- T16: scoped agent hooks treat .boundrail/model changes as out of scope; decide whether the vault is always in scope.
 - T5: the code check scans the checkout once with the native engine, which picks one language per
   checkout. Bound code in any other language holds no scanned file and is skipped as
   `not-scanned` (polyglot gap). The TypeScript and Python collectors scan only under `src/` when
@@ -790,3 +789,67 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   "history-fetch", remote, ref, before, after, updated, checkpoints}` with the IDs gained; a
   missing local history or remote ref is no change. Once fetched, checkpoint readings resolve, so
   CI can run `model history fetch` before `model check`.
+
+- T16: setup is `boundrail model setup`, not a flag of `boundrail init`. `init` is the scan-era
+  `layout.yaml` generator (presets, scopes, rule sync), which T18 may remove; a model command keeps
+  the two apart. `model setup [--name N] [--agent A]... [--language-servers] [--force]` creates the
+  vault through `vault::init` when absent (named after the checkout folder unless `--name`), installs
+  the `boundrail-model`, `boundrail-plan` and `boundrail-pr` skills, embedded with `include_str!`
+  from `skills/`, into each agent's project skill folder (`.claude/skills`, `.agents/skills` for
+  Codex as the project skill already uses, `.cursor/skills`, `.opencode/skills`), and with
+  `--language-servers` writes `.boundrail/language-servers.json` naming the allowlisted server of
+  each language a project file at the checkout root shows (`package.json` or `tsconfig.json`,
+  `pyproject.toml`, `setup.py`, `setup.cfg` or `requirements.txt` for `pyright-langserver`,
+  `Cargo.toml`, `go.mod`, `pom.xml` or Gradle files), nothing when none does. A file equal to what
+  setup writes is `unchanged`, a missing one `written`, and a different one `kept` unless `--force`
+  replaces it; no symbolic link on the way is followed. JSON lists `created`, `written`,
+  `unchanged`, `kept`, `language_servers` (null without the flag), `notes` (what setup left alone and
+  why, such as a `--name` unused because the vault exists) and `next_steps`. `boundrail
+  skill` drafts and adopts the scan-era project skill and installs nothing shipped, so the model
+  skills are not wired into it. ponytail: languages come from root project files only; a polyglot
+  monorepo with nested manifests gets fewer servers than it could use.
+- T16: the vault files Boundrail writes are always in scope for scoped agent hooks:
+  `edit_gate::check` never reports a changed `.boundrail/model/config.yaml`, or a file a journaled
+  write may write or delete (`vault::is_written_path`), as a scope violation, whatever `--scope`
+  says. Agents edit the vault through `boundrail model edit`, so leaving it out of a scope would
+  block authoring the model. Any other file under `.boundrail/model/`, `.boundrail/language-servers.json`
+  and the rest of `.boundrail` stay subject to the scope.
+- T16: `model check` diagnostics gain `file` and `line` (absent when unknown): the binding or anchor
+  path for `BINDING_*` and `ANCHOR_*` warnings, and the file and line of the evidence for
+  `RELATIONSHIP_UNDRAWN` (the import, call reference or configured address) and
+  `ENTRY_POINT_UNEXPOSED`. Semantic diagnostics carry none. `--format annotations` (model check only)
+  prints one GitHub workflow command per diagnostic, `::warning` for a warning and `::notice` for
+  information, with `file`, `line` and the code as `title`; data escapes `%`, CR and LF, and
+  properties also `:` and `,`. Either format on another command refuses `REQUEST_INVALID`. The model
+  commands' `--format` is their own enum, so the scan commands' formats do not change.
+- T16: `--format pr-comment` (model footprint only) prints a Markdown comment whose first line is
+  the marker `<!-- boundrail:footprint -->`: the touched modules, files outside every binding, the
+  crossings with the relationships drawn for them or `undrawn`, the `crossings_skipped` reason with
+  `scan_error`, and the model change counts per section, or why they were not compared. Module
+  names, paths, relationship names and the base reference are code spans, fenced longer than any
+  backtick run in them, so Markdown, HTML, mentions, issue references and links stay literal; `|`
+  is escaped in table cells. Control characters, zero-width and direction marks and bidirectional
+  embeddings, overrides and isolates (U+200B to U+200F, U+202A to U+202E, U+2066 to U+2069) become
+  spaces, and a name is cut at 120 characters. Messages are escaped as Markdown with `@` as an
+  entity. Each list shows at most 50 rows, and a comment over 60,000 bytes is cut at a line and
+  ends saying so and pointing at the job summary. It renders from the command's JSON output
+  (`src/arch/github.rs`), as the annotations do.
+- T16: the action's `mode` input is `scan` (the default, unchanged) or `model`, which runs
+  `ci/model-action.sh`. It keeps the token in a script variable, unsets `INPUT_TOKEN`, and gives it
+  to `gh` as `GH_TOKEN` only while posting. It installs the binary as scan mode does, runs `model
+  check --format annotations`, replays only its `::warning` and `::notice` lines with workflow
+  commands on (every other output runs under `::stop-commands::`), and adds the counts to the job
+  summary, since GitHub shows at most 10 annotations of each kind. With a base (`base-ref`, else the
+  pull request's base, refused when it starts with `-`) it unshallows a shallow checkout, writes
+  `model footprint --base <base> --format pr-comment` to the job summary (plus the whole
+  `--format markdown` footprint in a fenced block when the comment was cut), and on `pull_request`
+  with a `token` replaces the comment that starts with the marker, taken from the comment's first
+  line, and that the token's account wrote: the login `gh api user` names, else
+  `github-actions[bot]` for `GITHUB_TOKEN`. Posting is best effort: when the token cannot write (a
+  fork's pull request, a Dependabot run, a read-only token) the step leaves a notice and goes on.
+  `fail-on` takes `warnings` (the model default; the scan default list counts as it), `information`
+  or `never`. It never passes `--language-servers`: language servers run code from the checkout,
+  and a pull request head is untrusted. `tests/action.rs` checks that, that its commands, flags and
+  formats exist, and the best-effort post with stub `boundrail` and `gh` programs. T18 can delete
+  scan mode by removing the `scan` step, `ci/action.sh` and the scan inputs, then making `fail-on`
+  default to `warnings`.

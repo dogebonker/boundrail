@@ -175,6 +175,51 @@ fn mcp_snapshot_uses_pre_edit_baseline_without_git_and_does_not_consume_it() {
 }
 
 #[test]
+fn a_scoped_agent_may_write_model_files_and_nothing_else_outside_its_scope() {
+    let fixture = Fixture::new();
+    let capture = fixture.json(
+        &[
+            "hook",
+            "capture",
+            "--agent",
+            "codex",
+            "--scope",
+            "src/domain/**",
+            "--files",
+            "src/domain/a.ts",
+        ],
+        None,
+    );
+    let baseline = capture["snapshot"].as_str().unwrap();
+    let check = || fixture.command(&["hook", "check", "--baseline", baseline], None);
+    let module = fixture
+        .0
+        .join(".boundrail/model/modules/Web00001.module.json");
+    fs::create_dir_all(module.parent().unwrap()).unwrap();
+    fs::write(&module, "{}\n").unwrap();
+    let passed = check();
+    assert_eq!(
+        passed.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&passed.stdout)
+    );
+    // A file in the vault that Boundrail never writes is out of scope, as is the rest of
+    // .boundrail.
+    fs::write(fixture.0.join(".boundrail/model/notes.txt"), "draft\n").unwrap();
+    fs::write(fixture.0.join(".boundrail/notes.txt"), "outside\n").unwrap();
+    let blocked = check();
+    assert_eq!(blocked.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&blocked.stdout);
+    assert!(
+        stdout.contains("\".boundrail/model/notes.txt\""),
+        "{stdout}"
+    );
+    assert!(stdout.contains("\".boundrail/notes.txt\""), "{stdout}");
+    assert!(!stdout.contains("Web00001"), "{stdout}");
+}
+
+#[test]
 fn invalid_native_payload_returns_deny_instead_of_clean() {
     let fixture = Fixture::new();
     fixture.json(&["hook", "install", "--agent", "claude"], None);

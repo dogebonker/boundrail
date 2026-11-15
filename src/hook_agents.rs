@@ -198,14 +198,15 @@ fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn safe_path(root: &Path, relative: &str) -> Result<std::path::PathBuf> {
+/// `root` joined with `relative`, refusing a symbolic link at any existing component.
+pub fn safe_path(root: &Path, relative: &str) -> Result<std::path::PathBuf> {
     let mut path = root.to_path_buf();
     for part in Path::new(relative).components() {
         path.push(part);
         match fs::symlink_metadata(&path) {
             Ok(meta) => ensure!(
                 !meta.file_type().is_symlink(),
-                "refusing symlink in hook installation path: {}",
+                "refusing symlink in installation path: {}",
                 path.display()
             ),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),

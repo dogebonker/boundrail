@@ -367,6 +367,85 @@ fn init_refuses_a_blank_or_multiline_name_and_writes_nothing() {
 }
 
 #[test]
+fn setup_creates_the_vault_and_skills_once_and_keeps_edited_files() {
+    let checkout = Checkout::new();
+    for file in ["package.json", "Cargo.toml"] {
+        fs::write(checkout.path().join(file), "{}\n").unwrap();
+    }
+    let args = [
+        "setup",
+        "--agent",
+        "claude",
+        "--agent",
+        "codex",
+        "--language-servers",
+    ];
+    let skills = |dir: &str| {
+        ["boundrail-model", "boundrail-plan", "boundrail-pr"]
+            .map(|skill| format!("{dir}/{skill}/SKILL.md"))
+    };
+    let mut files: Vec<String> = skills(".claude/skills").into();
+    files.extend(skills(".agents/skills"));
+    files.push(".boundrail/language-servers.json".into());
+
+    let first = checkout.ok(&args);
+    assert_eq!(first["kind"], "setup");
+    assert_eq!(first["created"], true);
+    assert_eq!(first["written"], json!(files));
+    assert_eq!(
+        first["language_servers"],
+        json!(["typescript-language-server", "rust-analyzer"])
+    );
+    assert_eq!(first["next_steps"][0], "boundrail model read");
+    let shipped = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("skills/boundrail-model/SKILL.md"),
+    )
+    .unwrap();
+    let installed = checkout
+        .path()
+        .join(".claude/skills/boundrail-model/SKILL.md");
+    assert_eq!(fs::read_to_string(&installed).unwrap(), shipped);
+    let servers = fs::read_to_string(checkout.path().join(".boundrail/language-servers.json"));
+    let servers: Value = serde_json::from_str(&servers.unwrap()).unwrap();
+    assert_eq!(
+        servers,
+        json!([{"server": "typescript-language-server"}, {"server": "rust-analyzer"}])
+    );
+    let digest = checkout.digest();
+
+    let second = checkout.ok(&args);
+    assert_eq!(second["created"], false);
+    assert_eq!(second["written"], json!([]));
+    assert_eq!(second["unchanged"], json!(files));
+    assert_eq!(second["notes"], json!([]));
+    assert_eq!(checkout.digest(), digest);
+    let renamed = checkout.ok(&["setup", "--name", "Other"]);
+    assert_eq!(
+        renamed["notes"],
+        json!(["The vault exists, so --name was not used."])
+    );
+    assert_eq!(checkout.digest(), digest);
+
+    fs::write(&installed, "my notes\n").unwrap();
+    let kept = checkout.ok(&args);
+    assert_eq!(kept["kept"], json!([files[0]]));
+    assert_eq!(fs::read_to_string(&installed).unwrap(), "my notes\n");
+    let mut forced = args.to_vec();
+    forced.push("--force");
+    let replaced = checkout.ok(&forced);
+    assert_eq!(replaced["written"], json!([files[0]]));
+    assert_eq!(fs::read_to_string(&installed).unwrap(), shipped);
+
+    // Without --agent setup installs nothing and says how to.
+    let bare = Checkout::new();
+    let out = bare.ok(&["setup", "--name", "Shop"]);
+    assert_eq!(out["written"], json!([]));
+    assert_eq!(out["language_servers"], Value::Null);
+    assert_eq!(out["next_steps"][0], "boundrail model setup --agent claude");
+    assert_eq!(bare.ok(&["read"])["manifest"]["name"], "Shop");
+}
+
+#[test]
 fn read_an_empty_model() {
     let checkout = Checkout::new();
     let model = checkout.init();
@@ -2319,6 +2398,45 @@ fn check_compares_the_model_with_the_code() {
              Check failed: warnings: 3, information: 0\n"
         ),
         "{text}"
+    );
+}
+
+#[test]
+fn check_prints_github_annotations_at_the_file_the_evidence_names() {
+    let checkout = Checkout::new();
+    typescript(&checkout);
+    let model = shop(&checkout);
+    bind(&checkout, "Platfrm1", "src");
+    bind(&checkout, "WebApp01", "src/web");
+    bind(&checkout, "Billing1", "src/billing");
+    let mut ledger = module("Ledger01", "Ledger", "module", 2);
+    ledger["parent"] = format!("{model}#Platfrm1").into();
+    ledger["binding"] = json!({"path": "src/bank"});
+    checkout.module(ledger);
+    let mut ghost = module("Ghost001", "Ghost", "module", 3);
+    ghost["parent"] = format!("{model}#Platfrm1").into();
+    ghost["binding"] = json!({"path": "src/ghost"});
+    checkout.module(ghost);
+
+    let (code, out) = checkout.run(&["check"]);
+    assert_eq!(code, 1, "{out:#}");
+    assert_eq!(out["diagnostics"][0]["file"], "src/ghost");
+    assert_eq!(out["diagnostics"][0].get("line"), None);
+    assert_eq!(out["diagnostics"][1]["file"], "src/billing/index.ts");
+    assert_eq!(out["diagnostics"][1]["line"], 1);
+    let (code, text) = checkout.run_raw(&["check", "--format", "annotations"]);
+    assert_eq!(code, 1, "{text}");
+    assert_eq!(
+        text,
+        "::warning file=src/ghost,title=BINDING_PATH_MISSING::Ghost is bound to src/ghost, which \
+         does not exist\n\
+         ::warning file=src/billing/index.ts,line=1,title=RELATIONSHIP_UNDRAWN::Billing uses \
+         Ledger but no relationship is drawn: src/billing/index.ts:1 imports src/bank/index.ts\n"
+    );
+    let error = checkout.refused(&["read", "--format", "annotations"], "REQUEST_INVALID");
+    assert!(
+        error["message"].as_str().unwrap().contains("model check"),
+        "{error:#}"
     );
 }
 
@@ -4808,6 +4926,42 @@ fn footprint_reports_a_base_model_that_does_not_load() {
     let error = out["model_error"].as_str().unwrap();
     assert!(error.contains(&format!("commit {broken}")), "{error}");
     assert!(!error.contains("committed"), "{error}");
+}
+
+#[test]
+fn footprint_prints_a_pull_request_comment() {
+    let (checkout, model) = measured();
+    git(&checkout, &["checkout", "-q", "-b", "feature"]);
+    change(
+        &checkout,
+        &["src/billing/fee.ts", "src/billing/charge.ts"],
+        "fees",
+    );
+    let mut fees = module("Fees0001", "Fees", "module", 4);
+    fees["binding"] = json!({"path": "src/billing/fee.ts"});
+    fees["parent"] = format!("{model}#Billing1").into();
+    checkout.module(fees);
+    sources(&checkout, &[("NOTES.md", "draft\n")]);
+
+    let (code, text) = checkout.run_raw(&["footprint", "--base", "main", "--format", "pr-comment"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.starts_with("<!-- boundrail:footprint -->\n### Architecture footprint\n"),
+        "{text}"
+    );
+    for line in [
+        " (`main`) to the working tree.\n",
+        "| `Billing` | 1 | 1 |\n",
+        "| `Fees` | 1 | 0 |\n",
+        "Outside every binding: `NOTES.md`\n",
+        "| `Billing` | `Bank` | 1 | 0 | undrawn |\n",
+        "| `Web` | `Fees` | 1 | 0 | `Web -> Billing [call]` |\n",
+        "- Model modules: 1 added, 0 removed, 0 changed\n",
+    ] {
+        assert!(text.contains(line), "{line}\n{text}");
+    }
+    checkout.refused(&["read", "--format", "pr-comment"], "REQUEST_INVALID");
+    checkout.refused(&["check", "--format", "pr-comment"], "REQUEST_INVALID");
 }
 
 #[test]

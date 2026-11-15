@@ -6,10 +6,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::arch::vault;
 use crate::model::{CycleLevel, Document, Evidence};
 
 #[derive(Debug, Clone, Default)]
 pub struct Options {
+    /// Allowed paths and globs. The vault files `boundrail model` writes are always allowed:
+    /// agents author the model through it, and a scope that left them out would block that.
     pub scope: Vec<String>,
     /// Includes additions and deletions; callers supply paths from the actual edit.
     pub changed_files: Vec<String>,
@@ -166,7 +169,7 @@ pub fn check(before: &Document, after: &Document, options: &Options) -> Result<R
     }
     if !options.scope.is_empty() {
         for file in &options.changed_files {
-            if !scope.is_match(file) {
+            if !scope.is_match(file) && !vault::is_written_path(file) {
                 violations.push(violation("scope", "scope", file, Value::Null, None,
                     "Revert the out-of-scope edit, or obtain a scope that explicitly includes this file, then verify the edit again."));
             }
@@ -490,11 +493,15 @@ mod tests {
                 "domain/new.ts".into(),
                 "app/deleted.ts".into(),
                 "app/deleted.ts".into(),
+                ".boundrail/model/modules/Web00001.module.json".into(),
+                ".boundrail/model/config.yaml".into(),
+                ".boundrail/model/notes.txt".into(),
             ],
         };
+        // The vault files Boundrail writes are always in scope; any other file is not.
         let report = check(&doc, &doc, &options).unwrap();
-        assert_eq!(report.violations.len(), 1);
-        assert_eq!(report.violations[0].file, "app/deleted.ts");
+        let files: Vec<&str> = report.violations.iter().map(|v| v.file.as_str()).collect();
+        assert_eq!(files, [".boundrail/model/notes.txt", "app/deleted.ts"]);
         assert_eq!(report.violations[0].kind, "scope");
         for invalid in ["/tmp/a", "../a", "a/../b", "a\\b", "C:/a", "a\nb"] {
             assert!(

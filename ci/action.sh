@@ -4,7 +4,7 @@
 # GITHUB_STEP_SUMMARY:
 #
 #   INPUT_PATH INPUT_RULES INPUT_DEPTH INPUT_LANGUAGE INPUT_ENGINE INPUT_PACKAGE INPUT_EXCLUDE INPUT_FAIL_ON
-#   INPUT_FAIL_ON_RULES_CHANGE INPUT_VERSION INPUT_BINARY INPUT_BASE_REF   as in action.yml
+#   INPUT_FAIL_ON_RULES_CHANGE INPUT_VERSION INPUT_BINARY INPUT_BASE_REF INPUT_MODE   as in action.yml
 #   ARCHGRAPH_DEPCRUISE, ARCHGRAPH_PYTHON, ARCHGRAPH_GO   a collector to use instead of installing one
 #   ARCHGRAPH_ELIXIR   a preinstalled Elixir executable (default elixir)
 #
@@ -44,6 +44,8 @@ die() {
 here=$(cd "$(dirname "$0")/.." && pwd)
 : "${RUNNER_TEMP:?}" "${GITHUB_OUTPUT:?}" "${GITHUB_STEP_SUMMARY:?}"
 
+# Model mode runs ci/model-action.sh instead; any other mode is a typo.
+[[ ${INPUT_MODE:-scan} == scan ]] || die "mode must be scan or model"
 path=${INPUT_PATH:-.}
 [[ -d $path ]] || die "path $path is not a directory"
 lang=${INPUT_LANGUAGE:-}

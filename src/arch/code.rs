@@ -145,7 +145,17 @@ impl CodeReport {
         self.diagnostics
             .push(Diagnostic::new(code, subjects, message));
     }
+
+    /// `warn` with the file, and line, the evidence points at.
+    fn warn_at(&mut self, code: DiagnosticCode, subject: &str, message: String, at: Location<'_>) {
+        let (file, line) = at;
+        let found = Diagnostic::new(code, vec![subject.to_owned()], message).at(file, line);
+        self.diagnostics.push(found);
+    }
 }
+
+/// A repository file and the 1-based line in it, when known.
+type Location<'a> = (&'a str, Option<usize>);
 
 /// Which evidence is collected for which modules.
 struct Collected<'i> {
@@ -663,7 +673,7 @@ impl Site<'_> {
             (Err(reason), _) => {
                 if *reason == SkipReason::PathMissing {
                     let message = format!("{} {path}, which does not exist", self.label());
-                    report.warn(self.path_code, vec![subject.to_owned()], message);
+                    report.warn_at(self.path_code, subject, message, (path, None));
                 }
                 report.skip(self.site, subject, *reason);
             }
@@ -673,7 +683,7 @@ impl Site<'_> {
                     let label = self.label();
                     let message =
                         format!("{label} {path} {symbol}, but no file there {verb} {symbol}");
-                    report.warn(self.symbol_code, vec![subject.to_owned()], message);
+                    report.warn_at(self.symbol_code, subject, message, (path, None));
                 }
                 Err(reason) => report.skip(self.site, subject, reason),
             },
@@ -783,11 +793,8 @@ fn unit_binding<'s, 'd>(
     let path = &binding.path;
     if !root.join(path).is_file() {
         let message = format!("{name} is bound to {path}, which does not exist");
-        report.warn(
-            DiagnosticCode::BindingPathMissing,
-            vec![subject.to_owned()],
-            message,
-        );
+        let code = DiagnosticCode::BindingPathMissing;
+        report.warn_at(code, subject, message, (path, None));
         report.skip(SkipSite::Binding, subject, SkipReason::PathMissing);
         return Err(SkipReason::PathMissing);
     }
@@ -805,11 +812,8 @@ fn unit_binding<'s, 'd>(
         let symbol = binding.symbol.as_deref().unwrap_or_default();
         let message =
             format!("{name} is bound to {path} {symbol}, but no unit there is named {symbol}");
-        report.warn(
-            DiagnosticCode::BindingSymbolMissing,
-            vec![subject.to_owned()],
-            message,
-        );
+        let code = DiagnosticCode::BindingSymbolMissing;
+        report.warn_at(code, subject, message, (path, None));
     }
     Ok(Found {
         files: &[],
@@ -1063,23 +1067,27 @@ impl<'i, 'd, 'x> Pairs<'i, 'd, 'x> {
         self.served.contains(from) && self.targets.contains(to)
     }
 
-    /// Each pair's evidence as it reads, the first kind found: a runtime edge, else a
-    /// reference, else a configured hop.
-    fn evidence(&self) -> BTreeMap<(&'i str, &'i str), String> {
+    /// Each pair's evidence as it reads, with where it is written, the first kind found: a
+    /// runtime edge, else a reference, else a configured hop.
+    fn evidence(&self) -> BTreeMap<(&'i str, &'i str), (String, Location<'_>)> {
         let mut found = BTreeMap::new();
         for (&pair, edge) in &self.runtime {
-            found.insert(
-                pair,
-                format!("{} imports {}", location(edge), written(edge)),
-            );
+            let text = format!("{} imports {}", location(edge), written(edge));
+            found.insert(pair, (text, (edge.from.as_str(), edge.line)));
         }
         for (&pair, r) in &self.calls {
-            let calls = || format!("{}:{} calls {}", r.from, r.line, r.name);
+            let calls = || {
+                let text = format!("{}:{} calls {}", r.from, r.line, r.name);
+                (text, (r.from.as_str(), usize::try_from(r.line).ok()))
+            };
             found.entry(pair).or_insert_with(calls);
         }
         for (&pair, hop) in &self.configured {
             let (file, line, variable) = (&hop.file, hop.line, &hop.variable);
-            let names = || format!("{file}:{line} {variable} names {}", hop.address);
+            let names = || {
+                let text = format!("{file}:{line} {variable} names {}", hop.address);
+                (text, (file.as_str(), Some(line)))
+            };
             found.entry(pair).or_insert_with(names);
         }
         found
@@ -1234,7 +1242,7 @@ fn undrawn(
         from.iter()
             .any(|a| to.iter().any(|b| set.contains(&(*a, *b))))
     };
-    for ((from, to), evidence) in pairs.evidence() {
+    for ((from, to), (evidence, (file, line))) in pairs.evidence() {
         if index.is_below(from, to) || index.is_below(to, from) {
             continue;
         }
@@ -1247,11 +1255,9 @@ fn undrawn(
             index.name(from),
             index.name(to),
         );
-        report.warn(
-            DiagnosticCode::RelationshipUndrawn,
-            vec![from.to_owned(), to.to_owned()],
-            message,
-        );
+        let subjects = vec![from.to_owned(), to.to_owned()];
+        let found = Diagnostic::new(DiagnosticCode::RelationshipUndrawn, subjects, message);
+        report.diagnostics.push(found.at(file, line));
     }
 }
 
@@ -1340,11 +1346,8 @@ fn entry_points(
             index.name(id),
             entries.iter().copied().collect::<Vec<_>>().join(", ")
         );
-        report.warn(
-            DiagnosticCode::EntryPointUnexposed,
-            vec![(*id).to_owned()],
-            message,
-        );
+        let at = (edge.from.as_str(), edge.line);
+        report.warn_at(DiagnosticCode::EntryPointUnexposed, id, message, at);
     }
 }
 

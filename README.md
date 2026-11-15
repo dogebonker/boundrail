@@ -11,7 +11,7 @@ same source locations, rule reasons, and repeatable checks.
   <img src="docs/assets/boundrail-overview.svg" alt="Boundrail workflow: read source dependencies, declare a boundary in layout.yaml, and inspect an added forbidden import with its source and reason. This is an illustrative example, not measured production traffic." width="1200">
 </picture>
 
-[Quickstart](#quickstart) · [Architecture rules](#make-the-boundaries-explicit) · [For coding agents](#give-agents-a-project-workflow) · [Service model](#see-services-and-infrastructure-clients) · [Evidence and limits](#evidence-and-limits) · [Full guide](docs/guide.md)
+[Quickstart](#quickstart) · [Authored model](#authored-model) · [Architecture rules](#make-the-boundaries-explicit) · [For coding agents](#give-agents-a-project-workflow) · [Service model](#see-services-and-infrastructure-clients) · [Evidence and limits](#evidence-and-limits) · [Full guide](docs/guide.md)
 
 ## Review the architectural change
 
@@ -80,6 +80,29 @@ retain their existing names for compatibility. [Upgrade notes](docs/rename-bound
 The map supports zoom, module selection, remembered positions, and a file-level view. Its
 **What-if** mode previews file moves without changing source. Rust simulations and the project's
 build and tests remain the checks for an actual refactor.
+
+## Authored model
+
+The authored model is the architecture as you and your agents describe it: modules bound to
+code, relationships, flows, proposals and checkpoints, kept in `.boundrail/model/` and committed
+with the code. `boundrail model check` compares it with the code.
+
+```sh
+# Create the vault and install the model skills for your agent.
+boundrail model setup --agent claude
+
+# Read the model, then change it with a batch request (schema: boundrail model schema model-edit).
+boundrail model read --format markdown
+boundrail model edit --doing "Add the billing service" --input request.json
+
+# Compare the model with the code, then open it in the browser.
+boundrail model check --format markdown
+boundrail model view
+```
+
+Every edit names the revision it read and an operation ID, so a stale edit refuses and a retry is
+safe. In CI, the action's `mode: model` annotates `model check` findings and comments the branch's
+footprint on the pull request. [Design notes](docs/plans/architecture-model.md).
 
 ## Make the boundaries explicit
 
