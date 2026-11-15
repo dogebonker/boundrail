@@ -24,6 +24,9 @@ use super::{Code, Refusal, ids, revision};
 use crate::collect::TempDir;
 use crate::git;
 
+mod publish;
+pub use publish::{DEFAULT_REMOTE, Published, fetch, push};
+
 /// The history ref, one per repository.
 pub const HISTORY: &str = "refs/boundrail/history";
 /// The journal kind of a `model retain` record.
@@ -151,12 +154,17 @@ pub fn history_is_local(start: &Path) -> Result<bool> {
 /// and the model it holds, loaded from its tree without touching the checkout, which needs no
 /// vault. The model's `dir` is where the checkout's vault folder is.
 pub fn load(start: &Path, which: &str) -> Result<(Checkpoint, Model)> {
+    load_files(start, which).map(|(checkpoint, model, _)| (checkpoint, model))
+}
+
+/// [`load`], with the bytes of every file of the checkpoint's tree.
+pub fn load_files(start: &Path, which: &str) -> Result<(Checkpoint, Model, Blobs)> {
     let (vault, root) = locations(start)?;
     let checkpoint = find(history(&root, None)?.1, which)?;
-    let files = files(&root, &checkpoint)?;
+    let files = blobs(&root, &files(&root, &checkpoint)?)?;
     let temp = TempDir::new("checkpoint")?;
     let dir = temp.path().join("model");
-    write_blobs(&root, &files, &dir)?;
+    put(&dir, files.iter())?;
     let place = format!(
         "checkpoint {} (commit {})",
         checkpoint.id, checkpoint.commit
@@ -164,12 +172,16 @@ pub fn load(start: &Path, which: &str) -> Result<(Checkpoint, Model)> {
     let found = json!({ "checkpoint": checkpoint.id, "commit": checkpoint.commit });
     let mut model = vault::load_dir(dir).map_err(|error| located(error, &place, &found))?;
     model.dir = vault;
-    Ok((checkpoint, model))
+    Ok((checkpoint, model, files))
 }
 
 /// A `MODEL_INVALID` refusal of a model read from a tree, renamed after `place` instead of the
 /// temporary folder it was read from, with `found` added to its details.
-fn located(mut error: anyhow::Error, place: &str, found: &serde_json::Value) -> anyhow::Error {
+pub(super) fn located(
+    mut error: anyhow::Error,
+    place: &str,
+    found: &serde_json::Value,
+) -> anyhow::Error {
     if let Some(refusal) = error.downcast_mut::<Refusal>()
         && refusal.code == Code::ModelInvalid
         && let (Some(details), Some(found)) = (refusal.details.as_mut(), found.as_object())
@@ -228,7 +240,7 @@ pub fn load_committed(start: &Path, commit: &str) -> Result<Option<Model>> {
     }
     let temp = TempDir::new("committed")?;
     let dir = temp.path().join("model");
-    write_blobs(&root, &files, &dir)?;
+    put(&dir, blobs(&root, &files)?.iter())?;
     let place = format!("commit {commit}");
     let found = json!({ "commit": commit });
     let mut model = vault::load_dir(dir).map_err(|error| located(error, &place, &found))?;
@@ -236,30 +248,56 @@ pub fn load_committed(start: &Path, commit: &str) -> Result<Option<Model>> {
     Ok(Some(model))
 }
 
-/// Writes the blobs `files` lists as (vault-relative path, object, size) under `dir`. One
-/// `git show` prints each blob's bytes back to back, unconverted, so one call reads them all.
-fn write_blobs(root: &Path, files: &[(String, String, usize)], dir: &Path) -> Result<()> {
+/// The blobs of a tree, read back to back: each file's vault-relative path and size, and their
+/// bytes in that order.
+pub struct Blobs {
+    files: Vec<(String, usize)>,
+    bytes: Vec<u8>,
+}
+
+impl Blobs {
+    /// Each file's vault-relative path and bytes.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &[u8])> {
+        let mut rest = self.bytes.as_slice();
+        self.files.iter().map(move |(path, size)| {
+            let (content, tail) = rest.split_at(*size);
+            rest = tail;
+            (path.as_str(), content)
+        })
+    }
+}
+
+/// The blobs `files` lists as (vault-relative path, object, size). One `git show` prints each
+/// blob's bytes back to back, unconverted, so one call reads them all.
+fn blobs(root: &Path, files: &[(String, String, usize)]) -> Result<Blobs> {
     let mut args = vec!["show", "--no-textconv", "--no-color"];
     args.extend(files.iter().map(|(_, object, _)| object.as_str()));
     let bytes = git::run(root, &args)?;
-    let mut rest = bytes.as_slice();
-    for (path, _, size) in files {
-        ensure!(
-            rest.len() >= *size,
-            "git show returned fewer bytes than the tree lists"
-        );
-        let (content, tail) = rest.split_at(*size);
+    let listed: usize = files.iter().map(|(_, _, size)| size).sum();
+    ensure!(
+        bytes.len() == listed,
+        "git show returned {} bytes, not the {listed} the tree lists",
+        bytes.len()
+    );
+    let files = (files.iter())
+        .map(|(path, _, size)| (path.clone(), *size))
+        .collect();
+    Ok(Blobs { files, bytes })
+}
+
+/// Writes `files`, (vault-relative path, bytes), under the fresh folder `dir`, which a load then
+/// reads. The paths are vault file paths, so none leaves `dir`.
+pub(super) fn put<'a>(
+    dir: &Path,
+    files: impl IntoIterator<Item = (&'a str, &'a [u8])>,
+) -> Result<()> {
+    for (path, content) in files {
         let file = dir.join(path);
         if let Some(folder) = file.parent() {
             fs::create_dir_all(folder).with_context(|| format!("creating {}", folder.display()))?;
         }
         fs::write(&file, content).with_context(|| format!("writing {}", file.display()))?;
-        rest = tail;
     }
-    ensure!(
-        rest.is_empty(),
-        "git show returned more bytes than the tree lists"
-    );
     Ok(())
 }
 

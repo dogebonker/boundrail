@@ -17,10 +17,15 @@
 //! pull request heads in CI. The rasterizers `model pictures --write` runs for PNG pictures are no
 //! exception: Boundrail picks them from a fixed list (`resvg`, `rsvg-convert`, `magick`), finds
 //! them in absolute `PATH` folders outside the checkout, and runs them in a private temporary
-//! folder holding only the SVG it drew; the repository names none of them.
+//! folder holding only the SVG it drew; the repository names none of them. `model history push`
+//! and `model history fetch` reach a remote the user configured and names by its `git remote`
+//! name, never a URL or option, so Git runs the transport that config names (`ssh`,
+//! `core.sshCommand`, `remote.<name>.uploadpack` and `receivepack`, credential helpers): the
+//! same accepted scope as the signing program, and only on that explicit command. Hooks stay off
+//! there too, `pre-push` and `reference-transaction` included.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 
 use anyhow::{Context, Result, bail};
 
@@ -38,6 +43,19 @@ pub fn run(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
 /// A disposable index permits Git's own stat cache without changing the user's staging index,
 /// so `git diff` refreshes it: an entry whose stat changed is content-checked, not listed.
 pub fn run_with_index(root: &Path, args: &[&str], index: Option<&Path>) -> Result<Vec<u8>> {
+    let out = output(root, args, index)?;
+    if !out.status.success() {
+        bail!(
+            "git {}: {}",
+            subcommand(args),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(out.stdout)
+}
+
+/// The finished `git -C root args` process, whatever its exit status.
+fn output(root: &Path, args: &[&str], index: Option<&Path>) -> Result<Output> {
     let mut command = Command::new("git");
     if let Some(index) = index {
         command.env("GIT_INDEX_FILE", index).args([
@@ -47,7 +65,7 @@ pub fn run_with_index(root: &Path, args: &[&str], index: Option<&Path>) -> Resul
             "core.untrackedCache=true",
         ]);
     }
-    let out = command
+    command
         // Read-only queries must not rewrite the index and trigger the daemon watcher.
         .env(
             "GIT_OPTIONAL_LOCKS",
@@ -69,15 +87,28 @@ pub fn run_with_index(root: &Path, args: &[&str], index: Option<&Path>) -> Resul
         ])
         .args(args)
         .output()
-        .context("running git (is it installed?)")?;
-    if !out.status.success() {
-        bail!(
-            "git {}: {}",
-            subcommand(args),
+        .context("running git (is it installed?)")
+}
+
+/// Whether the commit `ancestor` is `descendant` or one of its ancestors. Git answers with exit
+/// status 1 for no; any other failure, such as an unknown object, is an error.
+pub fn is_ancestor(root: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+    let args = [
+        "merge-base",
+        "--is-ancestor",
+        "--end-of-options",
+        ancestor,
+        descendant,
+    ];
+    let out = output(root, &args, None)?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => bail!(
+            "git merge-base: {}",
             String::from_utf8_lossy(&out.stderr).trim()
-        );
+        ),
     }
-    Ok(out.stdout)
 }
 
 /// `run`, requiring UTF-8 output.
@@ -95,6 +126,15 @@ pub fn toplevel(root: &Path) -> Result<PathBuf> {
 /// The absolute Git directory of the work tree containing `root`.
 pub fn git_dir(root: &Path) -> Result<PathBuf> {
     let path = text(root, &["rev-parse", "--absolute-git-dir"])?;
+    Ok(PathBuf::from(path.trim_end_matches(['\n', '\r'])))
+}
+
+/// The absolute Git directory every worktree of the repository around `root` shares.
+pub fn common_dir(root: &Path) -> Result<PathBuf> {
+    let path = text(
+        root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
     Ok(PathBuf::from(path.trim_end_matches(['\n', '\r'])))
 }
 

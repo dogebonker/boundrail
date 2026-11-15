@@ -2,7 +2,8 @@ use super::*;
 use std::io::Read as _;
 use std::iter;
 
-use boundrail::arch::checkpoint::{self, Checkpoint};
+use boundrail::arch::bundle::{self, Exported};
+use boundrail::arch::checkpoint::{self, Checkpoint, Published};
 use boundrail::arch::claims::{self, Claim};
 use boundrail::arch::code::{self, CodeReport, NoScan, Skip, SkipReason, UnitStatus};
 use boundrail::arch::compare::{self, Comparison};
@@ -240,6 +241,56 @@ enum ModelCmd {
         #[arg(long)]
         claim: Option<String>,
     },
+    /// Merge into a draft what the current state changed since the draft was drawn or last
+    /// reconciled, and make the current state its predecessor; both sides changing one module,
+    /// relationship or collection refuses with the conflicts
+    Reconcile {
+        /// The proposal's ID
+        proposal: String,
+        /// The current state's revision digest the merge is for
+        #[arg(long)]
+        expected_revision: String,
+        /// The proposal's revision digest you read; another revision refuses
+        #[arg(long)]
+        expected_proposal_revision: String,
+        #[command(flatten)]
+        writing: WritingArgs,
+        /// Your claim covering what the merge changes in the proposal
+        #[arg(long)]
+        claim: Option<String>,
+    },
+    /// Write the current state, a proposal with its base, or a checkpoint as one JSON bundle
+    /// (schema `model-bundle`)
+    Export {
+        /// Export this proposal instead of the current state
+        #[arg(long, conflicts_with = "checkpoint")]
+        proposal: Option<String>,
+        /// Export the model a checkpoint holds: its ID or a unique commit prefix
+        #[arg(long)]
+        checkpoint: Option<String>,
+        /// Write to this file instead of standard output; its folder must exist, outside the
+        /// model vault and the Git folder
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Import a bundle of this model as a new draft proposal; the current state does not change
+    Import {
+        /// The bundle file; `-` reads standard input
+        file: PathBuf,
+        /// The current state's revision digest the import is for
+        #[arg(long)]
+        expected_revision: String,
+        /// The draft's name [default: the bundle's proposal or state name]
+        #[arg(long)]
+        name: Option<String>,
+        #[command(flatten)]
+        writing: WritingArgs,
+    },
+    /// Push or fetch the checkpoint history on a configured Git remote, fast-forward only
+    History {
+        #[command(subcommand)]
+        command: HistoryCmd,
+    },
     /// Set a proposal aside; it stays, reading only
     Shelve {
         /// The proposal's ID
@@ -344,6 +395,22 @@ enum ModelCmd {
         /// The branch's last commit [default: HEAD with the working tree]
         #[arg(long)]
         head: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum HistoryCmd {
+    /// Push refs/boundrail/history to the same ref on the remote
+    Push {
+        /// A remote `git remote` lists
+        #[arg(long, default_value = checkpoint::DEFAULT_REMOTE)]
+        remote: String,
+    },
+    /// Fetch the remote's refs/boundrail/history into the local one
+    Fetch {
+        /// A remote `git remote` lists
+        #[arg(long, default_value = checkpoint::DEFAULT_REMOTE)]
+        remote: String,
     },
 }
 
@@ -632,6 +699,63 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
             // The receipt's revisions cover the proposal too.
             let current = proposal::current_revision(&receipt);
             print_written(markdown, "adopt", &dir, &receipt, Some(&current))
+        }
+        ModelCmd::Reconcile {
+            proposal,
+            expected_revision,
+            expected_proposal_revision,
+            writing,
+            claim,
+        } => {
+            let dir = vault::locate(root)?;
+            let writing = writing.writing(claim.as_deref());
+            let compared = &expected_proposal_revision;
+            let (receipt, finished) =
+                proposal::reconcile(&dir, &writing, &proposal, &expected_revision, compared)?;
+            if let Some(scope) = &finished {
+                warn_unloadable(&dir, &[(scope, &receipt)]);
+            }
+            print_written(markdown, "reconcile", &dir, &receipt, None)
+        }
+        ModelCmd::Export {
+            proposal,
+            checkpoint,
+            output,
+        } => {
+            let what = match (&proposal, &checkpoint) {
+                (Some(proposal), _) => Exported::Proposal(proposal),
+                (None, Some(checkpoint)) => Exported::Checkpoint(checkpoint),
+                (None, None) => Exported::Current,
+            };
+            export_bundle(root, markdown, what, output.as_deref())
+        }
+        ModelCmd::Import {
+            file,
+            expected_revision,
+            name,
+            writing,
+        } => {
+            let dir = vault::locate(root)?;
+            let input = read_request(Some(&file))?;
+            let writing = writing.writing(None);
+            let (receipt, finished) =
+                bundle::import(&dir, &writing, &input, &expected_revision, name.as_deref())?;
+            if let Some(scope) = &finished {
+                warn_unloadable(&dir, &[(scope, &receipt)]);
+            }
+            print_written(markdown, "import", &dir, &receipt, None)
+        }
+        ModelCmd::History { command } => {
+            let (pushing, remote) = match &command {
+                HistoryCmd::Push { remote } => (true, remote),
+                HistoryCmd::Fetch { remote } => (false, remote),
+            };
+            let published = if pushing {
+                checkpoint::push(root, remote)?
+            } else {
+                checkpoint::fetch(root, remote)?
+            };
+            print_published(markdown, pushing, &published)
         }
         ModelCmd::Shelve {
             proposal,
@@ -1259,7 +1383,86 @@ impl RenderSpec {
     }
 }
 
-/// Refuses an `--output` whose folder is missing or lies inside the model vault.
+/// `model export`: the bundle on stdout, or in `--output` with a short report on stdout.
+fn export_bundle(
+    root: &Path,
+    markdown: bool,
+    what: Exported<'_>,
+    output: Option<&Path>,
+) -> Result<()> {
+    if markdown && output.is_none() {
+        let message = "model export prints a JSON bundle; add --output for a Markdown report";
+        return Err(Refusal::new(Code::RequestInvalid, message).into());
+    }
+    if let Some(output) = output {
+        check_output(root, output)?;
+    }
+    let bundle = bundle::export(root, what)?;
+    let text = bundle::to_text(&bundle)?;
+    let Some(output) = output else {
+        print!("{text}");
+        return Ok(());
+    };
+    write_file(output, text.as_bytes())?;
+    if markdown {
+        println!(
+            "Exported {} files to {}",
+            bundle.files.len(),
+            output.display()
+        );
+        return Ok(());
+    }
+    write(
+        None,
+        &json!({
+            "schema": MODEL_SCHEMA,
+            "kind": "export",
+            "success": true,
+            "output": output,
+            "source": bundle.source,
+            "files": bundle.files.len(),
+        }),
+    )
+}
+
+/// Prints what `model history push` or `fetch` moved.
+fn print_published(markdown: bool, pushing: bool, published: &Published) -> Result<()> {
+    let kind = if pushing {
+        "history-push"
+    } else {
+        "history-fetch"
+    };
+    if !markdown {
+        let mut output = json!({ "schema": MODEL_SCHEMA, "kind": kind, "success": true });
+        extend(&mut output, published)?;
+        return write(None, &output);
+    }
+    let (verb, place) = if pushing {
+        ("Pushed", format!("to {}", published.remote))
+    } else {
+        ("Fetched", format!("from {}", published.remote))
+    };
+    if !published.updated {
+        println!(
+            "{} is up to date with {}",
+            published.reference, published.remote
+        );
+        return Ok(());
+    }
+    println!(
+        "{verb} {} checkpoint(s) {place}: {} -> {}",
+        published.checkpoints.len(),
+        published.before.as_deref().unwrap_or("none"),
+        published.after.as_deref().unwrap_or("none"),
+    );
+    if !published.checkpoints.is_empty() {
+        println!("checkpoints: {}", published.checkpoints.join(", "));
+    }
+    Ok(())
+}
+
+/// Refuses an `--output` whose folder is missing or lies inside the model vault or the Git
+/// folder. The folder is resolved first, so a linked folder on the way cannot reach either.
 fn check_output(root: &Path, output: &Path) -> Result<()> {
     let parent = match output.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
@@ -1275,15 +1478,24 @@ fn check_output(root: &Path, output: &Path) -> Result<()> {
         )
     })?;
     let vault = vault::path(root).and_then(|dir| Ok(fs::canonicalize(dir)?));
-    if vault.is_ok_and(|vault| folder.starts_with(vault)) {
-        return Err(Refusal::new(
-            Code::RequestInvalid,
-            format!(
-                "--output {} is inside the model vault; write it elsewhere",
-                output.display()
-            ),
-        )
-        .into());
+    let git = boundrail::git::git_dir(root).and_then(|dir| Ok(fs::canonicalize(dir)?));
+    let common = boundrail::git::common_dir(root).and_then(|dir| Ok(fs::canonicalize(dir)?));
+    let places = [
+        (vault, "the model vault"),
+        (git, "the Git folder"),
+        (common, "the Git folder"),
+    ];
+    for (inside, place) in places {
+        if inside.is_ok_and(|inside| folder.starts_with(inside)) {
+            return Err(Refusal::new(
+                Code::RequestInvalid,
+                format!(
+                    "--output {} is inside {place}; write it elsewhere",
+                    output.display()
+                ),
+            )
+            .into());
+        }
     }
     Ok(())
 }

@@ -48,7 +48,7 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 | T14 | Walkthroughs: ordered beats over readings, playback in the browser | done |
 | T15 | Embedded pictures: render recipes in SVG/PNG, `check embeds`, PNG rasterize | done |
 | T16 | Agent integration: `init`, skills for authoring/planning/PRs, CI action with PR annotations and footprint comment | open |
-| T17 | Reconcile drafts after current changes, export/import bundles, history publication | open |
+| T17 | Reconcile drafts after current changes, export/import bundles, history publication | done |
 | T18 | Remove scan-era code that the model does not use | open |
 
 ## Notes
@@ -94,7 +94,8 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   compare-and-swap with a reflog entry; a lost race or a held ref lock refuses `HISTORY_MOVED` and a
   retry builds on the new tip. The new commit's parent and the swap's old value are the tip the
   history was read from, even a commit without checkpoint trailers. Checkpoints restore the current
-  state; drafts travel with the committed vault, and publishing them is T17. A vault file larger
+  state; drafts travel with the committed vault or in bundles (T17), and `model history push` and
+  `fetch` publish the history ref (T17); once fetched, checkpoint readings resolve. A vault file larger
   than the 4 MiB a checkpoint reader accepts refuses `MODEL_INVALID` before anything is written.
   Retaining an unchanged model refuses `NOTHING_TO_RETAIN`. Trailers `Source` and `Operation` appear
   only when there is a value.
@@ -169,7 +170,8 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   only; its `adopted_as` names the new state. `model adopt` prints the current state's new
   `revision` beside the receipt, whose revisions cover both the state and the proposal.
 - T8: `model adopt` refuses `STALE_REVISION` when `--expected-revision` is not the current revision,
-  then `PREDECESSOR_MOVED` when the proposal was drawn against another; reconcile is T17. It also
+  then `PREDECESSOR_MOVED` when the proposal was drawn against another, pointing at `model
+  reconcile` (T17). It also
   refuses `STALE_REVISION` when `--expected-proposal-revision` is not the proposal's revision, so
   a proposal edited after the comparison is never adopted unseen. `model shelve` refuses
   `STALE_REVISION` when its `--expected-revision` is not the proposal's. Each refusal names the
@@ -683,7 +685,8 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   `{subject: <picture>, site: "picture", reason: "unrenderable"}`. When the history ref is not in
   the repository, as in a clone that did not fetch it, every beat or picture reading a checkpoint
   adds a skip `{subject: <beat or picture>, site: "walkthrough" or "picture", reason:
-  "history-not-local"}` instead of a warning, and such a picture skips its freshness check too; a
+  "history-not-local"}` instead of a warning (CI can run `model history fetch` before `model
+  check` to judge them), and such a picture skips its freshness check too; a
   ref that lacks the checkpoint, or a checkpoint lacking the scope, focus or flow, still warns. So
   `skips` appears when the code check ran, a picture could not be checked, or a reading was
   skipped. A missing rasterizer never reaches the check.
@@ -702,3 +705,88 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   opened relative to a folder handle, so a link swapped in between is followed; open each
   segment without following links if outputs land where others write. No test runs a real
   rasterizer (none was installed here); a fake `resvg` script stands in.
+- T17: base snapshot. A new draft keeps `proposals/<id>/base/` with `modules/` and `collections/`
+  as its predecessor held them, and `proposal.json` says so with `"base": true` (left out when
+  false), since an empty predecessor leaves no base files to show it. The base is part of the
+  proposal's revision, `file_digests` and the journal's write allow-list, so an edit, adoption or
+  recovery covers it, but loads never parse it: reads, compare, render and checks see only the
+  draft. Only `model reconcile` reads it (`vault::load_base`, parsing without validation). Edits
+  never write it. `propose --from <draft>` copies the source's base (none when the source has
+  none); a draft from the current state, or from an adopted proposal that still is it, takes the
+  current state's modules and collections. A draft drawn before T17 has no base. Base files are
+  parsed and must be named by a local ID matching their item (`MODEL_INVALID`), so their writes
+  never leave the folder. ponytail: each draft stores a second full copy of the model it was
+  drawn from, and every proposal load reads and hashes it for the revision; hash the base lazily
+  (only for writes and reconcile) if drafts of large models make reads slow.
+- T17: `model reconcile <proposal> --expected-revision --expected-proposal-revision
+  --operation-id --doing [--writer] [--claim]` merges base, draft and current state
+  (`src/arch/merge.rs`). Granularity: a module's own fields (all but `outgoing`) are one subject
+  and each relationship another, with its owning module as a field, so a relationship added on
+  one side to a module renamed on the other merges, and a moved relationship is one change. A
+  collection is its whole file, flows and steps included: flows and steps move between lists and
+  collections, and a finer merge would need those moves as subjects of their own. A subject one
+  side changed takes that side; both sides making the same change merge. Different changes are
+  `both-changed`, a change against a removal `changed-removed`, a relationship whose owner the
+  other side removed `changed-removed` (unless the owner is in conflict already), and an ID the
+  current state retired that the merged draft holds `retired`. Any of them refuses
+  `RECONCILE_CONFLICT` with `details.conflicts` (`subject`, `kind`), writing nothing; the user
+  edits the draft to match one side and reconciles again. A merged module equal to one side's
+  (relationship order aside) is that side's file, so unchanged files are not rewritten.
+  Refusals in order: `PROPOSAL_CLOSED`, `STALE_REVISION` for either revision,
+  `RECONCILE_NO_BASE`, `RECONCILE_CONFLICT`, claims, `MODEL_INVALID` for a merged draft that does
+  not load, saying the problems come from merging the draft with the current state (`details.cause:
+  "merge"`) and that the draft needs editing. The write is one journaled operation of scope `reconcile` (the current state and the
+  proposal, like adoption, writing only the proposal): the merged files, a base equal to the
+  current state, the predecessor set to the current state and its normalized predecessor digest,
+  and the dropped list grown by the IDs the merge removed, less those the current state retired.
+  Claims cover what the merge changes in the draft, as an edit would, plus the proposal.
+- T17: bundles. `model export [--proposal P | --checkpoint C] [--output FILE]` prints one JSON
+  bundle (`model schema model-bundle`): `{schema: "boundrail/bundle/v1", model: {id, name},
+  source, files, digests}`. `source` is `{kind: "current", state, revision}`, `{kind:
+  "proposal", proposal, name, revision}` or `{kind: "checkpoint", checkpoint, commit,
+  revision}`. `files` maps paths to text: the vault files of the current state (manifest, config,
+  modules, collections, walkthroughs, pictures; claims and the journal live under `.git` and never
+  travel) or of a checkpoint's tree, or a proposal's own files (`proposal.json`, `modules/`,
+  `collections/`, `base/`) proposal-relative. `digests` holds each file's SHA-256, the digest the
+  load read. A file that changed since the load refuses `STALE_REVISION`, and a bundle larger than
+  the `INPUT_MAX` bytes import reads refuses `BUNDLE_INVALID` on export. `--output` uses render's
+  output check, which now also refuses the Git folders: the resolved folder must exist outside the
+  vault, the worktree's Git folder and the repository's common Git folder, and the file is
+  replaced atomically, never written through a link; JSON then prints `{kind: "export", output,
+  source, files}`, and Markdown without `--output` refuses `REQUEST_INVALID`.
+- T17: `model import <FILE|-> --expected-revision --operation-id --doing [--name] [--writer]`
+  draws a new draft from a bundle, leaving the current state alone. It refuses a request over
+  `INPUT_MAX` or one that does not parse with `REQUEST_INVALID` (as every request), another
+  model's bundle `MODEL_MISMATCH` (the header or the bundled manifest), and `BUNDLE_INVALID` for
+  another schema, a path its source never holds, two paths differing only in case, a missing
+  `model.json`, `config.yaml` or `proposal.json`, a digest that does not match, or a proposal base
+  whose files are not named by their local IDs or fail this vault's rules (`details.path`, with
+  the base's `problems`). The bundle's own text (schema, paths, model ID) goes into the details,
+  never into a refusal's message. The files then load through a temporary vault, so every loader
+  check applies (`MODEL_INVALID`): a current or checkpoint bundle with its own manifest and
+  config, a proposal bundle with this vault's. The draft holds the bundle's modules and
+  collections, named `--name`, the proposal's name or the state's. A current-state or checkpoint
+  bundle's draft has the current state as predecessor and base. A proposal bundle's draft keeps
+  that proposal's predecessor, base (none when it had none) and dropped IDs, so when this clone's
+  current state differs from the one the proposal was drawn against, adoption refuses
+  `PREDECESSOR_MOVED` and `model reconcile` merges the two. Walkthroughs and pictures in a
+  current-state bundle are validated and not imported, since they belong to the current state. The
+  fingerprint covers the writer, name, revision and the bundle's SHA-256. Claims: the model root.
+- T17: publication. `model history push [--remote origin]` pushes the object the local history
+  ref holds (`<object>:refs/boundrail/history`, with `--no-follow-tags`), without `+`, after
+  checking that the remote's tip is absent or an ancestor of it; otherwise, or when the push is
+  refused because the remote moved meanwhile, it refuses `HISTORY_DIVERGED` with the hint to
+  fetch first. `model history fetch [--remote origin]` fetches the remote ref into the scratch
+  ref `refs/boundrail/fetched`, deleted after every fetch. The fetched ref must peel to a commit,
+  and every first-parent commit from it that the local history lacks must carry checkpoint
+  trailers; otherwise it refuses `MODEL_INVALID` (`details.object`) and the local ref stays. A
+  local tip that already holds the fetched one stays; one the fetched tip does not descend from
+  refuses `HISTORY_DIVERGED`. Otherwise the local ref moves by compare-and-swap (`update-ref <new>
+  <old or absent>`); a swap lost to a concurrent retain re-reads the tip and judges again, up to
+  three times. Ancestry is `git merge-base --is-ancestor`, asked only when the other side's ref
+  exists. `--remote` must be a name `git remote` lists, never a URL or anything starting with
+  `-`, and reaches Git after `--end-of-options`; fetch passes `--no-tags`,
+  `--no-recurse-submodules` and `--no-write-fetch-head`. Both print `{kind: "history-push" |
+  "history-fetch", remote, ref, before, after, updated, checkpoints}` with the IDs gained; a
+  missing local history or remote ref is no change. Once fetched, checkpoint readings resolve, so
+  CI can run `model history fetch` before `model check`.

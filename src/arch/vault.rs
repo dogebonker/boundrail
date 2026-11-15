@@ -32,11 +32,12 @@ pub(super) use flows::{Ends, collection_position, flow_position, holds_name, mes
 pub use pictures::PictureEntry;
 pub(crate) use pictures::output_problems;
 pub(super) use pictures::picture_position;
-use proposals::{PROPOSAL, PROPOSALS, check_proposal, prefix, split_proposal, unprefixed};
-pub use proposals::{Scope, load_proposal, load_state, proposals};
 pub(super) use proposals::{
-    in_proposal, is_proposal, is_proposal_path, proposal_file, proposal_write, read_proposal,
+    BASE, PROPOSAL, base_writes, in_proposal, is_proposal, is_proposal_path, prefix, proposal_file,
+    proposal_write, read_proposal,
 };
+use proposals::{PROPOSALS, base_prefix, check_proposal, is_base, split_proposal, unprefixed};
+pub use proposals::{Scope, load_base, load_proposal, load_state, proposals};
 pub(crate) use walkthroughs::reading_ids;
 pub(super) use walkthroughs::walkthrough_position;
 pub use walkthroughs::{BeatView, WalkthroughEntry, WalkthroughView};
@@ -44,8 +45,8 @@ pub use walkthroughs::{BeatView, WalkthroughEntry, WalkthroughView};
 /// Boundrail's state folder at the checkout root, and the vault folder inside it.
 const STATE: &str = ".boundrail";
 const VAULT: &str = "model";
-const MANIFEST: &str = "model.json";
-const CONFIG: &str = "config.yaml";
+pub(super) const MANIFEST: &str = "model.json";
+pub(super) const CONFIG: &str = "config.yaml";
 const MODULES: &str = "modules";
 const MODULE_SUFFIX: &str = ".module.json";
 const COLLECTIONS: &str = "collections";
@@ -91,7 +92,7 @@ pub struct Model {
 }
 
 /// One reason a vault does not load: the vault-relative file and the ID or key it concerns.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Problem {
     pub file: String,
     pub subject: String,
@@ -246,8 +247,8 @@ fn state_folders(prefix: &str) -> &'static [(&'static str, &'static str)] {
 }
 
 /// The folders a load reads through, by their vault-relative paths: the state, vault, modules,
-/// collections and walkthroughs folders, and for a proposal its folder, the folder holding it and
-/// its own modules and collections folders.
+/// collections and walkthroughs folders, and for a proposal its folder, the folder holding it,
+/// its own modules and collections folders and its base's.
 fn folders(dir: &Path, proposal: Option<&str>) -> Vec<(String, PathBuf)> {
     let mut folders = vec![
         ("..".to_owned(), dir.parent().unwrap_or(dir).to_path_buf()),
@@ -261,9 +262,14 @@ fn folders(dir: &Path, proposal: Option<&str>) -> Vec<(String, PathBuf)> {
     };
     inside("");
     if let Some(id) = proposal {
-        let prefix = prefix(id);
-        inside(&prefix);
-        for path in [PROPOSALS.to_owned(), format!("{PROPOSALS}/{id}")] {
+        let base = base_prefix(id);
+        inside(&prefix(id));
+        inside(&base);
+        for path in [
+            PROPOSALS.to_owned(),
+            format!("{PROPOSALS}/{id}"),
+            base.trim_end_matches('/').to_owned(),
+        ] {
             folders.push((path.clone(), dir.join(path)));
         }
     }
@@ -369,7 +375,7 @@ fn load_scope(dir: PathBuf, proposal: Option<&str>) -> Result<Model> {
 
 /// The bytes of every file a load of the current state or of `proposal` reads, by vault-relative
 /// path: the manifest and config, the proposal's `proposal.json`, and the module and collection
-/// files of the state or proposal.
+/// files of the state or proposal and of the proposal's base.
 fn read_inputs(
     dir: &Path,
     proposal: Option<&str>,
@@ -396,11 +402,17 @@ fn read_inputs(
             Err(e) => return Err(e).with_context(|| format!("reading {path}")),
         }
     }
-    let prefix = proposal.map(prefix).unwrap_or_default();
-    for (folder, suffix) in state_folders(&prefix) {
-        for path in listed(dir, &prefix, folder, suffix, problems)? {
-            let bytes = fs::read(dir.join(&path)).with_context(|| format!("reading {path}"))?;
-            inputs.push((path, bytes));
+    // A proposal's base is part of its revision, though only `model reconcile` parses it.
+    let prefixes = match proposal {
+        Some(id) => vec![prefix(id), base_prefix(id)],
+        None => vec![String::new()],
+    };
+    for prefix in prefixes {
+        for (folder, suffix) in state_folders(&prefix) {
+            for path in listed(dir, &prefix, folder, suffix, problems)? {
+                let bytes = fs::read(dir.join(&path)).with_context(|| format!("reading {path}"))?;
+                inputs.push((path, bytes));
+            }
         }
     }
     Ok(inputs)
@@ -432,6 +444,7 @@ fn parse_inputs<'a>(inputs: &'a [(String, Vec<u8>)], problems: &mut Problems) ->
                 .map(|c| parsed.config = Some(c))
                 .map_err(|e| parse_message(&e)),
             _ if local == PROPOSAL => json(bytes).map(|p| parsed.proposal = Some(p)),
+            _ if is_base(local) => Ok(()),
             _ => match vault_file(local).map(|(folder, _)| folder) {
                 Some(MODULES) => json(bytes).map(|m| parsed.modules.push((path, m))),
                 Some(WALKTHROUGHS) => json(bytes).map(|w| parsed.walkthroughs.push((path, w))),
@@ -795,6 +808,7 @@ pub(super) fn file_digests(dir: &Path, scope: &Scope) -> Result<BTreeMap<String,
     if let Some(id) = scope.proposal() {
         paths.push(proposal_file(id));
         paths.extend(named(dir, &prefix(id))?);
+        paths.extend(named(dir, &base_prefix(id))?);
     }
     let mut digests = BTreeMap::new();
     for path in paths {
@@ -860,22 +874,25 @@ fn file_subject(path: &str) -> &str {
 }
 
 /// Whether a journaled write may write or delete `path`: the manifest, a module, collection,
-/// walkthrough or picture file of the current state, a module or collection file of a proposal,
-/// or a proposal's `proposal.json`.
+/// walkthrough or picture file of the current state, a module or collection file of a proposal
+/// or its base, or a proposal's `proposal.json`.
 fn is_written(path: &str) -> bool {
-    let (local, in_proposal) = match split_proposal(path) {
-        Some((id, rest)) if ids::is_local(id) => {
-            if rest == PROPOSAL {
-                return true;
-            }
-            (rest, true)
-        }
-        Some(_) => return false,
-        None if path == MANIFEST => return true,
-        None => (path, false),
-    };
-    vault_file(local).is_some_and(|(folder, id)| {
-        ids::is_local(id) && !(in_proposal && CURRENT_ONLY.contains(&folder))
+    match split_proposal(path) {
+        Some((id, rest)) => ids::is_local(id) && is_proposal_file(rest),
+        None => path == MANIFEST || is_id_file(path, &FOLDERS),
+    }
+}
+
+/// Whether a proposal-relative path names a file a journaled write may write in a proposal
+/// folder: its `proposal.json`, or a module or collection file of its own or of its base.
+pub(super) fn is_proposal_file(rest: &str) -> bool {
+    rest == PROPOSAL || is_id_file(rest.strip_prefix(BASE).unwrap_or(rest), &PROPOSAL_FOLDERS)
+}
+
+/// Whether `path` names a file directly inside one of `folders` by a well-formed local ID.
+fn is_id_file(path: &str, folders: &[(&str, &str)]) -> bool {
+    vault_file(path).is_some_and(|(folder, id)| {
+        ids::is_local(id) && folders.iter().any(|(known, _)| *known == folder)
     })
 }
 

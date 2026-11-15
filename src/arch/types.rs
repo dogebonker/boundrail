@@ -75,6 +75,11 @@ pub struct Proposal {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(inner(pattern(LOCAL_ID)))]
     pub dropped: Vec<String>,
+    /// Whether `base/` holds the predecessor's modules and collections as they were when the
+    /// proposal was drawn or last reconciled, which `model reconcile` merges against. Drafts drawn
+    /// before bases existed have none.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub base: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -689,7 +694,8 @@ impl Default for VaultConfig {
 pub type SchemaFn = fn() -> Schema;
 
 /// Every vault file format and request, by its `model schema` name.
-pub const SCHEMAS: [(&str, SchemaFn); 10] = [
+pub const SCHEMAS: [(&str, SchemaFn); 11] = [
+    ("model-bundle", root::<super::bundle::Bundle>),
     ("model-claim", root::<super::claims::ClaimRequest>),
     ("model-collection", root::<Collection>),
     ("model-edit", root::<super::edit::EditRequest>),

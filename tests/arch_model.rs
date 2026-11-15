@@ -695,6 +695,7 @@ fn schemas_describe_the_vault_files() {
     assert_eq!(
         names["schemas"],
         json!([
+            "model-bundle",
             "model-claim",
             "model-collection",
             "model-edit",
@@ -3653,7 +3654,7 @@ fn adopting_after_the_current_state_moved_refuses_predecessor_moved() {
         out["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("later release")
+            .contains("model reconcile")
     );
     assert_eq!(checkout.digest(), moved);
     assert_eq!(
@@ -7146,4 +7147,635 @@ fn a_failed_write_blocks_only_its_own_picture() {
             .starts_with("writing locked/shop.svg")
     );
     assert_eq!(out["pictures"][1]["written"], true);
+}
+
+/// `model reconcile` of the proposal `id` at the present revisions, by tester.
+fn reconcile(checkout: &Checkout, id: &str) -> (i32, Value) {
+    checkout.run(&[
+        "reconcile",
+        id,
+        "--expected-revision",
+        checkout.digest().as_str().unwrap(),
+        "--expected-proposal-revision",
+        &proposal_digest(checkout, id),
+        "--doing",
+        "catch up with the current state",
+        "--writer",
+        "tester",
+        "--operation-id",
+        &operation(),
+    ])
+}
+
+/// Refuses reconciling `id` with `expected`, leaving both revisions as they were: the conflicts.
+fn reconcile_refused(checkout: &Checkout, id: &str, expected: &str) -> Value {
+    let before = (checkout.digest(), proposal_digest(checkout, id));
+    let (code, out) = reconcile(checkout, id);
+    assert_eq!(code, 2, "{out:#}");
+    assert_eq!(out["error"]["code"], expected, "{out:#}");
+    assert_eq!((checkout.digest(), proposal_digest(checkout, id)), before);
+    out["error"]["details"]["conflicts"].clone()
+}
+
+#[test]
+fn reconciling_a_draft_merges_what_the_current_state_gained_and_it_then_adopts() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let q = |id: &str| format!("{model}#{id}");
+    let id = propose(&checkout, "Next", "current");
+    let folder = checkout.vault().join("proposals").join(&id);
+    let file: Value =
+        serde_json::from_str(&fs::read_to_string(folder.join("proposal.json")).unwrap()).unwrap();
+    assert_eq!(file["base"], true);
+    assert!(folder.join("base/modules/Billing1.module.json").is_file());
+    // The base stays out of what a proposal reads.
+    assert_eq!(
+        names(&checkout.ok(&["read", "--proposal", &id])),
+        names(&checkout.ok(&["read"]))
+    );
+    edited_proposal(
+        &checkout,
+        &id,
+        json!([{"type": "edit-module", "subject": "Billing", "set": {"name": "Payments"}}]),
+    );
+    let out = checkout.edited(json!([
+        {"type": "add-module", "module": {"name": "Ledger", "kind": "datastore", "order": 2}},
+        {"type": "add-relationship", "source": "Billing", "relationship": {"to": "Ledger", "kind": "call", "order": 1}},
+    ]));
+    let ledger = local(out["allocated"][0]["id"].as_str().unwrap()).to_owned();
+    let (code, out) = adopt(&checkout, &id, &checkout.digest());
+    assert_eq!(out["error"]["code"], "PREDECESSOR_MOVED", "{code} {out:#}");
+
+    let (code, out) = reconcile(&checkout, &id);
+    assert_eq!(code, 0, "{out:#}");
+    assert_eq!(out["kind"], "reconcile");
+    assert!(
+        out["subjects"]["added"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(q(&ledger)))
+    );
+    let read = checkout.ok(&["read", "--proposal", &id]);
+    assert_eq!(
+        names(&read),
+        ["Bank", "Ledger", "Payments", "Platform", "Web"]
+    );
+    // The rename and the new relationship from the renamed module both landed.
+    let payments = checkout.ok(&["read", "--proposal", &id, "Payments"]);
+    assert_eq!(payments["outgoing"].as_array().unwrap().len(), 2);
+    assert!(
+        folder
+            .join(format!("base/modules/{ledger}.module.json"))
+            .is_file()
+    );
+
+    let (code, out) = adopt(&checkout, &id, &checkout.digest());
+    assert_eq!(code, 0, "{out:#}");
+    let current = checkout.ok(&["read"]);
+    assert_eq!(
+        names(&current),
+        ["Bank", "Ledger", "Payments", "Platform", "Web"]
+    );
+}
+
+#[test]
+fn reconcile_refuses_both_sides_changing_a_module_until_the_proposal_matches_one() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let id = propose(&checkout, "Next", "current");
+    let set = |text: &str| json!([{"type": "edit-module", "subject": "Billing", "set": {"responsibility": text}}]);
+    edited_proposal(&checkout, &id, set("Takes payments"));
+    checkout.edited(set("Bills customers"));
+    let conflicts = reconcile_refused(&checkout, &id, "RECONCILE_CONFLICT");
+    assert_eq!(
+        conflicts,
+        json!([{"subject": format!("{model}#Billing1"), "kind": "both-changed"}])
+    );
+    // Matching the current state resolves it.
+    edited_proposal(&checkout, &id, set("Bills customers"));
+    let (code, out) = reconcile(&checkout, &id);
+    assert_eq!(code, 0, "{out:#}");
+}
+
+#[test]
+fn reconcile_refuses_a_proposal_change_to_a_module_the_current_state_removed() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let id = propose(&checkout, "Next", "current");
+    edited_proposal(
+        &checkout,
+        &id,
+        json!([{"type": "edit-module", "subject": "Web", "set": {"order": 5}}]),
+    );
+    checkout.edited(json!([{"type": "remove-module", "subject": "Web"}]));
+    let conflicts = reconcile_refused(&checkout, &id, "RECONCILE_CONFLICT");
+    assert_eq!(
+        conflicts,
+        json!([{"subject": format!("{model}#WebApp01"), "kind": "changed-removed"}])
+    );
+}
+
+#[test]
+fn reconcile_refuses_a_retired_id_the_proposal_still_holds() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    checkout.edited(json!([{"type": "remove-module", "subject": "Web"}]));
+    let id = propose(&checkout, "Next", "current");
+    checkout.write(
+        &format!("proposals/{id}/modules/WebApp01.module.json"),
+        &serde_json::to_string_pretty(&module("WebApp01", "Web", "app", 1)).unwrap(),
+    );
+    let conflicts = reconcile_refused(&checkout, &id, "RECONCILE_CONFLICT");
+    assert_eq!(
+        conflicts,
+        json!([{"subject": format!("{model}#WebApp01"), "kind": "retired"}])
+    );
+}
+
+#[test]
+fn reconcile_refuses_a_draft_without_a_base_and_a_closed_proposal() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let id = propose(&checkout, "Old", "current");
+    // A draft drawn before bases existed.
+    let folder = checkout.vault().join("proposals").join(&id);
+    let path = folder.join("proposal.json");
+    let mut file: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    file.as_object_mut().unwrap().remove("base");
+    fs::write(&path, serde_json::to_string_pretty(&file).unwrap()).unwrap();
+    fs::remove_dir_all(folder.join("base")).unwrap();
+    reconcile_refused(&checkout, &id, "RECONCILE_NO_BASE");
+    // A copy of it has no base either.
+    let copy = propose(&checkout, "Copy", &id);
+    reconcile_refused(&checkout, &copy, "RECONCILE_NO_BASE");
+
+    let shelved = propose(&checkout, "Shelved", "current");
+    checkout.ok(&[
+        "shelve",
+        &shelved,
+        "--expected-revision",
+        &proposal_digest(&checkout, &shelved),
+        "--doing",
+        "set aside",
+        "--writer",
+        "tester",
+        "--operation-id",
+        &operation(),
+    ]);
+    reconcile_refused(&checkout, &shelved, "PROPOSAL_CLOSED");
+}
+
+/// The bundle `model export` prints with `args`.
+fn export(checkout: &Checkout, args: &[&str]) -> Value {
+    let mut all = vec!["export"];
+    all.extend(args);
+    let (code, out) = checkout.run(&all);
+    assert_eq!(code, 0, "{out:#}");
+    out
+}
+
+/// `model import` of `bundle` by tester: the exit code and output.
+fn import(checkout: &Checkout, bundle: &Value) -> (i32, Value) {
+    let path = checkout.path().join("in.bundle.json");
+    fs::write(&path, bundle.to_string()).unwrap();
+    checkout.run(&[
+        "import",
+        path.to_str().unwrap(),
+        "--expected-revision",
+        checkout.digest().as_str().unwrap(),
+        "--doing",
+        "bring in a bundle",
+        "--writer",
+        "tester",
+        "--operation-id",
+        &operation(),
+    ])
+}
+
+/// The local ID of the draft `model import` of `bundle` drew.
+fn imported(checkout: &Checkout, bundle: &Value) -> String {
+    let (code, out) = import(checkout, bundle);
+    assert_eq!(code, 0, "{out:#}");
+    assert_eq!(out["kind"], "import");
+    local(out["allocated"][0]["id"].as_str().unwrap()).to_owned()
+}
+
+fn compares_equal(compared: &Value) -> bool {
+    ["modules", "relationships", "collections", "flows", "steps"]
+        .iter()
+        .all(|section| {
+            ["added", "removed", "changed"]
+                .iter()
+                .all(|list| compared[section][list] == json!([]))
+        })
+}
+
+#[test]
+fn an_exported_current_state_imports_as_a_draft_that_compares_equal() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let before = checkout.digest();
+    let bundle = export(&checkout, &[]);
+    let (_, schema) = checkout.run(&["schema", "model-bundle"]);
+    assert!(
+        jsonschema::validator_for(&schema)
+            .unwrap()
+            .is_valid(&bundle),
+        "{bundle:#}"
+    );
+    assert_eq!(bundle["schema"], "boundrail/bundle/v1");
+    assert_eq!(bundle["model"]["id"], model);
+    assert_eq!(bundle["source"]["kind"], "current");
+    assert_eq!(bundle["source"]["revision"], before);
+    let text = bundle["files"]["modules/Billing1.module.json"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        bundle["digests"]["modules/Billing1.module.json"],
+        sha256(text.as_bytes())
+    );
+
+    let id = imported(&checkout, &bundle);
+    assert_eq!(
+        checkout.digest(),
+        before,
+        "import changed the current state"
+    );
+    assert!(compares_equal(&checkout.ok(&["compare", &id])));
+    let read = checkout.ok(&["read", "--proposal", &id]);
+    assert_eq!(read["proposal"]["status"], "draft");
+    assert_eq!(read["proposal"]["base"], true);
+
+    // --output writes the same bundle, never inside the vault or the Git folder.
+    let out = checkout.ok(&["export", "--output", "shop.bundle.json"]);
+    assert_eq!(out["kind"], "export");
+    let written: Value = serde_json::from_str(
+        &fs::read_to_string(checkout.path().join("shop.bundle.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(written, bundle);
+    for inside in [".boundrail/model/x.json", ".git/x.json"] {
+        checkout.refused(&["export", "--output", inside], "REQUEST_INVALID");
+    }
+}
+
+/// A committed shop and a clone of it.
+fn clones() -> (Checkout, Checkout) {
+    let first = committed();
+    shop(&first);
+    git(&first, &["add", "-A"]);
+    git(&first, &["commit", "-q", "-m", "model"]);
+    let second = Checkout::outside();
+    let out = Command::new("git")
+        .args(["clone", "-q"])
+        .arg(first.path())
+        .arg(second.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    (first, second)
+}
+
+#[test]
+fn an_exported_proposal_imports_into_another_clone_of_the_model() {
+    let (first, second) = clones();
+
+    let (id, _) = next(&first);
+    let bundle = export(&first, &["--proposal", &id]);
+    assert_eq!(bundle["source"]["kind"], "proposal");
+    assert!(bundle["files"]["proposal.json"].is_string());
+    assert!(bundle["files"]["base/modules/BankApi1.module.json"].is_string());
+
+    let copy = imported(&second, &bundle);
+    let read = |checkout: &Checkout, id: &str| names(&checkout.ok(&["read", "--proposal", id]));
+    assert_eq!(read(&second, &copy), read(&first, &id));
+    assert_eq!(
+        second.ok(&["read", "--proposal", &copy])["proposal"]["name"],
+        "Next"
+    );
+    let (code, out) = adopt(&second, &copy, &second.digest());
+    assert_eq!(code, 0, "{out:#}");
+}
+
+#[test]
+fn import_refuses_another_models_bundle_and_a_tampered_one() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let bundle = export(&checkout, &[]);
+    let other = Checkout::new();
+    other.init();
+    let (code, out) = import(&other, &bundle);
+    assert_eq!(code, 2, "{out:#}");
+    assert_eq!(out["error"]["code"], "MODEL_MISMATCH");
+
+    let before = checkout.digest();
+    let mut tampered = bundle.clone();
+    tampered["files"]["modules/Billing1.module.json"] = "{}".into();
+    let (code, out) = import(&checkout, &tampered);
+    assert_eq!(
+        (code, &out["error"]["code"]),
+        (2, &json!("BUNDLE_INVALID")),
+        "{out:#}"
+    );
+    assert_eq!(
+        out["error"]["details"]["path"],
+        "modules/Billing1.module.json"
+    );
+
+    let mut unknown = bundle.clone();
+    unknown["files"]["notes.txt"] = "hello".into();
+    unknown["digests"]["notes.txt"] = sha256(b"hello").into();
+    let (code, out) = import(&checkout, &unknown);
+    assert_eq!(
+        (code, &out["error"]["code"]),
+        (2, &json!("BUNDLE_INVALID")),
+        "{out:#}"
+    );
+    assert_eq!(out["error"]["details"]["path"], "notes.txt");
+    assert_eq!(checkout.digest(), before);
+    assert!(
+        checkout.ok(&["proposals"])["proposals"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A bare repository for history tests.
+fn bare() -> TempDir {
+    let dir = TempDir::new("history-remote").unwrap();
+    let out = Command::new("git")
+        .args(["init", "-q", "--bare"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    dir
+}
+
+/// A committed checkout with `remote` as its origin.
+fn with_origin(remote: &TempDir) -> Checkout {
+    let checkout = committed();
+    git(
+        &checkout,
+        &["remote", "add", "origin", remote.path().to_str().unwrap()],
+    );
+    checkout
+}
+
+fn retain(checkout: &Checkout, doing: &str) -> String {
+    let out = checkout.ok(&["retain", "--doing", doing, "--writer", "tester"]);
+    out["checkpoint"]["id"].as_str().unwrap().to_owned()
+}
+
+#[test]
+fn a_pushed_history_fetched_into_another_clone_resolves_checkpoint_readings() {
+    let remote = bare();
+    let first = with_origin(&remote);
+    shop(&first);
+    let checkpoint = retain(&first, "the shop as drawn");
+    let out = first.ok(&["history", "push"]);
+    assert_eq!(out["kind"], "history-push");
+    assert_eq!(out["updated"], true);
+    assert_eq!(out["checkpoints"], json!([checkpoint]));
+    assert_eq!(first.ok(&["history", "push"])["updated"], false);
+
+    let second = with_origin(&remote);
+    second.refused(
+        &["read", "--checkpoint", &checkpoint],
+        "CHECKPOINT_NOT_FOUND",
+    );
+    let out = second.ok(&["history", "fetch"]);
+    assert_eq!(out["kind"], "history-fetch");
+    assert_eq!(out["updated"], true);
+    assert_eq!(out["checkpoints"], json!([checkpoint]));
+    let read = second.ok(&["read", "--checkpoint", &checkpoint]);
+    assert_eq!(names(&read), ["Bank", "Billing", "Platform", "Web"]);
+    assert_eq!(second.ok(&["history", "fetch"])["updated"], false);
+    // A fetched checkpoint exports without a vault in the checkout.
+    let (code, bundle) = second.run(&["export", "--checkpoint", &checkpoint]);
+    assert_eq!(code, 0, "{bundle:#}");
+    assert_eq!(bundle["source"]["checkpoint"], checkpoint);
+    assert!(bundle["files"]["modules/Billing1.module.json"].is_string());
+
+    // A fetched history grows by fast-forward.
+    first.edited(json!([{"type": "edit-module", "subject": "Web", "set": {"order": 3}}]));
+    let later = retain(&first, "web moves");
+    first.ok(&["history", "push"]);
+    assert_eq!(
+        second.ok(&["history", "fetch"])["checkpoints"],
+        json!([later])
+    );
+}
+
+#[test]
+fn diverged_histories_refuse_to_push_or_fetch() {
+    let remote = bare();
+    let first = with_origin(&remote);
+    shop(&first);
+    retain(&first, "first clone's history");
+    first.ok(&["history", "push"]);
+    let second = with_origin(&remote);
+    shop(&second);
+    retain(&second, "second clone's history");
+    let tip = git(&second, &["rev-parse", "refs/boundrail/history"]);
+    second.refused(&["history", "push"], "HISTORY_DIVERGED");
+    second.refused(&["history", "fetch"], "HISTORY_DIVERGED");
+    assert_eq!(git(&second, &["rev-parse", "refs/boundrail/history"]), tip);
+}
+
+#[test]
+fn history_publication_takes_only_a_configured_remote_name() {
+    let remote = bare();
+    let checkout = with_origin(&remote);
+    shop(&checkout);
+    retain(&checkout, "drawn");
+    let url = remote.path().to_str().unwrap().to_owned();
+    for name in [
+        "--remote=--upload-pack=touch pwned",
+        "--remote=-o",
+        &format!("--remote={url}"),
+        "--remote=nope",
+    ] {
+        checkout.refused(&["history", "push", name], "REQUEST_INVALID");
+        checkout.refused(&["history", "fetch", name], "REQUEST_INVALID");
+    }
+    assert!(!checkout.path().join("pwned").exists());
+}
+
+#[test]
+fn an_imported_proposal_keeps_its_predecessor_so_reconcile_keeps_both_changes() {
+    let (first, second) = clones();
+    let id = propose(&first, "Next", "current");
+    edited_proposal(
+        &first,
+        &id,
+        json!([{"type": "edit-module", "subject": "Web", "set": {"name": "Site"}}]),
+    );
+    second.edited(json!([{"type": "edit-module", "subject": "Billing", "set": {"responsibility": "Bills customers"}}]));
+    let copy = imported(&second, &export(&first, &["--proposal", &id]));
+    let (code, out) = adopt(&second, &copy, &second.digest());
+    assert_eq!(
+        (code, &out["error"]["code"]),
+        (2, &json!("PREDECESSOR_MOVED")),
+        "{out:#}"
+    );
+    let (code, out) = reconcile(&second, &copy);
+    assert_eq!(code, 0, "{out:#}");
+    let (code, out) = adopt(&second, &copy, &second.digest());
+    assert_eq!(code, 0, "{out:#}");
+    assert_eq!(
+        names(&second.ok(&["read"])),
+        ["Bank", "Billing", "Platform", "Site"]
+    );
+    let billing = second.ok(&["read", "Billing"]);
+    assert_eq!(billing["module"]["responsibility"], "Bills customers");
+}
+
+/// `bundle` with `text` at `path` and its digest.
+fn with_file(bundle: &Value, path: &str, text: &str) -> Value {
+    let mut bundle = bundle.clone();
+    bundle["files"][path] = text.into();
+    bundle["digests"][path] = sha256(text.as_bytes()).into();
+    bundle
+}
+
+#[test]
+fn import_refuses_a_bundle_whose_base_or_paths_do_not_hold() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let id = propose(&checkout, "Next", "current");
+    let bundle = export(&checkout, &["--proposal", &id]);
+    let before = checkout.digest();
+    let file = |id: &str, kind: &str| serde_json::to_string(&module(id, "E", kind, 0)).unwrap();
+    let path = "base/modules/AAAAAAAA.module.json";
+    for (path, text) in [
+        (path, file("../../../evil", "service")),
+        (path, file("ZZZZZZZZ", "service")),
+        (
+            "base/modules/ZZZZZZZZ.module.json",
+            file("ZZZZZZZZ", "nonsense"),
+        ),
+        (path, "{not json".to_owned()),
+    ] {
+        let (code, out) = import(&checkout, &with_file(&bundle, path, &text));
+        assert_eq!(
+            (code, &out["error"]["code"]),
+            (2, &json!("BUNDLE_INVALID")),
+            "{out:#}"
+        );
+        assert_eq!(out["error"]["details"]["path"], path, "{out:#}");
+    }
+    // Paths differing only in case would land on one file on some hosts.
+    let current = export(&checkout, &[]);
+    let shadow = with_file(
+        &current,
+        "modules/BILLING1.module.json",
+        &file("BILLING1", "service"),
+    );
+    let (code, out) = import(&checkout, &shadow);
+    assert_eq!(
+        (code, &out["error"]["code"]),
+        (2, &json!("BUNDLE_INVALID")),
+        "{out:#}"
+    );
+    assert_eq!(checkout.digest(), before);
+    assert_eq!(
+        checkout.ok(&["proposals"])["proposals"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn bundle_refusals_never_print_the_bundles_own_text() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let path = "\u{1b}]0;pwned\u{7}\u{1b}[31mmodules/x";
+    let bundle = with_file(&export(&checkout, &[]), path, "x");
+    let file = checkout.path().join("e.bundle.json");
+    fs::write(&file, bundle.to_string()).unwrap();
+    let digest = checkout.digest();
+    let (code, stdout) = checkout.run_raw(&[
+        "--format",
+        "markdown",
+        "import",
+        file.to_str().unwrap(),
+        "--expected-revision",
+        digest.as_str().unwrap(),
+        "--doing",
+        "bring it in",
+        "--writer",
+        "tester",
+        "--operation-id",
+        "escape",
+    ]);
+    assert_eq!(code, 2, "{stdout}");
+    assert!(stdout.starts_with("BUNDLE_INVALID: "), "{stdout}");
+    assert!(!stdout.contains('\u{1b}'), "{stdout:?}");
+}
+
+#[test]
+fn export_never_writes_into_the_shared_git_folder_from_a_linked_worktree() {
+    let checkout = committed();
+    shop(&checkout);
+    git(&checkout, &["add", "-A"]);
+    git(&checkout, &["commit", "-q", "-m", "model"]);
+    let linked = worktree(&checkout);
+    let exclude = checkout.path().join(".git/info/exclude");
+    let kept = fs::read(&exclude).unwrap();
+    linked.refused(
+        &["export", "--output", exclude.to_str().unwrap()],
+        "REQUEST_INVALID",
+    );
+    assert_eq!(fs::read(&exclude).unwrap(), kept);
+}
+
+/// `git` with `args` in the folder `dir`: its trimmed standard output.
+fn git_in(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    String::from_utf8(out.stdout).unwrap().trim().to_owned()
+}
+
+#[test]
+fn fetch_refuses_a_remote_history_that_retain_never_wrote() {
+    let remote = bare();
+    let checkout = with_origin(&remote);
+    shop(&checkout);
+    let local_refs = || git(&checkout, &["for-each-ref", "refs/boundrail"]);
+    let blob = checkout.path().join("blob.txt");
+    fs::write(&blob, "hi").unwrap();
+    let object = git_in(
+        remote.path(),
+        &["hash-object", "-w", blob.to_str().unwrap()],
+    );
+    git_in(
+        remote.path(),
+        &["update-ref", "refs/boundrail/history", &object],
+    );
+    checkout.refused(&["history", "fetch"], "MODEL_INVALID");
+    assert_eq!(local_refs(), "");
+
+    // A code commit, not a checkpoint.
+    let source = committed();
+    let url = remote.path().to_str().unwrap();
+    git(
+        &source,
+        &["push", "-q", url, "+HEAD:refs/boundrail/history"],
+    );
+    let error = checkout.refused(&["history", "fetch"], "MODEL_INVALID");
+    assert_eq!(
+        error["details"]["object"],
+        git(&source, &["rev-parse", "HEAD"]).trim()
+    );
+    assert_eq!(local_refs(), "");
+    retain(&checkout, "still retains");
 }

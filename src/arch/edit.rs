@@ -1646,6 +1646,7 @@ mod tests {
                 created: 0,
                 adopted_as: None,
                 dropped: vec!["Billing1".to_owned()],
+                base: false,
             }),
         };
         let batch = Batch::new(&model).unwrap();

@@ -15,6 +15,7 @@ use anyhow::{Context, Result};
 use serde_json::json;
 
 use super::edit::{self, Allocation, Plan, Receipt, Subjects};
+use super::merge::Side;
 use super::request::{check_doing, check_operation, check_writer};
 use super::revision::Revision;
 use super::types::{
@@ -22,6 +23,9 @@ use super::types::{
 };
 use super::vault::{self, Model, Scope};
 use super::{Code, Refusal, checkpoint, claims, ids, revision};
+
+mod reconcile;
+pub use reconcile::reconcile;
 
 /// The name `--from` and `--against` give the current state.
 pub const CURRENT: &str = "current";
@@ -62,6 +66,14 @@ pub fn propose(
             .map(|from| vault::load_proposal(vault.to_path_buf(), from))
             .transpose()?;
         let (predecessor, dropped) = inherited(&current, source.as_ref())?;
+        // A copy of a draft reconciles against its source's base; any other draft against the
+        // current state it was drawn from.
+        let copied = (source.as_ref().and_then(|s| s.proposal.as_ref()))
+            .is_some_and(|p| p.status != ProposalStatus::Adopted);
+        let base = match &source {
+            Some(source) if copied => vault::load_base(source)?,
+            _ => Some((current.modules.clone(), current.collections.clone())),
+        };
         let taken = taken(vault, &[&current])?;
         let proposal = Proposal {
             schema_version: SCHEMA_VERSION,
@@ -73,9 +85,15 @@ pub fn propose(
             created: claims::now(),
             adopted_as: None,
             dropped,
+            base: base.is_some(),
         };
         let source = source.as_ref().unwrap_or(&current);
-        let plan = drawing(source, proposal, writer.clone(), operation.clone(), writing)?;
+        let contents = (&source.modules[..], &source.collections[..]);
+        let base = base.as_ref().map(|(m, c)| (&m[..], &c[..]));
+        let named = (writer.clone(), operation.clone());
+        let plan = drawing(
+            "propose", &current, proposal, contents, base, named, writing,
+        )?;
         Ok(plan.record(fingerprint))
     })
 }
@@ -83,11 +101,8 @@ pub fn propose(
 /// The predecessor of a draft copied from `source`, or drawn from `current` without one, and the
 /// IDs the draft has dropped from it.
 fn inherited(current: &Model, source: Option<&Model>) -> Result<(Predecessor, Vec<String>)> {
-    let state = current.manifest.current.as_ref().map(|c| c.id.clone());
-    let of_current = Predecessor {
-        state: state.clone(),
-        revision: current.predecessor_digest()?,
-    };
+    let of_current = predecessor_of(current)?;
+    let state = of_current.state.clone();
     let Some((source, drawn)) = source.and_then(|s| Some((s, s.proposal.as_ref()?))) else {
         return Ok((of_current, Vec::new()));
     };
@@ -123,34 +138,42 @@ pub(super) fn taken(vault: &Path, models: &[&Model]) -> Result<BTreeSet<String>>
         .collect())
 }
 
-/// The plan that writes `proposal` holding `source`'s modules and collections.
-fn drawing(
-    source: &Model,
+/// The plan of the write `kind` that stores `proposal` in the vault of `current`, holding
+/// `contents` and, when given, `base` as its base; `named` is the writer and operation ID.
+/// `contents` must load as a proposal of this vault (`MODEL_INVALID`).
+pub(super) fn drawing(
+    kind: &'static str,
+    current: &Model,
     proposal: Proposal,
-    writer: String,
-    operation_id: String,
+    contents: Side<'_>,
+    base: Option<Side<'_>>,
+    (writer, operation_id): (String, String),
     writing: &Writing<'_>,
 ) -> Result<Plan> {
+    let (modules, collections) = contents;
     let problems = vault::problems(
-        &source.manifest,
-        &source.config,
+        &current.manifest,
+        &current.config,
         Some(&proposal),
-        &source.modules,
-        &source.collections,
+        modules,
+        collections,
         &[],
         &[],
     );
     if !problems.is_empty() {
-        return Err(vault::invalid(&source.dir, problems));
+        return Err(vault::invalid(&current.dir, problems));
     }
-    let modules: Vec<&Module> = source.modules.iter().collect();
-    let collections: Vec<_> = source.collections.iter().collect();
+    let modules: Vec<&Module> = modules.iter().collect();
+    let collections: Vec<_> = collections.iter().collect();
     let mut writes = vec![vault::proposal_write(&proposal)?];
     let copies = vault::plan_writes(None, &modules, &collections, &[], &[], &[])?;
     writes.extend(vault::in_proposal(&proposal.id, copies));
-    let id = source.qualify(&proposal.id);
+    if let Some(base) = base {
+        writes.extend(vault::base_writes(&proposal.id, base, None)?);
+    }
+    let id = current.qualify(&proposal.id);
     Ok(Plan {
-        kind: "propose",
+        kind,
         scope: Scope::Proposal(proposal.id),
         operation_id,
         writer,
@@ -423,10 +446,7 @@ fn refuse_compared(drawn: &Model, expected: &str) -> Result<()> {
 /// The draft `subject` names, loaded, with its `proposal.json`; a closed one refuses.
 fn open(vault: &Path, subject: &str) -> Result<(Model, Proposal)> {
     let drawn = vault::load_proposal(vault.to_path_buf(), subject)?;
-    let proposal = drawn
-        .proposal
-        .clone()
-        .context("a loaded proposal holds its proposal.json")?;
+    let proposal = proposal_of(&drawn)?;
     refuse_closed(&proposal)?;
     Ok((drawn, proposal))
 }
@@ -434,15 +454,7 @@ fn open(vault: &Path, subject: &str) -> Result<(Model, Proposal)> {
 /// Refuses an adoption the caller planned against another current revision, or of a proposal
 /// drawn against a current state that has moved since.
 fn refuse_moved(current: &Model, proposal: &Proposal, expected: &str) -> Result<()> {
-    let now = &current.revision.digest;
-    if expected != now {
-        return Err(Refusal::new(
-            Code::StaleRevision,
-            "the current state changed since the expected revision; read it again before adopting",
-        )
-        .with_details(json!({ "current": now }))
-        .into());
-    }
+    refuse_stale(current, expected)?;
     // Walkthroughs and pictures change on their own beside a proposal, so its predecessor leaves
     // them out, and the retired IDs their removal grows. Drafts drawn before retired IDs were left
     // out record model.json as it was on disk.
@@ -452,7 +464,7 @@ fn refuse_moved(current: &Model, proposal: &Proposal, expected: &str) -> Result<
         return Err(Refusal::new(
             Code::PredecessorMoved,
             format!(
-                "the current state moved since proposal {} was drawn; reconciling a proposal with a moved current state arrives in a later release, so draw a new proposal from the current state",
+                "the current state moved since proposal {} was drawn; merge what it gained with `boundrail model reconcile`, or draw a new proposal from the current state",
                 proposal.id
             ),
         )
@@ -466,9 +478,36 @@ fn refuse_moved(current: &Model, proposal: &Proposal, expected: &str) -> Result<
     Ok(())
 }
 
+/// The predecessor a draft drawn from `current` now names: its state and normalized digest.
+pub(super) fn predecessor_of(current: &Model) -> Result<Predecessor> {
+    Ok(Predecessor {
+        state: current.manifest.current.as_ref().map(|c| c.id.clone()),
+        revision: current.predecessor_digest()?,
+    })
+}
+
+/// The `proposal.json` of `model`, a loaded proposal.
+pub(super) fn proposal_of(model: &Model) -> Result<Proposal> {
+    (model.proposal.clone()).context("a loaded proposal holds its proposal.json")
+}
+
+/// `STALE_REVISION` when the caller read another revision of the current state than `current`.
+pub(super) fn refuse_stale(current: &Model, expected: &str) -> Result<()> {
+    let now = &current.revision.digest;
+    if expected == now {
+        return Ok(());
+    }
+    Err(Refusal::new(
+        Code::StaleRevision,
+        "the current state changed since the expected revision; read it again first",
+    )
+    .with_details(json!({ "current": now }))
+    .into())
+}
+
 /// The writer, `writing.writer` or the Git author name, and the operation ID, after checking
 /// them and `--doing`.
-fn start(vault: &Path, writing: &Writing<'_>) -> Result<(String, String)> {
+pub(super) fn start(vault: &Path, writing: &Writing<'_>) -> Result<(String, String)> {
     check_doing(writing.doing)?;
     check_operation(writing.operation_id)?;
     let writer = match writing.writer {

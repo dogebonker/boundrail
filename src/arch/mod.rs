@@ -1,6 +1,7 @@
 //! The authored architecture model: modules and relationships that agents write in
 //! `.boundrail/model/` and that Boundrail checks against the code.
 
+pub mod bundle;
 pub mod checkpoint;
 pub mod claims;
 pub mod code;
@@ -14,6 +15,7 @@ pub mod infra;
 pub mod inspect;
 pub mod locality;
 pub mod lsp;
+mod merge;
 pub mod picture;
 pub mod proposal;
 pub mod render;
@@ -92,6 +94,11 @@ pub enum Code {
     NoCurrentState,
     ProposalClosed,
     PredecessorMoved,
+    ReconcileConflict,
+    ReconcileNoBase,
+    ModelMismatch,
+    BundleInvalid,
+    HistoryDiverged,
 }
 
 impl Code {
@@ -130,6 +137,11 @@ impl Code {
             Code::NoCurrentState => "NO_CURRENT_STATE",
             Code::ProposalClosed => "PROPOSAL_CLOSED",
             Code::PredecessorMoved => "PREDECESSOR_MOVED",
+            Code::ReconcileConflict => "RECONCILE_CONFLICT",
+            Code::ReconcileNoBase => "RECONCILE_NO_BASE",
+            Code::ModelMismatch => "MODEL_MISMATCH",
+            Code::BundleInvalid => "BUNDLE_INVALID",
+            Code::HistoryDiverged => "HISTORY_DIVERGED",
         }
     }
 }
