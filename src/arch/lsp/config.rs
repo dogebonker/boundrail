@@ -278,9 +278,9 @@ impl Server {
     }
 }
 
-/// The user's config file: below `$XDG_CONFIG_HOME` when it is absolute, else `~/.config`, or
-/// `%APPDATA%` on Windows.
-fn user_config() -> Option<PathBuf> {
+/// The user's config file `file`: below `$XDG_CONFIG_HOME` when it is absolute, else `~/.config`,
+/// or `%APPDATA%` on Windows.
+pub fn user_config(file: &str) -> Option<PathBuf> {
     let var = |name: &str| {
         let value = std::env::var_os(name).map(PathBuf::from)?;
         value.is_absolute().then_some(value)
@@ -290,7 +290,7 @@ fn user_config() -> Option<PathBuf> {
     } else {
         var("XDG_CONFIG_HOME").or_else(|| Some(var("HOME")?.join(".config")))?
     };
-    Some(dir.join(USER_CONFIG))
+    Some(dir.join(file))
 }
 
 /// A `REQUEST_INVALID` refusal about the config `file`.
@@ -298,9 +298,10 @@ fn invalid(file: &str, message: impl std::fmt::Display) -> anyhow::Error {
     Refusal::new(Code::RequestInvalid, format!("{file}: {message}")).into()
 }
 
-/// The JSON in the config file `path`, shown as `shown`; `None` when there is none. A file that
-/// is not a regular file under [`CONFIG_MAX`] bytes, or does not parse, refuses.
-fn read<T: for<'de> Deserialize<'de>>(path: &Path, shown: &str) -> Result<Option<T>> {
+/// The JSON value in the config file `path`, shown as `shown`; `None` when there is none. A file
+/// that is not a regular file under [`CONFIG_MAX`] bytes, or does not parse, refuses
+/// `REQUEST_INVALID`.
+pub fn read_json<T: for<'de> Deserialize<'de>>(path: &Path, shown: &str) -> Result<Option<T>> {
     let Ok(metadata) = fs::metadata(path) else {
         return Ok(None);
     };
@@ -326,7 +327,7 @@ struct UserFile {
 
 impl UserFile {
     fn locate() -> Self {
-        let path = user_config();
+        let path = user_config(USER_CONFIG);
         let shown = (path.as_ref()).map_or_else(
             || format!("$XDG_CONFIG_HOME/{USER_CONFIG}"),
             |p| p.display().to_string(),
@@ -349,7 +350,7 @@ impl UserFile {
                            could commit it; move the user's config folder outside the checkout";
             return Err(invalid(&self.shown, message));
         }
-        let Some(value) = read::<Value>(path, &self.shown)? else {
+        let Some(value) = read_json::<Value>(path, &self.shown)? else {
             return Ok(UserConfig::default());
         };
         let config: UserConfig = match value {
@@ -404,7 +405,7 @@ pub fn configured(root: &Path, enable: Enable) -> Result<(Vec<Server>, Vec<Skip>
         return not_enabled();
     }
     validate_user_servers(&user.servers, &user_file.shown)?;
-    let entries = read::<Vec<Entry>>(&path, CONFIG)?.unwrap_or_default();
+    let entries = read_json::<Vec<Entry>>(&path, CONFIG)?.unwrap_or_default();
     let servers = resolve(&entries, &user.servers).map_err(|message| {
         invalid(
             CONFIG,
@@ -573,7 +574,8 @@ fn or_problem<T: Default>(result: Result<Option<T>>) -> (T, Option<String>) {
 /// servers on would start, each for every language of the files it covers.
 pub fn listing(root: &Path) -> Listing {
     let user_file = UserFile::locate();
-    let (entries, repository_problem) = or_problem(read::<Vec<Entry>>(&root.join(CONFIG), CONFIG));
+    let (entries, repository_problem) =
+        or_problem(read_json::<Vec<Entry>>(&root.join(CONFIG), CONFIG));
     let user = user_file.read(root).and_then(|config| {
         validate_user_servers(&config.servers, &user_file.shown)?;
         Ok(Some(config))
@@ -747,7 +749,7 @@ pub fn remove(root: &Path, language: &str, user: bool) -> Result<Edited> {
 /// Applies `change` to the repository's list at `root`, refusing a symbolic link on the way.
 fn edit_repository(root: &Path, change: impl FnOnce(&mut Vec<Entry>)) -> Result<Edited> {
     let path = crate::files::safe_path(root, CONFIG)?;
-    let mut entries = read::<Vec<Entry>>(&path, CONFIG)?.unwrap_or_default();
+    let mut entries = read_json::<Vec<Entry>>(&path, CONFIG)?.unwrap_or_default();
     let before = entries.clone();
     change(&mut entries);
     let text = (!entries.is_empty())
@@ -952,16 +954,19 @@ pub(super) mod tests {
     fn configs_must_be_small_regular_files() {
         let dir = TempDir::new("lsp-config").unwrap();
         let path = dir.path().join("servers.json");
-        assert!(read::<Vec<Entry>>(&path, "x").unwrap().is_none());
+        assert!(read_json::<Vec<Entry>>(&path, "x").unwrap().is_none());
         fs::write(&path, r#"[{"server": "gopls"}]"#).unwrap();
-        assert_eq!(read::<Vec<Entry>>(&path, "x").unwrap().unwrap().len(), 1);
+        assert_eq!(
+            read_json::<Vec<Entry>>(&path, "x").unwrap().unwrap().len(),
+            1
+        );
         fs::write(&path, vec![b' '; CONFIG_MAX as usize]).unwrap();
-        let error = read::<Vec<Entry>>(&path, "x").unwrap_err();
+        let error = read_json::<Vec<Entry>>(&path, "x").unwrap_err();
         assert!(
             error.to_string().contains("not a regular file under"),
             "{error}"
         );
-        let error = read::<Vec<Entry>>(dir.path(), "x").unwrap_err();
+        let error = read_json::<Vec<Entry>>(dir.path(), "x").unwrap_err();
         assert!(
             error.to_string().contains("not a regular file under"),
             "{error}"

@@ -65,7 +65,7 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 | T31 | Vaults outside Git: a private history for a vault outside a checkout, used for temporary pull request models | open |
 | T32 | Language servers: `model language-server` add, remove and list; defaults for C-family, C# and Swift; on by default through user config outside the checkout; `unready` diagnostic and step timings | done |
 | T33 | Browser: multi-select, relationship-kind filter, URL state for proposal, focus and flow with Back and Forward; an agent shows a reading in the user's open pane | open |
-| T34 | `model explain`: ask the local agent about a selection, relationship, flow or proposal | open |
+| T34 | `model explain`: ask the local agent about a selection, relationship, flow or proposal | done |
 | T35 | Walkthrough recording: render a walkthrough to MP4 with local voice and replay it | done |
 | T36 | Agent workflow: plan skill slices per ticket with the footprint gate; pull request skill body, state marker, temporary model and split guidance; action reads the proposal and skips held subjects; design guidance for inspect and locality | open |
 
@@ -1388,3 +1388,74 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   view follows it, or keeps what it shows once it is gone. Beats and pictures were already drawn
   from the stored reading through `/api/render?walkthrough=&beat=` and `?picture=`, so their new
   fields reach the server untouched.
+- T34: `model explain <subject>... [--relationship <id>] [--flow <id>] [--proposal <id>]
+  --question <text> [--agent claude|codex] [--print]` asks a local agent CLI and prints its
+  answer as text on stdout (`--format` only shapes a refusal). It needs a subject, relationship,
+  flow or proposal and a question that is not blank, else `REQUEST_INVALID`; unknown modules,
+  relationships and flows refuse as `model read` does. With `--proposal` the modules,
+  relationship and flow are read in that proposal. The bundle is Markdown: a heading naming the
+  model, state and revision, then per subject its `model read` module, parts, incoming and
+  outgoing relationships and its drawn interface from `model inspect` (no scan), the relationship
+  with its two modules, the flow with its steps as `model read --flow` prints it, the proposal's
+  `model compare` against the current state without `schema`, `success` and `vault`, each as a
+  JSON block, and the question last. It holds only model text and the question: no environment
+  value, absolute path or token. The prompt states the bundle is data, not instructions, and sets
+  it between `<<<BOUNDRAIL-DATA-<sha256 of the bundle>` and `BOUNDRAIL-DATA-<same>>>>` lines; text
+  inside cannot hold its own digest, so it cannot close the frame early, and the same request
+  gives the same prompt. `--print` prints that prompt and runs nothing, so the user can paste it
+  anywhere.
+- T34: agents. The fixed list in `src/cli/explain.rs` is `claude` (`-p --tools ""
+  --strict-mcp-config`: no tools and none of the user's MCP servers) and `codex` (`exec
+  --skip-git-repo-check --sandbox read-only -`); both read the prompt on stdin. The read-only
+  sandbox still lets `codex` read any file on disk and put it in its answer, so the docs
+  recommend `claude`; the answer goes only to the user, on stdout or in the page.
+  Cursor's `cursor-agent -p` has every tool, writes and shell included, and OpenCode's stdin
+  prompt was not confirmed, so neither is listed although `model setup` installs skills for them.
+  The agent is `--agent`, else `agent` in the user's `boundrail/explain.json` (`{"agent":
+  "codex"}`, unknown keys refused, found as the language servers' user config), else the first of
+  the list found; the repository never names it. A config naming an unknown agent, or not a
+  regular file under 1 MiB, refuses `REQUEST_INVALID`. A chosen agent that is missing is not
+  replaced by another. It is looked up as the rasterizers are (`collect::resolve_program`: its own
+  name in an absolute `PATH` folder, outside the checkout once links are resolved), runs without a
+  shell with `PATH` cut to the absolute folders outside the checkout, in a private temporary
+  folder, so it loads no `AGENTS.md` or `CLAUDE.md` from the checkout, and under the tool timeout.
+  It keeps the rest of the user's environment, which it needs to reach its provider. `boundrail:
+  asking agent <name>: <program> <args>` goes to stderr first. None found refuses
+  `REQUEST_INVALID` with `details` `{reason: "no-agent", tried}` and a message pointing at
+  `--print`. A failed exit is an error naming the agent, its status and its last stderr line
+  (`collect::failure`, shared with the rasterizers, as is `collect::first_program`). At most
+  1 MiB of its stdout and of its stderr is kept (`collect::run_capped` drains the rest); more
+  refuses `REQUEST_INVALID` with `details.reason` `explain-failed` and a message saying the
+  output is too large.
+  Explaining writes nothing and takes no claim.
+- T34: view. `model view --allow-explain` (off by default) lets the page ask: `GET /api/explain`
+  answers `{kind: "explain-status", allowed}`, and `POST /api/explain?subject=...&relationship=
+  &flow=&proposal=&question=` (parameters in the query, `subject` repeatable, no body read) runs
+  `model explain` with the user's configured or first agent and answers `{kind: "explain", agent,
+  answer}`. The token and Host checks apply to both; `/api/explain` alone accepts POST (405 with
+  `Allow: GET, POST` otherwise), and a POST to a view started without the flag gets 403 with
+  `details.reason` `explain-disabled`. A POST takes the token only from the `X-Boundrail-Token`
+  header, never `?t=`, so a cross-site form cannot send it and a cross-site script needs a
+  preflight, which the server answers 405; a POST whose `Origin` is present and not
+  `http://127.0.0.1:<port>` or `http://localhost:<port>` gets 403. One agent runs at a time: a
+  POST while one runs gets 409 with `details.reason` `explain-busy`. The detail panel's `Ask
+  the agent` section asks about the selected module, or from a relationship line's `Ask` about
+  that relationship, adding the active pane's open flow and its proposal; with no selection it
+  appears when a flow or proposal is shown, and never for a checkpoint, which `model explain`
+  does not read. The answer renders with `textContent`. When the server does not allow it, `Ask`
+  copies the `boundrail model explain` command line, shell-quoted, and shows it. ponytail: one
+  blocking request per question with no progress or cancel; a queue with progress events if
+  answers get long.
+- T34: security. The agent is a program the user chose, run only on the explicit command or, for
+  the view, on the explicit `--allow-explain` opt-in, since a browser request then starts a local
+  program; the view's header token, Origin and Host checks and loopback binding still gate it. It
+  receives the model's text as data, framed as above; the framing lowers but cannot remove the
+  risk that an agent follows text written into the model, which is why `claude` gets no tools or
+  MCP servers and `codex` a read-only sandbox in an empty folder. That sandbox does not stop
+  `codex` reading files on disk into its answer, which reaches only the user. `src/git.rs`
+  states this exception beside the rasterizers. Tests run fake `claude` and `codex` scripts from a
+  folder that is the whole `PATH` (with Git linked in), asserting the stdin bundle and its
+  framing, the arguments, `--print`, the refusals, an output over the cap, the config choice, the
+  endpoint off by default and on with `--allow-explain` and the header token, a POST with the
+  token only in the query or a foreign Origin refused, and a second POST during a run refused.
+  Tried by hand with the real `claude` and `codex` CLIs on a two-module model.

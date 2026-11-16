@@ -20,8 +20,8 @@ mod view_cli;
     about = "An authored architecture model checked against the code, for developers and coding agents"
 )]
 struct Cli {
-    /// Seconds an external tool (collector, language server, gh) may run before it is killed; 0
-    /// waits forever
+    /// Seconds an external tool (collector, language server, agent, gh) may run before it is
+    /// killed; 0 waits forever
     #[arg(long, global = true, value_name = "SECONDS", default_value_t = 600)]
     tool_timeout: u64,
     #[command(subcommand)]

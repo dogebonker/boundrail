@@ -58,6 +58,10 @@ const app = {
   picturesError: null,
   // Each picture's `model pictures` entry by ID, null until asked for: checking draws them all.
   pictureStatus: null,
+  // The open question to the agent, kept across redraws: `{ owner, target, question, answer,
+  // busy }`, where `owner` is the module whose panel shows it, or `summary`.
+  ask: null,
+  explainAllowed: null, // promise of whether the server runs the agent for the page
 };
 
 // ---------------------------------------------------------------- helpers
@@ -88,13 +92,16 @@ const item = (props, name, kind, ...rest) => h('button', { class: 'item', ...pro
 /** `[value, null]` when the promise keeps it, `[null, message]` when it breaks it. */
 const attempt = (promise) => promise.then((value) => [value, null], (error) => [null, error.message]);
 
-/** GET `/api/<path>` with the token; a refusal becomes an Error carrying its code and message. */
-async function api(path, params = {}, asText = false) {
+/** `/api/<path>` with the token, an array parameter repeated; a refusal becomes an Error
+ * carrying its code and message. */
+async function api(path, params = {}, asText = false, method = 'GET') {
   const query = new URLSearchParams();
   for (const [key, value] of Object.entries(params)) {
-    if (value !== null && value !== undefined && value !== '') query.set(key, value);
+    for (const one of [value].flat()) {
+      if (one !== null && one !== undefined && one !== '') query.append(key, one);
+    }
   }
-  const response = await fetch(`/api/${path}?${query}`, { headers: { 'X-Boundrail-Token': TOKEN } });
+  const response = await fetch(`/api/${path}?${query}`, { method, headers: { 'X-Boundrail-Token': TOKEN } });
   if (!response.ok) {
     let message = `The server answered ${response.status}.`;
     try {
@@ -752,12 +759,27 @@ const dl = (facts) => h('dl', {}, facts.flatMap(([k, v]) => [h('dt', { text: k }
 
 function renderDetail() {
   const box = $('#detail');
+  const typing = document.activeElement?.dataset.key === 'ask' ? document.activeElement : null;
   box.replaceChildren();
+  renderModule(box);
+  if (typing) {
+    const field = box.querySelector('[data-key="ask"]');
+    field?.focus();
+    field?.setSelectionRange(typing.selectionStart, typing.selectionEnd);
+  }
+}
+
+function renderModule(box) {
   const model = shown();
   const m = app.selected ? model.modules.get(app.selected) : beatModule(model);
+  const context = askContext();
   if (!m) {
-    return box.append(...(app.selected ? [note('The selected module is not part of this state.')] : summary(model)));
+    if (app.selected) return box.append(note('The selected module is not part of this state.'));
+    box.append(...summary(model));
+    if (context && (context.flow || context.proposal)) box.append(askSection('summary', context));
+    return;
   }
+  const ask = (target) => askAbout(m.id, target);
   box.append(
     h('div', { class: 'subtitle' }, kindDot(m.kind), kindName(m.kind)),
     h('h2', { class: 'title', text: m.name }),
@@ -781,6 +803,11 @@ function renderDetail() {
   const line = (r, other) => h('li', { class: 'rel' },
     h('span', { class: 'rel-main' }, kindDot(model.modules.get(other)?.kind), link(other)),
     h('span', { class: 'tag', text: relationshipKind(r.kind) }),
+    context ? h('button', {
+      class: 'link',
+      title: 'Ask the agent about this relationship',
+      onclick: () => ask({ ...context, relationship: r.id }),
+    }, 'Ask') : null,
     r.label ? h('span', { class: 'rel-label', text: r.label }) : null);
   const outgoing = relationships.filter((r) => r.from === m.id).map((r) => line(r, r.to));
   const incoming = relationships.filter((r) => r.to === m.id).map((r) => line(r, r.from));
@@ -799,6 +826,7 @@ function renderDetail() {
     ? h('ul', {}, diagnostics.map((d) => h('li', {}, d.message, h('div', { class: 'id', text: `${d.severity}, ${d.code}` }))))
     : note(app.check ? 'None.' : (app.checkError ?? 'Checking'))));
   box.append(interfaceSection(m));
+  if (context) box.append(askSection(m.id, { ...context, subjects: [m.id] }));
 }
 
 /** The module's interface from `model inspect`, fetched once per state and module. */
@@ -848,6 +876,103 @@ function interfaceBody(report, id) {
       h('ul', {}, entry.deep_imports.map((d) => h('li', { text: `${d.from} imports ${d.to}` }))));
   }
   return out;
+}
+
+// ---------------------------------------------------------------- asking the agent
+
+/** What the active pane adds to a question, its open flow and its proposal; null for a
+ * checkpoint, which `model explain` does not read. */
+function askContext() {
+  const pane = activePane();
+  if (pane.state.kind === 'checkpoint') return null;
+  return {
+    subjects: [],
+    flow: pane.view !== 'architecture' ? pane.flow : null,
+    proposal: pane.state.kind === 'proposal' ? pane.state.id : null,
+  };
+}
+
+function describe(target, model) {
+  const parts = target.subjects.map((id) => nameOf(model, id));
+  if (target.relationship) {
+    const r = (model.data?.relationships ?? []).find((x) => x.id === target.relationship);
+    parts.push(r ? `${nameOf(model, r.from)} to ${nameOf(model, r.to)}` : target.relationship);
+  }
+  if (target.flow) parts.push(`the flow ${flows(model).find((f) => f.id === target.flow)?.name ?? target.flow}`);
+  if (target.proposal) parts.push('this proposal');
+  return `About ${parts.join(', ')}`;
+}
+
+/** A prompt field for the open question of `owner`, else one about `fallback`. */
+function askSection(owner, fallback) {
+  if (app.ask && app.ask.owner !== owner) app.ask = null;
+  const kept = app.ask;
+  const target = kept?.target ?? fallback;
+  const question = h('textarea', {
+    rows: 3,
+    'data-key': 'ask',
+    'aria-label': 'Question for the agent',
+    placeholder: 'What do you want to know?',
+    oninput: () => { if (app.ask) app.ask.question = question.value; },
+  });
+  question.value = kept?.question ?? '';
+  const details = h('details', { class: 'ask' },
+    h('summary', { text: 'Ask the agent' }),
+    h('p', { class: 'id', text: describe(target, shown()) }),
+    question,
+    h('button', { disabled: kept?.busy, onclick: () => send(question.value.trim()) }, 'Ask'),
+    h('p', { class: 'answer', text: kept?.answer ?? '' }));
+  details.open = Boolean(kept);
+  details.addEventListener('toggle', () => {
+    if (details.open && !app.ask) app.ask = { owner, target, question: question.value, answer: '' };
+    if (!details.open && app.ask?.owner === owner && !app.ask.busy) app.ask = null;
+  });
+  return details;
+}
+
+/** Points the prompt in `owner`'s panel at `target` and opens it. */
+function askAbout(owner, target) {
+  app.ask = { owner, target, question: app.ask?.owner === owner ? app.ask.question : '', answer: '' };
+  renderDetail();
+  $('#detail [data-key="ask"]')?.focus();
+}
+
+const shellWord = (word) => (/^[\w@%+=:,./-]+$/.test(word) ? word : `'${word.replaceAll("'", "'\\''")}'`);
+
+/** The `boundrail model explain` command line asking `question` about `target`. */
+function explainCommand(target, question) {
+  const words = ['boundrail', 'model', 'explain', ...target.subjects];
+  for (const flag of ['relationship', 'flow', 'proposal']) {
+    if (target[flag]) words.push(`--${flag}`, target[flag]);
+  }
+  return [...words, '--question', question].map(shellWord).join(' ');
+}
+
+/** Asks the open question: through the server when it was started with --allow-explain, else by
+ * copying the command line for the user to run. The answer is shown as text. */
+async function send(text) {
+  const ask = app.ask;
+  if (!ask || !text) return;
+  ask.question = text;
+  app.explainAllowed ??= api('explain').then((status) => status.allowed, () => false);
+  if (!(await app.explainAllowed)) {
+    const command = explainCommand(ask.target, text);
+    ask.answer = `This view runs the agent only when started with --allow-explain. Run in a terminal:\n${command}`;
+    try {
+      await navigator.clipboard.writeText(command);
+      toast('Command copied');
+    } catch {
+      toast('Copying is not allowed here');
+    }
+    return renderDetail();
+  }
+  ask.busy = true;
+  ask.answer = 'Asking the agent';
+  renderDetail();
+  const [out, error] = await attempt(api('explain', { ...ask.target, question: text }, false, 'POST'));
+  ask.busy = false;
+  ask.answer = out ? out.answer : error;
+  if (app.ask === ask) renderDetail();
 }
 
 // ---------------------------------------------------------------- canvas

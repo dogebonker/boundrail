@@ -43,6 +43,10 @@ pub(super) struct ViewArgs {
     /// Print the URL without opening a browser
     #[arg(long)]
     no_open: bool,
+    /// Let the page ask the local agent CLI about the model (POST /api/explain), as `model
+    /// explain` does. Off by default: a browser request then runs a program on this machine
+    #[arg(long)]
+    allow_explain: bool,
 }
 
 struct Server {
@@ -51,6 +55,9 @@ struct Server {
     /// The code the opener's URL carries instead of the token.
     launch: page::Launch,
     port: u16,
+    /// Whether `POST /api/explain` runs the agent.
+    allow_explain: bool,
+    explains: AtomicUsize,
     connections: AtomicUsize,
     streams: AtomicUsize,
     /// The latest change; event streams wait on `changed`.
@@ -85,6 +92,8 @@ pub(super) fn run(root: &Path, args: &ViewArgs) -> Result<()> {
         token: boundrail::token()?,
         launch: page::Launch::new()?,
         port,
+        allow_explain: args.allow_explain,
+        explains: AtomicUsize::new(0),
         connections: AtomicUsize::new(0),
         streams: AtomicUsize::new(0),
         news: Mutex::default(),
@@ -95,6 +104,9 @@ pub(super) fn run(root: &Path, args: &ViewArgs) -> Result<()> {
     println!("{url}");
     std::io::stdout().flush()?;
     eprintln!("Serving a read-only view of the model; stop with Ctrl-C");
+    if args.allow_explain {
+        eprintln!("The page may ask the local agent CLI about the model (--allow-explain)");
+    }
     if !args.no_open
         && let Some(code) = server.launch.code()
     {
@@ -342,19 +354,31 @@ impl Server {
         if !page::host_allowed(request, self.port) {
             return Some(text(403, "Unknown Host"));
         }
-        if request.method != "GET" {
-            let allow = [("Allow", "GET")];
-            let body = b"Only GET";
+        let explain = request.path == "/api/explain";
+        let allowed = if explain { "GET, POST" } else { "GET" };
+        if !allowed.split(", ").any(|m| m == request.method) {
+            let allow = [("Allow", allowed)];
+            let body = format!("Only {allowed}");
             return Some(page::response(
                 405,
                 "text/plain; charset=utf-8",
-                body,
+                body.as_bytes(),
                 &allow,
             ));
+        }
+        if request.method == "POST" && !page::origin_allowed(request, self.port) {
+            return Some(text(403, "Unknown Origin"));
         }
         let api = request.path.starts_with("/api/");
         if api && !page::token_matches(request, &self.token) {
             let refusal = Refusal::new(Code::RequestInvalid, "missing or wrong view token");
+            return Some(json_response(403, &model_cli::refusal_output(&refusal)));
+        }
+        if explain && request.method == "POST" && !self.allow_explain {
+            let message = "this view was started without --allow-explain; run `boundrail model \
+                           explain` in a terminal instead";
+            let refusal = Refusal::new(Code::RequestInvalid, message)
+                .with_details(json!({"reason": "explain-disabled"}));
             return Some(json_response(403, &model_cli::refusal_output(&refusal)));
         }
         None
@@ -362,6 +386,18 @@ impl Server {
 
     /// The answer to an allowed request.
     fn answer(&self, request: &Request) -> Vec<u8> {
+        let _running = if request.path == "/api/explain" && request.method == "POST" {
+            if !claim(&self.explains, 1) {
+                let message = "the agent is still answering another question; ask again when it \
+                               is done";
+                let refusal = Refusal::new(Code::RequestInvalid, message)
+                    .with_details(json!({"reason": "explain-busy"}));
+                return json_response(409, &model_cli::refusal_output(&refusal));
+            }
+            Some(Release(&self.explains))
+        } else {
+            None
+        };
         let asset = |content_type: &str, body: &str| {
             let csp = [("Content-Security-Policy", page::CONTENT_SECURITY_POLICY)];
             page::response(200, content_type, body.as_bytes(), &csp)
@@ -455,6 +491,23 @@ impl Server {
                 model_cli::walkthrough_output(root, id)?
             }
             "/api/pictures" => model_cli::pictures_output(root, param("status").is_some())?,
+            "/api/explain" if request.method == "GET" => {
+                json!({"kind": "explain-status", "allowed": self.allow_explain})
+            }
+            "/api/explain" => {
+                let subjects = (request.query.iter())
+                    .filter(|(name, value)| name == "subject" && !value.is_empty())
+                    .map(|(_, value)| value.as_str())
+                    .collect();
+                let asked = model_cli::Asked {
+                    subjects,
+                    relationship: param("relationship"),
+                    flow: param("flow"),
+                    proposal: param("proposal"),
+                    question: param("question").unwrap_or_default(),
+                };
+                model_cli::explain_output(root, &asked)?
+            }
             _ => return Ok(None),
         }))
     }
@@ -577,6 +630,8 @@ mod tests {
             token: boundrail::token().unwrap(),
             launch: page::Launch::new().unwrap(),
             port: 4000,
+            allow_explain: false,
+            explains: AtomicUsize::new(0),
             connections: AtomicUsize::new(0),
             streams: AtomicUsize::new(0),
             news: Mutex::default(),

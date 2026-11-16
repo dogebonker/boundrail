@@ -586,7 +586,7 @@ svg g.dimmed:not(.undim) text { opacity: 0.6; }
 .detail ul { list-style: none; padding: 0; margin: 0; }
 .detail li { padding: 4px 0; color: var(--text-2); font-size: var(--fs-13); }
 .detail .rels li {
-  display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 0 8px;
+  display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 0 8px;
   min-height: 28px; margin: 0 -8px; padding: 4px 8px; border-radius: var(--radius);
 }
 .detail .rels li:hover { background: var(--hover); }
@@ -724,3 +724,9 @@ svg g.dimmed:not(.undim) text { opacity: 0.6; }
   .sidebar { order: 2; padding: 12px 8px 32px; border-top: 1px solid var(--divider); }
   .sidebar, .detail { overflow: visible; border-left: 0; border-right: 0; min-height: auto; }
 }
+.ask textarea {
+  display: block; width: 100%; margin: 8px 0; padding: 8px; resize: vertical;
+  border: 1px solid var(--divider-strong); border-radius: var(--radius); background: var(--raised);
+  font: inherit; color: inherit;
+}
+.detail .answer { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text); }

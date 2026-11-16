@@ -117,6 +117,9 @@ Other codes explain themselves in their message. `skips` list what the check cou
   regions) and `visibility` (keep only what lies within that many hops of the focus; needs a
   focus). Kinds and groups are `config.yaml` keys.
 - See the model in a browser with `boundrail model view`.
+- When the user wants another agent's reading of part of the model, `boundrail model explain
+  <module>... [--relationship <id>] [--flow <id>] [--proposal <id>] --question "<text>"` asks
+  their local agent CLI; `--print` prints the bundle instead. It writes nothing.
 
 ## History
 

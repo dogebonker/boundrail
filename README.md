@@ -205,6 +205,27 @@ commit lacks, and `unavailable` when no commit was recorded or this repository l
 local refs only, never the network. A write interrupted before its checkpoint landed refuses
 `RECOVERY_REQUIRED`; `boundrail model recover` retains it once.
 
+## Explain
+
+`boundrail model explain` asks a local agent CLI about the model and prints its answer. Boundrail
+writes the modules (with parts, relationships and drawn interface), the relationship, the flow's
+steps and the proposal's comparison you name into a Markdown bundle, frames it as data rather than
+instructions, and hands it with your question to `claude -p` (no tools, no MCP servers) or `codex
+exec` (read-only sandbox) on stdin, run in an empty temporary folder. Prefer `claude`: the
+read-only sandbox still lets `codex` read any file on disk and put it in its answer. The answer
+goes only to you, on stdout or in the page. Pick the agent with `--agent`, or with `{"agent":
+"codex"}` in `~/.config/boundrail/explain.json`; otherwise the first found on `PATH` runs. The
+repository never chooses it. `--print` prints the bundle instead, to paste into any agent.
+
+```sh
+boundrail model explain Billing --question "Why does Billing call the bank directly?"
+boundrail model explain --relationship <id> --flow Checkout --question "Is this step drawn right?"
+boundrail model explain --proposal <id> --question "What does this proposal risk?" --print
+```
+
+`boundrail model view --allow-explain` lets the browser's `Ask the agent` field run the same
+command; without the flag the field copies the command line for you to run.
+
 ## In CI
 
 The GitHub Action runs `model check`, annotates its findings, and on a pull request comments the

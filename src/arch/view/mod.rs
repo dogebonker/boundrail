@@ -29,7 +29,8 @@ pub const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'
 /// The policy of an SVG opened on its own: no scripts or loads, only its own styling.
 pub const RENDER_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'";
 
-/// A request line and headers. GET requests carry no body, so nothing after the head is read.
+/// A request line and headers. Nothing after the head is read: GET requests carry no body, and
+/// `POST /api/explain` takes its parameters in the query too.
 #[derive(Debug)]
 pub struct Request {
     pub method: String,
@@ -203,10 +204,30 @@ pub fn host_allowed(request: &Request, port: u16) -> bool {
     host == format!("127.0.0.1:{port}") || host == format!("localhost:{port}")
 }
 
-/// Whether the request carries `token` in the `t` query parameter or the [`TOKEN_HEADER`].
+/// Whether the request carries `token` in the [`TOKEN_HEADER`], or, for a GET, in the `t` query
+/// parameter. A POST must use the header, which a cross-site form cannot set and a cross-site
+/// script cannot send without a preflight.
 pub fn token_matches(request: &Request, token: &str) -> bool {
-    let given = request.param("t").or_else(|| request.header(TOKEN_HEADER));
+    let query = (request.method == "GET")
+        .then(|| request.param("t"))
+        .flatten();
+    let given = query.or_else(|| request.header(TOKEN_HEADER));
     given.is_some_and(|given| same(given.as_bytes(), token.as_bytes()))
+}
+
+/// Whether the request has no Origin header, or exactly one naming this server by its loopback
+/// address or `localhost` with its port.
+pub fn origin_allowed(request: &Request, port: u16) -> bool {
+    let mut origins = request.headers.iter().filter(|(n, _)| n == "origin");
+    match (origins.next(), origins.next()) {
+        (None, _) => true,
+        (Some((_, origin)), None) => {
+            let origin = origin.to_ascii_lowercase();
+            origin == format!("http://127.0.0.1:{port}")
+                || origin == format!("http://localhost:{port}")
+        }
+        (Some(_), Some(_)) => false,
+    }
 }
 
 /// Compares in time independent of where the inputs differ.
@@ -409,6 +430,30 @@ mod tests {
     }
 
     #[test]
+    fn only_no_origin_or_this_servers_own_origin_passes() {
+        let with = |origins: &[&str]| {
+            let lines: String = origins.iter().map(|o| format!("Origin: {o}\r\n")).collect();
+            request(&format!("POST /api/explain HTTP/1.1\r\n{lines}"))
+        };
+        for origins in [
+            &[][..],
+            &["http://127.0.0.1:4000"],
+            &["http://LocalHost:4000"],
+        ] {
+            assert!(origin_allowed(&with(origins), 4000), "{origins:?}");
+        }
+        for origins in [
+            &["https://evil.example"][..],
+            &["http://127.0.0.1:4001"],
+            &["https://127.0.0.1:4000"],
+            &["null"],
+            &["http://127.0.0.1:4000", "http://127.0.0.1:4000"],
+        ] {
+            assert!(!origin_allowed(&with(origins), 4000), "{origins:?}");
+        }
+    }
+
+    #[test]
     fn a_launch_code_redeems_once_and_is_never_the_token() {
         let token = crate::token().unwrap();
         let launch = Launch::new().unwrap();
@@ -438,6 +483,15 @@ mod tests {
             "GET /api/model HTTP/1.1\r\n{TOKEN_HEADER}: {token}\r\n"
         ));
         assert!(token_matches(&header, &token));
+        let posted = request(&format!("POST /api/explain?t={token} HTTP/1.1\r\n"));
+        assert!(
+            !token_matches(&posted, &token),
+            "a POST takes the header only"
+        );
+        let posted = request(&format!(
+            "POST /api/explain HTTP/1.1\r\n{TOKEN_HEADER}: {token}\r\n"
+        ));
+        assert!(token_matches(&posted, &token));
         for head in [
             "GET /api/model HTTP/1.1\r\n".to_owned(),
             "GET /api/model?t= HTTP/1.1\r\n".to_owned(),

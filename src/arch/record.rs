@@ -172,11 +172,8 @@ pub struct Speaker {
 
 /// The first of `SPEAKERS` on `PATH` outside `checkout`; `no-text-to-speech` when none is.
 pub fn speaker(checkout: &Path) -> Result<Speaker, Unrendered> {
-    let found = (SPEAKERS.iter()).find_map(|(name, kind)| {
-        let program = collect::resolve_program(name, checkout).ok()?;
-        Some((*name, *kind, program))
-    });
-    let (name, kind, program) = found.ok_or_else(|| {
+    let found = collect::first_program(&SPEAKERS, |(name, _)| name, checkout);
+    let (&(name, kind), program) = found.ok_or_else(|| {
         let names: Vec<&str> = SPEAKERS.iter().map(|(name, _)| *name).collect();
         Unrendered {
             reason: "no-text-to-speech",
@@ -371,12 +368,7 @@ fn run(
         .env("PATH", collect::path_outside(checkout));
     let out =
         collect::run_with_input(&mut command, input.to_vec()).map_err(|e| format!("{e:#}"))?;
-    if out.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let last = stderr.lines().rev().find(|l| !l.trim().is_empty());
-    Err(format!("{}: {}", out.status, last.unwrap_or_default()))
+    collect::failure(&out).map_or(Ok(()), Err)
 }
 
 /// How many seconds the WAV or AIFF (AIFF-C too) `audio` lasts, from its header.

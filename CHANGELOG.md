@@ -114,6 +114,13 @@
   audio and `talk.json`, and `--replay <talk folder>` encodes the MP4 again from it alone. A
   missing rasterizer, voice or ffmpeg refuses `REQUEST_INVALID` with `details.reason`
   (`no-rasterizer`, `no-text-to-speech`, `no-ffmpeg`) before anything is written.
+- `model explain <module>... [--relationship <id>] [--flow <id>] [--proposal <id>] --question
+  <text>` asks a local agent CLI (`claude` or `codex`, by `--agent` or the user's
+  `boundrail/explain.json`, never the repository) about the model: the selected parts go to the
+  agent on stdin as a Markdown bundle framed as data, and its answer prints to stdout. With no
+  agent on `PATH` it refuses `REQUEST_INVALID` with `details.reason` `no-agent`; `--print` prints
+  the bundle instead. `model view --allow-explain` adds `POST /api/explain` and an `Ask the agent`
+  field to the detail panel, which otherwise copies the command line.
 
 ### Changed
 

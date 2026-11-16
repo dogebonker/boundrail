@@ -36,6 +36,8 @@ use boundrail::arch::{Code, Refusal};
 use boundrail::cochange::MAX_FILES;
 use serde_json::{Value, json};
 
+#[path = "explain.rs"]
+mod explain;
 #[path = "language_server.rs"]
 mod language_server;
 #[path = "pictures.rs"]
@@ -44,6 +46,7 @@ mod pictures;
 mod record;
 #[path = "setup.rs"]
 mod setup;
+pub(super) use explain::{Asked, explain_output};
 pub(super) use pictures::pictures_output;
 use setup::Agent;
 
@@ -54,7 +57,8 @@ pub(super) struct ModelArgs {
     /// Directory inside the Git checkout that holds the model
     #[arg(long, global = true, default_value = ".")]
     root: PathBuf,
-    /// Output format; JSON when absent, except `model render`, which then prints the SVG.
+    /// Output format; JSON when absent, except `model render`, which then prints the SVG, and
+    /// `model explain`, which prints text.
     /// `annotations` (model check only) prints GitHub workflow commands, and `pr-comment`
     /// (model footprint only) a Markdown pull request comment
     #[arg(long, global = true, value_enum)]
@@ -126,6 +130,10 @@ enum Command {
     Render(Box<RenderArgs>),
     /// Serve a live, read-only view of the model in the browser on a local port
     View(super::view_cli::ViewArgs),
+    /// Ask a local agent CLI about modules, a relationship, a flow or a proposal: Boundrail
+    /// hands it the model's text as data with the question on stdin and prints its answer as
+    /// text. The agent is a program you choose, run only by this command
+    Explain(explain::ExplainArgs),
     /// List the picture recipes with whether each file still matches what the model draws:
     /// fresh, stale, missing or unrenderable
     Pictures {
@@ -646,6 +654,7 @@ pub(super) fn run(args: ModelArgs) -> Result<ExitCode> {
             render_model(&args.root, args.format, &render).map(|()| ExitCode::SUCCESS)
         }
         Command::View(view) => super::view_cli::run(&args.root, &view).map(|()| ExitCode::SUCCESS),
+        Command::Explain(explain) => explain::run(&args.root, &explain).map(|()| ExitCode::SUCCESS),
         Command::Pictures { write, only } => {
             pictures::list(&args.root, markdown, only.as_deref(), write)
         }
@@ -3285,7 +3294,17 @@ pub(super) struct Compare<'a> {
 
 /// The JSON output of `model compare`.
 pub(super) fn compare_output(root: &Path, asked: &Compare<'_>) -> Result<Value> {
-    let c = compared(root, asked)?;
+    compared_output(&compared(root, asked)?)
+}
+
+/// The JSON output of `model compare` for the loaded proposal `after` against the loaded current
+/// state `before`.
+pub(super) fn compare_loaded(vault: PathBuf, before: Model, after: Model) -> Result<Value> {
+    let against = side(&before);
+    compared_output(&compared_models(vault, before, against, vec![after]))
+}
+
+fn compared_output(c: &Compared) -> Result<Value> {
     let first = &c.alternatives[0];
     let mut output = json!({
         "schema": MODEL_SCHEMA,
@@ -3355,17 +3374,29 @@ fn compared(root: &Path, asked: &Compare<'_>) -> Result<Compared> {
     for beside in asked.beside {
         models.push(vault::load_proposal(dir.clone(), beside)?);
     }
-    let model_id = models[0].manifest.id.clone();
-    let side = |model: &Model| match &model.proposal {
-        Some(drawn) => {
-            json!({"id": model.qualify(&drawn.id), "name": drawn.name, "revision": model.revision.digest})
-        }
-        None => json!({"id": CURRENT, "revision": model.revision.digest}),
-    };
     let against_side = match &checkpoint {
         Some(checkpoint) => json!({"checkpoint": checkpoint, "revision": before.revision.digest}),
         None => side(&before),
     };
+    Ok(compared_models(dir, before, against_side, models))
+}
+
+fn side(model: &Model) -> Value {
+    match &model.proposal {
+        Some(drawn) => {
+            json!({"id": model.qualify(&drawn.id), "name": drawn.name, "revision": model.revision.digest})
+        }
+        None => json!({"id": CURRENT, "revision": model.revision.digest}),
+    }
+}
+
+fn compared_models(
+    vault: PathBuf,
+    before: Model,
+    against_side: Value,
+    models: Vec<Model>,
+) -> Compared {
+    let model_id = models[0].manifest.id.clone();
     let drawn = inspect::drawn(&model_id, &before.modules, None);
     let alternatives = (models.into_iter())
         .map(|after| {
@@ -3384,13 +3415,13 @@ fn compared(root: &Path, asked: &Compare<'_>) -> Result<Compared> {
             }
         })
         .collect();
-    Ok(Compared {
-        vault: dir,
+    Compared {
+        vault,
         against: before,
         side: against_side,
         drawn,
         alternatives,
-    })
+    }
 }
 
 /// How a Markdown line names a compared state.

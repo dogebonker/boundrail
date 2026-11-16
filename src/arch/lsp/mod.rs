@@ -27,7 +27,7 @@ use crate::model::Document;
 use client::Session;
 pub use config::{
     CONFIG, Change, DefinedBy, Edited, Effective, Enable, Entry, Listed, Listing, Server,
-    UserConfig, add, configured, detected_servers, listing, remove,
+    UserConfig, add, configured, detected_servers, listing, read_json, remove, user_config,
 };
 use wire::{Range, Roots, Text, file_uri};
 

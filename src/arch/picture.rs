@@ -266,13 +266,11 @@ pub struct Rasterizer {
 
 /// The first of `RASTERIZERS` on `PATH` outside `checkout`; `no-rasterizer` when none is.
 pub fn rasterizer(checkout: &Path) -> Result<Rasterizer, Unrendered> {
-    let found = (RASTERIZERS.iter()).find_map(|(name, args)| {
-        let program = collect::resolve_program(name, checkout).ok()?;
-        Some(Rasterizer {
-            name,
-            args,
-            program,
-        })
+    let found = collect::first_program(&RASTERIZERS, |(name, _)| name, checkout);
+    let found = found.map(|(&(name, args), program)| Rasterizer {
+        name,
+        args,
+        program,
     });
     found.ok_or_else(|| {
         let names: Vec<&str> = RASTERIZERS.iter().map(|(name, _)| *name).collect();
@@ -310,14 +308,8 @@ impl Rasterizer {
             .current_dir(dir.path())
             .env("PATH", collect::path_outside(checkout));
         let out = collect::run(&mut command).map_err(|e| failed(format!("{e:#}")))?;
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let last = stderr.lines().rev().find(|l| !l.trim().is_empty());
-            return Err(failed(format!(
-                "{}: {}",
-                out.status,
-                last.unwrap_or_default()
-            )));
+        if let Some(why) = collect::failure(&out) {
+            return Err(failed(why));
         }
         let png = fs::read(dir.path().join("out.png")).map_err(|e| failed(e.to_string()))?;
         let tagged = with_source(&png, &drawing.digest);

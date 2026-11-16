@@ -30,7 +30,17 @@
 //! programs and ffmpeg `model record` runs are the same accepted scope: fixed lists (`say`,
 //! `espeak-ng`, `piper`; `ffmpeg`), found the same way, with arguments Boundrail builds, run
 //! without a shell in a private temporary folder holding only their inputs, the narration passed
-//! in a file or on stdin, never as an argument. `model history push`
+//! in a file or on stdin, never as an argument. So is the agent `model explain` runs: a program
+//! the user chose from a fixed list (`claude`, `codex`), by `--agent` or the user's
+//! `boundrail/explain.json` outside the checkout, else the first found, never by the repository.
+//! It is found and run like the rasterizers, with fixed arguments, no shell and its prompt on
+//! stdin, in a private temporary folder under the tool timeout, and it keeps the user's
+//! environment, which it needs to reach its provider. It runs only on that explicit command, or
+//! for the browser view when the user started `model view --allow-explain`, and it receives the
+//! model's text and the question as data between marker lines, holding no environment value or
+//! token. Its answer goes only to the user. `claude` runs with no tools and no MCP servers;
+//! `codex` runs in its read-only sandbox, which still lets it read any file on disk and put it in
+//! the answer, so `claude` is the one to prefer. `model history push`
 //! and `model history fetch` reach a remote the user configured and names by its `git remote`
 //! name, never a URL or option, so Git runs the transport that config names (`ssh`,
 //! `core.sshCommand`, `remote.<name>.uploadpack` and `receivepack`, credential helpers): the

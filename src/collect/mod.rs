@@ -130,10 +130,23 @@ pub fn run(command: &mut Command) -> Result<Output> {
 /// `TOOL_TIMEOUT`. The input is written from another thread, so a tool that exits before reading
 /// all of it reports its own error output; a write error surfaces only when the tool succeeded.
 pub fn run_with_input(command: &mut Command, input: Vec<u8>) -> Result<Output> {
-    fn read_all(mut pipe: impl Read + Send + 'static) -> JoinHandle<std::io::Result<Vec<u8>>> {
+    run_capped(command, input, u64::MAX)
+}
+
+/// [`run_with_input`] keeping at most `cap` bytes of stdout and of stderr: the rest is read and
+/// dropped, so an output longer than `cap` comes back as its first `cap + 1` bytes.
+pub fn run_capped(command: &mut Command, input: Vec<u8>, cap: u64) -> Result<Output> {
+    fn read_all(
+        mut pipe: impl Read + Send + 'static,
+        cap: u64,
+    ) -> JoinHandle<std::io::Result<Vec<u8>>> {
         thread::spawn(move || {
             let mut bytes = Vec::new();
-            pipe.read_to_end(&mut bytes).map(|_| bytes)
+            (&mut pipe)
+                .take(cap.saturating_add(1))
+                .read_to_end(&mut bytes)?;
+            std::io::copy(&mut pipe, &mut std::io::sink())?;
+            Ok(bytes)
         })
     }
     let mut child = command
@@ -143,8 +156,8 @@ pub fn run_with_input(command: &mut Command, input: Vec<u8>) -> Result<Output> {
         .spawn()?;
     let mut stdin = child.stdin.take().expect("piped stdin");
     let writer = thread::spawn(move || stdin.write_all(&input));
-    let stdout = read_all(child.stdout.take().expect("piped stdout"));
-    let stderr = read_all(child.stderr.take().expect("piped stderr"));
+    let stdout = read_all(child.stdout.take().expect("piped stdout"), cap);
+    let stderr = read_all(child.stderr.take().expect("piped stderr"), cap);
     let status = match tool_timeout() {
         None => child.wait()?,
         Some(timeout) => {
@@ -224,6 +237,26 @@ fn absolute_dirs() -> Vec<PathBuf> {
 /// plants.
 pub fn absolute_path() -> std::ffi::OsString {
     std::env::join_paths(absolute_dirs()).unwrap_or_default()
+}
+
+/// The first of `tools` whose `name` [`resolve_program`] finds, with that program.
+pub fn first_program<'a, T>(
+    tools: &'a [T],
+    name: impl Fn(&T) -> &str,
+    checkout: &Path,
+) -> Option<(&'a T, PathBuf)> {
+    (tools.iter()).find_map(|tool| Some((tool, resolve_program(name(tool), checkout).ok()?)))
+}
+
+/// Why a tool that ran failed, its exit status and last non-blank stderr line, or `None` when it
+/// succeeded.
+pub fn failure(out: &Output) -> Option<String> {
+    if out.status.success() {
+        return None;
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let last = stderr.lines().rev().find(|l| !l.trim().is_empty());
+    Some(format!("{}: {}", out.status, last.unwrap_or_default()))
 }
 
 /// The program a bare `command` names: the first executable file of that name in an absolute
@@ -476,8 +509,19 @@ mod tests {
             String::from_utf8_lossy(&output.stderr).trim(),
             "helper failed early"
         );
+        assert_eq!(
+            failure(&output).unwrap(),
+            format!("{}: helper failed early", output.status)
+        );
         let echoed = run_with_input(&mut Command::new("cat"), input.clone()).unwrap();
         assert_eq!(echoed.stdout, input);
+        assert_eq!(failure(&echoed), None);
+        let capped = run_capped(&mut Command::new("cat"), input.clone(), 10).unwrap();
+        assert!(
+            capped.status.success(),
+            "the rest is drained, not left blocking"
+        );
+        assert_eq!(capped.stdout, input[..11]);
     }
 
     #[test]
