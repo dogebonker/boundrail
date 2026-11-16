@@ -23,6 +23,10 @@ const WHEEL_RATE = 0.0015;
 const KEY_STEP = 40;
 const DRAG_PX = 4;
 const FIT_PAD = 16;
+const FIT_MAX = 1.25;
+const TOP_PAD = 32;
+const FIT_GLIDE = 150;
+const phone = matchMedia('(max-width: 600px)');
 const BACKOFF = { first: 1000, most: 30000 };
 
 const app = {
@@ -131,6 +135,19 @@ const nameOf = (model, id) => model.modules.get(id)?.name ?? id;
 const kindName = (kind) => shown().data?.config?.['node-kinds']?.[kind]?.name ?? kind;
 const relationshipKind = (kind) => shown().data?.config?.['relationship-kinds']?.[kind]?.name ?? kind;
 const flows = (model) => (model.data?.collections ?? []).flatMap((c) => c.flows);
+const TONES = ['ui', 'service', 'system', 'module', 'job', 'datastore', 'cache', 'app', 'external'];
+const BORROWED = TONES.filter((tone) => tone !== 'external');
+function toneOf(kind = '') {
+  if (TONES.includes(kind)) return kind;
+  let hash = 0;
+  for (const c of kind) hash = (hash * 31 + c.charCodeAt(0)) >>> 0;
+  return BORROWED[hash % BORROWED.length];
+}
+function paint(node, kind) {
+  node.style.setProperty('--tone', `var(--k-${toneOf(kind)})`);
+  return node;
+}
+const kindDot = (kind) => paint(h('span', { class: 'dot', 'aria-hidden': 'true' }), kind);
 
 function ancestors(model, id) {
   const found = [];
@@ -366,7 +383,13 @@ function renderControls() {
   }
   $('#depth').value = pane.depth;
   $('#depth').disabled = pane.view !== 'architecture';
-  $('#focus').setAttribute('aria-pressed', String(app.focus));
+  $('.stepper').hidden = pane.view !== 'architecture';
+  $('#depth-down').disabled = $('#depth').disabled || pane.depth <= Number($('#depth').min);
+  $('#depth-up').disabled = $('#depth').disabled || pane.depth >= Number($('#depth').max);
+  const canFocus = shown().modules.has(app.selected);
+  $('#focus').setAttribute('aria-disabled', String(!canFocus));
+  $('#focus').setAttribute('aria-pressed', String(app.focus && canFocus));
+  $('#focus').title = canFocus ? 'Focus on selection: dim what it does not touch' : 'Select a module to focus';
   $('#split').setAttribute('aria-pressed', String(app.split));
 }
 
@@ -415,8 +438,9 @@ function renderKinds() {
       app.kinds[app.kinds.has(kind) ? 'delete' : 'add'](kind);
       event.currentTarget.setAttribute('aria-pressed', String(app.kinds.has(kind)));
       renderTree();
+      app.panes.forEach(decorate);
     },
-  }, kindName(kind)))));
+  }, kindDot(kind), kindName(kind)))));
 }
 
 function renderTree() {
@@ -450,6 +474,7 @@ function renderTree() {
           ondblclick: () => drill(activePane(), id),
         }, m.name, kindName(m.kind),
         counts.get(id) ? h('span', { class: 'count', title: 'Warnings', text: counts.get(id) }) : null);
+        entry.prepend(kindDot(m.kind));
         const li = h('li', {}, h('div', { class: 'row' }, toggle, entry));
         if (parts.length && open) li.append(add(parts, h('ul')));
         parent.append(li);
@@ -469,7 +494,7 @@ function renderFlows() {
   keepFocus(box, () => {
     box.replaceChildren();
     if (!flows(shown()).length) {
-      return box.append(note('No flows yet. A flow follows one request through the modules, step by step.'));
+      return box.append(note('No flows yet.'));
     }
     for (const collection of shown().data.collections) {
       box.append(h('div', { class: 'collection', text: collection.name }));
@@ -496,7 +521,7 @@ async function renderWalkthroughs() {
     const list = data?.walkthroughs ?? [];
     if (!data) return box.append(note(error));
     if (!list.length) {
-      return box.append(note('No walkthroughs yet. A walkthrough tells the architecture beat by beat.'));
+      return box.append(note('No walkthroughs yet.'));
     }
     for (const w of list) {
       const playing = app.play?.id === w.id;
@@ -515,12 +540,11 @@ async function renderWalkthroughs() {
  * checked. */
 function renderPictures() {
   const box = $('#pictures');
+  markEmpty(box, !app.pictures.length && !app.picturesError);
   keepFocus(box, () => {
     box.replaceChildren();
     if (app.picturesError) box.append(note(app.picturesError));
-    if (!app.pictures.length) {
-      return box.append(note('No pictures yet. A picture draws a reading to a file documentation embeds.'));
-    }
+    if (!app.pictures.length) return box.append(note('No pictures yet.'));
     for (const p of app.pictures) {
       const status = app.pictureStatus?.get(p.id);
       box.append(item({
@@ -552,10 +576,8 @@ async function showPicture(id) {
 function renderWarnings() {
   const box = $('#warnings');
   box.replaceChildren();
-  if (app.checkError) return box.append(note(app.checkError));
-  if (!app.check) return box.append(note(shown().data ? 'Checking the model against the code' : ''));
-  const diagnostics = app.check.diagnostics;
-  if (!diagnostics.length) return box.append(note('No warnings: the model matches the code.'));
+  const diagnostics = app.check?.diagnostics ?? [];
+  box.closest('section').hidden = !diagnostics.length;
   for (const [severity, heading] of [['warning', 'Warnings'], ['information', 'Information']]) {
     const group = diagnostics.filter((d) => d.severity === severity);
     if (!group.length) continue;
@@ -587,21 +609,83 @@ function renderChanges() {
   if (!box.children.length) box.append(note('No differences.'));
 }
 
+function markEmpty(box, empty) {
+  box.closest('section').dataset.empty = String(empty);
+  const names = [...document.querySelectorAll('.sidebar section[data-empty="true"]')].map((s) => s.dataset.none);
+  const line = $('#empties');
+  line.hidden = !names.length;
+  line.textContent = names.length ? `No ${names.length > 1 ? `${names.slice(0, -1).join(', ')} or ${names.at(-1)}` : names[0]} yet.` : '';
+}
+
 function renderLists() {
+  markEmpty($('#proposals'), !app.proposals.length);
+  markEmpty($('#history'), !app.checkpoints.length);
   $('#proposals').replaceChildren(...(app.proposals.length
     ? app.proposals.map((p) => item({ onclick: () => setState({ kind: 'proposal', id: p.id }) }, p.name, p.status))
-    : [note('No proposals. `boundrail model propose` drafts a future architecture.')]));
+    : [note('No proposals yet.')]));
   $('#history').replaceChildren(...(app.checkpoints.length
     ? app.checkpoints.map((c) => item({
       title: `${c.id} by ${c.writer} at ${c.time}`,
       onclick: () => setState({ kind: 'checkpoint', id: c.id }),
     }, c.doing, c.time.slice(0, 10)))
-    : [note('No checkpoints yet. `boundrail model retain` records one.')]));
+    : [note('No checkpoints yet.')]));
 }
 
 // ---------------------------------------------------------------- detail panel
 
 const link = (id) => h('button', { class: 'link', onclick: () => select(id, true) }, nameOf(shown(), id));
+const icon = (path) => {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 16 16');
+  svg.setAttribute('aria-hidden', 'true');
+  svg.innerHTML = path;
+  return svg;
+};
+const COPY_ICON = '<rect x="5.5" y="5.5" width="8" height="8" rx="2"/><path d="M10.5 3.5v-.5a1.5 1.5 0 0 0-1.5-1.5H4A1.5 1.5 0 0 0 2.5 3v5A1.5 1.5 0 0 0 4 9.5h.5"/>';
+const CLOSE_ICON = '<path d="M4 4l8 8M12 4l-8 8"/>';
+
+async function copyId(id) {
+  try {
+    await navigator.clipboard.writeText(id);
+    toast('ID copied');
+  } catch {
+    toast('Copying is not allowed here');
+  }
+}
+
+function summary(model) {
+  if (!model.data) return [note(model.error)];
+  const byKind = new Map();
+  for (const m of model.modules.values()) byKind.set(m.kind, (byKind.get(m.kind) ?? 0) + 1);
+  const warnings = (app.check?.diagnostics ?? []).filter((d) => d.severity === 'warning').length;
+  const count = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+  let status;
+  if (app.checkError) status = ['bad', app.checkError];
+  else if (!app.check) status = ['pending', 'Checking against the code'];
+  else if (warnings) status = ['warn', `${count(warnings, 'warning')}, listed on the left`];
+  else status = ['ok', 'No warnings. The model matches the code.'];
+  const walkthroughs = model.data.walkthroughs ?? [];
+  const goto = (label, onclick, extra) => h('li', {}, h('button', { class: 'link', onclick }, label), extra ? h('span', { class: 'n', text: extra }) : null);
+  return [
+    h('h2', { class: 'title', text: model.data.manifest.name }),
+    h('p', { class: 'lede', text: `${count(model.modules.size, 'module')} in ${count(byKind.size, 'kind')}` }),
+    h('p', { class: 'kinds-line', text: [...byKind].sort((a, b) => b[1] - a[1]).map(([k, n]) => `${n} ${kindName(k)}`).join(', ') }),
+    h('h2', { text: 'Checks' }),
+    h('p', { class: `status ${status[0]}` },
+      status[0] === 'pending' ? h('span', { class: 'spinner', 'aria-hidden': 'true' }) : h('span', { class: 'status-dot', 'aria-hidden': 'true' }),
+      status[1]),
+    h('h2', { text: 'Flows' }),
+    flows(model).length ? h('ul', { class: 'goto' }, flows(model).map((f) => goto(f.name, () => openFlow(f.id), f.steps ? count(f.steps.length, 'step') : null))) : note('No flows yet.'),
+    h('h2', { text: 'Walkthroughs' }),
+    walkthroughs.length ? h('ul', { class: 'goto' }, walkthroughs.map((w) => goto(w.name, () => playWalkthrough(w.id), count(w.beats, 'beat')))) : note('No walkthroughs yet.'),
+  ];
+}
+
+function beatModule(model) {
+  const focus = app.play?.walkthrough?.beats[app.play.index]?.reading?.focus ?? [];
+  return focus.length === 1 ? model.modules.get(focus[0]) ?? null : null;
+}
+
 const section = (title, ...content) => [h('h2', { text: title }), ...content];
 const dl = (facts) => h('dl', {}, facts.flatMap(([k, v]) => [h('dt', { text: k }), h('dd', {}, v)]));
 
@@ -609,16 +693,15 @@ function renderDetail() {
   const box = $('#detail');
   box.replaceChildren();
   const model = shown();
-  const m = app.selected ? model.modules.get(app.selected) : null;
+  const m = app.selected ? model.modules.get(app.selected) : beatModule(model);
   if (!m) {
-    return box.append(h('p', { class: 'placeholder' }, app.selected
-      ? 'The selected module is not part of this state.'
-      : 'Select a module on the canvas or in the list to see its job, its relationships and what the checks say about it.'));
+    return box.append(...(app.selected ? [note('The selected module is not part of this state.')] : summary(model)));
   }
   box.append(
-    h('div', { class: 'subtitle', text: kindName(m.kind) }),
+    h('div', { class: 'subtitle' }, kindDot(m.kind), kindName(m.kind)),
     h('h2', { class: 'title', text: m.name }),
-    h('div', { class: 'id', text: m.id }),
+    h('div', { class: 'id' }, h('span', { text: m.id }),
+      h('button', { class: 'icon', title: 'Copy ID', 'aria-label': 'Copy module ID', onclick: () => copyId(m.id) }, icon(COPY_ICON))),
     m.responsibility ? h('p', { class: 'responsibility', text: m.responsibility }) : '',
     m.description ? h('p', { text: m.description }) : '',
   );
@@ -634,12 +717,14 @@ function renderDetail() {
   if (facts.length) box.append(dl(facts));
 
   const relationships = model.data.relationships;
-  const line = (r, other, arrow) => h('li', {}, `${arrow} `, link(other),
-    ` ${relationshipKind(r.kind)}${r.label ? `, ${r.label}` : ''}`);
-  const outgoing = relationships.filter((r) => r.from === m.id).map((r) => line(r, r.to, 'to'));
-  const incoming = relationships.filter((r) => r.to === m.id).map((r) => line(r, r.from, 'from'));
-  box.append(...section('Outgoing', outgoing.length ? h('ul', {}, outgoing) : note('None drawn.')));
-  box.append(...section('Incoming', incoming.length ? h('ul', {}, incoming) : note('None drawn.')));
+  const line = (r, other) => h('li', { class: 'rel' },
+    h('span', { class: 'rel-main' }, kindDot(model.modules.get(other)?.kind), link(other)),
+    h('span', { class: 'tag', text: relationshipKind(r.kind) }),
+    r.label ? h('span', { class: 'rel-label', text: r.label }) : null);
+  const outgoing = relationships.filter((r) => r.from === m.id).map((r) => line(r, r.to));
+  const incoming = relationships.filter((r) => r.to === m.id).map((r) => line(r, r.from));
+  box.append(...section('Outgoing', outgoing.length ? h('ul', { class: 'rels' }, outgoing) : note('None.')));
+  box.append(...section('Incoming', incoming.length ? h('ul', { class: 'rels' }, incoming) : note('None.')));
 
   const holders = new Set([m.id, ...ancestors(model, m.id), model.data.manifest.id]);
   const claims = (model.data.claims ?? []).filter((c) => c.subjects.some((s) => holders.has(s)));
@@ -715,6 +800,7 @@ function newPane(from) {
 
 function buildPanes() {
   const host = $('#panes');
+  app.panes.forEach((pane) => cancelAnimationFrame(pane.glide));
   host.replaceChildren();
   host.classList.toggle('split', app.split);
   app.panes.forEach((pane, i) => {
@@ -740,8 +826,9 @@ function renderCrumbs(pane) {
     onclick: () => { pane.scope = scope; pane.view = 'architecture'; redraw(pane); },
   }, label);
   const name = model.data?.manifest?.name ?? 'Model';
+  const atTop = pane.view === 'architecture' && !pane.scope;
   if (pane.view === 'architecture') {
-    if (!pane.scope) crumbs.push(h('span', { class: 'here', text: name }));
+    if (atTop) crumbs.push(h('span', { class: 'here', text: name }));
     else {
       crumbs.push(go(null, name));
       for (const a of ancestors(model, pane.scope).reverse()) crumbs.push(' / ', go(a, nameOf(model, a)));
@@ -754,9 +841,11 @@ function renderCrumbs(pane) {
   const compared = baseOf(pane) ? `, compared with ${againstLabel(baseOf(pane))}` : '';
   crumbs.push(h('span', { class: 'caption', text: `${stateLabel(pane.state)}${compared}` }));
   pane.crumbs.replaceChildren(...crumbs);
+  pane.crumbs.hidden = atTop && pane.state.kind === 'current' && !compared;
 }
 
 function clearSheet(pane) {
+  cancelAnimationFrame(pane.glide);
   pane.sheet.querySelector('svg, .note')?.remove();
   Object.assign(pane, { svg: null, text: null, key: '' });
   pane.scale.textContent = '';
@@ -796,8 +885,10 @@ async function drawPane(pane) {
     against: pane.against || null,
   };
   const ticket = ++pane.ticket;
+  pane.sheet.classList.toggle('loading', JSON.stringify(params) !== pane.key);
   const [text, error] = await attempt(api('render', params, true));
   if (ticket !== pane.ticket) return;
+  pane.sheet.classList.remove('loading');
   if (error) return showNote(pane, error, true);
   if (text === pane.text) return decorate(pane);
   const doc = new DOMParser().parseFromString(text, 'image/svg+xml');
@@ -814,12 +905,85 @@ async function drawPane(pane) {
   const kept = pane.key === key && pane.box;
   clearSheet(pane);
   pane.sheet.prepend(svg);
+  dress(svg, pane.model ?? EMPTY);
   Object.assign(pane, { svg, text, key });
   const [x, y, w, height] = svg.getAttribute('viewBox').split(/\s+/).map(Number);
   pane.base = contentBox(svg) ?? { x, y, w, h: height };
-  if (!kept) pane.box = { ...pane.base };
+  if (!kept) pane.box = fitBox(pane);
   applyBox(pane);
   decorate(pane);
+}
+
+const SVG_NS = 'http://www.w3.org/2000/svg';
+function svgNode(tag, attributes) {
+  const node = document.createElementNS(SVG_NS, tag);
+  for (const [k, v] of Object.entries(attributes)) node.setAttribute(k, v);
+  return node;
+}
+
+function fitText(text, size, room) {
+  text.style.fontSize = `${size}px`;
+  const length = text.getComputedTextLength();
+  if (length > room) text.style.fontSize = `${Math.max(11, (size * room) / length).toFixed(1)}px`;
+}
+
+function ellipsize(text, size, room) {
+  text.style.fontSize = `${size}px`;
+  const full = text.textContent;
+  if (text.getComputedTextLength() <= room) return;
+  let kept = full.length;
+  while (kept > 1 && text.getComputedTextLength() > room) text.textContent = `${full.slice(0, --kept).trimEnd()}\u2026`;
+  text.append(svgNode('title', {}));
+  text.lastChild.textContent = full;
+}
+
+function dress(svg, model) {
+  for (const group of svg.querySelectorAll('g.module, g.lifeline')) {
+    const kind = model.modules.get(group.dataset.id)?.kind;
+    const box = group.querySelector(':scope > rect');
+    const [title, kindLine] = group.querySelectorAll(':scope > text');
+    if (!kind || !box || !title) continue;
+    paint(group, kind);
+    const [x, y, width] = ['x', 'y', 'width'].map((a) => Number(box.getAttribute(a)));
+    const left = x + 14;
+    const titleY = kindLine ? y + 22 : Number(title.getAttribute('y'));
+    const room = x + width - (left + 12) - 8;
+    for (const [text, at] of [[title, titleY], [kindLine, y + 39]]) {
+      if (!text) continue;
+      Object.entries({ x: left + 12, y: at, 'text-anchor': 'start' }).forEach(([k, v]) => text.setAttribute(k, v));
+    }
+    if (kindLine) kindLine.textContent = kindLine.textContent.replace(/^\[([^\]]*)\]/, '$1');
+    if (group.classList.contains('lifeline')) ellipsize(title, 13, room);
+    else fitText(title, 15, room);
+    if (kindLine) fitText(kindLine, 12, room);
+    box.after(svgNode('circle', { class: 'kind-dot', cx: left + 3.5, cy: titleY - 5, r: 3.5 }));
+  }
+  for (const box of svg.querySelectorAll('rect[fill="#fff9db"]')) {
+    const [x, y, height] = ['x', 'y', 'height'].map((a) => Number(box.getAttribute(a)));
+    box.classList.add('note-box');
+    box.after(svgNode('rect', { class: 'note-rule', x: x + 1, y: y + 6, width: 2, height: height - 12, rx: 1 }));
+  }
+  for (const step of svg.querySelectorAll('g.step')) {
+    const box = step.querySelector(':scope > rect');
+    const text = step.querySelector(':scope > text');
+    const parts = text?.textContent.match(/^(.+?) -> (.+?): (.*)$/);
+    if (!box || !text) continue;
+    if (parts) {
+      text.textContent = '';
+      text.append(svgNode('tspan', { class: 'actor' }), ' \u2192 ', svgNode('tspan', { class: 'actor' }), `: ${parts[3]}`);
+      const [from, to] = text.querySelectorAll('tspan');
+      from.textContent = parts[1];
+      to.textContent = parts[2];
+    }
+    const [x, y, width, height] = ['x', 'y', 'width', 'height'].map((a) => Number(box.getAttribute(a)));
+    text.style.fontSize = '15px';
+    const need = text.getComputedTextLength() + 32;
+    const grown = Math.max(width, need);
+    box.setAttribute('x', x + width / 2 - grown / 2);
+    box.setAttribute('width', grown);
+    Object.entries({ x: x + width / 2 - grown / 2 + 16, y: y + height / 2 + 5, 'text-anchor': 'start' })
+      .forEach(([k, v]) => text.setAttribute(k, v));
+  }
 }
 
 function redraw(pane) {
@@ -835,11 +999,28 @@ function applyBox(pane) {
   pane.frame = 0;
   const { x, y, w, h: height } = pane.box;
   pane.svg.setAttribute('viewBox', `${x} ${y} ${w} ${height}`);
-  pane.scale.textContent = `${Math.round((pane.base.w / w) * 100)}%`;
+  pane.scale.textContent = `${Math.round(100 / mapping(pane, pane.sheet.getBoundingClientRect()).scale)}%`;
+}
+
+function fitBox(pane) {
+  const rect = pane.sheet.getBoundingClientRect();
+  const bar = $('#play');
+  const below = pane === activePane() && !bar.hidden ? bar.offsetHeight + 24 : 0;
+  const room = { w: Math.max(rect.width, 1), h: Math.max(rect.height - below, 1) };
+  const { x, y, w, h: height } = pane.base;
+  const sequence = Boolean(pane.svg.querySelector('g.lifeline'));
+  const readsFromTop = phone.matches || sequence;
+  let scale = readsFromTop ? Math.min(room.w / w, FIT_MAX) : Math.min(room.w / w, room.h / height, FIT_MAX);
+  if (sequence && !phone.matches) scale = Math.max(scale, 1);
+  const box = { w: room.w / scale, h: Math.max(rect.height, 1) / scale };
+  const y0 = readsFromTop ? y - TOP_PAD / scale : y + height / 2 - room.h / (2 * scale);
+  const x0 = w * scale > room.w ? x - TOP_PAD / scale : x + w / 2 - box.w / 2;
+  return { ...box, x: x0, y: y0 };
 }
 
 /** Applies the pane's zoom on the next frame, once however many events changed it. */
 function schedule(pane) {
+  cancelAnimationFrame(pane.glide);
   if (pane.svg && !pane.frame) pane.frame = requestAnimationFrame(() => applyBox(pane));
 }
 
@@ -872,10 +1053,28 @@ function panBy(pane, dx, dy, from = pane.box, scale = mapping(pane, pane.sheet.g
   schedule(pane);
 }
 
-function fit(pane) {
+const slightlyCloser = (box) => ({ x: box.x + box.w * 0.02, y: box.y + box.h * 0.02, w: box.w * 0.96, h: box.h * 0.96 });
+
+function fit(pane, glide = false) {
   if (!pane.svg) return;
-  pane.box = { ...pane.base };
-  schedule(pane);
+  const to = fitBox(pane);
+  if (!glide || matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    pane.box = to;
+    return schedule(pane);
+  }
+  const fitted = ['x', 'y', 'w', 'h'].every((k) => Math.abs(pane.box[k] - to[k]) < 0.5);
+  const from = fitted ? slightlyCloser(to) : { ...pane.box };
+  const start = performance.now();
+  const step = (now) => {
+    if (!pane.svg) return;
+    const t = Math.min(1, (now - start) / FIT_GLIDE);
+    const e = 1 - (1 - t) ** 3;
+    pane.box = Object.fromEntries(['x', 'y', 'w', 'h'].map((k) => [k, from[k] + (to[k] - from[k]) * e]));
+    applyBox(pane);
+    pane.glide = t < 1 ? requestAnimationFrame(step) : 0;
+  };
+  cancelAnimationFrame(pane.glide);
+  pane.glide = requestAnimationFrame(step);
 }
 
 /** What the canvas keys do. */
@@ -919,6 +1118,7 @@ function attachPanZoom(pane) {
     sheet.classList.remove('dragging');
     const id = click ? moduleAt(pane, event) : null;
     if (id) select(id);
+    else if (click && phone.matches) setDrawer(false);
   };
   sheet.addEventListener('pointerup', end);
   sheet.addEventListener('pointercancel', end);
@@ -954,6 +1154,21 @@ function decorate(pane) {
   if (!pane.svg) return;
   const model = pane.model ?? EMPTY;
   const near = app.focus && model.modules.has(app.selected) ? neighbourhood(model, app.selected) : null;
+  const beatFocus = Boolean(pane.beat && pane.svg.querySelector('g.dimmed'));
+  const focus = new Set(beatFocus ? app.play?.walkthrough?.beats[app.play.index]?.reading?.focus ?? [] : []);
+  const shownIds = new Set(focus);
+  const ties = (model.data?.relationships ?? []).filter((r) => focus.has(r.from) || focus.has(r.to));
+  ties.forEach((r) => { shownIds.add(r.from); shownIds.add(r.to); });
+  const shownTies = new Set(ties.map((r) => r.id));
+  for (const wrapper of pane.svg.querySelectorAll('g.dimmed')) {
+    const id = wrapper.querySelector('[data-id]')?.dataset.id;
+    wrapper.classList.toggle('undim', shownIds.has(id) || shownTies.has(id));
+  }
+  const filtering = app.filter.trim() !== '' || app.kinds.size > 0;
+  const matched = filtering ? keptModules(model) : null;
+  const rels = new Map((model.data?.relationships ?? []).map((r) => [r.id, r]));
+  const linked = new Set((model.data?.relationships ?? [])
+    .filter((r) => r.from === app.selected || r.to === app.selected).map((r) => r.id));
   for (const group of pane.svg.querySelectorAll('g[data-id]')) {
     const id = group.dataset.id;
     group.classList.toggle('is-selected', id === app.selected);
@@ -962,6 +1177,12 @@ function decorate(pane) {
     if (near && (group.classList.contains('module') || group.classList.contains('lifeline'))) kept = near.modules.has(id);
     if (near && group.classList.contains('relationship')) kept = near.relationships.has(id);
     group.classList.toggle('is-dim', !kept);
+    group.classList.toggle('is-linked', linked.has(id));
+    const rel = rels.get(id);
+    group.classList.toggle('is-filtered', Boolean(matched) && (rel ? !(matched.has(rel.from) && matched.has(rel.to))
+      : group.classList.contains('module') && !matched.has(id)));
+    group.classList.toggle('is-focus', beatFocus && group.classList.contains('module')
+      && !group.closest('g.dimmed') && !group.querySelector(':scope > rect[fill-opacity]'));
   }
 }
 
@@ -982,8 +1203,10 @@ function select(id, reveal = false) {
     }
   }
   $('#announce').textContent = id ? `Selected: ${nameOf(model, id)}` : 'Selection cleared';
+  if (id && phone.matches) setDrawer(true);
   renderTree();
   renderDetail();
+  renderControls();
   app.panes.forEach(decorate);
 }
 
@@ -1135,6 +1358,7 @@ async function showBeat(moved) {
   } else {
     renderControls();
     renderFlows();
+    renderDetail();
   }
   const { walkthrough, index } = app.play;
   history.replaceState(null, '', `#walkthrough=${encodeURIComponent(walkthrough.id)}&beat=${index + 1}`);
@@ -1163,6 +1387,7 @@ async function endWalkthrough() {
   pane.beat = null;
   history.replaceState(null, '', location.pathname);
   renderPlay();
+  renderDetail();
   drawPane(pane);
   await renderWalkthroughs();
   $('#walkthroughs').querySelector(`[data-key="${CSS.escape(id)}"]`)?.focus();
@@ -1176,10 +1401,10 @@ function renderPlay() {
   const { walkthrough, index, error } = app.play;
   const beats = walkthrough?.beats ?? [];
   const beat = beats[index];
-  const end = h('button', { class: 'end', onclick: endWalkthrough }, 'End walkthrough');
+  const end = h('button', { class: 'end icon', 'data-key': 'end', title: 'End walkthrough', 'aria-label': 'End walkthrough', onclick: endWalkthrough }, icon(CLOSE_ICON));
   if (!walkthrough || !beat) {
     const why = error ?? `${walkthrough?.name ?? 'This walkthrough'} has no beats yet.`;
-    return keepFocus(panel, () => panel.replaceChildren(h('p', { class: 'narration', text: why }), h('div', { class: 'controls' }, end)));
+    return keepFocus(panel, () => panel.replaceChildren(h('div', { class: 'bar' }, h('p', { class: 'narration', text: why }), end)));
   }
   const dots = beats.map((b, k) => h('button', {
     class: 'dot',
@@ -1199,16 +1424,16 @@ function renderPlay() {
   }, label);
   const narration = h('p', { class: 'narration', text: beat.narration });
   keepFocus(panel, () => panel.replaceChildren(
-    h('div', { class: 'script' },
-      h('p', { class: 'where', text: `${walkthrough.name}, beat ${index + 1} of ${beats.length}` }),
+    h('div', { class: 'bar' },
+      h('span', { class: 'where', title: walkthrough.name, 'aria-label': `${walkthrough.name}, beat ${index + 1} of ${beats.length}` },
+        `${index + 1}/${beats.length}`),
       h('h2', { class: 'beat-title', text: beat.title }),
-      narration),
-    h('div', { class: 'controls' },
+      h('div', { class: 'dots', role: 'group', 'aria-label': 'Beats' }, dots),
       h('div', { class: 'steps' },
         step('prev', -1, 'Previous', index === 0),
         step('next', 1, 'Next', index === beats.length - 1)),
-      h('div', { class: 'dots', role: 'group', 'aria-label': 'Beats' }, dots),
       end),
+    narration,
   ));
   // A narration longer than its box scrolls, so keyboard users can reach it.
   if (narration.scrollHeight > narration.clientHeight) {
@@ -1285,6 +1510,17 @@ function connect() {
 
 // ---------------------------------------------------------------- start
 
+function setDrawer(open) {
+  $('#drawer').classList.toggle('open', open);
+  $('#drawer-handle').setAttribute('aria-expanded', String(open));
+}
+
+function closeSheets() {
+  $('.topbar').classList.remove('menu-open');
+  $('#menu').setAttribute('aria-expanded', 'false');
+  setDrawer(false);
+}
+
 function bind() {
   $('#state').addEventListener('change', (event) => setState(parseState(event.target.value)));
   $('#against').addEventListener('change', (event) => {
@@ -1301,14 +1537,37 @@ function bind() {
     activePane().depth = Math.max(low, Math.min(high, Number.parseInt(input.value, 10) || low));
     redraw(activePane());
   });
-  $('#fit').addEventListener('click', () => fit(activePane()));
-  $('#split').addEventListener('click', toggleSplit);
-  $('#focus').addEventListener('click', () => {
+  for (const [id, by] of [['#depth-down', -1], ['#depth-up', 1]]) {
+    $(id).addEventListener('click', () => {
+      const input = $('#depth');
+      input.value = Number(input.value) + by;
+      input.dispatchEvent(new Event('change'));
+    });
+  }
+  $('#menu').addEventListener('click', (event) => {
+    const open = $('.topbar').classList.toggle('menu-open');
+    event.currentTarget.setAttribute('aria-expanded', String(open));
+  });
+  $('#drawer-handle').addEventListener('click', () => setDrawer(!$('#drawer').classList.contains('open')));
+  $('#drawer-close').addEventListener('click', () => setDrawer(false));
+  const place = () => (phone.matches ? $('#state-controls') : $('.toolbar')).append($('.stepper'), $('.group'));
+  phone.addEventListener('change', place);
+  place();
+  $('#fit').addEventListener('click', () => fit(activePane(), true));
+  // Focus and Split stay focusable when they cannot act, so their tooltips can say why.
+  const usable = (event) => event.currentTarget.getAttribute('aria-disabled') !== 'true';
+  $('#split').addEventListener('click', (event) => usable(event) && toggleSplit());
+  $('#focus').addEventListener('click', (event) => {
+    if (!usable(event)) return;
     app.focus = !app.focus;
     renderControls();
     app.panes.forEach(decorate);
   });
-  $('#filter').addEventListener('input', (event) => { app.filter = event.target.value; renderTree(); });
+  $('#filter').addEventListener('input', (event) => {
+    app.filter = event.target.value;
+    renderTree();
+    app.panes.forEach(decorate);
+  });
   document.addEventListener('keydown', (event) => {
     const typing = /^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement?.tagName ?? '');
     if (stepKey(event) && !typing) {
@@ -1319,6 +1578,9 @@ function bind() {
       $('#filter').focus();
     } else if (event.key === 'Escape') {
       if (typing) document.activeElement.blur();
+      const menu = $('.topbar').classList.contains('menu-open');
+      const sheet = phone.matches && $('#drawer').classList.contains('open');
+      if (menu || sheet) return closeSheets();
       select(null);
     }
   });

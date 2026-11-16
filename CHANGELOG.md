@@ -39,6 +39,10 @@
 
 - The new layout changes the bytes of every architecture picture, so existing pictures report
   stale until `model pictures --write` draws them again.
+- `model view` has a new interface: dark and light themes that follow the system, an embedded
+  Geist font, kind colours shared by the list, the canvas and the filters, a model summary when
+  nothing is selected, relationships listed as rows, a text filter that dims the canvas, a
+  floating walkthrough bar, and a phone layout with a drawer.
 
 ### Removed
 
