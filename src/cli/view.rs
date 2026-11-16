@@ -1,11 +1,12 @@
 //! `boundrail model view`: the live browser view. A small HTTP/1.1 server on the loopback
 //! interface answers the page's requests with the same JSON the model commands print, and tells
-//! open pages over Server-Sent Events when the vault changes. It reads only.
+//! open pages over Server-Sent Events when the vault changes or an agent asks to show a reading.
+//! It writes only its own state file, so `model view --show` and `--panes` can find it.
 
 use super::*;
-use std::collections::BTreeSet;
-use std::io::Write as _;
-use std::net::{TcpListener, TcpStream};
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Read as _, Write as _};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex};
@@ -14,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use boundrail::arch::proposal::CURRENT;
 use boundrail::arch::vault;
-use boundrail::arch::view::{self as page, Request};
+use boundrail::arch::view::{self as page, Request, Shown};
 use boundrail::arch::{Code, Refusal};
 use clap::ValueEnum as _;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -34,6 +35,16 @@ const MAX_CONN: usize = 64;
 const MAX_STREAMS: usize = 16;
 /// The pause after a failed accept, so a persistent error does not spin the loop.
 const ACCEPT_PAUSE: Duration = Duration::from_millis(50);
+/// The file in this worktree's Boundrail state folder that names the running view.
+const STATE_FILE: &str = "view.json";
+/// The most a state file may hold.
+const STATE_MAX: u64 = 4096;
+/// How long `--show` and `--panes` wait to reach the view and for its answer.
+const CONTROL_WAIT: Duration = Duration::from_secs(10);
+/// Panes a page may report; the page has two at most.
+const MAX_PANES: usize = 2;
+const RESPONSE_MAX: u64 = 1 << 20;
+const STATUS_CODE: std::ops::Range<usize> = 9..12;
 
 #[derive(Args)]
 pub(super) struct ViewArgs {
@@ -47,6 +58,59 @@ pub(super) struct ViewArgs {
     /// explain` does. Off by default: a browser request then runs a program on this machine
     #[arg(long)]
     allow_explain: bool,
+    /// Show a reading in the page open on the view already running for this checkout, in its
+    /// active pane, instead of serving: the current state's architecture, or what the reading
+    /// flags below ask for, which `model render` would draw
+    #[arg(long, conflicts_with_all = ["port", "no_open", "allow_explain", "panes"])]
+    show: bool,
+    /// List the pages open on the view already running for this checkout, with what each of
+    /// their panes shows, instead of serving
+    #[arg(long, conflicts_with_all = ["port", "no_open", "allow_explain"])]
+    panes: bool,
+    #[command(flatten)]
+    reading: ShowArgs,
+}
+
+/// What `--show` shows, with the flags `model render` takes for it.
+#[derive(Args)]
+struct ShowArgs {
+    /// The view to show; a flow's sequence diagram when --flow is given, else the architecture
+    #[arg(long, value_enum, requires = "show")]
+    view: Option<RenderView>,
+    /// The flow a sequence or flowchart view shows: its qualified or local ID, or its unique name
+    #[arg(long, requires = "show")]
+    flow: Option<String>,
+    /// Show only this module's parts: its ID or unique current or former name
+    #[arg(long, requires = "show")]
+    scope: Option<String>,
+    /// How many levels of containers the architecture view opens [default: 2]
+    #[arg(long, requires = "show")]
+    depth: Option<usize>,
+    /// Select this module and focus on it, dimming what the selection does not touch: its ID or
+    /// unique name; repeat for several
+    #[arg(long, requires = "show")]
+    focus: Vec<String>,
+    /// Show this proposal
+    #[arg(long, requires = "show")]
+    proposal: Option<String>,
+    /// Show the model a checkpoint holds: its ID or a unique commit prefix
+    #[arg(long, requires = "show")]
+    checkpoint: Option<String>,
+    /// Compare with the current state or this proposal
+    #[arg(long, requires = "show")]
+    against: Option<String>,
+    /// Show what this saved view reads: its ID or unique name, with no other reading flag
+    #[arg(long = "saved-view", requires = "show")]
+    saved_view: Option<String>,
+    /// Play this walkthrough: its ID or unique name, with no other reading flag
+    #[arg(long, requires = "show", conflicts_with = "saved_view")]
+    walkthrough: Option<String>,
+    /// The beat of --walkthrough to show: its number, from 1, or its ID [default: 1]
+    #[arg(long, requires = "walkthrough")]
+    beat: Option<String>,
+    /// The page to show it in, as --panes numbers them [default: the page used last]
+    #[arg(long, requires = "show")]
+    page: Option<u64>,
 }
 
 struct Server {
@@ -57,6 +121,9 @@ struct Server {
     port: u16,
     /// Whether `POST /api/explain` runs the agent.
     allow_explain: bool,
+    /// The token `model view --show` and `--panes` send, which the page never sees.
+    control: String,
+    pages: Mutex<Pages>,
     explains: AtomicUsize,
     connections: AtomicUsize,
     streams: AtomicUsize,
@@ -75,12 +142,46 @@ struct News {
     /// What changed: `model` (the current state's files), `proposals`, `state` (claims and the
     /// edit journal) or `history` (checkpoints).
     parts: BTreeSet<&'static str>,
+    /// How many readings `--show` has sent.
+    shows: u64,
+    /// The last of them: the page it is for and its hash.
+    show: Option<(u64, String)>,
+}
+
+/// The pages open on the server, by the number their event stream gave them.
+#[derive(Default)]
+struct Pages {
+    next: u64,
+    /// How many reports the pages have made, which orders them by when they were used.
+    reports: u64,
+    open: BTreeMap<u64, Page>,
+}
+
+/// What a page last reported: each pane's hash, the active one, and its report's number.
+#[derive(Default)]
+struct Page {
+    panes: Vec<String>,
+    active: usize,
+    reported: u64,
+}
+
+/// What `model view` leaves in the state folder while it serves, readable by the user alone.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Running {
+    port: u16,
+    control: String,
 }
 
 /// Serves until the process is stopped. The URL, with its token, is the first line on stdout.
 /// The browser opener gets a one-time launch URL instead, so the token stays out of its
-/// arguments.
-pub(super) fn run(root: &Path, args: &ViewArgs) -> Result<()> {
+/// arguments. With `--show` or `--panes` it asks the running view instead.
+pub(super) fn run(root: &Path, markdown: bool, args: &ViewArgs) -> Result<()> {
+    if args.show {
+        return show(root, markdown, &args.reading);
+    }
+    if args.panes {
+        return list_panes(root, markdown);
+    }
     // The tool timeout belongs to the calling thread; connections take it along.
     let timeout = collect::tool_timeout();
     let vault = vault::locate(root)?;
@@ -93,6 +194,8 @@ pub(super) fn run(root: &Path, args: &ViewArgs) -> Result<()> {
         launch: page::Launch::new()?,
         port,
         allow_explain: args.allow_explain,
+        control: boundrail::token()?,
+        pages: Mutex::default(),
         explains: AtomicUsize::new(0),
         connections: AtomicUsize::new(0),
         streams: AtomicUsize::new(0),
@@ -100,6 +203,7 @@ pub(super) fn run(root: &Path, args: &ViewArgs) -> Result<()> {
         changed: Condvar::new(),
     });
     watch(&server, &vault)?;
+    let _published = publish(&vault, port, &server.control);
     let url = format!("http://127.0.0.1:{port}/?t={}", server.token);
     println!("{url}");
     std::io::stdout().flush()?;
@@ -184,6 +288,223 @@ fn open(url: &str) {
     }
 }
 
+/// `view.json` in this worktree's Boundrail state folder, which Git never tracks.
+fn state_file(vault: &Path) -> Result<PathBuf> {
+    Ok(boundrail::arch::state_dir(vault)?.join(STATE_FILE))
+}
+
+/// Removes the state file when dropped, if it still names this view: a second view in the
+/// checkout may have taken it over.
+struct Published {
+    path: PathBuf,
+    control: String,
+}
+
+impl Drop for Published {
+    fn drop(&mut self) {
+        if let Ok(Some(running)) = read_running(&self.path)
+            && running.control == self.control
+        {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Writes the state file, readable and writable by the user alone, so `--show` and `--panes`
+/// find this view: whole, by renaming a new file over it. A view that cannot write it still
+/// serves, with a warning.
+fn publish(vault: &Path, port: u16, control: &str) -> Option<Published> {
+    let written = (|| -> Result<PathBuf> {
+        let path = state_file(vault)?;
+        let dir = path.parent().context("the state file has a folder")?;
+        fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        let fresh = dir.join(format!("{STATE_FILE}.{}", std::process::id()));
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let running = Running {
+            port,
+            control: control.to_owned(),
+        };
+        let mut file = options
+            .open(&fresh)
+            .with_context(|| format!("creating {}", fresh.display()))?;
+        file.write_all(&serde_json::to_vec(&running)?)?;
+        drop(file);
+        fs::rename(&fresh, &path).inspect_err(|_| {
+            let _ = fs::remove_file(&fresh);
+        })?;
+        Ok(path)
+    })();
+    match written {
+        Ok(path) => Some(Published {
+            path,
+            control: control.to_owned(),
+        }),
+        Err(error) => {
+            eprintln!("warning: model view --show cannot find this view: {error:#}");
+            None
+        }
+    }
+}
+
+fn read_running(path: &Path) -> Result<Option<Running>> {
+    let mut text = String::new();
+    match fs::File::open(path) {
+        Ok(file) => file.take(STATE_MAX).read_to_string(&mut text).map(drop)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+    serde_json::from_str(&text)
+        .map(Some)
+        .with_context(|| format!("reading {}", path.display()))
+}
+
+/// Refuses as no running view for this checkout, with `why`.
+fn no_view(why: &str) -> anyhow::Error {
+    let message = format!("{why}; start one with `boundrail model view`");
+    Refusal::new(Code::RequestInvalid, message)
+        .with_details(json!({"reason": "no-view"}))
+        .into()
+}
+
+/// Sends `method target` to the view running for this checkout with its control token, and
+/// returns its JSON answer. A refusal comes back as a refusal.
+fn ask_running(root: &Path, method: &str, target: &str) -> Result<Value> {
+    let path = state_file(&vault::locate(root)?)?;
+    let Some(running) = read_running(&path)? else {
+        return Err(no_view("no view is running for this checkout"));
+    };
+    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, running.port));
+    let gone = || no_view("the view that wrote its state file is no longer running");
+    let mut stream = TcpStream::connect_timeout(&address, CONTROL_WAIT).map_err(|_| gone())?;
+    stream.set_read_timeout(Some(CONTROL_WAIT))?;
+    stream.set_write_timeout(Some(CONTROL_WAIT))?;
+    write!(
+        stream,
+        "{method} {target} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n{}: {}\r\nContent-Length: 0\r\n\r\n",
+        running.port,
+        page::CONTROL_HEADER,
+        running.control
+    )
+    .map_err(|_| gone())?;
+    let mut response = String::new();
+    stream
+        .take(RESPONSE_MAX)
+        .read_to_string(&mut response)
+        .map_err(|_| gone())?;
+    let status = response
+        .get(STATUS_CODE)
+        .and_then(|s| s.parse::<u16>().ok());
+    let body = response.split_once("\r\n\r\n").map(|(_, body)| body);
+    let (Some(status), Some(body)) = (status, body) else {
+        return Err(gone());
+    };
+    if status == 403 {
+        return Err(gone());
+    }
+    let answer: Value = serde_json::from_str(body).map_err(|_| gone())?;
+    if status == 200 {
+        return Ok(answer);
+    }
+    let error = &answer["error"];
+    let code = match error["code"].as_str() {
+        Some("SUBJECT_NOT_FOUND") => Code::SubjectNotFound,
+        _ => Code::RequestInvalid,
+    };
+    let message = error["message"].as_str().unwrap_or("the view refused");
+    let mut refusal = Refusal::new(code, message);
+    if !error["details"].is_null() {
+        refusal = refusal.with_details(error["details"].clone());
+    }
+    Err(refusal.into())
+}
+
+/// `model view --show`: sends the reading to the running view, which shows it in a page's
+/// active pane.
+fn show(root: &Path, markdown: bool, args: &ShowArgs) -> Result<()> {
+    let spec = RenderSpec {
+        walkthrough: args.walkthrough.clone(),
+        beat: args
+            .walkthrough
+            .as_ref()
+            .map(|_| args.beat.clone().unwrap_or_else(|| "1".into())),
+        saved_view: args.saved_view.clone(),
+        proposal: args.proposal.clone(),
+        checkpoint: args.checkpoint.clone(),
+        view: args.view,
+        flow: args.flow.clone(),
+        scope: args.scope.clone(),
+        depth: args.depth,
+        against: args.against.clone(),
+        focus: args.focus.clone(),
+        ..RenderSpec::default()
+    };
+    let shown = model_cli::shown_reading(root, &spec)?;
+    let hash = shown.to_hash();
+    let mut target = format!("/api/show?reading={}", page::encode(&hash));
+    if let Some(page) = args.page {
+        target.push_str(&format!("&page={page}"));
+    }
+    let answer = ask_running(root, "POST", &target)?;
+    if markdown {
+        println!("Shown in page {}: #{hash}", answer["page"]);
+        return Ok(());
+    }
+    print_json(&json!({
+        "schema": model_cli::MODEL_SCHEMA,
+        "kind": "view-show",
+        "success": true,
+        "page": answer["page"],
+        "hash": hash,
+        "reading": shown,
+    }))
+}
+
+/// `model view --panes`: the pages open on the running view and what their panes show.
+fn list_panes(root: &Path, markdown: bool) -> Result<()> {
+    let answer = ask_running(root, "GET", "/api/panes")?;
+    let pages = answer["pages"].as_array().cloned().unwrap_or_default();
+    if !markdown {
+        return print_json(&json!({
+            "schema": model_cli::MODEL_SCHEMA,
+            "kind": "view-panes",
+            "success": true,
+            "pages": pages,
+        }));
+    }
+    if pages.is_empty() {
+        println!("No page is open on the view");
+    }
+    for page in &pages {
+        let used = if page["last_used"] == true {
+            ", used last"
+        } else {
+            ""
+        };
+        println!("Page {}{used}:", page["page"]);
+        for pane in page["panes"].as_array().into_iter().flatten() {
+            let active = if pane["active"] == true {
+                " (active)"
+            } else {
+                ""
+            };
+            let hash = vault::escape_controls(pane["hash"].as_str().unwrap_or_default());
+            println!("- pane {}{active}: #{hash}", pane["pane"]);
+        }
+    }
+    Ok(())
+}
+
+fn print_json(value: &Value) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
+}
+
 /// The paths the view follows, canonical, since watchers report canonical paths.
 struct Watched {
     vault: PathBuf,
@@ -219,7 +540,13 @@ impl Watched {
     /// The part of the model a changed path belongs to, or `None` for a path the view ignores.
     fn part(&self, path: &Path) -> Option<&'static str> {
         let under = |dir: &Option<PathBuf>| dir.as_ref().is_some_and(|d| path.starts_with(d));
-        if path.starts_with(&self.proposals) {
+        let own = path.parent() == self.state.as_deref()
+            && path
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with(STATE_FILE));
+        if own {
+            None
+        } else if path.starts_with(&self.proposals) {
             Some("proposals")
         } else if path.starts_with(&self.vault) {
             Some("model")
@@ -348,7 +675,12 @@ impl Server {
             return Some(text(403, "Unknown Host"));
         }
         let explain = request.path == "/api/explain";
-        let allowed = if explain { "GET, POST" } else { "GET" };
+        let control = matches!(request.path.as_str(), "/api/show" | "/api/panes");
+        let allowed = match request.path.as_str() {
+            "/api/explain" => "GET, POST",
+            "/api/show" | "/api/pane-state" => "POST",
+            _ => "GET",
+        };
         if !allowed.split(", ").any(|m| m == request.method) {
             let allow = [("Allow", allowed)];
             let body = format!("Only {allowed}");
@@ -359,11 +691,15 @@ impl Server {
                 &allow,
             ));
         }
-        if request.method == "POST" && !page::origin_allowed(request, self.port) {
+        if (request.method == "POST" || control) && !page::origin_allowed(request, self.port) {
             return Some(text(403, "Unknown Origin"));
         }
+        if control && !page::control_matches(request, &self.control) {
+            let refusal = Refusal::new(Code::RequestInvalid, "missing or wrong control token");
+            return Some(json_response(403, &model_cli::refusal_output(&refusal)));
+        }
         let api = request.path.starts_with("/api/");
-        if api && !page::token_matches(request, &self.token) {
+        if api && !control && !page::token_matches(request, &self.token) {
             let refusal = Refusal::new(Code::RequestInvalid, "missing or wrong view token");
             return Some(json_response(403, &model_cli::refusal_output(&refusal)));
         }
@@ -483,6 +819,9 @@ impl Server {
                 model_cli::walkthrough_output(root, id)?
             }
             "/api/pictures" => model_cli::pictures_output(root, param("status").is_some())?,
+            "/api/show" => self.send_show(request)?,
+            "/api/pane-state" => self.pane_state(request)?,
+            "/api/panes" => self.panes(),
             "/api/explain" if request.method == "GET" => {
                 json!({"kind": "explain-status", "allowed": self.allow_explain})
             }
@@ -516,6 +855,97 @@ impl Server {
         }))
     }
 
+    /// Sends the reading `reading` (a hash, possibly empty) to page `page`, else to the page used
+    /// last, over its event stream.
+    fn send_show(&self, request: &Request) -> Result<Value> {
+        let reading = (request.query.iter())
+            .find(|(name, _)| name == "reading")
+            .map(|(_, value)| value.clone())
+            .ok_or_else(|| invalid("show needs reading"))?;
+        let asked = (request.param("page"))
+            .map(|p| {
+                p.parse::<u64>()
+                    .map_err(|_| invalid("page must be a whole number"))
+            })
+            .transpose()?;
+        let pages = self.pages.lock().unwrap_or_else(|e| e.into_inner());
+        let page = match asked {
+            Some(page) if pages.open.contains_key(&page) => page,
+            Some(page) => {
+                let message = format!("no page {page} is open; `model view --panes` lists them");
+                return Err(Refusal::new(Code::SubjectNotFound, message).into());
+            }
+            None => pages.last_used().ok_or_else(|| {
+                let message = "no page is open on this view; open its URL in a browser";
+                anyhow::Error::from(
+                    Refusal::new(Code::RequestInvalid, message)
+                        .with_details(json!({"reason": "no-page"})),
+                )
+            })?,
+        };
+        drop(pages);
+        let mut news = self.news.lock().unwrap_or_else(|e| e.into_inner());
+        news.shows += 1;
+        news.show = Some((page, reading.clone()));
+        drop(news);
+        self.changed.notify_all();
+        Ok(json!({"kind": "view-show", "page": page, "reading": reading}))
+    }
+
+    /// Keeps what an open page says its panes show: `pane` once per pane, as hashes, and the
+    /// `active` one's index.
+    fn pane_state(&self, request: &Request) -> Result<Value> {
+        let page = (request.param("page"))
+            .and_then(|p| p.parse::<u64>().ok())
+            .ok_or_else(|| invalid("pane-state needs page, a whole number"))?;
+        let panes: Vec<String> = (request.query.iter())
+            .filter(|(name, _)| name == "pane")
+            .map(|(_, value)| value.strip_prefix('#').unwrap_or(value).to_owned())
+            .collect();
+        let active = request
+            .param("active")
+            .and_then(|a| a.parse().ok())
+            .unwrap_or(0);
+        if panes.is_empty() || panes.len() > MAX_PANES || active >= panes.len() {
+            let message = format!("pane-state needs one to {MAX_PANES} panes and an active one");
+            return Err(invalid(&message));
+        }
+        let mut pages = self.pages.lock().unwrap_or_else(|e| e.into_inner());
+        pages.reports += 1;
+        let reported = pages.reports;
+        let Some(open) = pages.open.get_mut(&page) else {
+            return Err(Refusal::new(Code::SubjectNotFound, "no such page is open").into());
+        };
+        *open = Page {
+            panes,
+            active,
+            reported,
+        };
+        Ok(json!({"kind": "pane-state", "page": page}))
+    }
+
+    /// The open pages, each pane with its hash and what it reads.
+    fn panes(&self) -> Value {
+        let pages = self.pages.lock().unwrap_or_else(|e| e.into_inner());
+        let last = pages.last_used();
+        let list: Vec<Value> = (pages.open.iter())
+            .map(|(number, page)| {
+                let panes: Vec<Value> = (page.panes.iter().enumerate())
+                    .map(|(i, hash)| {
+                        json!({
+                            "pane": i,
+                            "active": i == page.active,
+                            "hash": hash,
+                            "reading": Shown::parse(hash),
+                        })
+                    })
+                    .collect();
+                json!({"page": number, "last_used": Some(*number) == last, "panes": panes})
+            })
+            .collect();
+        json!({"kind": "view-panes", "pages": list})
+    }
+
     fn render(&self, request: &Request) -> Result<String> {
         let owned = |name| request.param(name).map(str::to_owned);
         let view = (request.param("view"))
@@ -544,25 +974,54 @@ impl Server {
         model_cli::render_svg(&self.root, &spec, None).map(|(rendered, _)| rendered.svg)
     }
 
-    /// Streams `changed` events with the current state's revision (null when it does not load)
-    /// and the parts that changed, until the page goes away.
+    /// Streams a `hello` event with the number the page goes by, then `changed` events with the
+    /// current state's revision (null when it does not load) and the parts that changed, and
+    /// `show` events with a reading `--show` sent this page, until the page goes away.
     fn events(&self, mut stream: TcpStream) {
-        let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
-                    Cache-Control: no-store\r\nConnection: close\r\n\
-                    X-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n\r\n\
-                    retry: 2000\n\n";
+        let number = {
+            let mut pages = self.pages.lock().unwrap_or_else(|e| e.into_inner());
+            pages.next += 1;
+            let number = pages.next;
+            pages.open.insert(number, Page::default());
+            number
+        };
+        let _open = Closing(self, number);
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+             Cache-Control: no-store\r\nConnection: close\r\n\
+             X-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n\r\n\
+             retry: 2000\n\nevent: hello\ndata: {}\n\n",
+            json!({ "page": number })
+        );
         let lock = || self.news.lock().unwrap_or_else(|e| e.into_inner());
         // Read before the head goes out, so a change the page causes once connected is sent.
-        let mut seen = lock().generation;
+        let (mut seen, mut shown) = {
+            let news = lock();
+            (news.generation, news.shows)
+        };
         if stream.write_all(head.as_bytes()).is_err() {
             return;
         }
         loop {
             let (news, _) = (self.changed)
-                .wait_timeout_while(lock(), KEEPALIVE, |n| n.generation == seen)
+                .wait_timeout_while(lock(), KEEPALIVE, |n| {
+                    n.generation == seen && n.shows == shown
+                })
                 .unwrap_or_else(|e| e.into_inner());
-            let message = if news.generation == seen {
-                ": keepalive\n\n".to_owned()
+            let mut message = String::new();
+            if news.shows != shown {
+                shown = news.shows;
+                if let Some((page, reading)) = &news.show
+                    && *page == number
+                {
+                    let data = json!({ "reading": reading });
+                    message.push_str(&format!("event: show\ndata: {data}\n\n"));
+                }
+            }
+            if news.generation == seen {
+                if message.is_empty() {
+                    message.push_str(": keepalive\n\n");
+                }
             } else {
                 // A stream that slept through several changes cannot tell what they touched.
                 let parts: Vec<&str> = if news.generation == seen + 1 {
@@ -572,13 +1031,32 @@ impl Server {
                 };
                 seen = news.generation;
                 let data = json!({ "revision": news.revision, "parts": parts });
-                format!("event: changed\ndata: {data}\n\n")
-            };
+                message.push_str(&format!("event: changed\ndata: {data}\n\n"));
+            }
             drop(news);
             if stream.write_all(message.as_bytes()).is_err() {
                 return;
             }
         }
+    }
+}
+
+impl Pages {
+    /// The open page that reported last, else the newest.
+    fn last_used(&self) -> Option<u64> {
+        (self.open.iter())
+            .max_by_key(|(number, page)| (page.reported, **number))
+            .map(|(number, _)| *number)
+    }
+}
+
+/// Forgets page `.1` when its event stream ends.
+struct Closing<'a>(&'a Server, u64);
+
+impl Drop for Closing<'_> {
+    fn drop(&mut self) {
+        let mut pages = self.0.pages.lock().unwrap_or_else(|e| e.into_inner());
+        pages.open.remove(&self.1);
     }
 }
 
@@ -635,6 +1113,8 @@ mod tests {
             launch: page::Launch::new().unwrap(),
             port: 4000,
             allow_explain: false,
+            control: boundrail::token().unwrap(),
+            pages: Mutex::default(),
             explains: AtomicUsize::new(0),
             connections: AtomicUsize::new(0),
             streams: AtomicUsize::new(0),

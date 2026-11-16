@@ -32,6 +32,7 @@ use boundrail::arch::vault::{
     self, CollectionView, Found, Model, ModuleView, PictureEntry, RelationshipView, Scope,
     ViewEntry, WalkthroughEntry, escape_controls,
 };
+use boundrail::arch::view::Shown;
 use boundrail::arch::{Code, Refusal};
 use boundrail::cochange::MAX_FILES;
 use serde_json::{Value, json};
@@ -53,7 +54,7 @@ pub(super) use pictures::pictures_output;
 pub(super) use references::{reference_output, references_output};
 use setup::Agent;
 
-const MODEL_SCHEMA: &str = "boundrail/model/v1";
+pub(super) const MODEL_SCHEMA: &str = "boundrail/model/v1";
 
 #[derive(Args)]
 pub(super) struct ModelArgs {
@@ -680,7 +681,9 @@ pub(super) fn run(args: ModelArgs) -> Result<ExitCode> {
         Command::Render(render) => {
             render_model(&args.root, args.format, &render).map(|()| ExitCode::SUCCESS)
         }
-        Command::View(view) => super::view_cli::run(&args.root, &view).map(|()| ExitCode::SUCCESS),
+        Command::View(view) => {
+            super::view_cli::run(&args.root, markdown, &view).map(|()| ExitCode::SUCCESS)
+        }
         Command::Explain(explain) => explain::run(&args.root, &explain).map(|()| ExitCode::SUCCESS),
         Command::Pictures { write, only } => {
             pictures::list(&args.root, markdown, only.as_deref(), write)
@@ -1710,15 +1713,7 @@ fn paint<'m>(
     base: Option<(&'m Model, Option<&str>)>,
     output: Option<&Path>,
 ) -> Result<(render::Rendered, &'static str)> {
-    // A proposal's local and qualified IDs name the same state.
-    let id = |model: &Model| model.proposal.as_ref().map(|p| p.id.clone());
-    if let Some((base, _)) = base
-        && id(drawn.0).is_some()
-        && id(drawn.0) == id(base)
-    {
-        let message = "--against names the state being drawn";
-        return Err(Refusal::new(Code::RequestInvalid, message).into());
-    }
+    refuse_self_comparison(drawn.0, base.map(|(base, _)| base))?;
     if let Some(output) = output {
         check_output(root, output, "--output")?;
     }
@@ -1729,6 +1724,95 @@ fn paint<'m>(
     let base = base.map(side);
     let rendered = render::render(&side(drawn), base.as_ref(), view, options)?;
     Ok((rendered, view.name()))
+}
+
+fn refuse_self_comparison(drawn: &Model, base: Option<&Model>) -> Result<()> {
+    // A proposal's local and qualified IDs name the same state.
+    let id = |model: &Model| model.proposal.as_ref().map(|p| p.id.clone());
+    if let Some(base) = base
+        && id(drawn).is_some()
+        && id(drawn) == id(base)
+    {
+        let message = "--against names the state being drawn";
+        return Err(Refusal::new(Code::RequestInvalid, message).into());
+    }
+    Ok(())
+}
+
+/// What `model view --show` sends the page: the reading `spec` asks for, refused as `model
+/// render` refuses it, with its names resolved to the qualified IDs the page reads. It makes the
+/// lookups `model render` makes but lays nothing out.
+pub(super) fn shown_reading(root: &Path, spec: &RenderSpec) -> Result<Shown> {
+    if let Some(view) = &spec.saved_view {
+        spec.refuse_drawing_flags("--saved-view draws what the view reads", false)?;
+        let (current, _) = load_state(root, RenderState::Current)?;
+        return Ok(Shown {
+            saved: Some(current.qualify(&current.saved_view(view)?.id)),
+            ..Shown::default()
+        });
+    }
+    if let Some(walkthrough) = &spec.walkthrough {
+        if spec.proposal.is_some() {
+            let message = "the page plays the current state's walkthroughs; leave out --proposal";
+            return Err(Refusal::new(Code::RequestInvalid, message).into());
+        }
+        let (current, _) = load_state(root, RenderState::Current)?;
+        let reading = spec.beat(&current)?;
+        let walkthrough = current.walkthrough(walkthrough)?;
+        let number = (walkthrough.beats.iter()).position(|b| std::ptr::eq(&b.reading, reading));
+        return Ok(Shown {
+            walkthrough: Some(current.qualify(&walkthrough.id)),
+            beat: number.and_then(|at| u32::try_from(at + 1).ok()),
+            ..Shown::default()
+        });
+    }
+    if let View::Architecture { depth: 0, .. } = spec.view()? {
+        return Err(Refusal::new(Code::RequestInvalid, "--depth must be at least 1").into());
+    }
+    let (drawn, base) = spec.states()?;
+    let drawn = load_render_state(root, drawn)?;
+    let base = base.map(|b| load_render_state(root, b)).transpose()?;
+    let model = &drawn.model;
+    refuse_self_comparison(model, base.as_ref().map(|b| &b.model))?;
+    let module = |subject: &str| -> Result<String> {
+        let found = vault::find(&model.manifest.id, &model.modules, subject)?;
+        Ok(model.qualify(&found.id))
+    };
+    let flow = (spec.flow.as_deref())
+        .map(|f| model.flow(f).map(|(_, flow)| model.qualify(&flow.id)))
+        .transpose()?;
+    let view = match spec.view {
+        Some(RenderView::Architecture) => None,
+        Some(RenderView::Flowchart) => Some("flowchart"),
+        Some(RenderView::Sequence) => Some("sequence"),
+        None => spec.flow.as_ref().map(|_| "sequence"),
+    };
+    let checkpoint = (iter::once(&drawn).chain(&base)).find_map(|l| l.checkpoint.as_ref());
+    let proposal = (spec.proposal.as_ref())
+        .and(model.proposal.as_ref())
+        .map(|p| p.id.clone());
+    let against = match spec.against.as_deref() {
+        Some(CURRENT) | None => spec.against.clone(),
+        Some(_) => (iter::once(&drawn).chain(&base))
+            .filter_map(|l| l.model.proposal.as_ref().map(|p| p.id.clone()))
+            .find(|id| Some(id) != proposal.as_ref()),
+    };
+    Ok(Shown {
+        proposal,
+        checkpoint: checkpoint.map(|c| c.id.clone()),
+        against,
+        view: view.map(str::to_owned),
+        flow,
+        scope: spec.scope.as_deref().map(module).transpose()?,
+        depth: spec.depth.and_then(|d| u32::try_from(d).ok()),
+        select: spec
+            .focus
+            .iter()
+            .map(|f| module(f))
+            .collect::<Result<_>>()?,
+        focus: !spec.focus.is_empty(),
+        ..Shown::default()
+    })
 }
 
 /// What a beat's reading draws, as the flags would ask for it.
@@ -1778,16 +1862,20 @@ impl RenderState<'_> {
     }
 }
 
-/// The model `state` holds, and how a title names it: `None` for the current state.
-fn load_state(root: &Path, state: RenderState<'_>) -> Result<(Model, Option<String>)> {
+fn load_render_state(root: &Path, state: RenderState<'_>) -> Result<Loaded> {
     let (checkpoint, proposal) = match state {
         RenderState::Checkpoint(c) => (Some(c), None),
         RenderState::Current => (None, None),
         RenderState::Proposal(p) => (None, Some(p)),
     };
+    load_reading(root, checkpoint, proposal)
+}
+
+/// The model `state` holds, and how a title names it: `None` for the current state.
+fn load_state(root: &Path, state: RenderState<'_>) -> Result<(Model, Option<String>)> {
     let Loaded {
         model, checkpoint, ..
-    } = load_reading(root, checkpoint, proposal)?;
+    } = load_render_state(root, state)?;
     let name = match (&checkpoint, &model.proposal) {
         (Some(c), _) => Some(format!("checkpoint {}", c.id)),
         (None, Some(p)) => Some(format!("proposal {}", p.name)),

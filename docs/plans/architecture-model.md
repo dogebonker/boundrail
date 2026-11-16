@@ -64,7 +64,7 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 | T30 | History repair and restore: correct a recorded state with source commits and an audit trail; restore a bundle into an empty vault with identities and history | open |
 | T31 | Vaults outside Git: a private history for a vault outside a checkout, used for temporary pull request models | open |
 | T32 | Language servers: `model language-server` add, remove and list; defaults for C-family, C# and Swift; on by default through user config outside the checkout; `unready` diagnostic and step timings | done |
-| T33 | Browser: multi-select, relationship-kind filter, URL state for proposal, focus and flow with Back and Forward; an agent shows a reading in the user's open pane | open |
+| T33 | Browser: multi-select, relationship-kind filter, URL state for proposal, focus and flow with Back and Forward; an agent shows a reading in the user's open pane | done |
 | T34 | `model explain`: ask the local agent about a selection, relationship, flow or proposal | done |
 | T35 | Walkthrough recording: render a walkthrough to MP4 with local voice and replay it | done |
 | T36 | Agent workflow: plan skill slices per ticket with the footprint gate; pull request skill body, state marker, temporary model and split guidance; action reads the proposal and skips held subjects; design guidance for inspect and locality | done |
@@ -399,9 +399,9 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   Content-Security-Policy allows only its own script, style, font (`font-src 'self'`) and
   connections; SVG is parsed with `DOMParser` and imported, never run, and `/api/render` opened on
   its own carries `default-src 'none'; style-src 'unsafe-inline'`.
-  The server writes nothing: every endpoint is a read the CLI already does. The hardening exception
-  of T7 covers its reads too: a clean or process filter driver repository config defines may run
-  when Git content-checks a working-tree entry.
+  The server writes nothing but its state file (T33): every endpoint is a read the CLI already
+  does. The hardening exception of T7 covers its reads too: a clean or process filter driver
+  repository config defines may run when Git content-checks a working-tree entry.
 - T11: limits. ponytail: a thread per connection under the caps, fine for one person's pages; a pool
   if many share a server. The vault watch is set at start: a vault folder deleted and made again is
   not followed. Checks and interfaces scan the checkout on each request, as the commands do, so
@@ -1478,6 +1478,65 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   endpoint off by default and on with `--allow-explain` and the header token, a POST with the
   token only in the query or a foreign Origin refused, and a second POST during a run refused.
   Tried by hand with the real `claude` and `codex` CLIs on a two-module model.
+- T33: selection. Shift-, Command- or Control-click on a module in the list or on the canvas
+  adds it to the selection or takes it out; a plain click selects it alone and Escape clears.
+  With one module the detail panel is the module's; with several it is the selection's: its
+  members (each removable), the relationships between them (both ends inside a member or its
+  parts) and the outside modules they reach, with counts, plus `Ask the agent` about every
+  member. Focus dims what the whole set does not touch, and the canvas outlines every member.
+- T33: relationship-kind filter. The sidebar shows a chip per relationship kind the shown state
+  uses, named from `config.yaml` with a line drawn in its dash; pressing one hides that kind's
+  relationships on the canvas (client side, `display: none`, as the kind filter dims) and in the
+  module and selection lists, which say how many are hidden. It never reaches `/api/render`, so
+  readings keep drawing every kind they name.
+- T33: the address. After `#` the page keeps what its active pane shows, as `key=value` pairs:
+  `proposal` or `checkpoint`, `against`, `view` (absent for the architecture), `flow`, `scope`,
+  `depth` (absent at 2), `saved`, `picture`, `walkthrough` and `beat` (from 1), then `select` per
+  selected module and `focus=1`. A pane drawing a saved view, picture or beat writes only that.
+  A lone selected module stays `#<qualified module ID>`, and `#walkthrough=<id>&beat=<n>` reads
+  as before. Every change (selection, focus, state, comparison, view, flow, drill, depth, beat,
+  view or picture opened, split or active pane) adds a history entry; Back and Forward restore
+  the entry's reading in the active pane, replacing rather than adding entries while they do,
+  and a pasted address opens it. The token is never in the hash. `Shown` in
+  `src/arch/view/mod.rs` reads and writes the same form, so `--show` and `--panes` share it with
+  the page; unknown keys and values that do not parse are left out. The relationship filter,
+  the text and kind filters and the second pane's reading stay out of the address.
+- T33: an agent shows a reading. `model view` writes `view.json` (`{port, control}`) to this
+  worktree's `<git dir>/boundrail`, created as a new file with mode 0600 and renamed into place. On
+  return it removes the file only if the file still holds its own control token, so a second view's
+  file is never removed by the first; there is no signal handler and no `unsafe`. The control token
+  is a second 256-bit value the page never sees. The watcher ignores the file. `model view --show`
+  takes the reading flags of `model render` (`--view`, `--flow`, `--scope`, `--depth`, `--focus`,
+  `--proposal`, `--checkpoint`, `--against`, `--saved-view`, `--walkthrough` with `--beat`, default
+  1) plus `--page`, validates them with the checks and name lookups `model render` makes before it
+  lays anything out (so it refuses the same way, without drawing; a saved view's or beat's own
+  targets are left to `model check` and the page), resolves names to the qualified IDs the page
+  reads (a proposal's name to its ID), and sends `POST /api/show?reading=<hash>[&page=N]`;
+  `--focus` selects its modules with focus on. The page plays the current state's walkthroughs, so
+  `--walkthrough` with `--proposal` (T26) refuses `REQUEST_INVALID`. `--panes` sends `GET /api/panes`. Both carry the control token in `X-Boundrail-Control`
+  only, never the query, and neither accepts the page token; the page's token never passes them, and
+  the Host and Origin rules apply to both, GET included. `/api/show` and `/api/pane-state` take POST
+  only. Each event stream starts with `event: hello` giving the page a number; the page reports its
+  panes' hashes and active pane with `POST /api/pane-state?page=&active=&pane=...` (the page token
+  in its header), on every change and when its window gains focus. A reading goes to `--page`, else
+  to the open page that reported last, as `event: show` on its stream; the page adds a history
+  entry, shows it in its active pane and marks the pane with a ring that fades in 600 ms. No view
+  refuses `REQUEST_INVALID` with `details.reason` `no-view` (no state file, a server that does not
+  answer at its port, or one that refuses the file's control token with 403); no open page refuses
+  `no-page` (409); an unknown `--page` refuses `SUBJECT_NOT_FOUND`. Everything stays on 127.0.0.1.
+  ponytail: one state file per worktree, so a second view in the same worktree takes it over; a view
+  stopped by a signal or killed leaves a stale 0600 file, which readers treat as no view; a closed
+  page stays listed until its next keepalive fails (up to 15 s).
+- T33: tests. `Shown` round-trips every field and reads the older forms and what `URLSearchParams`
+  writes (unit); the control token passes in its header only (unit). Against a running view: the
+  state file's port, control token and mode 0600; `--show` and `--panes` with no view, a stale file,
+  an unknown page, a reading render refuses and flags without `--show`; two pages, the one that
+  reported last receiving the reading with names resolved; the control endpoints refusing no token,
+  the page token, the control token in the query or as the page header, a foreign Origin or Host,
+  and GET on `/api/show`; two views in one checkout, the second reachable after the first stops; a
+  stale file and one whose control token the server refuses reading as no view; page-reported hashes
+  printed with control characters escaped; the file's writes raising no change event. A lone
+  selection's short hash form is tested on its own (unit).
 - T29: a module's `references` is an optional ordered list, left out of the file when empty, so
   a vault written before T29 loads, reads and digests as it did. Each is `{model?, state?,
   subject?, pin?}`: `model` is a repository path relative to the checkout root (the `binding`

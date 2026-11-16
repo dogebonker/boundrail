@@ -27,6 +27,7 @@ const FIT_MAX = 1.25;
 const TOP_PAD = 32;
 const FIT_GLIDE = 150;
 const phone = matchMedia('(max-width: 600px)');
+const finePointer = matchMedia('(pointer: fine)');
 const BACKOFF = { first: 1000, most: 30000 };
 
 const app = {
@@ -43,11 +44,14 @@ const app = {
   // first load's until an event comes. Kept apart from later loads, which may race the events.
   eventRevision: undefined,
   currentFailed: false, // whether the last load of the current state failed
-  selected: null, // qualified module ID
+  selection: [], // qualified module IDs, in the order they were selected
   hits: [], // subjects a warning pointed at
   focus: false,
   filter: '',
   kinds: new Set(), // kinds shown; empty shows every kind
+  hiddenRels: new Set(), // relationship kinds hidden on the canvas and in the detail lists
+  page: null, // the number the server's event stream gave this page
+  restoring: true,
   collapsed: new Set(),
   interfaceOpen: null,
   split: false,
@@ -173,9 +177,9 @@ function subtree(model, id) {
   return found;
 }
 
-/** The modules and relationships connected to `id` or its parts, with their containers. */
-function neighbourhood(model, id) {
-  const inside = new Set(subtree(model, id));
+/** The modules and relationships connected to `ids` or their parts, with their containers. */
+function neighbourhood(model, ids) {
+  const inside = new Set(ids.flatMap((id) => subtree(model, id)));
   const modules = new Set(inside);
   const relationships = new Set();
   for (const r of model.data?.relationships ?? []) {
@@ -323,6 +327,7 @@ function showActive() {
   const ticket = ++app.ticket;
   renderHeader();
   renderControls();
+  remember();
   renderTree();
   renderFlows();
   renderWalkthroughs();
@@ -413,7 +418,7 @@ function renderControls() {
   $('.stepper').hidden = pane.view !== 'architecture';
   $('#depth-down').disabled = $('#depth').disabled || pane.depth <= Number($('#depth').min);
   $('#depth-up').disabled = $('#depth').disabled || pane.depth >= Number($('#depth').max);
-  const canFocus = shown().modules.has(app.selected);
+  const canFocus = app.selection.some((id) => shown().modules.has(id));
   $('#focus').setAttribute('aria-disabled', String(!canFocus));
   $('#focus').setAttribute('aria-pressed', String(app.focus && canFocus));
   $('#focus').title = canFocus ? 'Focus on selection: dim what it does not touch' : 'Select a module to focus';
@@ -470,8 +475,42 @@ function renderKinds() {
   }, kindDot(kind), kindName(kind)))));
 }
 
+const DASHES = { dashed: '6 4', dotted: '2 3' };
+
+/** A short line drawn as relationship kind `kind` is: solid, dashed or dotted. */
+function lineSample(kind) {
+  const svg = svgNode('svg', { class: 'line', viewBox: '0 0 18 8', 'aria-hidden': 'true' });
+  const dash = DASHES[shown().data?.config?.['relationship-kinds']?.[kind]?.dash];
+  svg.append(svgNode('line', { x1: 1, y1: 4, x2: 17, y2: 4, ...(dash ? { 'stroke-dasharray': dash } : {}) }));
+  return svg;
+}
+
+/** The relationship kind chips, one per kind the state uses; a pressed chip hides its kind. */
+function renderRelKinds() {
+  const kinds = [...new Set((shown().data?.relationships ?? []).map((r) => r.kind))].sort();
+  for (const kind of [...app.hiddenRels]) if (!kinds.includes(kind)) app.hiddenRels.delete(kind);
+  const box = $('#rel-kinds');
+  box.hidden = !kinds.length;
+  if (box.dataset.kinds === kinds.join(' ')) return;
+  box.dataset.kinds = kinds.join(' ');
+  const label = (kind) => `${app.hiddenRels.has(kind) ? 'Show' : 'Hide'} ${relationshipKind(kind)} relationships`;
+  keepFocus(box, () => box.replaceChildren(...kinds.map((kind) => h('button', {
+    'data-key': kind,
+    'aria-pressed': String(app.hiddenRels.has(kind)),
+    title: label(kind),
+    onclick: (event) => {
+      app.hiddenRels[app.hiddenRels.has(kind) ? 'delete' : 'add'](kind);
+      event.currentTarget.setAttribute('aria-pressed', String(app.hiddenRels.has(kind)));
+      event.currentTarget.title = label(kind);
+      renderDetail();
+      app.panes.forEach(decorate);
+    },
+  }, lineSample(kind), relationshipKind(kind)))));
+}
+
 function renderTree() {
   renderKinds();
+  renderRelKinds();
   const list = $('#tree');
   const model = shown();
   keepFocus(list, () => {
@@ -492,12 +531,13 @@ function renderTree() {
           'aria-label': `Parts of ${m.name}`,
           onclick: () => { app.collapsed[app.collapsed.has(id) ? 'delete' : 'add'](id); renderTree(); },
         }) : h('span', { class: 'toggle leaf' });
+        const chosen = app.selection.includes(id);
         const entry = item({
-          class: id === app.selected ? 'item selected' : 'item',
+          class: chosen ? 'item selected' : 'item',
           'data-key': `item:${id}`,
-          'aria-current': id === app.selected ? 'true' : null,
+          'aria-current': chosen ? 'true' : null,
           title: m.children.length ? 'Double-click to open its parts' : null,
-          onclick: () => select(id, true),
+          onclick: (event) => (adds(event) ? toggleSelect(id) : select(id, true)),
           ondblclick: () => drill(activePane(), id),
         }, m.name, kindName(m.kind),
         counts.get(id) ? h('span', { class: 'count', title: 'Warnings', text: counts.get(id) }) : null);
@@ -591,11 +631,7 @@ async function showView(id) {
   const { data } = await loadModel({ kind: 'current' });
   const view = (data?.views ?? []).find((v) => v.id === id);
   if (!view) return;
-  if (app.play) {
-    app.play = null;
-    history.replaceState(null, '', location.pathname);
-    renderPlay();
-  }
+  stopPlaying();
   const pane = activePane();
   applyReading(pane, view.reading, { saved: id });
   await loadPane(pane);
@@ -628,11 +664,7 @@ function renderPictures() {
 async function showPicture(id) {
   const picture = app.pictures.find((p) => p.id === id);
   if (!picture) return;
-  if (app.play) {
-    app.play = null;
-    history.replaceState(null, '', location.pathname);
-    renderPlay();
-  }
+  stopPlaying();
   const pane = activePane();
   applyReading(pane, picture.reading, { picture: id });
   await loadPane(pane);
@@ -729,12 +761,13 @@ async function copyId(id) {
   }
 }
 
+const count = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+
 function summary(model) {
   if (!model.data) return [note(model.error)];
   const byKind = new Map();
   for (const m of model.modules.values()) byKind.set(m.kind, (byKind.get(m.kind) ?? 0) + 1);
   const warnings = (app.check?.diagnostics ?? []).filter((d) => d.severity === 'warning').length;
-  const count = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
   let status;
   if (app.checkError) status = ['bad', app.checkError];
   else if (!app.check) status = ['pending', 'Checking against the code'];
@@ -779,10 +812,11 @@ function renderDetail() {
 
 function renderModule(box) {
   const model = shown();
-  const m = app.selected ? model.modules.get(app.selected) : beatModule(model);
   const context = askContext();
+  if (app.selection.length > 1) return renderSelection(box, model, context);
+  const m = app.selection.length ? model.modules.get(app.selection[0]) : beatModule(model);
   if (!m) {
-    if (app.selected) return box.append(note('The selected module is not part of this state.'));
+    if (app.selection.length) return box.append(note('The selected module is not part of this state.'));
     box.append(...summary(model));
     if (context && (context.flow || context.proposal)) box.append(askSection('summary', context));
     return;
@@ -818,10 +852,13 @@ function renderModule(box) {
       onclick: () => ask({ ...context, relationship: r.id }),
     }, 'Ask') : null,
     r.label ? h('span', { class: 'rel-label', text: r.label }) : null);
-  const outgoing = relationships.filter((r) => r.from === m.id).map((r) => line(r, r.to));
-  const incoming = relationships.filter((r) => r.to === m.id).map((r) => line(r, r.from));
+  const shownRels = relationships.filter((r) => !app.hiddenRels.has(r.kind));
+  const outgoing = shownRels.filter((r) => r.from === m.id).map((r) => line(r, r.to));
+  const incoming = shownRels.filter((r) => r.to === m.id).map((r) => line(r, r.from));
   box.append(...section('Outgoing', outgoing.length ? h('ul', { class: 'rels' }, outgoing) : note('None.')));
   box.append(...section('Incoming', incoming.length ? h('ul', { class: 'rels' }, incoming) : note('None.')));
+  const hidden = relationships.filter((r) => (r.from === m.id || r.to === m.id) && app.hiddenRels.has(r.kind)).length;
+  if (hidden) box.append(note(`${count(hidden, 'relationship')} hidden by the relationship filter.`));
 
   const holders = new Set([m.id, ...ancestors(model, m.id), model.data.manifest.id]);
   const claims = (model.data.claims ?? []).filter((c) => c.subjects.some((s) => holders.has(s)));
@@ -836,6 +873,46 @@ function renderModule(box) {
     : note(app.check ? 'None.' : (app.checkError ?? 'Checking'))));
   box.append(interfaceSection(m));
   if (context) box.append(askSection(m.id, { ...context, subjects: [m.id] }));
+}
+
+/** The combined panel of several selected modules: the members, the relationships among them
+ * and the modules outside the selection they reach, each relationship kind the filter shows. */
+function renderSelection(box, model, context) {
+  const ids = app.selection.filter((id) => model.modules.has(id));
+  const inside = new Set(ids.flatMap((id) => subtree(model, id)));
+  const relationships = (model.data?.relationships ?? []).filter((r) => !app.hiddenRels.has(r.kind));
+  const among = relationships.filter((r) => inside.has(r.from) && inside.has(r.to));
+  const outside = new Map();
+  for (const r of relationships) {
+    if (inside.has(r.from) === inside.has(r.to)) continue;
+    const other = inside.has(r.from) ? r.to : r.from;
+    outside.set(other, (outside.get(other) ?? 0) + 1);
+  }
+  const missing = app.selection.length - ids.length;
+  box.append(
+    h('div', { class: 'subtitle', text: 'Selection' }),
+    h('h2', { class: 'title', text: count(ids.length, 'module') }),
+    finePointer.matches ? h('p', { class: 'lede', text: 'Shift-click adds or removes a module; Escape clears.' }) : '',
+    missing ? note(`${count(missing, 'selected module')} not part of this state.`) : '',
+    h('button', { class: 'clear', 'data-key': 'clear', onclick: () => select(null) }, 'Clear selection'),
+  );
+  box.append(...section('Members', h('ul', { class: 'rels' }, ids.map((id) => h('li', { class: 'rel' },
+    h('span', { class: 'rel-main' }, kindDot(model.modules.get(id).kind), link(id)),
+    h('span', { class: 'tag', text: kindName(model.modules.get(id).kind) }),
+    h('button', { class: 'link remove', title: `Take ${nameOf(model, id)} out of the selection`, onclick: () => toggleSelect(id) }, 'Remove'))))));
+  box.append(...section('Between them', among.length
+    ? h('ul', { class: 'rels' }, among.map((r) => h('li', { class: 'rel' },
+      h('span', { class: 'rel-main' }, link(r.from), h('span', { class: 'to', text: 'to' }), link(r.to)),
+      h('span', { class: 'tag', text: relationshipKind(r.kind) }),
+      r.label ? h('span', { class: 'rel-label', text: r.label }) : null)))
+    : note('No relationship joins them.')));
+  const neighbours = [...outside].sort((a, b) => b[1] - a[1] || nameOf(model, a[0]).localeCompare(nameOf(model, b[0])));
+  box.append(...section('Outside neighbours', neighbours.length
+    ? h('ul', { class: 'rels' }, neighbours.map(([id, n]) => h('li', { class: 'rel' },
+      h('span', { class: 'rel-main' }, kindDot(model.modules.get(id)?.kind), link(id)),
+      h('span', { class: 'n', text: count(n, 'relationship') }))))
+    : note('Nothing outside the selection.')));
+  if (context) box.append(askSection('selection', { ...context, subjects: ids }));
 }
 
 /** How a reference reads as authored: where, what and which state. */
@@ -1272,6 +1349,7 @@ function redraw(pane) {
   pane.beat = null;
   if (pane === activePane()) {
     renderControls();
+    remember();
     renderFlows();
   }
   drawPane(pane);
@@ -1399,7 +1477,7 @@ function attachPanZoom(pane) {
     drag = null;
     sheet.classList.remove('dragging');
     const id = click ? moduleAt(pane, event) : null;
-    if (id) select(id);
+    if (id) (adds(event) ? toggleSelect : select)(id);
     else if (click && phone.matches) setDrawer(false);
   };
   sheet.addEventListener('pointerup', end);
@@ -1437,7 +1515,8 @@ function drill(pane, id) {
 function decorate(pane) {
   if (!pane.svg) return;
   const model = pane.model ?? EMPTY;
-  const near = app.focus && model.modules.has(app.selected) ? neighbourhood(model, app.selected) : null;
+  const chosen = new Set(app.selection.filter((id) => model.modules.has(id)));
+  const near = app.focus && chosen.size ? neighbourhood(model, [...chosen]) : null;
   const beatFocus = Boolean(pane.beat && pane.svg.querySelector('g.dimmed'));
   const focus = new Set(beatFocus ? app.play?.walkthrough?.beats[app.play.index]?.reading?.focus ?? [] : []);
   const shownIds = new Set(focus);
@@ -1452,17 +1531,18 @@ function decorate(pane) {
   const matched = filtering ? keptModules(model) : null;
   const rels = new Map((model.data?.relationships ?? []).map((r) => [r.id, r]));
   const linked = new Set((model.data?.relationships ?? [])
-    .filter((r) => r.from === app.selected || r.to === app.selected).map((r) => r.id));
+    .filter((r) => chosen.has(r.from) || chosen.has(r.to)).map((r) => r.id));
   for (const group of pane.svg.querySelectorAll('g[data-id]')) {
     const id = group.dataset.id;
-    group.classList.toggle('is-selected', id === app.selected);
-    group.classList.toggle('is-hit', id !== app.selected && app.hits.includes(id));
+    group.classList.toggle('is-selected', chosen.has(id));
+    group.classList.toggle('is-hit', !chosen.has(id) && app.hits.includes(id));
     let kept = true;
     if (near && (group.classList.contains('module') || group.classList.contains('lifeline'))) kept = near.modules.has(id);
     if (near && group.classList.contains('relationship')) kept = near.relationships.has(id);
     group.classList.toggle('is-dim', !kept);
     group.classList.toggle('is-linked', linked.has(id));
     const rel = rels.get(id);
+    group.classList.toggle('is-hidden', Boolean(rel) && app.hiddenRels.has(rel.kind));
     group.classList.toggle('is-filtered', Boolean(matched) && (rel ? !(matched.has(rel.from) && matched.has(rel.to))
       : group.classList.contains('module') && !matched.has(id)));
     group.classList.toggle('is-focus', beatFocus && group.classList.contains('module')
@@ -1472,11 +1552,27 @@ function decorate(pane) {
 
 // ---------------------------------------------------------------- actions
 
+/** Whether a click adds to the selection or takes from it rather than replacing it. */
+const adds = (event) => event.shiftKey || event.metaKey || event.ctrlKey;
+
+/** Selects module `id` alone, or nothing for null; `reveal` opens the list and the canvas
+ * where it is. */
 function select(id, reveal = false) {
-  app.selected = id;
+  setSelection(id ? [id] : [], reveal ? id : null);
+}
+
+/** Adds module `id` to the selection, or takes it out when it is in. */
+function toggleSelect(id) {
+  const has = app.selection.includes(id);
+  setSelection(has ? app.selection.filter((x) => x !== id) : [...app.selection, id], null);
+}
+
+/** Selects modules `ids`; `id` names the one to reveal, if any. */
+function setSelection(ids, id) {
+  app.selection = ids;
   app.hits = [];
   const model = shown();
-  if (reveal && id) {
+  if (id) {
     ancestors(model, id).forEach((a) => app.collapsed.delete(a));
     const pane = activePane();
     const drawn = !pane.scope || (id !== pane.scope && subtree(model, pane.scope).includes(id));
@@ -1486,11 +1582,13 @@ function select(id, reveal = false) {
       drawPane(pane);
     }
   }
-  $('#announce').textContent = id ? `Selected: ${nameOf(model, id)}` : 'Selection cleared';
-  if (id && phone.matches) setDrawer(true);
+  $('#announce').textContent = ids.length > 1 ? `${ids.length} modules selected`
+    : ids.length ? `Selected: ${nameOf(model, ids[0])}` : 'Selection cleared';
+  if (ids.length && phone.matches) setDrawer(true);
   renderTree();
   renderDetail();
   renderControls();
+  remember();
   app.panes.forEach(decorate);
 }
 
@@ -1641,11 +1739,11 @@ async function showBeat(moved) {
     showActive();
   } else {
     renderControls();
+    remember();
     renderFlows();
     renderDetail();
   }
   const { walkthrough, index } = app.play;
-  history.replaceState(null, '', `#walkthrough=${encodeURIComponent(walkthrough.id)}&beat=${index + 1}`);
   $('#announce').textContent = `Beat ${index + 1} of ${walkthrough.beats.length}: ${walkthrough.beats[index].title}`;
 }
 
@@ -1669,9 +1767,10 @@ async function endWalkthrough() {
   app.play = null;
   const pane = activePane();
   pane.beat = null;
-  history.replaceState(null, '', location.pathname);
   renderPlay();
   renderDetail();
+  renderControls();
+  remember();
   drawPane(pane);
   await renderWalkthroughs();
   $('#walkthroughs').querySelector(`[data-key="${CSS.escape(id)}"]`)?.focus();
@@ -1727,12 +1826,117 @@ function renderPlay() {
   }
 }
 
-/** `#walkthrough=<id>&beat=<n>` in the address, as `{ id, index }`, or null. */
-function linkedBeat() {
-  if (!location.hash.startsWith('#walkthrough=')) return null;
-  const params = new URLSearchParams(location.hash.slice(1));
-  const beat = Number.parseInt(params.get('beat') ?? '1', 10);
-  return { id: params.get('walkthrough'), index: Number.isFinite(beat) && beat > 0 ? beat - 1 : 0 };
+/** Ends the walkthrough being played, if one is, leaving the pane as it is. */
+function stopPlaying() {
+  if (!app.play) return;
+  app.play = null;
+  renderPlay();
+}
+
+// ---------------------------------------------------------------- address
+
+const SHOWN_KEYS = ['proposal', 'checkpoint', 'against', 'view', 'flow', 'scope', 'depth', 'saved', 'picture', 'walkthrough', 'beat'];
+
+/** The hash of what `pane` shows; `chosen` adds the selection and focus, which belong to the
+ * active pane. */
+function hashOf(pane, chosen) {
+  const values = {};
+  const beat = chosen && app.play ? { walkthrough: app.play.id, beat: app.play.index + 1 } : pane.beat;
+  if (beat?.walkthrough) Object.assign(values, { walkthrough: beat.walkthrough, beat: beat.beat });
+  else if (beat?.saved) values.saved = beat.saved;
+  else if (beat?.picture) values.picture = beat.picture;
+  else {
+    if (pane.state.kind !== 'current') values[pane.state.kind] = pane.state.id;
+    values.against = pane.against;
+    if (FLOW_VIEWS.includes(pane.view)) Object.assign(values, { view: pane.view, flow: pane.flow });
+    else Object.assign(values, { scope: pane.scope, depth: pane.depth === 2 ? null : pane.depth });
+  }
+  const params = new URLSearchParams();
+  for (const key of SHOWN_KEYS) {
+    if (values[key] !== null && values[key] !== undefined && values[key] !== '') params.set(key, values[key]);
+  }
+  const ids = chosen ? app.selection : [];
+  if (ids.length === 1 && !params.size && !app.focus) return encodeURIComponent(ids[0]);
+  ids.forEach((id) => params.append('select', id));
+  if (ids.length && app.focus) params.set('focus', '1');
+  return params.toString();
+}
+
+/** What a hash shows, as `hashOf` writes it, `#walkthrough=<id>&beat=<n>` included; what does
+ * not parse is left out. */
+function readHash(hash) {
+  const text = hash.replace(/^#/, '');
+  const shown = { select: [], focus: false };
+  if (!text.includes('=')) {
+    try {
+      if (text) shown.select.push(decodeURIComponent(text));
+    } catch { /* a malformed hash selects nothing */ }
+    return shown;
+  }
+  const params = new URLSearchParams(text);
+  for (const key of SHOWN_KEYS) if (params.get(key)) shown[key] = params.get(key);
+  for (const key of ['depth', 'beat']) shown[key] = /^\d+$/.test(shown[key] ?? '') && Number(shown[key]) > 0 ? Number(shown[key]) : undefined;
+  if (!FLOW_VIEWS.includes(shown.view)) delete shown.view;
+  shown.select = params.getAll('select').filter(Boolean);
+  shown.focus = params.get('focus') === '1';
+  return shown;
+}
+
+/** Sets `pane` to the state, view and comparison `shown` names; drawing it is the caller's. */
+function setPane(pane, shown) {
+  const state = (shown.proposal && { kind: 'proposal', id: shown.proposal })
+    || (shown.checkpoint && { kind: 'checkpoint', id: shown.checkpoint }) || { kind: 'current' };
+  Object.assign(pane, {
+    state,
+    against: shown.against ?? '',
+    view: shown.view ?? 'architecture',
+    flow: shown.flow ?? null,
+    scope: shown.scope ?? null,
+    depth: shown.depth ?? 2,
+    beat: null,
+  });
+}
+
+/** Shows what `shown` reads in the active pane: after Back or Forward, a pasted address, or a
+ * reading `model view --show` sent. The address entry is replaced, not added to. */
+async function restore(shown) {
+  app.restoring = true;
+  try {
+    Object.assign(app, { selection: shown.select, focus: shown.focus, hits: [] });
+    if (shown.walkthrough) return await playWalkthrough(shown.walkthrough, (shown.beat ?? 1) - 1);
+    stopPlaying();
+    if (shown.saved) return await showView(shown.saved);
+    if (shown.picture) return await showPicture(shown.picture);
+    const pane = activePane();
+    setPane(pane, shown);
+    await loadPane(pane);
+    fit(pane);
+    showActive();
+  } finally {
+    app.restoring = false;
+    remember();
+  }
+}
+
+/** Puts what the active pane shows in the address, as a new history entry so Back returns to
+ * what it showed before, and tells the server what every pane shows. */
+function remember() {
+  report();
+  const hash = hashOf(activePane(), true);
+  if (hash === location.hash.replace(/^#/, '')) return;
+  const url = `${location.pathname}${location.search}${hash ? `#${hash}` : ''}`;
+  history[app.restoring ? 'replaceState' : 'pushState'](null, '', url);
+}
+
+/** Tells the server what this page's panes show, for `model view --panes` and `--show`, once
+ * per change. */
+function report(again = false) {
+  if (!app.page) return;
+  const panes = app.panes.map((pane, i) => `#${hashOf(pane, i === app.active)}`);
+  const key = JSON.stringify([app.page, app.active, panes]);
+  if (key === report.last && !again) return;
+  report.last = key;
+  api('pane-state', { page: app.page, active: app.active, pane: panes }, false, 'POST').catch(() => { report.last = null; });
 }
 
 // ---------------------------------------------------------------- live updates
@@ -1781,6 +1985,21 @@ function connect() {
     offline = false;
   });
   source.addEventListener('changed', onChanged);
+  source.addEventListener('hello', (event) => {
+    app.page = JSON.parse(event.data).page;
+    report(true);
+  });
+  source.addEventListener('show', (event) => {
+    const { reading } = JSON.parse(event.data);
+    history.pushState(null, '', `${location.pathname}${reading ? `#${reading}` : ''}`);
+    toast('Shown from the command line');
+    restore(readHash(reading)).then(() => {
+      const { el } = activePane();
+      el.classList.remove('arrived');
+      void el.offsetWidth;
+      el.classList.add('arrived');
+    });
+  });
   source.addEventListener('error', () => {
     if (!offline) toast('Live updates offline, reconnecting');
     offline = true;
@@ -1845,6 +2064,7 @@ function bind() {
     if (!usable(event)) return;
     app.focus = !app.focus;
     renderControls();
+    remember();
     app.panes.forEach(decorate);
   });
   $('#filter').addEventListener('input', (event) => {
@@ -1852,6 +2072,8 @@ function bind() {
     renderTree();
     app.panes.forEach(decorate);
   });
+  window.addEventListener('popstate', () => restore(readHash(location.hash)));
+  window.addEventListener('focus', () => report(true));
   document.addEventListener('keydown', (event) => {
     const typing = /^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement?.tagName ?? '');
     if (stepKey(event) && !typing) {
@@ -1871,16 +2093,17 @@ function bind() {
 }
 
 app.panes = [newPane()];
-// `#walkthrough=<id>&beat=<n>` plays that beat; `#<qualified module ID>` selects that module; a
-// malformed one selects nothing.
-const linked = linkedBeat();
-try {
-  app.selected = linked ? null : decodeURIComponent(location.hash.slice(1)) || null;
-} catch {
-  app.selected = null;
-}
+// The address opens what its hash shows; a reading drawn from the vault waits for the model.
+const opened = readHash(location.hash);
+const recipe = opened.walkthrough || opened.saved || opened.picture;
+Object.assign(app, { selection: opened.select, focus: opened.focus });
+if (!recipe) setPane(activePane(), opened);
 bind();
 buildPanes();
 renderControls();
-loadAll().then(() => linked?.id && playWalkthrough(linked.id, linked.index));
+loadAll().then(() => {
+  if (recipe) return restore(opened);
+  app.restoring = false;
+  return remember();
+});
 connect();

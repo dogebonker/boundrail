@@ -10173,7 +10173,7 @@ fn view_serves_walkthroughs_and_plays_them() {
         "'Previous'",
         "'Next'",
         "ArrowRight",
-        "#walkthrough=",
+        "'walkthrough', 'beat']",
         "aria-current': k === index ? 'step'",
     ] {
         assert!(script.contains(control), "{control}");
@@ -12634,6 +12634,241 @@ fn view_asks_the_agent_only_with_allow_explain_and_the_token() {
         200,
         "the place is given back"
     );
+}
+
+/// Reads `stream` into `seen` until it holds `needle`, for at most ten seconds.
+fn read_until(stream: &mut std::net::TcpStream, seen: &mut String, needle: &str) {
+    use std::io::Read as _;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut chunk = [0u8; 1024];
+    while !seen.contains(needle) {
+        assert!(Instant::now() < deadline, "no {needle:?} in {seen}");
+        let n = stream.read(&mut chunk).expect(seen);
+        assert!(n > 0, "the stream closed: {seen}");
+        seen.push_str(&String::from_utf8_lossy(&chunk[..n]));
+    }
+}
+
+impl View {
+    /// Opens the event stream as a page does, and the number its `hello` gives the page.
+    fn page(&self) -> (std::net::TcpStream, u64, String) {
+        let mut events = self.connect();
+        write!(
+            events,
+            "GET /api/events?t={} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+            self.token, self.port
+        )
+        .unwrap();
+        let mut seen = String::new();
+        read_until(&mut events, &mut seen, "event: hello\ndata: {\"page\":");
+        read_until(&mut events, &mut seen, "}\n\n");
+        let data = seen.split("event: hello\ndata: ").nth(1).unwrap();
+        let hello: Value = serde_json::from_str(data.split("\n\n").next().unwrap()).unwrap();
+        (events, hello["page"].as_u64().unwrap(), seen)
+    }
+
+    /// The running view's state file, as JSON.
+    fn state_file(checkout: &Checkout) -> PathBuf {
+        checkout.path().join(".git/boundrail/view.json")
+    }
+}
+
+#[test]
+fn view_show_sends_a_reading_to_the_page_used_last_with_the_control_token() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    checkout.edited(checkout_changes());
+    let refused = checkout.refused(&["view", "--show"], "REQUEST_INVALID");
+    assert_eq!(refused["details"]["reason"], "no-view", "{refused:#}");
+    checkout.refused(&["view", "--panes"], "REQUEST_INVALID");
+
+    let view = View::start(&checkout);
+    let state = View::state_file(&checkout);
+    let running: Value = serde_json::from_str(&fs::read_to_string(&state).unwrap()).unwrap();
+    assert_eq!(running["port"], view.port);
+    let control = running["control"].as_str().unwrap().to_owned();
+    assert_eq!(control.len(), 64);
+    assert_ne!(control, view.token, "the page never sees the control token");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = fs::metadata(&state).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+    }
+
+    // Two pages; the second reports what its panes show, so it is the one used last.
+    let (_first, one, _) = view.page();
+    let (mut events, two, _) = view.page();
+    assert_ne!(one, two);
+    let host = format!("Host: 127.0.0.1:{}\r\n", view.port);
+    let report =
+        format!("/api/pane-state?page={two}&active=1&pane=%23&pane=%23{model}%2523Billing1");
+    let page_token = format!("{host}X-Boundrail-Token: {}\r\n", view.token);
+    let (status, out) = view.send_with("POST", &report, &page_token);
+    assert_eq!(status, 200, "{out}");
+    assert_eq!(
+        view.send_with("POST", &report, &host).0,
+        403,
+        "the page's token is needed"
+    );
+
+    let listed = checkout.ok(&["view", "--panes"]);
+    assert_eq!(listed["kind"], "view-panes");
+    let pages = listed["pages"].as_array().unwrap();
+    assert_eq!(pages.len(), 2, "{listed:#}");
+    let second = pages.iter().find(|p| p["page"] == two).unwrap();
+    assert_eq!(second["last_used"], true);
+    assert_eq!(
+        second["panes"][0],
+        json!({"pane": 0, "active": false, "hash": "", "reading": {}})
+    );
+    assert_eq!(second["panes"][1]["active"], true);
+    assert_eq!(
+        second["panes"][1]["reading"]["select"],
+        json!([format!("{model}#Billing1")])
+    );
+
+    // Names resolve to the IDs the page reads, and the reading reaches the page used last.
+    let shown = checkout.ok(&["view", "--show", "--flow", "Checkout", "--focus", "Billing"]);
+    assert_eq!(shown["page"], two);
+    let hash = shown["hash"].as_str().unwrap();
+    let flow = checkout.ok(&["read"])["collections"][0]["flows"][0]["id"].clone();
+    assert!(flow.as_str().unwrap().starts_with(&format!("{model}#")));
+    assert_eq!(
+        shown["reading"],
+        json!({"view": "sequence", "flow": flow, "select": [format!("{model}#Billing1")], "focus": true})
+    );
+    let mut seen = String::new();
+    read_until(
+        &mut events,
+        &mut seen,
+        &format!("event: show\ndata: {{\"reading\":\"{hash}\"}}\n\n"),
+    );
+    let walked = checkout.ok(&["view", "--show", "--page", &one.to_string()]);
+    assert_eq!(
+        (&walked["page"], &walked["hash"]),
+        (&json!(one), &json!(""))
+    );
+
+    // A reading render would refuse is refused before it is sent; an unknown page is refused.
+    checkout.refused(
+        &["view", "--show", "--flow", "Nowhere"],
+        "SUBJECT_NOT_FOUND",
+    );
+    checkout.refused(&["view", "--show", "--view", "sequence"], "REQUEST_INVALID");
+    checkout.refused(&["view", "--show", "--page", "99"], "SUBJECT_NOT_FOUND");
+    let next = propose(&checkout, "Next", "current");
+    let compared = checkout.ok(&["view", "--show", "--against", "Next"]);
+    assert_eq!(compared["reading"], json!({"against": next}));
+    let in_proposal = [
+        "view",
+        "--show",
+        "--proposal",
+        "Next",
+        "--walkthrough",
+        "Tour",
+    ];
+    let refused = checkout.refused(&in_proposal, "REQUEST_INVALID");
+    let message = refused["message"].as_str().unwrap();
+    assert!(
+        message.contains("current state's walkthroughs"),
+        "{message}"
+    );
+    let (code, _) = checkout.run_raw(&["view", "--flow", "Checkout"]);
+    assert_eq!(code, 2, "reading flags need --show");
+
+    // The control requests take the control token in its header only, never the page's, and
+    // a foreign Origin is refused.
+    let with = |headers: &str| format!("{host}{headers}");
+    let show = "/api/show?reading=";
+    let own = format!("X-Boundrail-Control: {control}\r\n");
+    assert_eq!(view.send_with("POST", show, &with(&own)).0, 200);
+    for headers in [
+        String::new(),
+        format!("X-Boundrail-Token: {}\r\n", view.token),
+        format!("X-Boundrail-Control: {}\r\n", view.token),
+        format!("{own}Origin: https://evil.example\r\n"),
+    ] {
+        let (status, out) = view.send_with("POST", show, &with(&headers));
+        assert_eq!(status, 403, "{headers}: {out}");
+    }
+    assert_eq!(
+        view.send_with("POST", &format!("{show}&t={control}"), &host)
+            .0,
+        403
+    );
+    assert_eq!(view.send_with("GET", "/api/panes", &with(&own)).0, 200);
+    assert_eq!(
+        view.send_with("GET", &format!("/api/panes?t={}", view.token), &host)
+            .0,
+        403
+    );
+    let (status, out) = view.send_with("GET", show, &with(&own));
+    assert_eq!(status, 405, "{out}");
+    assert!(out.contains("Allow: POST"), "{out}");
+    let evil = format!("Host: evil.example:{}\r\n{own}", view.port);
+    assert_eq!(view.send_with("POST", show, &evil).0, 403);
+}
+
+#[test]
+fn a_stopped_view_leaves_the_next_reachable_and_a_stale_state_file_reads_as_no_view() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let state = View::state_file(&checkout);
+    let running =
+        || -> Value { serde_json::from_str(&fs::read_to_string(&state).unwrap()).unwrap() };
+
+    // Two views in one checkout: the second takes the state file over, and stopping the first
+    // leaves the second reachable.
+    let first = View::start(&checkout);
+    let second = View::start(&checkout);
+    drop(first);
+    assert_eq!(running()["port"], second.port);
+    assert_eq!(checkout.ok(&["view", "--panes"])["pages"], json!([]));
+
+    // A view killed outright leaves its file, readable by the user alone; the server it names
+    // no longer answers.
+    drop(second);
+    assert!(state.exists());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = fs::metadata(&state).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+    }
+    let refused = checkout.refused(&["view", "--show"], "REQUEST_INVALID");
+    assert_eq!(refused["details"]["reason"], "no-view", "{refused:#}");
+    assert!(
+        refused["message"]
+            .as_str()
+            .unwrap()
+            .contains("no longer running"),
+        "{refused:#}"
+    );
+
+    // What a page reports never drives the terminal.
+    let view = View::start(&checkout);
+    let (mut events, page, mut seen) = view.page();
+    let report = format!("/api/pane-state?page={page}&active=0&pane=%23select%3D%1B%5B31m");
+    let headers = format!(
+        "Host: 127.0.0.1:{}\r\nX-Boundrail-Token: {}\r\n",
+        view.port, view.token
+    );
+    assert_eq!(view.send_with("POST", &report, &headers).0, 200);
+    let (code, text) = checkout.run_raw(&["view", "--panes", "--format", "markdown"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(!text.contains('\u{1b}'), "{text:?}");
+    assert!(text.contains("#select=\\u{1b}[31m"), "{text}");
+
+    // A state file whose control token the server at its port refuses reads as no view too.
+    let wrong = json!({"port": view.port, "control": "0".repeat(64)});
+    fs::write(&state, wrong.to_string()).unwrap();
+    let refused = checkout.refused(&["view", "--panes"], "REQUEST_INVALID");
+    assert_eq!(refused["details"]["reason"], "no-view", "{refused:#}");
+
+    // The view's own state file is no news to the pages.
+    checkout.claim("tester", json!(["Billing"]));
+    read_until(&mut events, &mut seen, "\"parts\":[\"state\"]");
 }
 
 /// A Git repository at `dir` with a model named `name` holding the service Gateway (`Gatewy01`),

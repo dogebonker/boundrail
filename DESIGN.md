@@ -21,10 +21,19 @@ flow, see what a proposal changes, and see where the code disagrees with the mod
 A top bar names the model, its revision and whether the view is live, with the state to show and
 the state to compare with. The canvas toolbar groups the view switch (architecture, sequence,
 flowchart), a depth stepper, and fit, focus and split, each showing its state. A sidebar filters
-modules by text and by kind and lists modules, flows, walkthroughs, pictures, warnings, changes,
-proposals and history. The detail panel presents the selection, with relationships as rows, or a
-model summary when nothing is selected. A walkthrough plays in a floating bar that the diagram fits
-above.
+modules by text and by kind, hides relationships by kind (chips drawn with the kind's dash; a
+pressed chip is struck through and dashed, since it switches its kind off), and lists modules,
+flows, walkthroughs, pictures, warnings, changes, proposals and history. The detail panel presents
+the selection, with relationships as rows, or a model summary when nothing is selected; with
+several modules selected (Shift-, Command- or Control-click) it lists the members, the
+relationships between them and their outside neighbours. A walkthrough plays in a floating bar
+that the diagram fits above.
+
+The address after `#` holds what the active pane shows (state, comparison, view, flow, scope,
+depth, saved view, picture or beat, selection and focus), and every change adds a history entry,
+so Back and Forward step through what the user looked at. A reading an agent sends with `model
+view --show` replaces the active pane's reading the same way, with a toast and a 2px accent ring
+around the pane that fades in 600 ms.
 
 ## Visual language
 
@@ -50,7 +59,7 @@ label. No remote fonts or imagery.
 
 Native buttons, inputs and selects with labels, visible focus outlines in the accent colour, a
 polite status region for announcements, and no colour-only distinctions. Transitions stop under
-`prefers-reduced-motion`.
+`prefers-reduced-motion`, and the arrival ring is not drawn at all.
 
 ## Responsive behavior
 

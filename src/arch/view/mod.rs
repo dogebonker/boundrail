@@ -19,6 +19,8 @@ pub const HEAD_MAX: usize = 16 * 1024;
 pub const HEAD_DEADLINE: Duration = Duration::from_secs(10);
 /// The header an API request may carry its token in, instead of the `t` query parameter.
 pub const TOKEN_HEADER: &str = "x-boundrail-token";
+/// The header `model view --show` and `--panes` carry the control token in; never a query.
+pub const CONTROL_HEADER: &str = "x-boundrail-control";
 
 /// What the page may load: its own script, style and font, and requests to its own server. SVG
 /// from `/api/render` is imported as nodes and styled by presentation attributes, which the
@@ -215,6 +217,13 @@ pub fn token_matches(request: &Request, token: &str) -> bool {
     given.is_some_and(|given| same(given.as_bytes(), token.as_bytes()))
 }
 
+/// Whether the request carries `control` in the [`CONTROL_HEADER`]; the query never counts.
+pub fn control_matches(request: &Request, control: &str) -> bool {
+    request
+        .header(CONTROL_HEADER)
+        .is_some_and(|given| same(given.as_bytes(), control.as_bytes()))
+}
+
 /// Whether the request has no Origin header, or exactly one naming this server by its loopback
 /// address or `localhost` with its port.
 pub fn origin_allowed(request: &Request, port: u16) -> bool {
@@ -276,6 +285,141 @@ impl Launch {
             Redeem::Fresh
         }
     }
+}
+
+/// What a pane shows, in the form the page keeps after `#` in its address, reports for each pane
+/// and takes from `model view --show`: `key=value` pairs in the order of the fields, `select`
+/// once per selected module and `focus=1`. A lone selected module is `#<qualified module ID>`.
+/// Empty fields mean the current state's architecture at the default depth.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Shown {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
+    /// `current` or a proposal ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub against: Option<String>,
+    /// `sequence` or `flowchart`; absent for the architecture.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub view: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flow: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub depth: Option<u32>,
+    /// A saved view's qualified ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub saved: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub picture: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub walkthrough: Option<String>,
+    /// The beat of `walkthrough`, from 1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub beat: Option<u32>,
+    /// Qualified module IDs, in the order they were selected.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub select: Vec<String>,
+    /// Whether the pane dims what the selection does not touch.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub focus: bool,
+}
+
+impl Shown {
+    /// Reads a hash, with or without its `#`. Unknown keys and values that do not parse are
+    /// left out, so an address from a newer page still opens what this one understands.
+    pub fn parse(hash: &str) -> Self {
+        let hash = hash.strip_prefix('#').unwrap_or(hash);
+        let mut shown = Self::default();
+        if !hash.contains('=') {
+            shown
+                .select
+                .extend(decode(hash).filter(|id| !id.is_empty()));
+            return shown;
+        }
+        for pair in hash.split('&') {
+            let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+            let (Some(name), Some(value)) = (decode(name), decode(value)) else {
+                continue;
+            };
+            if value.is_empty() {
+                continue;
+            }
+            let number = || value.parse().ok().filter(|n| *n > 0);
+            match name.as_str() {
+                "select" => shown.select.push(value),
+                "focus" => shown.focus = value == "1",
+                "depth" => shown.depth = number(),
+                "beat" => shown.beat = number(),
+                "view" if matches!(value.as_str(), "sequence" | "flowchart") => {
+                    shown.view = Some(value);
+                }
+                "proposal" => shown.proposal = Some(value),
+                "checkpoint" => shown.checkpoint = Some(value),
+                "against" => shown.against = Some(value),
+                "flow" => shown.flow = Some(value),
+                "scope" => shown.scope = Some(value),
+                "saved" => shown.saved = Some(value),
+                "picture" => shown.picture = Some(value),
+                "walkthrough" => shown.walkthrough = Some(value),
+                _ => {}
+            }
+        }
+        shown
+    }
+
+    /// The hash, without its `#`.
+    pub fn to_hash(&self) -> String {
+        let depth = self.depth.map(|n| n.to_string());
+        let beat = self.beat.map(|n| n.to_string());
+        let single = [
+            ("proposal", self.proposal.as_deref()),
+            ("checkpoint", self.checkpoint.as_deref()),
+            ("against", self.against.as_deref()),
+            ("view", self.view.as_deref()),
+            ("flow", self.flow.as_deref()),
+            ("scope", self.scope.as_deref()),
+            ("depth", depth.as_deref()),
+            ("saved", self.saved.as_deref()),
+            ("picture", self.picture.as_deref()),
+            ("walkthrough", self.walkthrough.as_deref()),
+            ("beat", beat.as_deref()),
+        ];
+        let mut pairs: Vec<String> = (single.into_iter())
+            .filter_map(|(key, value)| value.map(|v| format!("{key}={}", encode(v))))
+            .collect();
+        if let [only] = self.select.as_slice()
+            && pairs.is_empty()
+            && !self.focus
+        {
+            return encode(only);
+        }
+        pairs.extend(
+            self.select
+                .iter()
+                .map(|id| format!("select={}", encode(id))),
+        );
+        if self.focus {
+            pairs.push("focus=1".to_owned());
+        }
+        pairs.join("&")
+    }
+}
+
+/// `text` with every byte but ASCII letters, digits and `-._~` percent-encoded, which both
+/// [`decode`] and the browser's `URLSearchParams` read back.
+pub fn encode(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 /// A complete response that closes the connection. Every response forbids caching and sniffing.
@@ -499,6 +643,118 @@ mod tests {
             format!("GET /api/model?t={}x HTTP/1.1\r\n", &token[1..]),
         ] {
             assert!(!token_matches(&request(&head), &token), "{head}");
+        }
+    }
+
+    #[test]
+    fn the_control_token_passes_in_its_header_only() {
+        let control = crate::token().unwrap();
+        let header = request(&format!(
+            "POST /api/show HTTP/1.1\r\n{CONTROL_HEADER}: {control}\r\n"
+        ));
+        assert!(control_matches(&header, &control));
+        for head in [
+            format!("POST /api/show?t={control} HTTP/1.1\r\n"),
+            format!("GET /api/panes HTTP/1.1\r\n{TOKEN_HEADER}: {control}\r\n"),
+            format!(
+                "GET /api/panes HTTP/1.1\r\n{CONTROL_HEADER}: {}\r\n",
+                &control[1..]
+            ),
+            "GET /api/panes HTTP/1.1\r\n".to_owned(),
+        ] {
+            assert!(!control_matches(&request(&head), &control), "{head}");
+        }
+    }
+
+    #[test]
+    fn a_shown_hash_round_trips_and_reads_the_older_forms() {
+        let full = Shown {
+            proposal: Some("Prop0001".into()),
+            against: Some("current".into()),
+            view: Some("sequence".into()),
+            flow: Some("Mdl#Flow 1/a&b=c".into()),
+            depth: Some(3),
+            select: vec!["Mdl#Aaaa".into(), "Mdl#Bbbb".into()],
+            focus: true,
+            ..Shown::default()
+        };
+        let hash = full.to_hash();
+        assert_eq!(
+            hash,
+            "proposal=Prop0001&against=current&view=sequence&flow=Mdl%23Flow%201%2Fa%26b%3Dc\
+             &depth=3&select=Mdl%23Aaaa&select=Mdl%23Bbbb&focus=1"
+        );
+        assert_eq!(Shown::parse(&hash), full);
+        assert_eq!(Shown::parse(&format!("#{hash}")), full);
+        let played = Shown {
+            walkthrough: Some("Mdl#Walk".into()),
+            beat: Some(2),
+            ..Shown::default()
+        };
+        assert_eq!(played.to_hash(), "walkthrough=Mdl%23Walk&beat=2");
+        assert_eq!(Shown::parse(&played.to_hash()), played);
+        let saved = Shown {
+            saved: Some("Mdl#View".into()),
+            checkpoint: Some("abc".into()),
+            ..Shown::default()
+        };
+        assert_eq!(Shown::parse(&saved.to_hash()), saved);
+
+        // A lone module keeps the `#<qualified module ID>` form, and both older forms read.
+        let one = Shown {
+            select: vec!["Mdl#Aaaa".into()],
+            ..Shown::default()
+        };
+        assert_eq!(one.to_hash(), "Mdl%23Aaaa");
+        assert_eq!(Shown::parse("#Mdl%23Aaaa"), one);
+        assert_eq!(Shown::parse("Mdl#Aaaa"), one);
+        assert_eq!(Shown::parse("#walkthrough=Mdl%23Walk&beat=2"), played);
+        assert_eq!(Shown::parse(""), Shown::default());
+        assert_eq!(Shown::default().to_hash(), "");
+
+        // What the browser's URLSearchParams writes reads the same; what does not parse is left out.
+        let browser = Shown::parse("view=flowchart&flow=F+1&select=M%23a&focus=1");
+        assert_eq!(browser.flow.as_deref(), Some("F 1"));
+        assert_eq!(
+            (browser.view.as_deref(), browser.focus),
+            (Some("flowchart"), true)
+        );
+        let odd = Shown::parse("view=diagram&depth=0&beat=x&focus=yes&new=1&scope=&select=%zz");
+        assert_eq!(odd, Shown::default());
+    }
+
+    #[test]
+    fn a_lone_selection_is_the_bare_module_id_only_when_nothing_else_is_shown() {
+        let one = |shown: Shown| Shown {
+            select: vec!["Mdl#Aaaa".into()],
+            ..shown
+        };
+        assert_eq!(one(Shown::default()).to_hash(), "Mdl%23Aaaa");
+        for (shown, hash) in [
+            (
+                one(Shown {
+                    focus: true,
+                    ..Shown::default()
+                }),
+                "select=Mdl%23Aaaa&focus=1",
+            ),
+            (
+                one(Shown {
+                    depth: Some(3),
+                    ..Shown::default()
+                }),
+                "depth=3&select=Mdl%23Aaaa",
+            ),
+            (
+                one(Shown {
+                    proposal: Some("Prop0001".into()),
+                    ..Shown::default()
+                }),
+                "proposal=Prop0001&select=Mdl%23Aaaa",
+            ),
+        ] {
+            assert_eq!(shown.to_hash(), hash);
+            assert_eq!(Shown::parse(hash), shown);
         }
     }
 

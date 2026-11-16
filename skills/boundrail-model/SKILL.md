@@ -130,7 +130,11 @@ Other codes explain themselves in their message. `skips` list what the check cou
   groups' members, their neighbours dimmed), `groups` (group keys or `"all"`, drawn as labelled
   regions) and `visibility` (keep only what lies within that many hops of the focus; needs a
   focus). Kinds and groups are `config.yaml` keys.
-- See the model in a browser with `boundrail model view`.
+- See the model in a browser with `boundrail model view`. While the user has it open, show them
+  what you are talking about with `boundrail model view --show` and the `model render` reading
+  flags (`--flow`, `--focus`, `--scope`, `--proposal`, `--saved-view`, `--walkthrough --beat`);
+  `--panes` lists what their panes show. `details.reason` `no-view` means no view runs for this
+  checkout; then point the user at `boundrail model view` or draw with `model render`.
 - When the user wants another agent's reading of part of the model, `boundrail model explain
   <module>... [--relationship <id>] [--flow <id>] [--proposal <id>] --question "<text>"` asks
   their local agent CLI; `--print` prints the bundle instead. It writes nothing.

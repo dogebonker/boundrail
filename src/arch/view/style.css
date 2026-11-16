@@ -276,6 +276,15 @@ h1 {
   border-color: color-mix(in srgb, var(--accent) 45%, transparent);
   color: var(--text); font-weight: 600;
 }
+.chips .line { width: 18px; height: 8px; stroke: var(--edge); stroke-width: 1.5; stroke-linecap: butt; }
+.rel-chips { margin-top: 6px; }
+/* A pressed relationship chip hides its kind, so it reads as switched off. */
+.rel-chips button[aria-pressed="true"] {
+  background: none; border-color: var(--divider); border-style: dashed;
+  color: var(--text-3); font-weight: 500;
+  text-decoration: line-through; text-decoration-color: var(--text-3);
+}
+.rel-chips button[aria-pressed="true"] .line { opacity: 0.35; }
 
 .sidebar section { margin-top: 20px; }
 .sidebar section[data-empty="true"] { display: none; }
@@ -405,6 +414,13 @@ button.diagnostic:active { transform: none; background: var(--press); }
 .panes.split { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
 .pane { position: relative; display: grid; grid-template-rows: auto minmax(0, 1fr); min-width: 0; min-height: 0; }
 .panes.split .pane + .pane { border-left: 1px solid var(--divider); }
+/* A reading an agent sent lands with a short ring around the pane, then the ring fades. */
+.pane.arrived::before {
+  content: ""; position: absolute; inset: 0; z-index: 1; pointer-events: none;
+  box-shadow: inset 0 0 0 2px var(--accent);
+  animation: arrive 600ms var(--ease-out) forwards;
+}
+@keyframes arrive { from { opacity: 1; } to { opacity: 0; } }
 /* Drawn above the sheet, which would cover an outline on the pane itself. */
 .panes.split .pane.active::after {
   content: ""; position: absolute; inset: 0; z-index: 1; pointer-events: none;
@@ -494,6 +510,7 @@ button.diagnostic:active { transform: none; background: var(--press); }
 .sheet svg .note-rule { fill: var(--accent); }
 .sheet svg g.message:not(.step) > .note-box ~ text { fill: var(--text-2); }
 svg g.is-filtered { opacity: 0.25; }
+.sheet svg g.is-hidden { display: none; }
 .sheet svg g.relationship > rect { rx: 4; }
 
 svg g.module, svg g.lifeline { cursor: pointer; }
@@ -609,6 +626,10 @@ svg g.dimmed:not(.undim) text { opacity: 0.6; }
 .rel-main { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .rel-main .link { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rel-label { grid-column: 1 / -1; padding-left: 14px; color: var(--text-3); font-size: var(--fs-12); }
+.rel-main .to { color: var(--text-3); }
+.rels .n { justify-self: end; color: var(--text-3); font-size: var(--fs-12); font-variant-numeric: tabular-nums; }
+.detail .clear { align-self: flex-start; margin-top: 12px; min-height: 26px; font-size: var(--fs-12); }
+.rels .remove { color: var(--text-3); font-weight: 400; font-size: var(--fs-12); }
 .tag {
   display: inline-flex; align-items: center; height: 20px; padding: 0 6px; margin: 0 4px 4px 0;
   border-radius: var(--radius-s); background: var(--hover);
@@ -665,6 +686,7 @@ svg g.dimmed:not(.undim) text { opacity: 0.6; }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; animation: none !important; }
+  .pane.arrived::before { display: none; }
 }
 
 @media (max-width: 1000px) and (min-width: 601px) {

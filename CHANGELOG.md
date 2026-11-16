@@ -131,6 +131,22 @@
   agent on `PATH` it refuses `REQUEST_INVALID` with `details.reason` `no-agent`; `--print` prints
   the bundle instead. `model view --allow-explain` adds `POST /api/explain` and an `Ask the agent`
   field to the detail panel, which otherwise copies the command line.
+- `model view` keeps a selection of several modules (Shift-, Command- or Control-click in the
+  list or on the canvas; Escape clears) with a combined panel of the members, the relationships
+  between them and their outside neighbours, and Focus on the whole set. Chips per relationship
+  kind, drawn in the kind's dash, hide that kind on the canvas and in the detail lists. The
+  address keeps the proposal or checkpoint, comparison, view, flow, scope, depth, saved view,
+  picture, walkthrough beat, selection and focus after `#`, extending `#<module>` and
+  `#walkthrough=`; every change adds a history entry, so Back and Forward restore it, and a
+  pasted address opens it. The token never enters the hash.
+- `model view --show` sends a reading (the `model render` flags `--view`, `--flow`, `--scope`,
+  `--depth`, `--focus`, `--proposal`, `--checkpoint`, `--against`, `--saved-view`,
+  `--walkthrough` and `--beat`, plus `--page`) to the view running for this checkout, which shows
+  it in the active pane of the page used last; `--panes` lists every open page's panes. The view
+  writes `view.json` (port and a separate control token, mode 0600) in `.git/boundrail`, which a
+  stopped view may leave behind and readers then treat as no view; `POST /api/show` and `GET /api/panes` take that token in
+  `X-Boundrail-Control` only, with the Host and Origin checks. With no view running they refuse
+  `REQUEST_INVALID` with `details.reason` `no-view`, and with no page open `no-page`.
 - Module `references`: an optional ordered list of `{model, state, subject, pin}` pointing at
   another model (a path inside the checkout or `<alias>:` from the user's
   `boundrail/checkouts.json`), its current state, a proposal or a checkpoint, a subject there, and

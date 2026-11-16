@@ -258,6 +258,21 @@ boundrail model explain --proposal <id> --question "What does this proposal risk
 `boundrail model view --allow-explain` lets the browser's `Ask the agent` field run the same
 command; without the flag the field copies the command line for you to run.
 
+An agent can show you a reading in the page you have open. `model view --show` takes the reading
+flags of `model render` and sends them to the view running for this checkout, which switches the
+active pane of the page you used last; `--panes` lists what every open page shows. They find the
+view through a state file in `.git/boundrail`, readable by you alone, and send it a control token
+the page never sees.
+
+```sh
+boundrail model view --show --flow Checkout --focus Billing
+boundrail model view --show --walkthrough Tour --beat 2
+boundrail model view --panes
+```
+
+In the page, Shift-click adds modules to the selection, the relationship chips hide a kind of
+relationship, and the address keeps what the pane shows, so Back, Forward and a pasted link work.
+
 ## In CI
 
 The GitHub Action runs `model check`, annotates its findings, and on a pull request comments the
