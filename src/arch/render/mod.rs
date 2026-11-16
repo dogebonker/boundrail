@@ -51,14 +51,28 @@ pub struct Side<'a> {
     pub name: Option<String>,
 }
 
-/// How to draw, beyond what: the modules lit, the node kinds left out, whether a legend names the
-/// kinds drawn, and the colors.
+/// How to draw, beyond what: the modules lit, selected and kept, the node kinds and relationship
+/// kinds left out, the group regions, whether a legend names the kinds drawn, and the colors.
 #[derive(Default)]
 pub struct Options<'a> {
-    /// Qualified module IDs drawn as usual, the rest dimmed; none dims nothing.
+    /// Qualified module IDs drawn as usual, the rest dimmed; none dims nothing. A focus module
+    /// the group filter leaves out is not drawn, so every module drawn is dimmed.
     pub focus: &'a [String],
     /// Node kind keys whose modules the architecture view leaves out.
     pub hide: &'a [String],
+    /// Qualified module IDs the architecture view outlines as selected.
+    pub selection: &'a [String],
+    /// Relationship kind keys the architecture view draws; empty draws every kind.
+    pub relationships: &'a [String],
+    /// Group keys whose members alone the architecture view draws as usual, with the modules
+    /// they have relationships with dimmed; without a focus the members light as one would.
+    /// Empty draws every module; a group with no module drawn is refused.
+    pub groups: &'a [String],
+    /// Group keys the architecture view draws as labelled regions behind their members.
+    pub regions: &'a [String],
+    /// How many relationship hops from the focus the architecture view keeps drawn; `None`, or
+    /// no focus, keeps every module.
+    pub visibility: Option<usize>,
     /// Name the node and relationship kinds the architecture view draws, below it.
     pub legend: bool,
     pub theme: Theme,
@@ -150,6 +164,9 @@ const LEGEND_GAP: f64 = 6.0;
 const LEGEND_LINE: f64 = 28.0;
 const LEGEND_SPACE: f64 = 18.0;
 const SWATCH_RADIUS: f64 = 2.0;
+/// The outline of a selected module.
+const SELECTED: &str = "#1c7ed6";
+const SELECTED_WIDTH: f64 = 2.6;
 
 /// How a comparison marks an element.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -194,6 +211,8 @@ struct Context<'a> {
     marks: Option<BTreeMap<String, Mark>>,
     /// `None` when nothing is focused.
     focus: Option<Focus>,
+    /// Qualified IDs of the modules outlined as selected.
+    selection: BTreeSet<String>,
     title: String,
 }
 
@@ -489,13 +508,41 @@ pub fn render(
         let message = "--hide-kind and --legend apply to the architecture view only";
         return Err(Refusal::new(Code::RequestInvalid, message));
     }
-    if let Some(kind) = (options.hide.iter()).find(|k| !model.config.node_kinds.contains_key(*k)) {
-        let known: Vec<&str> = model.config.node_kinds.keys().map(String::as_str).collect();
-        let message = format!(
-            "--hide-kind `{kind}` is not a node kind in config.yaml; known: {}",
-            known.join(", ")
-        );
+    let arranged = !options.selection.is_empty()
+        || !options.relationships.is_empty()
+        || !options.groups.is_empty()
+        || !options.regions.is_empty()
+        || options.visibility.is_some();
+    if !architecture && arranged {
+        let message = "--group, selection, filters, groups and visibility apply to the architecture view only";
         return Err(Refusal::new(Code::RequestInvalid, message));
+    }
+    let config = &model.config;
+    let groups = keys(&config.groups);
+    let asked = [
+        (
+            "--hide-kind",
+            "node kind",
+            options.hide,
+            keys(&config.node_kinds),
+        ),
+        (
+            "relationship filter",
+            "relationship kind",
+            options.relationships,
+            keys(&config.relationship_kinds),
+        ),
+        ("--group", "group", options.groups, groups.clone()),
+        ("group region", "group", options.regions, groups),
+    ];
+    for (flag, what, wanted, known) in asked {
+        if let Some(key) = wanted.iter().find(|k| !known.contains(&k.as_str())) {
+            let message = format!(
+                "{flag} `{key}` is not a {what} in config.yaml; known: {}",
+                known.join(", ")
+            );
+            return Err(Refusal::new(Code::RequestInvalid, message));
+        }
     }
     let comparison = base.map(|b| {
         compare::compare(
@@ -510,6 +557,11 @@ pub fn render(
         None => Cow::Borrowed(model.modules.as_slice()),
     };
     let modules = without_kinds(id, modules, options.hide);
+    let (modules, members) = kept(id, modules, options)?;
+    let focus = match options.focus {
+        [] => members.as_slice(),
+        focus => focus,
+    };
     let mut context = Context {
         model: id,
         config: &model.config,
@@ -517,7 +569,8 @@ pub fn render(
             .map(|m| (ids::qualify(id, &m.id), m.name.as_str()))
             .collect(),
         marks: comparison.as_ref().map(marks),
-        focus: Focus::new(id, &modules, options.focus),
+        focus: Focus::new(id, &modules, focus),
+        selection: options.selection.iter().cloned().collect(),
         title: title(drawn, base),
     };
     let (svg, drawn_modules, relationships, fallbacks) = match *view {
@@ -553,6 +606,90 @@ pub fn render(
         relationships,
         fallbacks,
     })
+}
+
+/// `modules` cut to what `options` keep: relationships of the kinds asked; the members of the
+/// groups asked and the other ends of their relationships; what lies within `visibility` hops of
+/// the focus; each with the containers around it. Returns the members too, by qualified ID.
+/// Refuses a group asked that has no member among `modules`, which would draw none of it.
+fn kept<'a>(
+    model: &str,
+    mut modules: Cow<'a, [Module]>,
+    options: &Options<'_>,
+) -> Result<(Cow<'a, [Module]>, Vec<String>), Refusal> {
+    let kinds = options.relationships;
+    let unasked = |m: &Module| m.outgoing.iter().any(|r| !kinds.contains(&r.kind));
+    if !kinds.is_empty() && modules.iter().any(unasked) {
+        for module in modules.to_mut() {
+            module.outgoing.retain(|r| kinds.contains(&r.kind));
+        }
+    }
+    let member = |m: &Module, group: &String| m.groups.contains(group);
+    if let Some(group) = (options.groups.iter()).find(|g| !modules.iter().any(|m| member(m, g))) {
+        let message = format!("group `{group}` has no module drawn; name a group with members");
+        return Err(Refusal::new(Code::RequestInvalid, message));
+    }
+    let members: Vec<String> = (modules.iter())
+        .filter(|m| options.groups.iter().any(|g| member(m, g)))
+        .map(|m| ids::qualify(model, &m.id))
+        .collect();
+    let keep = {
+        let index = Index::new(model, &modules);
+        let grouped = (!options.groups.is_empty()).then(|| reach(&index, &members, 1));
+        let near = (options.visibility)
+            .filter(|_| !options.focus.is_empty())
+            .map(|hops| reach(&index, options.focus, hops));
+        let keep = match (grouped, near) {
+            (Some(a), Some(b)) => Some(a.intersection(&b).cloned().collect()),
+            (a, b) => a.or(b),
+        };
+        keep.map(|keep: BTreeSet<String>| {
+            let around = keep.iter().flat_map(|id| index.chain(id));
+            around.map(str::to_owned).collect::<BTreeSet<String>>()
+        })
+    };
+    let Some(keep) = keep else {
+        return Ok((modules, members));
+    };
+    let kept = |m: &Module| keep.contains(&ids::qualify(model, &m.id));
+    let modules = match modules {
+        Cow::Owned(mut owned) => {
+            owned.retain(kept);
+            owned
+        }
+        Cow::Borrowed(all) => all.iter().filter(|m| kept(m)).cloned().collect(),
+    };
+    Ok((Cow::Owned(modules), members))
+}
+
+/// `start`, the modules inside it, and every module within `hops` relationships of them, by
+/// qualified ID.
+fn reach(index: &Index<'_>, start: &[String], hops: usize) -> BTreeSet<String> {
+    let mut found: BTreeSet<String> = BTreeSet::new();
+    for id in start.iter().filter(|id| index.by_id.contains_key(*id)) {
+        found.insert(id.clone());
+        found.extend(index.descendants(id).into_iter().map(|(d, _)| d.to_owned()));
+    }
+    for _ in 0..hops {
+        let mut next = found.clone();
+        for line in &index.lines {
+            if found.contains(&line.from) {
+                next.insert(line.to.to_owned());
+            }
+            if found.contains(line.to) {
+                next.insert(line.from.clone());
+            }
+        }
+        if next.len() == found.len() {
+            break;
+        }
+        found = next;
+    }
+    found
+}
+
+fn keys<V>(map: &BTreeMap<String, V>) -> Vec<&str> {
+    map.keys().map(String::as_str).collect()
 }
 
 fn without_kinds<'a>(
@@ -647,7 +784,7 @@ fn draw_architecture(
         modules,
         scope.as_deref(),
         depth,
-        options.legend,
+        (options.regions, options.legend),
     ))
 }
 
@@ -867,6 +1004,7 @@ mod tests {
             collections,
             walkthroughs: Vec::new(),
             pictures: Vec::new(),
+            views: Vec::new(),
             revision: Revision {
                 digest: "x".into(),
                 files: Vec::new(),
@@ -990,6 +1128,7 @@ mod tests {
             names: BTreeMap::new(),
             marks: None,
             focus: None,
+            selection: BTreeSet::new(),
             title: String::new(),
         };
         context.fill(kind).to_owned()
@@ -1067,6 +1206,116 @@ mod tests {
         let bank = [q("BankApi1")];
         let inside = focused(&platform, &bank);
         assert!(!inside.contains("dimmed"), "{inside}");
+    }
+
+    #[test]
+    fn readings_select_filter_and_keep_what_is_near() {
+        let mut shop = shop();
+        let pay = serde_json::from_value(json!({"name": "Payments"})).unwrap();
+        shop.config.groups.insert("pay".to_owned(), pay);
+        let quiet = serde_json::from_value(json!({"name": "Quiet"})).unwrap();
+        shop.config.groups.insert("idle".to_owned(), quiet);
+        shop.modules[2].groups = vec!["pay".to_owned()];
+        shop.modules
+            .push(module(json!({"id": "AuditLg1", "name": "Audit"})));
+        let drawn = Side {
+            model: &shop,
+            name: None,
+        };
+        let draw = |options: &Options<'_>| render(&drawn, None, &WHOLE, options);
+        let (web, billing, bank) = (q("WebApp01"), q("Billing1"), q("BankApi1"));
+        let box_of = |out: &str, id: &str| out.contains(&format!("data-id=\"{id}\""));
+
+        let selection = [web.clone()];
+        let out = draw(&Options {
+            selection: &selection,
+            ..Options::default()
+        })
+        .unwrap()
+        .svg;
+        let group = format!("<g class=\"module selected\" data-id=\"{web}\">\n<rect");
+        let at = out.find(&group).unwrap_or_else(|| panic!("{out}"));
+        assert!(out[at..].starts_with(&format!("{group} x=")));
+        let stroke = format!("stroke=\"{SELECTED}\"");
+        assert!(out[at..out[at..].find("/>").unwrap() + at].contains(&stroke));
+        assert!(!out.contains("dimmed"));
+
+        let calls = ["call".to_owned()];
+        let out = draw(&Options {
+            relationships: &calls,
+            ..Options::default()
+        })
+        .unwrap()
+        .svg;
+        assert!(
+            !box_of(&out, &q("RelWeb01")) && box_of(&out, &q("RelBil01")),
+            "{out}"
+        );
+
+        // Billing's group keeps Billing lit, Web and Bank dimmed beside it, and Audit out.
+        let pay = ["pay".to_owned()];
+        let out = draw(&Options {
+            groups: &pay,
+            ..Options::default()
+        })
+        .unwrap();
+        assert!(!box_of(&out.svg, &q("AuditLg1")), "{}", out.svg);
+        assert_eq!(
+            out.modules,
+            [bank.clone(), q("Platfrm1"), billing.clone(), web.clone()]
+        );
+        assert_eq!(
+            out.svg.matches("class=\"dimmed\"").count(),
+            2,
+            "{}",
+            out.svg
+        );
+
+        let focus = [web.clone()];
+        let near = |hops| {
+            draw(&Options {
+                focus: &focus,
+                visibility: Some(hops),
+                ..Options::default()
+            })
+            .unwrap()
+            .modules
+        };
+        assert_eq!(near(0), [q("Platfrm1"), web.clone()]);
+        assert_eq!(near(1), [q("Platfrm1"), billing.clone(), web.clone()]);
+        assert_eq!(near(2), [bank, q("Platfrm1"), billing, web]);
+
+        let regions = Options {
+            regions: &pay,
+            ..Options::default()
+        };
+        let out = draw(&regions).unwrap().svg;
+        let region = out
+            .find("<g class=\"region\">")
+            .unwrap_or_else(|| panic!("{out}"));
+        assert!(region < out.find("<g class=\"module").unwrap());
+        assert!(out[region..].contains(">Payments</text>"));
+        assert_eq!(out.matches("<g class=\"region\">").count(), 1);
+
+        let refused = |options: &Options<'_>, view: &View<'_>| {
+            render(&drawn, None, view, options).unwrap_err().code
+        };
+        let edge = ["edge".to_owned()];
+        let unknown = Options {
+            groups: &edge,
+            ..Options::default()
+        };
+        assert_eq!(refused(&unknown, &WHOLE), Code::RequestInvalid);
+        let idle = ["idle".to_owned()];
+        let empty = Options {
+            groups: &idle,
+            ..Options::default()
+        };
+        let error = render(&drawn, None, &WHOLE, &empty).unwrap_err();
+        assert_eq!(error.code, Code::RequestInvalid);
+        assert!(error.message.contains("`idle`"), "{}", error.message);
+        let sequence = View::Sequence("Checkout");
+        assert_eq!(refused(&regions, &sequence), Code::RequestInvalid);
     }
 
     #[test]

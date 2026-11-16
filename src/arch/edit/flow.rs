@@ -889,6 +889,7 @@ mod tests {
             collections,
             walkthroughs: Vec::new(),
             pictures: Vec::new(),
+            views: Vec::new(),
             revision: revision::of(std::iter::empty()),
             proposal: None,
         }

@@ -6,22 +6,21 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use super::walkthroughs::{Known, reading_problems};
-use super::{Contents, Model, Problems, STATE, check_file, check_text, is_repo_path, pick};
-use crate::arch::types::{BeatReading, DESCRIPTION_MAX, Picture};
+use super::{Contents, Model, Problems, STATE, is_repo_path, views};
+use crate::arch::types::{BeatReading, Picture, VaultConfig};
 use crate::arch::{Refusal, ids};
 
 /// Every picture's own fields and reading, and that no two write the same file.
-pub(super) fn check(model: Option<&str>, contents: Contents<'_>, problems: &mut Problems) {
-    let known = Known::new(model, contents);
+pub(super) fn check<'a>(
+    model: Option<&str>,
+    config: Option<&VaultConfig>,
+    contents: Contents<'a>,
+    problems: &mut Problems,
+) {
     // Case-insensitive file systems would make two spellings one file.
     let mut outputs: BTreeMap<String, &str> = BTreeMap::new();
-    for (file, picture) in contents.pictures {
+    let own = |file: &str, picture: &'a Picture, problems: &mut Problems| {
         let id = picture.id.as_str();
-        check_file(problems, file, id, picture.schema_version, &picture.name);
-        let description = picture.description.as_deref();
-        let max = Some(DESCRIPTION_MAX);
-        check_text(problems, file, id, "description", description, max, true);
         for message in output_problems(&picture.output) {
             problems.push(file, id, message);
         }
@@ -29,10 +28,8 @@ pub(super) fn check(model: Option<&str>, contents: Contents<'_>, problems: &mut 
             let message = format!("output {} is also picture {other}'s", picture.output);
             problems.push(file, id, message);
         }
-        for message in reading_problems(&picture.reading, known.as_ref()) {
-            problems.push(file, id, message);
-        }
-    }
+    };
+    views::check(model, config, contents, contents.pictures, problems, own);
 }
 
 /// Why `output` is not a file a picture may write: a relative repository path with no empty or
@@ -60,18 +57,6 @@ pub(crate) fn output_problems(output: &str) -> Vec<String> {
     out
 }
 
-/// The position among `pictures` of the picture `subject` names: its qualified or local ID, else
-/// its unique name.
-pub(crate) fn picture_position(
-    model: &str,
-    pictures: &[Picture],
-    subject: &str,
-) -> Result<usize, Refusal> {
-    let items =
-        (pictures.iter().enumerate()).map(|(p, x)| (p, x.id.as_str(), x.name.as_str(), &[][..]));
-    pick(model, "picture", items, subject)
-}
-
 /// A picture as `model read` shows it, its ID qualified.
 #[derive(Debug, Serialize)]
 pub struct PictureEntry<'a> {
@@ -94,9 +79,7 @@ impl Model {
 
     /// The pictures by order, then name, then ID.
     pub fn pictures_in_order(&self) -> Vec<&Picture> {
-        let mut pictures: Vec<&Picture> = self.pictures.iter().collect();
-        pictures.sort_by_key(|p| (p.order, &p.name, &p.id));
-        pictures
+        views::in_order(&self.pictures)
     }
 
     pub fn picture_entry<'a>(&self, picture: &'a Picture) -> PictureEntry<'a> {
@@ -112,7 +95,7 @@ impl Model {
 
     /// The picture `subject` names, its qualified or local ID or its unique name.
     pub fn picture(&self, subject: &str) -> Result<&Picture, Refusal> {
-        let at = picture_position(&self.manifest.id, &self.pictures, subject)?;
+        let at = views::position(&self.manifest.id, &self.pictures, subject)?;
         Ok(&self.pictures[at])
     }
 }
@@ -146,8 +129,7 @@ mod tests {
             None,
             &[],
             &[],
-            &[],
-            pictures,
+            (&[], pictures, &[]),
         );
         found.into_iter().map(|p| p.message).collect()
     }

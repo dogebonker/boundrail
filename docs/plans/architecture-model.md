@@ -59,7 +59,7 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 | T25 | History on every write: each edit, including in proposals, retains a checkpoint with its doing line; publication destination with per-checkpoint status; source-commit availability on checkpoint reads | done |
 | T26 | Proposal metadata: summary, linked documents, rename and edit through `set`, select by unique name; walkthroughs authored inside proposals | open |
 | T27 | Proposal families: child proposals of a draft, family reconcile, standing, settle conflicts by mine, theirs or edited; `INHERITANCE_DROPPED` and `PART_RECREATED` confirmations | open |
-| T28 | Readings: group regions and group filter; beat selection apart from focus, relationship filters, groups, visibility; saved views that need no output file | open |
+| T28 | Readings: group regions and group filter; beat selection apart from focus, relationship filters, groups, visibility; saved views that need no output file | done |
 | T29 | Cross-model references: modules reference another model, state or subject, `read --references`, pinned foreign checkpoints; `read --code` resolves and opens the code target | open |
 | T30 | History repair and restore: correct a recorded state with source commits and an audit trail; restore a bundle into an empty vault with identities and history | open |
 | T31 | Vaults outside Git: a private history for a vault outside a checkout, used for temporary pull request models | open |
@@ -1323,3 +1323,68 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   An answered server also prints `boundrail: language server <name> answered: start N ms,
   initialize N ms, queries N ms, shutdown N ms` to stderr in every format, as the starting line
   is.
+- T28: a reading (beat, picture or saved view) gains four optional fields, each left out of the
+  file when absent, so a vault written before T28 loads and digests as it did and a reading that
+  uses none of them draws the same bytes. `selection` lists qualified modules, each once, outlined
+  in `#1c7ed6` at 2.6 with the group class `module selected`; it dims nothing, and on a compared
+  drawing its outline replaces the mark's while the class and label keep the mark. `filters` is
+  `{relationships?, groups?}`: the relationship kinds drawn (the others leave the drawing before
+  layout and count for no hop) and the groups whose members alone are drawn as usual, with the
+  other end of each of their relationships, or a member's part's, kept and dimmed and everything
+  else left out. `groups` names the group regions, `config.yaml` keys or `"all"`.
+  `visibility` (0 to 9) keeps the focus, its parts and what lies within that many relationship
+  hops of them, counted both ways; the rest is left out, not dimmed. Every kept module keeps the
+  containers around it. A group filter and visibility together keep what both keep. A group
+  filter without a focus lights the members as a focus would; with one, the focus decides what
+  dims. The task row asked for `filters.relationships` to name the kinds shown, so it does, and
+  an empty list or `{}` is a problem rather than "show nothing".
+- T28: validation, beside the T14 rules: the four fields apply to the architecture view only;
+  `filters` names a kind or group, `groups` lists one; a kind or group listed twice, or one
+  `config.yaml` lacks, is a problem; `visibility` needs a focus; `selection` references follow
+  `focus` (existing modules in the current state, qualified IDs elsewhere), and
+  `WALKTHROUGH_TARGET_MISSING`, `PICTURE_TARGET_MISSING` and `VIEW_TARGET_MISSING` judge it too.
+  Keys are checked against the vault's config, so removing a group a reading names makes the
+  vault invalid until the reading is edited, as a module naming it already did. A drawn state
+  whose own config lacks a key (an old checkpoint) refuses `REQUEST_INVALID` on render. Edits set
+  `selection`, `filters`, `groups` and `visibility` whole and clear them by name, deduplicating
+  in order; `edit-beat`, `edit-picture` and `edit-view` take them alike.
+- T28: group regions. After layout and before routing, each group named, in the order given
+  (`"all"` in key order), with a drawn box naming it, gets a band: its members' boxes' bounds grown
+  by 12, joined with its name's plate grown by 4, `rx` 10, filled and stroked with the group's
+  color (else `#9aa5b1`) at fill opacity 0.1, drawn in `<g class="region">` (no `data-id`, so the
+  browser never takes it for a module) after the title and before every box. The name, bold
+  `SOFT_INK`, sits 12 above the members' top left corner, or on the first spot of the label rings
+  that keeps 12 off every box (inside a container only below its header) and meets no fixed area
+  (`layout::free_spot`), 12 being a route's straight start and a gap. Each placed name joins the
+  scene's fixed areas, so later names, routes and labels keep off it. A band may cover boxes
+  that are not members; it is behind them. `assert_regions_clear` in `tests/arch_model.rs`
+  checks names against boxes, titles, labels, routes and each other on the platform fixture, and
+  `assert_clean_layout` still holds. Known ceiling (ponytail): a route that finds no path while
+  fixed areas block it retries ignoring them, as for the picture title, and may then cross a
+  region name; the fixture does not.
+- T28: `model render --group <key>` (repeatable) is the group filter on the command line; it
+  refuses beside `--walkthrough`, `--picture` and `--saved-view`, with a flow view, and for a key
+  `config.yaml` lacks (`REQUEST_INVALID`, as `--hide-kind`). No flag sets selection, regions or
+  visibility: a saved view does without a file.
+- T28: a saved view is `views/<id>.view.json` (schema `model-view`): `{schema_version, id, name,
+  order, description?, reading}`, a picture without `output`. Views belong to the current state
+  as walkthroughs and pictures do: its revision, `file_digests`, the journal's write allow-list,
+  checkpoints, bundles and committed reads cover them; proposal loads never read a `views`
+  folder; a proposal edit with a view change refuses `REQUEST_INVALID`; a proposal's predecessor
+  digest leaves `views/` out; adoption checks the adopted state with the current views. IDs come
+  from the model-wide allocator and are retired on removal; a view resolves by ID or unique name
+  and a claim on it holds it. Edits: `add-view`, `edit-view` (set name, order, description and any
+  reading field; clear description and the reading fields), `remove-view`. Removing a module or
+  flow an unedited view reads refuses `REFERENCED_BY_VIEW` with `details.views`, after
+  `REFERENCED_BY_PICTURE`. `model read` lists `views` (JSON, and `Views:` in Markdown), `model read
+  --view <id>` (or `model read <view ID>`) prints one with its `Shows:` line, and `model render
+  --saved-view <id>` draws it through the beat path, refusing any other drawing flag. The render
+  flag is not `--view`, which already names the kind of drawing. `model check` adds
+  `VIEW_TARGET_MISSING` (warning, skip site `view`) in the semantic part, loading each state once
+  with the beats'.
+- T28: the browser lists the current state's views in a Views section of the sidebar from the
+  model read. Opening one applies its reading to the active pane and draws through
+  `/api/render?saved=<id>`, so the server applies every field; after a reload a pane showing a
+  view follows it, or keeps what it shows once it is gone. Beats and pictures were already drawn
+  from the stored reading through `/api/render?walkthrough=&beat=` and `?picture=`, so their new
+  fields reach the server untouched.

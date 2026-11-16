@@ -474,6 +474,7 @@ impl Server {
             walkthrough: owned("walkthrough"),
             beat: owned("beat"),
             picture: owned("picture"),
+            saved_view: owned("saved"),
             proposal: owned("proposal"),
             checkpoint: owned("checkpoint"),
             view,

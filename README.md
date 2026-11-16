@@ -83,7 +83,21 @@ boundrail model render --png model.png --scale 2 --region 0,0,600,400
 # A receipt: revision, width, height, the module and relationship IDs drawn, the SVG's digest,
 # and how many arrows and labels fell back.
 boundrail model render --format json
+
+# Only the members of a configured group, and dimmed, the modules they talk to.
+boundrail model render --group payments
+
+# A saved view: a named reading kept in the model, drawn without any file to keep.
+boundrail model render --saved-view "Payments path"
 ```
+
+A reading, in a walkthrough beat, a picture or a saved view (`add-view`, `edit-view`,
+`remove-view`; `model read --view <id>`), can also outline `selection` modules without dimming
+anything, show only some relationship kinds (`filters.relationships`), keep only some groups'
+members and their neighbours (`filters.groups`), draw configured groups as labelled regions behind
+their members (`groups`: keys or `"all"`), and keep only what lies within `visibility`
+relationship hops of its focus. These apply to the architecture view. The browser lists saved
+views in the sidebar.
 
 `--png` needs `resvg`, `rsvg-convert` or `magick` on PATH outside the checkout, and refuses
 without one. A dark or auto theme in a PNG is only as dark as the rasterizer's CSS support makes

@@ -800,6 +800,7 @@ fn schemas_describe_the_vault_files() {
             "model-picture",
             "model-proposal",
             "model-release",
+            "model-view",
             "model-walkthrough",
             "module",
             "vault-config"
@@ -5916,6 +5917,356 @@ fn render_routes_around_boxes_and_keeps_labels_apart() {
     shop(&small);
     assert_clean_layout(&small.render(&[]));
     assert_clean_layout(&small.render(&["--depth", "1"]));
+}
+
+/// Asserts each group region's name meets no leaf box, no box's text, no container but from
+/// inside, no relationship label, no route and no other region's name.
+fn assert_regions_clear(svg: &str) {
+    let modules: Vec<(Area, Vec<Area>)> = (groups(svg, "module").into_iter())
+        .map(|body| {
+            let rect = tags(body, "rect")[0];
+            let area = Area {
+                x: number(rect, "x"),
+                y: number(rect, "y"),
+                w: number(rect, "width"),
+                h: number(rect, "height"),
+            };
+            (area, text_areas(body))
+        })
+        .collect();
+    let plates: Vec<Area> = (groups(svg, "relationship label").into_iter())
+        .map(|body| {
+            let rect = tags(body, "rect")[0];
+            Area {
+                x: number(rect, "x"),
+                y: number(rect, "y"),
+                w: number(rect, "width"),
+                h: number(rect, "height"),
+            }
+        })
+        .collect();
+    let mut segments = Vec::new();
+    for body in groups(svg, "relationship") {
+        let points: Vec<(f64, f64)> = (attr(tags(body, "polyline")[0], "points").unwrap())
+            .split(' ')
+            .map(|p| {
+                let (x, y) = p.split_once(',').unwrap();
+                (x.parse().unwrap(), y.parse().unwrap())
+            })
+            .collect();
+        segments.extend(points.windows(2).map(|pair| Area {
+            x: pair[0].0.min(pair[1].0),
+            y: pair[0].1.min(pair[1].1),
+            w: (pair[0].0 - pair[1].0).abs(),
+            h: (pair[0].1 - pair[1].1).abs(),
+        }));
+    }
+    let names: Vec<Area> = (groups(svg, "region").into_iter())
+        .map(|body| text_areas(body)[0])
+        .collect();
+    assert!(!names.is_empty(), "no region: {svg}");
+    for (k, name) in names.iter().enumerate() {
+        for other in &names[k + 1..] {
+            assert!(
+                !name.overlaps(other),
+                "region names meet: {name:?} {other:?}"
+            );
+        }
+        for (i, (area, texts)) in modules.iter().enumerate() {
+            let container = (modules.iter().enumerate()).any(|(k, (b, _))| k != i && area.holds(b));
+            assert!(
+                !name.overlaps(area) || (container && area.holds(name)),
+                "the region name at {name:?} meets the box at {area:?}: {svg}"
+            );
+            for text in texts {
+                assert!(
+                    !name.overlaps(text),
+                    "the region name at {name:?} meets a title"
+                );
+            }
+        }
+        for plate in &plates {
+            assert!(
+                !name.overlaps(plate),
+                "the region name at {name:?} meets a label"
+            );
+        }
+        for segment in &segments {
+            assert!(
+                !name.overlaps(segment),
+                "a route crosses the region name at {name:?}"
+            );
+        }
+    }
+}
+
+/// The platform with the groups `edge` (Web UI, Mobile App and Gateway inside Platform) and
+/// `store` (Postgres and Redis).
+fn grouped_platform(checkout: &Checkout) {
+    platform(checkout);
+    let path = checkout.vault().join("config.yaml");
+    let mut config: Value = serde_yaml_ng::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    config["groups"] =
+        json!({"edge": {"name": "Edge", "color": "#e8590c"}, "store": {"name": "Storage"}});
+    fs::write(&path, serde_yaml_ng::to_string(&config).unwrap()).unwrap();
+    let mut changes = Vec::new();
+    for (name, group) in [
+        ("Web UI", "edge"),
+        ("Mobile App", "edge"),
+        ("Gateway", "edge"),
+        ("Postgres", "store"),
+        ("Redis", "store"),
+    ] {
+        changes.push(json!({"type": "edit-module", "subject": name, "set": {"groups": [group]}}));
+    }
+    checkout.edited(Value::Array(changes));
+}
+
+#[test]
+fn group_regions_and_the_group_filter_keep_the_layout_clean() {
+    let checkout = Checkout::new();
+    grouped_platform(&checkout);
+    let plain = checkout.render(&[]);
+    checkout.edited(
+        json!([{"type": "add-view", "view": {"name": "Groups", "order": 0,
+        "reading": {"view": "architecture", "groups": "all"}}}]),
+    );
+    let regions = checkout.render(&["--saved-view", "Groups"]);
+    assert_eq!(
+        regions.matches("<g class=\"region\">").count(),
+        2,
+        "{regions}"
+    );
+    let edge = group_holding(&regions, "region", ">Edge</text>").unwrap();
+    assert!(
+        edge.contains("fill=\"#e8590c\" stroke=\"#e8590c\" fill-opacity=\"0.1\""),
+        "{edge}"
+    );
+    assert!(group_holding(&regions, "region", ">Storage</text>").is_some());
+    assert_clean_layout(&regions);
+    assert_regions_clear(&regions);
+    // Without regions the drawing is the one the flags draw.
+    checkout.edited(json!([{"type": "edit-view", "subject": "Groups", "clear": ["groups"]}]));
+    assert_eq!(checkout.render(&["--saved-view", "Groups"]), plain);
+    checkout.edited(json!([{"type": "edit-view", "subject": "Groups",
+        "set": {"groups": ["store"], "depth": 1}}]));
+    let collapsed = checkout.render(&["--saved-view", "Groups"]);
+    assert_eq!(collapsed.matches("<g class=\"region\">").count(), 1);
+    assert_clean_layout(&collapsed);
+    assert_regions_clear(&collapsed);
+
+    // The group filter draws the members and, dimmed, what they have relationships with.
+    let filtered = checkout.render(&["--group", "store"]);
+    for name in [
+        "Postgres", "Redis", "Orders", "Catalog", "Worker", "Platform",
+    ] {
+        assert!(
+            filtered.contains(&format!(">{name}</text>")),
+            "{name}: {filtered}"
+        );
+    }
+    for name in ["Web UI", "Mobile App", "Gateway", "Billing", "Stripe"] {
+        assert!(
+            !filtered.contains(&format!(">{name}</text>")),
+            "{name}: {filtered}"
+        );
+    }
+    let dimmed = |name: &str| {
+        filtered
+            .split("<g class=\"dimmed\"")
+            .skip(1)
+            .any(|part| part[..part.find("</g>").unwrap()].contains(&format!(">{name}</text>")))
+    };
+    assert!(dimmed("Orders") && dimmed("Worker") && !dimmed("Postgres") && !dimmed("Redis"));
+    assert_clean_layout(&filtered);
+    let (_, json) = checkout.run(&[
+        "render", "--group", "edge", "--group", "store", "--format", "json",
+    ]);
+    // Stripe talks only to Billing, a neighbour, not a member.
+    let drawn = json["modules"].as_array().unwrap();
+    assert_eq!(drawn.len(), 10, "{json:#}");
+    assert!(!json["svg"].as_str().unwrap().contains(">Stripe</text>"));
+    checkout.refused(&["render", "--group", "nowhere"], "REQUEST_INVALID");
+    // A configured group with no module drawn would draw nothing of it.
+    let path = checkout.vault().join("config.yaml");
+    let mut config: Value = serde_yaml_ng::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    config["groups"]["idle"] = json!({"name": "Idle"});
+    fs::write(&path, serde_yaml_ng::to_string(&config).unwrap()).unwrap();
+    let error = checkout.refused(&["render", "--group", "idle"], "REQUEST_INVALID");
+    assert!(
+        error["message"].as_str().unwrap().contains("`idle`"),
+        "{error:#}"
+    );
+    checkout.refused(
+        &["render", "--group", "store", "--saved-view", "Groups"],
+        "REQUEST_INVALID",
+    );
+}
+
+#[test]
+fn saved_views_are_read_and_drawn_and_write_no_file() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let q = |id: &str| format!("{model}#{id}");
+    let out = checkout.edited(json!([{"type": "add-view", "view": {
+        "name": "Payments", "order": 0, "description": "Who pays whom",
+        "reading": {"view": "architecture", "focus": ["Billing"], "visibility": 1,
+            "selection": ["Bank"], "filters": {"relationships": ["call"]}}}}]));
+    let id = out["allocated"][0]["id"].as_str().unwrap().to_owned();
+    let local = id.split_once('#').unwrap().1.to_owned();
+    let path = format!("views/{local}.view.json");
+    let file: Value =
+        serde_json::from_str(&fs::read_to_string(checkout.vault().join(&path)).unwrap()).unwrap();
+    let (_, schema) = checkout.run(&["schema", "model-view"]);
+    assert!(jsonschema::validator_for(&schema).unwrap().is_valid(&file));
+    assert_eq!(
+        file["reading"],
+        json!({"view": "architecture", "focus": [q("Billing1")], "selection": [q("BankApi1")],
+            "filters": {"relationships": ["call"]}, "visibility": 1})
+    );
+
+    let read = checkout.ok(&["read"]);
+    assert_eq!(read["views"][0]["id"], id.as_str());
+    assert_eq!(read["views"][0]["reading"], file["reading"]);
+    assert!(
+        read["revision"]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["path"] == path.as_str())
+    );
+    let one = checkout.ok(&["read", "--view", "Payments"]);
+    assert_eq!(
+        (one["kind"].as_str(), &one["view"]["name"]),
+        (Some("read-view"), &json!("Payments"))
+    );
+    assert_eq!(checkout.ok(&["read", &local])["view"]["id"], id.as_str());
+    let (_, text) = checkout.run_raw(&["read", "--view", &id, "--format", "markdown"]);
+    assert_eq!(
+        text,
+        format!(
+            "View Payments {id}\nWho pays whom\nShows: architecture in the current state, focus on Billing within 1 hop, Bank selected, only call relationships\n"
+        )
+    );
+    let (_, text) = checkout.run_raw(&["read", "--format", "markdown"]);
+    assert!(
+        text.contains(&format!("Views:\n- Payments {id}\n")),
+        "{text}"
+    );
+
+    // Drawing it writes nothing. Bank is one call away from Billing; Web reaches Billing only
+    // over HTTP, which the filter hides, so it is left out.
+    let status = || {
+        git(
+            &checkout,
+            &["status", "--porcelain", "--untracked-files=all"],
+        )
+    };
+    let before = status();
+    let svg = checkout.render(&["--saved-view", "Payments"]);
+    assert_eq!(status(), before);
+    assert!(
+        svg.contains(&format!(
+            "<g class=\"module selected\" data-id=\"{}\">",
+            q("BankApi1")
+        )),
+        "{svg}"
+    );
+    assert!(
+        !svg.contains(">Web</text>") && svg.contains(">Billing</text>"),
+        "{svg}"
+    );
+    assert_eq!(checkout.render(&["--saved-view", &id]), svg);
+    checkout.refused(
+        &["render", "--saved-view", "Payments", "--depth", "1"],
+        "REQUEST_INVALID",
+    );
+    checkout.refused(&["render", "--saved-view", "Nothing"], "SUBJECT_NOT_FOUND");
+    checkout.refused(&["read", "--view", "Nothing"], "SUBJECT_NOT_FOUND");
+
+    let error = checkout.edit_refused(
+        &checkout.request(json!([{"type": "remove-module", "subject": "Bank"}])),
+        "REFERENCED_BY_VIEW",
+    );
+    assert_eq!(error["details"]["views"], json!([id]));
+    let error = checkout.edit_refused(
+        &checkout.request(json!([{"type": "edit-view", "subject": "Payments",
+            "set": {"view": "sequence"}}])),
+        "MODEL_INVALID",
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("apply to the architecture view only"),
+        "{error}"
+    );
+
+    // A view reading a proposal that goes away warns in the check.
+    let proposal = propose(&checkout, "Next", "current");
+    let request = proposal_request(
+        &checkout,
+        &proposal,
+        "tester",
+        json!([{"type": "remove-view", "subject": "Payments"}]),
+    );
+    let (code, out) = edit_proposal(&checkout, &proposal, &request);
+    assert_eq!(
+        (code, &out["error"]["code"]),
+        (2, &json!("REQUEST_INVALID")),
+        "{out:#}"
+    );
+    checkout.edited(
+        json!([{"type": "add-view", "view": {"name": "Next", "order": 1,
+        "reading": {"view": "architecture", "state": {"proposal": proposal}}}}]),
+    );
+    checkout.render(&["--saved-view", "Next"]);
+    fs::remove_dir_all(checkout.vault().join("proposals")).unwrap();
+    let (_, check) = checkout.run(&["check", "--only", "semantic"]);
+    let codes: Vec<&str> = (check["diagnostics"].as_array().unwrap().iter())
+        .filter_map(|d| d["code"].as_str())
+        .collect();
+    assert!(codes.contains(&"VIEW_TARGET_MISSING"), "{check:#}");
+
+    checkout.edited(json!([{"type": "remove-view", "subject": "Payments"}]));
+    assert!(!checkout.vault().join(&path).exists());
+}
+
+#[test]
+fn a_beat_draws_its_selection_filters_and_visibility() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let q = |id: &str| format!("{model}#{id}");
+    checkout.edited(
+        json!([{"type": "add-walkthrough", "walkthrough": {"name": "Tour", "order": 0,
+        "beats": [{"title": "Billing", "narration": "Billing alone.",
+            "reading": {"view": "architecture", "focus": ["Billing"], "visibility": 0,
+                "selection": ["Billing"]}}]}}]),
+    );
+    let svg = checkout.render(&["--walkthrough", "Tour", "--beat", "1"]);
+    assert!(
+        svg.contains(&format!(
+            "<g class=\"module selected\" data-id=\"{}\">",
+            q("Billing1")
+        )),
+        "{svg}"
+    );
+    assert!(
+        !svg.contains(">Web</text>") && !svg.contains(">Bank</text>"),
+        "{svg}"
+    );
+    let beat = checkout.ok(&["read", "--walkthrough", "Tour"])["walkthrough"]["beats"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    checkout.edited(json!([{"type": "edit-beat", "subject": beat,
+        "clear": ["visibility", "selection"], "set": {"filters": {"relationships": ["http"]}}}]));
+    let svg = checkout.render(&["--walkthrough", "Tour", "--beat", "1"]);
+    assert!(
+        svg.contains(">charges</text>") && svg.contains(">Bank</text>"),
+        "{svg}"
+    );
+    assert_eq!(svg.matches("<g class=\"relationship\"").count(), 1, "{svg}");
+    assert!(!svg.contains("module selected"));
 }
 
 #[test]
@@ -11428,4 +11779,36 @@ fn checkpoints_in_markdown_escape_control_characters_from_history_text() {
     );
     assert!(text.contains(r#"by a\u{7}b at"#), "{text}");
     assert!(text.contains(r#": \u{1b}[2J"quoted" C:\path"#), "{text}");
+}
+
+#[test]
+fn view_lists_saved_views_and_draws_one_as_stored() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let out = checkout.edited(json!([{"type": "add-view", "view": {"name": "Selected",
+        "order": 0, "reading": {"view": "architecture", "selection": ["Billing"]}}}]));
+    let id = out["allocated"][0]["id"].as_str().unwrap().to_owned();
+    let view = View::start(&checkout);
+    let t = &view.token;
+    let (status, svg) = view.get(&format!(
+        "/api/render?t={t}&saved={}",
+        id.replace('#', "%23")
+    ));
+    assert_eq!(status, 200, "{svg}");
+    let selected = format!("<g class=\"module selected\" data-id=\"{model}#Billing1\">");
+    assert!(View::body(&svg).contains(&selected), "{svg}");
+    // A picture and a saved view each say what to draw, as the flags conflict.
+    let (status, refused) = view.get(&format!(
+        "/api/render?t={t}&saved={}&picture=Selected",
+        id.replace('#', "%23")
+    ));
+    assert_eq!(status, 400, "{refused}");
+    let refused: Value = serde_json::from_str(View::body(&refused)).unwrap();
+    assert_eq!(refused["error"]["code"], "REQUEST_INVALID");
+    let (_, page) = view.get("/");
+    assert!(page.contains("id=\"views\""));
+    let (_, script) = view.get("/app.js");
+    for control in ["showView", "{ saved: id }", "data?.views"] {
+        assert!(script.contains(control), "{control}");
+    }
 }

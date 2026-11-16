@@ -11,7 +11,8 @@ use super::{CURRENT_ONLY, MANIFEST, file_json, revision};
 use super::{Contents, Model, Problems, check_file, check_text, pick};
 use crate::arch::types::{
     BEATS_MAX, Beat, BeatReading, Collection, DESCRIPTION_MAX, LABEL_MAX, Module, NARRATION_MAX,
-    READING_DEPTH_MAX, ReadingState, ReadingView, Walkthrough,
+    READING_DEPTH_MAX, ReadingGroups, ReadingState, ReadingView, VISIBILITY_MAX, VaultConfig,
+    Walkthrough,
 };
 use crate::arch::{Refusal, ids, one_line};
 use crate::files::hash;
@@ -56,8 +57,14 @@ impl Known {
     }
 }
 
-/// Every walkthrough's own fields and beats. References are judged only with the model ID.
-pub(super) fn check(model: Option<&str>, contents: Contents<'_>, problems: &mut Problems) {
+/// Every walkthrough's own fields and beats. References are judged only with the model ID, and
+/// configured keys only with the config.
+pub(super) fn check(
+    model: Option<&str>,
+    config: Option<&VaultConfig>,
+    contents: Contents<'_>,
+    problems: &mut Problems,
+) {
     let known = Known::new(model, contents);
     for (file, walkthrough) in contents.walkthroughs {
         let id = walkthrough.id.as_str();
@@ -75,12 +82,18 @@ pub(super) fn check(model: Option<&str>, contents: Contents<'_>, problems: &mut 
             );
         }
         for beat in &walkthrough.beats {
-            check_beat(file, beat, known.as_ref(), problems);
+            check_beat(file, beat, known.as_ref(), config, problems);
         }
     }
 }
 
-fn check_beat(file: &str, beat: &Beat, known: Option<&Known>, problems: &mut Problems) {
+fn check_beat(
+    file: &str,
+    beat: &Beat,
+    known: Option<&Known>,
+    config: Option<&VaultConfig>,
+    problems: &mut Problems,
+) {
     let id = beat.id.as_str();
     if !one_line(&beat.title, LABEL_MAX) {
         let message = format!("title needs 1 to {LABEL_MAX} characters and no control characters");
@@ -99,20 +112,59 @@ fn check_beat(file: &str, beat: &Beat, known: Option<&Known>, problems: &mut Pro
         Some(NARRATION_MAX),
         true,
     );
-    for message in reading_problems(&beat.reading, known) {
+    for message in reading_problems(&beat.reading, known, config) {
         problems.push(file, id, message);
     }
 }
 
 /// Why a reading does not hold: fields that do not go together, as `model render` refuses them,
-/// a focus listed twice, and references. Into the current state they must exist; into a proposal
-/// or checkpoint they must be well formed.
-pub(super) fn reading_problems(reading: &BeatReading, known: Option<&Known>) -> Vec<String> {
+/// a module, kind or group listed twice, keys `config` lacks, and references. Into the current
+/// state they must exist; into a proposal or checkpoint they must be well formed.
+pub(super) fn reading_problems(
+    reading: &BeatReading,
+    known: Option<&Known>,
+    config: Option<&VaultConfig>,
+) -> Vec<String> {
     let mut out = shape_problems(reading);
-    let mut seen = BTreeSet::new();
-    for module in &reading.focus {
-        if !seen.insert(module) {
-            out.push(format!("focus lists {module} more than once"));
+    let filters = reading.filters.as_ref();
+    let regions = match &reading.groups {
+        Some(ReadingGroups::Keys(keys)) => keys.as_slice(),
+        _ => &[],
+    };
+    let lists = [
+        ("focus", reading.focus.as_slice()),
+        ("selection", &reading.selection),
+        (
+            "filters.relationships",
+            filters.map_or(&[][..], |f| &f.relationships),
+        ),
+        ("filters.groups", filters.map_or(&[][..], |f| &f.groups)),
+        ("groups", regions),
+    ];
+    for (field, list) in lists {
+        let mut seen = BTreeSet::new();
+        for item in list {
+            if !seen.insert(item) {
+                out.push(format!("{field} lists {item} more than once"));
+            }
+        }
+    }
+    if let Some(config) = config {
+        let kinds = (filters.into_iter()).flat_map(|f| &f.relationships);
+        for kind in kinds.filter(|k| !config.relationship_kinds.contains_key(*k)) {
+            out.push(format!(
+                "filters.relationships names `{kind}`, not a relationship kind in config.yaml"
+            ));
+        }
+        let groups = (filters
+            .into_iter()
+            .flat_map(|f| &f.groups)
+            .map(|g| ("filters.groups", g)))
+        .chain(regions.iter().map(|g| ("groups", g)));
+        for (field, group) in groups.filter(|(_, g)| !config.groups.contains_key(*g)) {
+            out.push(format!(
+                "{field} names `{group}`, not a group in config.yaml"
+            ));
         }
     }
     if let Some(known) = known {
@@ -143,6 +195,34 @@ fn shape_problems(reading: &BeatReading) -> Vec<String> {
         .is_some_and(|d| !(1..=READING_DEPTH_MAX).contains(&d))
     {
         out.push(format!("depth needs 1 to {READING_DEPTH_MAX}"));
+    }
+    let arranged = !reading.selection.is_empty()
+        || reading.filters.is_some()
+        || reading.groups.is_some()
+        || reading.visibility.is_some();
+    if reading.view != ReadingView::Architecture && arranged {
+        out.push(
+            "selection, filters, groups and visibility apply to the architecture view only"
+                .to_owned(),
+        );
+    }
+    if reading
+        .filters
+        .as_ref()
+        .is_some_and(|f| f.relationships.is_empty() && f.groups.is_empty())
+    {
+        out.push("filters names no relationship kind or group".to_owned());
+    }
+    if matches!(&reading.groups, Some(ReadingGroups::Keys(keys)) if keys.is_empty()) {
+        out.push("groups lists no group".to_owned());
+    }
+    if let Some(visibility) = reading.visibility {
+        if visibility > VISIBILITY_MAX {
+            out.push(format!("visibility needs 0 to {VISIBILITY_MAX}"));
+        }
+        if reading.focus.is_empty() {
+            out.push("visibility counts hops from the focus; add a focus".to_owned());
+        }
     }
     match &reading.against {
         Some(ReadingState::Checkpoint(_)) => out.push(
@@ -186,7 +266,8 @@ fn reference_problems(reading: &BeatReading, known: &Known) -> Vec<String> {
     let current = reading.state.is_current();
     let modules = reading.scope.iter().map(|s| ("scope", s));
     let focus = reading.focus.iter().map(|f| ("focus", f));
-    for (field, module) in modules.chain(focus) {
+    let selection = reading.selection.iter().map(|s| ("selection", s));
+    for (field, module) in modules.chain(focus).chain(selection) {
         if current && !known.modules.contains(module) {
             out.push(format!("{field} {module} is not a module"));
         } else if !current && !qualified(module) {
@@ -249,9 +330,9 @@ pub struct BeatView<'a> {
 
 impl Model {
     /// The digest a proposal drawn from this current state records as its predecessor: the
-    /// revision without the walkthrough and picture files, which a proposal neither holds nor
-    /// replaces, and with `model.json` in canonical form without its retired IDs, which removing a
-    /// beat, walkthrough or picture grows.
+    /// revision without the walkthrough, picture and view files, which a proposal neither holds
+    /// nor replaces, and with `model.json` in canonical form without its retired IDs, which
+    /// removing a beat, walkthrough, picture or view grows.
     pub fn predecessor_digest(&self) -> Result<String> {
         let mut manifest = self.manifest.clone();
         manifest.retired_ids.clear();
@@ -351,14 +432,13 @@ mod tests {
             None,
             &[],
             &[],
-            &[walkthrough],
-            &[],
+            (&[walkthrough], &[], &[]),
         );
         found.into_iter().map(|p| p.message).collect()
     }
 
     /// The (subject, message) of each problem of one walkthrough holding one beat reading
-    /// `reading`, over modules Web and Api and the flow Checkout.
+    /// `reading`, over modules Web and Api, the flow Checkout and the group `core`.
     fn problems_of(reading: Value) -> Vec<(String, String)> {
         let module = |id: &str| -> Module {
             serde_json::from_value(
@@ -376,14 +456,16 @@ mod tests {
             "beats": [{"id": "Beat0001", "title": "Start", "narration": "Here\nwe go", "reading": reading}],
         }))
         .unwrap();
+        let mut config = VaultConfig::default();
+        let core = serde_json::from_value(json!({"name": "Core"})).unwrap();
+        config.groups.insert("core".to_owned(), core);
         super::super::problems(
             &manifest(),
-            &VaultConfig::default(),
+            &config,
             None,
             &[module("WebApp01"), module("ApiSrv01")],
             &[collection],
-            &[walkthrough],
-            &[],
+            (&[walkthrough], &[], &[]),
         )
         .into_iter()
         .map(|p| {
@@ -475,6 +557,58 @@ mod tests {
         let older = json!({"view": "architecture", "state": {"proposal": q("Propose1")},
             "against": "current"});
         assert_eq!(problems_of(older), []);
+    }
+
+    #[test]
+    fn arranged_readings_name_configured_kinds_and_groups() {
+        let good = json!({"view": "architecture", "focus": [q("ApiSrv01")], "visibility": 0,
+            "selection": [q("WebApp01")], "filters": {"relationships": ["call"], "groups": ["core"]},
+            "groups": ["core"]});
+        assert_eq!(problems_of(good), []);
+        let all = json!({"view": "architecture", "groups": "all"});
+        assert_eq!(problems_of(all), []);
+        let elsewhere = json!({"view": "architecture", "state": {"proposal": q("Propose1")},
+            "selection": [q("Gone0001")]});
+        assert_eq!(problems_of(elsewhere), []);
+        assert_eq!(
+            messages(
+                json!({"view": "sequence", "flow": q("Flow0001"), "visibility": 1,
+                "focus": [q("ApiSrv01")]})
+            ),
+            ["selection, filters, groups and visibility apply to the architecture view only"]
+        );
+        assert_eq!(
+            messages(
+                json!({"view": "architecture", "selection": [q("Gone0001"), q("Gone0001")],
+                "filters": {"relationships": ["call", "telepathy", "call"]},
+                "groups": ["core", "edge"], "visibility": 10})
+            ),
+            [
+                "visibility needs 0 to 9".to_owned(),
+                "visibility counts hops from the focus; add a focus".to_owned(),
+                format!("selection lists {} more than once", q("Gone0001")),
+                "filters.relationships lists call more than once".to_owned(),
+                "filters.relationships names `telepathy`, not a relationship kind in config.yaml"
+                    .to_owned(),
+                "groups names `edge`, not a group in config.yaml".to_owned(),
+                format!("selection {} is not a module", q("Gone0001")),
+                format!("selection {} is not a module", q("Gone0001")),
+            ]
+        );
+        assert_eq!(
+            messages(
+                json!({"view": "architecture", "filters": {"groups": ["edge"]},
+                "groups": []})
+            ),
+            [
+                "groups lists no group",
+                "filters.groups names `edge`, not a group in config.yaml",
+            ]
+        );
+        assert_eq!(
+            messages(json!({"view": "architecture", "filters": {}})),
+            ["filters names no relationship kind or group"]
+        );
     }
 
     #[test]

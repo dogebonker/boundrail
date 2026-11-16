@@ -87,8 +87,8 @@ impl SkipReason {
 }
 
 /// What a skip concerns: a module's binding, a relationship's or message step's anchor, the
-/// relationship, a language server (its name, or the config file), a walkthrough's beat, or a
-/// picture.
+/// relationship, a language server (its name, or the config file), a walkthrough's beat, a
+/// picture, or a saved view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SkipSite {
@@ -98,6 +98,7 @@ pub enum SkipSite {
     LanguageServer,
     Walkthrough,
     Picture,
+    View,
 }
 
 impl SkipSite {
@@ -109,14 +110,15 @@ impl SkipSite {
             Self::LanguageServer => "language-server",
             Self::Walkthrough => "walkthrough",
             Self::Picture => "picture",
+            Self::View => "view",
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct Skip {
-    /// Qualified ID of the module, relationship, step, beat or picture, or a language server's
-    /// name.
+    /// Qualified ID of the module, relationship, step, beat, picture or view, or a language
+    /// server's name.
     pub subject: String,
     pub site: SkipSite,
     pub reason: SkipReason,

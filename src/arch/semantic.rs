@@ -424,14 +424,31 @@ pub fn walkthroughs(states: &mut States<'_>) -> (Vec<Diagnostic>, Vec<Skip>) {
     (out, skips)
 }
 
-/// The scope, focus and flow of `reading` that `target`, the state named `state`, does not hold.
+/// `VIEW_TARGET_MISSING` for a saved view whose target the current state's `states` cannot draw,
+/// as `targets` judges it, with its skips.
+pub fn views(states: &mut States<'_>) -> (Vec<Diagnostic>, Vec<Skip>) {
+    let model = states.current();
+    let views = model.view_entries();
+    let readings = views.iter().map(|v| Judged {
+        code: DiagnosticCode::ViewTargetMissing,
+        subjects: vec![v.id.clone()],
+        label: v.name.to_owned(),
+        site: SkipSite::View,
+        reading: v.reading,
+    });
+    targets(states, readings)
+}
+
+/// The scope, focus, selection and flow of `reading` that `target`, the state named `state`, does
+/// not hold.
 fn lacks(target: &Model, reading: &BeatReading, state: &ReadingState) -> Vec<String> {
     let place = state.text();
     let (modules, flows) =
         vault::reading_ids(&target.manifest.id, &target.modules, &target.collections);
     let mut out = Vec::new();
     let named = (reading.scope.iter().map(|s| ("scope", s)))
-        .chain(reading.focus.iter().map(|f| ("focus", f)));
+        .chain(reading.focus.iter().map(|f| ("focus", f)))
+        .chain(reading.selection.iter().map(|s| ("selection", s)));
     for (field, module) in named.filter(|(_, m)| !modules.contains(*m)) {
         out.push(format!("{field} {module} is not a module of {place}"));
     }

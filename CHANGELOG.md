@@ -45,6 +45,17 @@
   and `--png` with `--scale` and `--region`. `--format json` adds the revision, width, height,
   module and relationship IDs drawn, the SVG's SHA-256, and `fallbacks: {routes, labels}`; a note on
   stderr names any fallback. A dark or auto theme in a PNG depends on the rasterizer's CSS support.
+- Readings gain `selection` (modules outlined as selected, nothing dimmed), `filters` with
+  `relationships` (the kinds drawn) and `groups` (only those groups' members as usual and their
+  direct neighbours dimmed), `groups` (configured groups drawn as labelled regions behind their
+  members, by key or `"all"`), and `visibility` (relationship hops from the focus kept drawn). All
+  apply to the architecture view, are optional, and are validated on write against
+  `config.yaml`. `model render --group <key>` (repeatable) is the group filter on the command line.
+  Readings without them draw the same bytes as before.
+- Saved views: `views/<id>.view.json` (schema `model-view`), a named reading of the current state
+  that writes no file, with `add-view`, `edit-view` and `remove-view` edits, `model read --view`,
+  `model render --saved-view`, `REFERENCED_BY_VIEW` when an edit removes what one reads,
+  `VIEW_TARGET_MISSING` in `model check`, and a Views list in the browser's sidebar.
 - Relationship `traffic`: an optional `{protocol, sync, rate, payload}` (`sync` is `sync` or
   `async`; at least one field), set and cleared through `edit-relationship`, shown by `model read`,
   a changed field in `model compare`, and drawn in brackets after the label of an arrow that

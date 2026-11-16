@@ -265,6 +265,19 @@ async function loadPictures() {
   renderPictures();
 }
 
+/** A pane showing a saved view follows it after a reload, or keeps what it shows once the view
+ * is gone. */
+async function followViews() {
+  const { data } = await loadModel({ kind: 'current' });
+  for (const pane of app.panes) {
+    const id = pane.beat?.saved;
+    if (!id) continue;
+    const view = (data?.views ?? []).find((v) => v.id === id);
+    if (view) applyReading(pane, view.reading, { saved: id });
+    else pane.beat = null;
+  }
+}
+
 /** Asks the server to draw every picture and compare it with its file. */
 async function checkPictures() {
   const [data, error] = await attempt(api('pictures', { status: 1 }));
@@ -289,7 +302,7 @@ async function loadPane(pane) {
 async function loadAll() {
   forget();
   app.currentFailed = false;
-  await Promise.all([refreshPlay(), loadPictures()]);
+  await Promise.all([refreshPlay(), loadPictures(), followViews()]);
   await Promise.all([loadLists(), ...app.panes.map(loadPane)]);
   showActive();
   renderPlay();
@@ -303,6 +316,7 @@ function showActive() {
   renderTree();
   renderFlows();
   renderWalkthroughs();
+  renderViews();
   renderDetail();
   app.panes.forEach(renderCrumbs);
   loadCheck(ticket);
@@ -537,6 +551,46 @@ async function renderWalkthroughs() {
       }, w.name, `${w.beats} beat${w.beats === 1 ? '' : 's'}`));
     }
   });
+}
+
+/** The current state's saved views; opening one draws its reading in the active pane. */
+async function renderViews() {
+  const { data, error } = await loadModel({ kind: 'current' });
+  const box = $('#views');
+  const list = data?.views ?? [];
+  markEmpty(box, Boolean(data) && !list.length);
+  keepFocus(box, () => {
+    box.replaceChildren();
+    if (!data) return box.append(note(error));
+    if (!list.length) return box.append(note('No saved views yet.'));
+    const shown = activePane().beat?.saved;
+    for (const v of list) {
+      box.append(item({
+        class: shown === v.id ? 'item selected' : 'item',
+        'data-key': v.id,
+        'aria-current': shown === v.id ? 'true' : null,
+        title: v.description,
+        onclick: () => showView(v.id),
+      }, v.name));
+    }
+  });
+}
+
+/** Shows what saved view `id` reads in the active pane, as the server draws it. */
+async function showView(id) {
+  const { data } = await loadModel({ kind: 'current' });
+  const view = (data?.views ?? []).find((v) => v.id === id);
+  if (!view) return;
+  if (app.play) {
+    app.play = null;
+    history.replaceState(null, '', location.pathname);
+    renderPlay();
+  }
+  const pane = activePane();
+  applyReading(pane, view.reading, { saved: id });
+  await loadPane(pane);
+  fit(pane);
+  showActive();
 }
 
 /** The current state's pictures, with whether each file still matches what the model draws once

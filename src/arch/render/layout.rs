@@ -904,6 +904,22 @@ pub(super) fn labels(
     (centers, stuck)
 }
 
+/// A rectangle of `size` that keeps clear of every box, except inside a container below its
+/// header, by more than a route's straight start, and meets no fixed area: centered on `center`
+/// when that is free, else on the first free spot of the rings around it, as labels search.
+pub(super) fn free_spot(scene: &Scene<'_>, (w, h): Point, center: Point) -> Rect {
+    let rect = |c: Point| Rect {
+        x: c.0 - w / 2.0,
+        y: c.1 - h / 2.0,
+        w,
+        h,
+    };
+    let clear = CLEAR + LABEL_GAP;
+    let free = |c: &Point| !blocks_label(scene, &[], &inflate(&rect(*c), clear));
+    let found = (std::iter::once(center).chain(rings(center))).find(free);
+    rect(found.unwrap_or(center))
+}
+
 fn along(a: Point, b: Point) -> Vec<Point> {
     let length = (b.0 - a.0).abs() + (b.1 - a.1).abs();
     let middle = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);

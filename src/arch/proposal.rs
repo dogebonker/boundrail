@@ -157,8 +157,7 @@ pub(super) fn drawing(
         Some(&proposal),
         modules,
         collections,
-        &[],
-        &[],
+        (&[], &[], &[]),
     );
     if !problems.is_empty() {
         return Err(vault::invalid(&current.dir, problems));
@@ -166,7 +165,7 @@ pub(super) fn drawing(
     let modules: Vec<&Module> = modules.iter().collect();
     let collections: Vec<_> = collections.iter().collect();
     let mut writes = vec![vault::proposal_write(&proposal)?];
-    let copies = vault::plan_writes(None, &modules, &collections, &[], &[], &[])?;
+    let copies = vault::plan_writes(None, &modules, &collections, &[], &[], &[], &[])?;
     writes.extend(vault::in_proposal(&proposal.id, copies));
     if let Some(base) = base {
         writes.extend(vault::base_writes(&proposal.id, base, None)?);
@@ -213,13 +212,14 @@ pub fn adopt(
         refuse_compared(&drawn, compared)?;
         let taken = taken(vault, &[&current, &drawn])?;
         let state = ids::allocate(|candidate| taken.contains(candidate))?;
-        // Walkthroughs and pictures belong to the current state and stay as they are.
+        // Walkthroughs, pictures and views belong to the current state and stay as they are.
         let diff = edit::diff(
             &current,
             &drawn.modules,
             &drawn.collections,
             &current.walkthroughs,
             &current.pictures,
+            &current.views,
             &[],
         );
         let id = current.qualify(&proposal.id);
@@ -269,6 +269,7 @@ impl Adoption<'_> {
             &diff.write_collections,
             &diff.write_walkthroughs,
             &diff.write_pictures,
+            &diff.write_views,
             &diff.remove,
         )?;
         self.proposal.status = ProposalStatus::Adopted;
@@ -298,9 +299,9 @@ impl Adoption<'_> {
 }
 
 /// The manifest after adopting `drawn` as the state `state` named `name`, refusing
-/// `MODEL_INVALID` when the adopted state would not load, the current state's walkthroughs and
-/// pictures included: a beat or picture reading a module or flow the adopted state drops must be
-/// edited first. The
+/// `MODEL_INVALID` when the adopted state would not load, the current state's walkthroughs,
+/// pictures and views included: a beat, picture or view reading a module or flow the adopted
+/// state drops must be edited first. The
 /// state it replaces leaves the model with the IDs it drops, `retired`, and all stay reserved, as
 /// do the IDs the proposal dropped.
 fn adopted_manifest(
@@ -335,8 +336,7 @@ fn adopted_manifest(
         None,
         &drawn.modules,
         &drawn.collections,
-        &current.walkthroughs,
-        &current.pictures,
+        (&current.walkthroughs, &current.pictures, &current.views),
     );
     if !problems.is_empty() {
         return Err(vault::invalid(&current.dir, problems));
@@ -455,9 +455,9 @@ fn open(vault: &Path, subject: &str) -> Result<(Model, Proposal)> {
 /// drawn against a current state that has moved since.
 fn refuse_moved(current: &Model, proposal: &Proposal, expected: &str) -> Result<()> {
     refuse_stale(current, expected)?;
-    // Walkthroughs and pictures change on their own beside a proposal, so its predecessor leaves
-    // them out, and the retired IDs their removal grows. Drafts drawn before retired IDs were left
-    // out record model.json as it was on disk.
+    // Walkthroughs, pictures and views change on their own beside a proposal, so its predecessor
+    // leaves them out, and the retired IDs their removal grows. Drafts drawn before retired IDs
+    // were left out record model.json as it was on disk.
     let drawn_from = current.predecessor_digest()?;
     let recorded = &proposal.predecessor.revision;
     if *recorded != drawn_from && *recorded != current.earlier_predecessor_digest() {

@@ -8,7 +8,7 @@ use serde_json::json;
 use super::{Model, Problems, check_anchor, check_file, check_name, check_text};
 use crate::arch::types::{
     BRANCHES_MIN, Collection, DESCRIPTION_MAX, FLOW_STEPS_MAX, Flow, LABEL_MAX, Module,
-    NESTING_MAX, Picture, REPEAT_MIN, SUMMARY_MAX, Step, Walkthrough, walk,
+    NESTING_MAX, Picture, REPEAT_MIN, SUMMARY_MAX, SavedView, Step, Walkthrough, walk,
 };
 use crate::arch::{Code, Refusal, ids, one_line};
 
@@ -332,12 +332,13 @@ pub struct FlowView<'a> {
     pub steps: Vec<Step>,
 }
 
-/// A collection, a flow with the collection holding it, a walkthrough or a picture.
+/// A collection, a flow with the collection holding it, a walkthrough, a picture or a saved view.
 pub enum Found<'a> {
     Collection(&'a Collection),
     Flow(&'a Collection, &'a Flow),
     Walkthrough(&'a Walkthrough),
     Picture(&'a Picture),
+    View(&'a SavedView),
 }
 
 impl Model {
@@ -385,7 +386,8 @@ impl Model {
         }
     }
 
-    /// The collection, flow, walkthrough or picture whose qualified or local ID is `subject`.
+    /// The collection, flow, walkthrough, picture or saved view whose qualified or local ID is
+    /// `subject`.
     pub fn find_grouping(&self, subject: &str) -> Option<Found<'_>> {
         let local = ids::local(&self.manifest.id, subject);
         let walkthrough = || {
@@ -398,6 +400,7 @@ impl Model {
                         .find(|p| p.id == local)
                         .map(Found::Picture)
                 })
+                .or_else(|| self.views.iter().find(|v| v.id == local).map(Found::View))
         };
         self.collections
             .iter()
@@ -494,8 +497,7 @@ mod tests {
             None,
             &modules(),
             &[collection],
-            &[],
-            &[],
+            (&[], &[], &[]),
         )
         .into_iter()
         .map(|p| {
@@ -603,8 +605,7 @@ mod tests {
             None,
             &modules(),
             &[collection],
-            &[],
-            &[],
+            (&[], &[], &[]),
         )
         .into_iter()
         .map(|p| (p.subject, p.message))

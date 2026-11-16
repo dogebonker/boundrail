@@ -341,8 +341,7 @@ fn open_proposal(
             Some(&drawn),
             modules,
             collections,
-            &[],
-            &[],
+            (&[], &[], &[]),
         );
         if !problems.is_empty() {
             return Err(base_invalid(id, problems));

@@ -24,23 +24,26 @@ use super::request::{
 use super::revision::{self, Revision};
 use super::state::{self, Locked};
 use super::types::{
-    Anchor, Binding, Collection, Emphasis, Module, Picture, Relationship, SCHEMA_VERSION, Step,
-    Traffic, Walkthrough, walk,
+    Anchor, Binding, Collection, Emphasis, Module, Picture, Relationship, SCHEMA_VERSION,
+    SavedView, Step, Traffic, Walkthrough, walk,
 };
 use super::vault::{self, FileWrite, Model, Scope, relationships};
 use super::{Code, Refusal, ids, proposal};
 
 mod flow;
 mod picture;
+mod view;
 mod walkthrough;
 
 pub use flow::{
     CollectionField, CollectionSet, FlowField, FlowSet, NewBranch, NewCollection, NewFlow, NewStep,
     StepField, StepSet,
 };
-pub use picture::{NewPicture, PictureField, PictureSet};
+pub use picture::{NewPicture, PictureSet};
+pub use view::{NamedField, NewView, ViewSet};
 pub use walkthrough::{
-    BeatField, BeatSet, NewBeat, NewReading, NewWalkthrough, WalkthroughField, WalkthroughSet,
+    BeatField, BeatSet, NewBeat, NewReading, NewWalkthrough, ReadingSet, WalkthroughField,
+    WalkthroughSet,
 };
 
 const CHANGES_MAX: usize = 1000;
@@ -81,8 +84,8 @@ pub struct EditRequest {
 /// or former name, modules added earlier in the batch included; a collection, flow or walkthrough
 /// subject is a qualified or local ID or a unique name, likewise; a relationship, step, branch or
 /// beat subject is a qualified or local ID. A step's or beat's position is its index in its list,
-/// the end when absent. A picture subject is a qualified or local ID or a unique name. Walkthrough
-/// and picture changes apply to the current state only.
+/// the end when absent. A picture or view subject is a qualified or local ID or a unique name.
+/// Walkthrough, picture and view changes apply to the current state only.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Change {
@@ -236,10 +239,25 @@ pub enum Change {
         #[serde(default)]
         set: PictureSet,
         #[serde(default)]
-        clear: Vec<PictureField>,
+        clear: Vec<NamedField>,
     },
     /// Removes the picture's recipe; the file it drew stays.
     RemovePicture {
+        subject: String,
+    },
+    /// Adds a saved view: a named reading that writes no file.
+    AddView {
+        view: NewView,
+    },
+    /// Sets or clears a saved view's name, order, description and reading fields.
+    EditView {
+        subject: String,
+        #[serde(default)]
+        set: ViewSet,
+        #[serde(default)]
+        clear: Vec<NamedField>,
+    },
+    RemoveView {
         subject: String,
     },
 }
@@ -359,10 +377,11 @@ pub struct Receipt {
     pub checkpoint: Option<Checkpoint>,
 }
 
-/// Qualified IDs of the modules, relationships, collections, flows, walkthroughs and pictures the
-/// edit added, changed or removed. A module counts as changed when its file changed, including its
-/// outgoing relationships, and a collection when its file changed, including its flows. Steps,
-/// branches and beats are not listed; the flow or walkthrough holding them counts as changed.
+/// Qualified IDs of the modules, relationships, collections, flows, walkthroughs, pictures and
+/// views the edit added, changed or removed. A module counts as changed when its file changed,
+/// including its outgoing relationships, and a collection when its file changed, including its
+/// flows. Steps, branches and beats are not listed; the flow or walkthrough holding them counts
+/// as changed.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Subjects {
     pub added: Vec<String>,
@@ -698,6 +717,7 @@ fn plan(
         &batch.collections,
         &batch.walkthroughs,
         &batch.pictures,
+        &batch.views,
         &batch.fresh,
     );
 
@@ -724,8 +744,7 @@ fn plan(
         drawn,
         &batch.modules,
         &batch.collections,
-        &batch.walkthroughs,
-        &batch.pictures,
+        (&batch.walkthroughs, &batch.pictures, &batch.views),
     );
     if !problems.is_empty() {
         for problem in &mut problems {
@@ -741,6 +760,7 @@ fn plan(
         &diff.write_collections,
         &diff.write_walkthroughs,
         &diff.write_pictures,
+        &diff.write_views,
         &diff.remove,
     )?;
     let (scope, writes) = match drawn {
@@ -944,7 +964,9 @@ pub(super) struct Diff<'a> {
     pub(super) write_walkthroughs: Vec<&'a Walkthrough>,
     /// Picture files to write: added and changed pictures.
     pub(super) write_pictures: Vec<&'a Picture>,
-    /// Vault-relative paths of module, collection, walkthrough and picture files to delete.
+    /// View files to write: added and changed views.
+    pub(super) write_views: Vec<&'a SavedView>,
+    /// Vault-relative paths of module, collection, walkthrough, picture and view files to delete.
     pub(super) remove: Vec<String>,
     /// IDs leaving the model, allocated-then-removed ones included; they stay reserved.
     pub(super) retired: Vec<String>,
@@ -962,6 +984,7 @@ pub(super) fn diff<'a>(
     collections: &'a [Collection],
     walkthroughs: &'a [Walkthrough],
     pictures: &'a [Picture],
+    views: &'a [SavedView],
     fresh: &[String],
 ) -> Diff<'a> {
     let (old_modules, new_modules) = (by_id(&model.modules), by_id(new));
@@ -970,6 +993,7 @@ pub(super) fn diff<'a>(
     let grouped: BTreeSet<&str> = (collections.iter().flat_map(Collection::ids))
         .chain(walkthroughs.iter().flat_map(Walkthrough::ids))
         .chain(pictures.iter().map(|p| p.id.as_str()))
+        .chain(views.iter().map(|v| v.id.as_str()))
         .collect();
     let live = |id: &str| {
         new_modules.contains_key(id) || new_relationships.contains_key(id) || grouped.contains(id)
@@ -979,6 +1003,7 @@ pub(super) fn diff<'a>(
         write_collections: Vec::new(),
         write_walkthroughs: Vec::new(),
         write_pictures: Vec::new(),
+        write_views: Vec::new(),
         remove: Vec::new(),
         retired: Vec::new(),
         subjects: Subjects::default(),
@@ -1018,6 +1043,7 @@ pub(super) fn diff<'a>(
         walkthrough::diff_current_only(model, &model.walkthroughs, walkthroughs, &mut diff, told);
     diff.write_pictures =
         walkthrough::diff_current_only(model, &model.pictures, pictures, &mut diff, told);
+    diff.write_views = walkthrough::diff_current_only(model, &model.views, views, &mut diff, told);
     diff.retired
         .extend(fresh.iter().filter(|id| !live(id)).cloned());
     for list in [
@@ -1034,7 +1060,7 @@ pub(super) fn diff<'a>(
     // and target of each relationship added, changed, moved or removed. So is every module whose
     // current or former name an added or renamed module takes, since the name would then stop
     // naming it alone. Collections and flows are touched as `flow::diff_collections` says, and
-    // walkthroughs and pictures as `walkthrough::diff_current_only` says. IDs
+    // walkthroughs, pictures and views as `walkthrough::diff_current_only` says. IDs
     // this batch allocates are left out: allocation skips every ID the edited state holds or
     // reserves, so a claim holds one only by a random clash with an ID that only another state
     // holds (a proposal's, or for a proposal edit the current state's).
@@ -1130,7 +1156,8 @@ struct Batch<'a> {
     collections: Vec<Collection>,
     walkthroughs: Vec<Walkthrough>,
     pictures: Vec<Picture>,
-    /// Whether the batch edits a proposal, which holds no walkthroughs or pictures.
+    views: Vec<SavedView>,
+    /// Whether the batch edits a proposal, which holds no walkthroughs, pictures or views.
     in_proposal: bool,
     removed: BTreeSet<String>,
     /// Local IDs of relationships the batch removed or gave another source or target.
@@ -1142,7 +1169,7 @@ struct Batch<'a> {
     allocated: Vec<Allocation>,
     edited: BTreeSet<String>,
     /// The last change that touched each module, relationship, collection, flow, step, branch,
-    /// walkthrough, beat or picture, by local ID.
+    /// walkthrough, beat, picture or view, by local ID.
     touched: BTreeMap<String, usize>,
 }
 
@@ -1155,6 +1182,7 @@ impl<'a> Batch<'a> {
             collections: model.collections.clone(),
             walkthroughs: model.walkthroughs.clone(),
             pictures: model.pictures.clone(),
+            views: model.views.clone(),
             in_proposal: model.proposal.is_some(),
             removed: BTreeSet::new(),
             moved: BTreeSet::new(),
@@ -1272,9 +1300,23 @@ impl<'a> Batch<'a> {
             } => self.apply_current(index, "pictures", |b| {
                 b.edit_picture(index, &subject, set, &clear)
             }),
-            Change::RemovePicture { subject } => {
-                self.apply_current(index, "pictures", |b| b.remove_picture(index, &subject))
+            Change::RemovePicture { subject } => self.apply_current(index, "pictures", |b| {
+                b.remove_named(index, &subject, |b| &mut b.pictures)
+            }),
+            Change::AddView { view } => {
+                self.apply_current(index, "views", |b| b.add_view(index, view))
             }
+            Change::EditView {
+                subject,
+                set,
+                clear,
+            } => self.apply_current(index, "views", |b| {
+                b.edit_named(index, &subject, set, &clear, |b| &mut b.views)
+                    .map(drop)
+            }),
+            Change::RemoveView { subject } => self.apply_current(index, "views", |b| {
+                b.remove_named(index, &subject, |b| &mut b.views)
+            }),
         }
     }
 
@@ -1557,7 +1599,8 @@ impl<'a> Batch<'a> {
         }
         self.refuse_flow_references(&gone)?;
         self.refuse_walkthrough_references()?;
-        self.refuse_picture_references()
+        self.refuse_picture_references()?;
+        self.refuse_view_references()
     }
 
     /// Refuses when a message step the batch did not edit references a module the batch removes,
@@ -1752,6 +1795,7 @@ mod tests {
             collections: Vec::new(),
             walkthroughs: Vec::new(),
             pictures: Vec::new(),
+            views: Vec::new(),
             revision: revision::of(iter::empty()),
             // After the proposal removed Billing, which its predecessor holds.
             proposal: Some(Proposal {

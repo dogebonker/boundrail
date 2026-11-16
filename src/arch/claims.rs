@@ -320,8 +320,8 @@ pub(super) fn check_edit(
 }
 
 /// The stored form of `subject`: the model ID, or a qualified module, relationship, collection,
-/// flow, walkthrough or picture ID. Collection, flow, walkthrough and picture IDs resolve before
-/// module names, as in `model read`.
+/// flow, walkthrough, picture or view ID. Collection, flow, walkthrough, picture and view IDs
+/// resolve before module names, as in `model read`.
 /// Modules resolve first, as in an edit, so a name never shadows a relationship ID by accident.
 fn resolve(
     model: &Model,
@@ -345,7 +345,7 @@ fn resolve(
             Err(Refusal::new(
                 Code::SubjectNotFound,
                 format!(
-                    "no model, proposal, module, relationship, collection, flow, walkthrough or picture has the ID or name `{subject}`"
+                    "no model, proposal, module, relationship, collection, flow, walkthrough, picture or view has the ID or name `{subject}`"
                 ),
             )
             .into())

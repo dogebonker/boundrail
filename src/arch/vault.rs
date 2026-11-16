@@ -15,8 +15,8 @@ use serde_json::json;
 use super::revision::{self, Revision};
 use super::types::{
     Anchor, Binding, Collection, DESCRIPTION_MAX, Emphasis, LABEL_MAX, Manifest, Module, Picture,
-    Proposal, RESPONSIBILITY_MAX, Relationship, SCHEMA_VERSION, State, Traffic, VaultConfig,
-    Walkthrough,
+    Proposal, RESPONSIBILITY_MAX, Relationship, SCHEMA_VERSION, SavedView, State, Traffic,
+    VaultConfig, Walkthrough,
 };
 use super::{Code, Refusal, ids, one_line, state};
 use crate::files::{hash, refuse_symlink, write_atomic};
@@ -24,6 +24,7 @@ use crate::files::{hash, refuse_symlink, write_atomic};
 mod flows;
 mod pictures;
 mod proposals;
+mod views;
 mod walkthroughs;
 
 use flows::pick;
@@ -31,13 +32,14 @@ pub use flows::{CollectionView, FlowEntry, FlowView, Found};
 pub(super) use flows::{Ends, collection_position, flow_position, holds_name, message_problems};
 pub use pictures::PictureEntry;
 pub(crate) use pictures::output_problems;
-pub(super) use pictures::picture_position;
 pub(super) use proposals::{
     BASE, PROPOSAL, base_writes, in_proposal, is_proposal, is_proposal_path, prefix, proposal_file,
     proposal_write, read_proposal,
 };
 use proposals::{PROPOSALS, base_prefix, check_proposal, is_base, split_proposal, unprefixed};
 pub use proposals::{Scope, load_base, load_proposal, load_state, proposals};
+pub use views::ViewEntry;
+pub(crate) use views::{Named, position};
 pub(crate) use walkthroughs::reading_ids;
 pub(super) use walkthroughs::walkthrough_position;
 pub use walkthroughs::{BeatView, WalkthroughEntry, WalkthroughView};
@@ -55,21 +57,24 @@ const WALKTHROUGHS: &str = "walkthroughs";
 const WALKTHROUGH_SUFFIX: &str = ".walkthrough.json";
 const PICTURES: &str = "pictures";
 const PICTURE_SUFFIX: &str = ".picture.json";
+const VIEWS: &str = "views";
+const VIEW_SUFFIX: &str = ".view.json";
 /// The folders of the current state's per-ID vault files, each with the suffix its files end in.
-const FOLDERS: [(&str, &str); 4] = [
+const FOLDERS: [(&str, &str); 5] = [
     (MODULES, MODULE_SUFFIX),
     (COLLECTIONS, COLLECTION_SUFFIX),
     (WALKTHROUGHS, WALKTHROUGH_SUFFIX),
     (PICTURES, PICTURE_SUFFIX),
+    (VIEWS, VIEW_SUFFIX),
 ];
 /// The folders only the current state holds.
-const CURRENT_ONLY: [&str; 2] = [WALKTHROUGHS, PICTURES];
-/// A proposal's folders: walkthroughs and pictures belong to the current state.
+const CURRENT_ONLY: [&str; 3] = [WALKTHROUGHS, PICTURES, VIEWS];
+/// A proposal's folders: walkthroughs, pictures and views belong to the current state.
 const PROPOSAL_FOLDERS: [(&str, &str); 2] =
     [(MODULES, MODULE_SUFFIX), (COLLECTIONS, COLLECTION_SUFFIX)];
 /// The name of a new model's current state.
 const DEFAULT_STATE_NAME: &str = "Current";
-/// The longest model, module, collection, flow, walkthrough or picture name.
+/// The longest model, module, collection, flow, walkthrough, picture or view name.
 const NAME_MAX: usize = 120;
 
 #[derive(Debug)]
@@ -85,6 +90,8 @@ pub struct Model {
     pub walkthroughs: Vec<Walkthrough>,
     /// Sorted by local ID; always empty in a proposal.
     pub pictures: Vec<Picture>,
+    /// Sorted by local ID; always empty in a proposal.
+    pub views: Vec<SavedView>,
     /// The revision of what was loaded: the current state's files, or the proposal's.
     pub revision: Revision,
     /// The proposal this model holds the modules and collections of; `None` for the current state.
@@ -336,6 +343,7 @@ fn load_scope(dir: PathBuf, proposal: Option<&str>) -> Result<Model> {
     let told: Vec<(&str, &Walkthrough)> =
         parsed.walkthroughs.iter().map(|(f, w)| (*f, w)).collect();
     let drawn: Vec<(&str, &Picture)> = parsed.pictures.iter().map(|(f, p)| (*f, p)).collect();
+    let saved: Vec<(&str, &SavedView)> = parsed.views.iter().map(|(f, v)| (*f, v)).collect();
     let file = proposal.map(proposal_file);
     check(
         parsed.manifest.as_ref(),
@@ -346,6 +354,7 @@ fn load_scope(dir: PathBuf, proposal: Option<&str>) -> Result<Model> {
             collections: &groups,
             walkthroughs: &told,
             pictures: &drawn,
+            views: &saved,
         },
         &mut problems,
     );
@@ -362,6 +371,8 @@ fn load_scope(dir: PathBuf, proposal: Option<&str>) -> Result<Model> {
             walkthroughs.sort_by(|a, b| a.id.cmp(&b.id));
             let mut pictures: Vec<Picture> = parsed.pictures.into_iter().map(|(_, p)| p).collect();
             pictures.sort_by(|a, b| a.id.cmp(&b.id));
+            let mut views: Vec<SavedView> = parsed.views.into_iter().map(|(_, v)| v).collect();
+            views.sort_by(|a, b| a.id.cmp(&b.id));
             Ok(Model {
                 dir,
                 manifest,
@@ -370,6 +381,7 @@ fn load_scope(dir: PathBuf, proposal: Option<&str>) -> Result<Model> {
                 collections,
                 walkthroughs,
                 pictures,
+                views,
                 revision,
                 proposal: parsed.proposal,
             })
@@ -433,6 +445,7 @@ struct Parsed<'a> {
     collections: Vec<(&'a str, Collection)>,
     walkthroughs: Vec<(&'a str, Walkthrough)>,
     pictures: Vec<(&'a str, Picture)>,
+    views: Vec<(&'a str, SavedView)>,
 }
 
 fn parse_inputs<'a>(inputs: &'a [(String, Vec<u8>)], problems: &mut Problems) -> Parsed<'a> {
@@ -454,6 +467,7 @@ fn parse_inputs<'a>(inputs: &'a [(String, Vec<u8>)], problems: &mut Problems) ->
                 Some(MODULES) => json(bytes).map(|m| parsed.modules.push((path, m))),
                 Some(WALKTHROUGHS) => json(bytes).map(|w| parsed.walkthroughs.push((path, w))),
                 Some(PICTURES) => json(bytes).map(|p| parsed.pictures.push((path, p))),
+                Some(VIEWS) => json(bytes).map(|v| parsed.views.push((path, v))),
                 _ => json(bytes).map(|c| parsed.collections.push((path, c))),
             },
         };
@@ -551,6 +565,7 @@ struct Contents<'a> {
     collections: &'a [(&'a str, &'a Collection)],
     walkthroughs: &'a [(&'a str, &'a Walkthrough)],
     pictures: &'a [(&'a str, &'a Picture)],
+    views: &'a [(&'a str, &'a SavedView)],
 }
 
 impl Contents<'_> {
@@ -559,6 +574,7 @@ impl Contents<'_> {
             && self.collections.is_empty()
             && self.walkthroughs.is_empty()
             && self.pictures.is_empty()
+            && self.views.is_empty()
     }
 }
 
@@ -582,14 +598,14 @@ pub(super) fn problems(
     proposal: Option<&Proposal>,
     modules: &[Module],
     collections: &[Collection],
-    walkthroughs: &[Walkthrough],
-    pictures: &[Picture],
+    (walkthroughs, pictures, views): (&[Walkthrough], &[Picture], &[SavedView]),
 ) -> Vec<Problem> {
     let prefix = proposal.map(|p| prefix(&p.id)).unwrap_or_default();
     let module_files = files(&prefix, modules, |m| module_file(&m.id));
     let collection_files = files(&prefix, collections, |c| collection_file(&c.id));
     let walkthrough_files = files(&prefix, walkthroughs, |w| walkthrough_file(&w.id));
     let picture_files = files(&prefix, pictures, |p| picture_file(&p.id));
+    let view_files = files(&prefix, views, |v| view_file(&v.id));
     let file = proposal.map(|p| proposal_file(&p.id));
     let mut problems = Problems::default();
     check(
@@ -601,6 +617,7 @@ pub(super) fn problems(
             collections: &pair(&collection_files, collections),
             walkthroughs: &pair(&walkthrough_files, walkthroughs),
             pictures: &pair(&picture_files, pictures),
+            views: &pair(&view_files, views),
         },
         &mut problems,
     );
@@ -627,8 +644,16 @@ fn check(
     }
     let model = manifest.map(|m| m.id.as_str());
     flows::check(model, modules, collections, problems);
-    walkthroughs::check(model, contents, problems);
-    pictures::check(model, contents, problems);
+    walkthroughs::check(model, config, contents, problems);
+    pictures::check(model, config, contents, problems);
+    views::check(
+        model,
+        config,
+        contents,
+        contents.views,
+        problems,
+        |_, _, _| {},
+    );
     for (file, module) in modules {
         check_module(file, module, config, problems);
     }
@@ -656,7 +681,7 @@ fn check(
                 problems.push(
                     MANIFEST,
                     &m.id,
-                    "a planning model holds no modules, collections, walkthroughs or pictures until a proposal is adopted",
+                    "a planning model holds no modules, collections, walkthroughs, pictures or views until a proposal is adopted",
                 );
             }
             None => {}
@@ -681,6 +706,10 @@ pub(super) fn picture_file(id: &str) -> String {
     format!("{PICTURES}/{id}{PICTURE_SUFFIX}")
 }
 
+pub(super) fn view_file(id: &str) -> String {
+    format!("{VIEWS}/{id}{VIEW_SUFFIX}")
+}
+
 /// Every relationship by its local ID, with the local ID of the module that owns it.
 pub(super) fn relationships(modules: &[Module]) -> BTreeMap<&str, (&str, &Relationship)> {
     modules
@@ -700,15 +729,17 @@ pub(super) struct FileWrite {
     pub(super) content: Option<String>,
 }
 
-/// The writes that store `manifest` (when given), `modules`, `collections`, `walkthroughs` and
-/// `pictures` and delete the `removed` vault files, in the order they apply: the manifest first,
-/// so retired IDs are recorded before any file leaves, then the per-ID files, then the deletions.
+/// The writes that store `manifest` (when given), `modules`, `collections`, `walkthroughs`,
+/// `pictures` and `views` and delete the `removed` vault files, in the order they apply: the
+/// manifest first, so retired IDs are recorded before any file leaves, then the per-ID files,
+/// then the deletions.
 pub(super) fn plan_writes(
     manifest: Option<&Manifest>,
     modules: &[&Module],
     collections: &[&Collection],
     walkthroughs: &[&Walkthrough],
     pictures: &[&Picture],
+    views: &[&SavedView],
     removed: &[String],
 ) -> Result<Vec<FileWrite>> {
     let write = |path: String, content: String| FileWrite {
@@ -734,6 +765,9 @@ pub(super) fn plan_writes(
     }
     for picture in pictures {
         writes.push(write(picture_file(&picture.id), file_json(picture)?));
+    }
+    for view in views {
+        writes.push(write(view_file(&view.id), file_json(view)?));
     }
     writes.extend(removed.iter().map(|path| FileWrite {
         path: path.clone(),
@@ -858,7 +892,7 @@ fn named(dir: &Path, prefix: &str) -> Result<Vec<String>> {
     Ok(paths)
 }
 
-/// The folder and local ID of a module, collection, walkthrough or picture file, by its
+/// The folder and local ID of a module, collection, walkthrough, picture or view file, by its
 /// vault-relative path.
 fn vault_file(path: &str) -> Option<(&'static str, &str)> {
     FOLDERS.iter().find_map(|(folder, suffix)| {
@@ -871,14 +905,14 @@ fn vault_file(path: &str) -> Option<(&'static str, &str)> {
 }
 
 /// Whether `path` names a file `load_dir` reads: the manifest, the config, or a module,
-/// collection, walkthrough or picture file named by a well-formed local ID, so a path from a
-/// bundle or a fetched checkpoint never leaves its folder on any host.
+/// collection, walkthrough, picture or view file named by a well-formed local ID, so a path from
+/// a bundle or a fetched checkpoint never leaves its folder on any host.
 pub(super) fn is_vault_file(path: &str) -> bool {
     path == MANIFEST || path == CONFIG || is_id_file(path, &FOLDERS)
 }
 
-/// Whether `path` is named like a module, collection, walkthrough or picture file directly in its
-/// folder, but not by a well-formed local ID.
+/// Whether `path` is named like a module, collection, walkthrough, picture or view file directly
+/// in its folder, but not by a well-formed local ID.
 pub(super) fn is_misnamed(path: &str) -> bool {
     vault_file(path).is_some_and(|(_, id)| !id.contains('/') && !ids::is_local(id))
 }
@@ -888,8 +922,8 @@ fn file_subject(path: &str) -> &str {
 }
 
 /// Whether a journaled write may write or delete `path`: the manifest, a module, collection,
-/// walkthrough or picture file of the current state, a module or collection file of a proposal
-/// or its base, or a proposal's `proposal.json`.
+/// walkthrough, picture or view file of the current state, a module or collection file of a
+/// proposal or its base, or a proposal's `proposal.json`.
 fn is_written(path: &str) -> bool {
     match split_proposal(path) {
         Some((id, rest)) => ids::is_local(id) && is_proposal_file(rest),
@@ -911,9 +945,9 @@ fn is_id_file(path: &str, folders: &[(&str, &str)]) -> bool {
 }
 
 /// Every allocated ID (model, state, proposal, module, relationship, collection, flow, step,
-/// branch, walkthrough, beat, picture) shares one namespace: each must be well formed, unique and
-/// not retired. A proposal may hold IDs the current state retired after it was drawn: it cannot
-/// be adopted until reconciled.
+/// branch, walkthrough, beat, picture, view) shares one namespace: each must be well formed,
+/// unique and not retired. A proposal may hold IDs the current state retired after it was drawn:
+/// it cannot be adopted until reconciled.
 fn check_ids(
     manifest: Option<&Manifest>,
     proposal: Option<(&str, &Proposal)>,
@@ -960,6 +994,12 @@ fn check_ids(
             .pictures
             .iter()
             .map(|(file, p)| (*file, p.id.as_str())),
+    );
+    ids.extend(
+        contents
+            .views
+            .iter()
+            .map(|(file, v)| (*file, v.id.as_str())),
     );
     let mut seen: BTreeMap<&str, &str> = BTreeMap::new();
     for (file, id) in ids {
@@ -1334,7 +1374,7 @@ impl Model {
 
     /// Every ID this model holds or reserves: the model's, its current state's, the retired
     /// ones, the proposal's, the state it became and the IDs it dropped, and every module,
-    /// relationship, collection, flow, step, branch, walkthrough, beat and picture.
+    /// relationship, collection, flow, step, branch, walkthrough, beat, picture and view.
     pub(super) fn ids(&self) -> impl Iterator<Item = &str> {
         let manifest = &self.manifest;
         let proposal = self
@@ -1353,6 +1393,7 @@ impl Model {
             .chain(self.collections.iter().flat_map(Collection::ids))
             .chain(self.walkthroughs.iter().flat_map(Walkthrough::ids))
             .chain(self.pictures.iter().map(|p| p.id.as_str()))
+            .chain(self.views.iter().map(|v| v.id.as_str()))
     }
 
     /// Modules keyed by their parent's qualified ID (`None` for roots), each list in order.

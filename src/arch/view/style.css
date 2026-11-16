@@ -57,6 +57,7 @@
   --add: #2b8a3e;
   --remove: #c92a2a;
   --change: #d9480f;
+  --selected: #1c7ed6;
   --shadow-1: 0 1px 2px rgba(15, 18, 25, 0.05);
   --shadow-2: 0 8px 24px rgba(15, 18, 25, 0.1), 0 1px 3px rgba(15, 18, 25, 0.06);
   --dim: 0.38;
@@ -98,6 +99,7 @@
     --add: #69db7c;
     --remove: #ff8787;
     --change: #ffa94d;
+    --selected: #4dabf7;
     --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.4);
     --shadow-2: 0 12px 32px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.04);
 
@@ -478,6 +480,7 @@ button.diagnostic:active { transform: none; background: var(--press); }
 .sheet svg [stroke="#f08c00"] { stroke: var(--change); }
 .sheet svg [fill="#f08c00"] { fill: var(--change); }
 .sheet svg [stroke="#e0c873"] { stroke: var(--note-edge); }
+.sheet svg [stroke="#1c7ed6"] { stroke: var(--selected); }
 
 .sheet svg [stroke="#3e4c59"] { stroke: var(--edge); }
 .sheet svg [fill="#3e4c59"] { fill: var(--edge); }
@@ -496,7 +499,7 @@ svg g.is-filtered { opacity: 0.25; }
 svg g.module, svg g.lifeline { cursor: pointer; }
 .sheet svg g.module > rect:first-of-type,
 .sheet svg g.lifeline > rect { transition: stroke 120ms ease; }
-.sheet svg g.module:not(.is-selected):hover > rect:first-of-type,
+.sheet svg g.module:not(.is-selected, .selected):hover > rect:first-of-type,
 .sheet svg g.lifeline:not(.is-selected):hover > rect { stroke: var(--text-3); }
 .sheet svg g.is-selected > rect:first-of-type,
 .sheet svg g.is-focus > rect:first-of-type { stroke: var(--accent); stroke-width: 1.5; }

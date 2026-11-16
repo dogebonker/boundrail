@@ -462,6 +462,8 @@ pub const BEATS_MAX: usize = 200;
 pub const NARRATION_MAX: usize = 2000;
 /// The deepest container level a reading opens.
 pub const READING_DEPTH_MAX: u32 = 9;
+/// The most relationship hops from the focus a reading keeps drawn.
+pub const VISIBILITY_MAX: u32 = 9;
 
 /// `walkthroughs/<id>.walkthrough.json`: an authored narrative over the current state, beats in
 /// the order they are told.
@@ -521,6 +523,50 @@ pub struct BeatReading {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(inner(pattern(QUALIFIED_ID)))]
     pub focus: Vec<String>,
+    /// Modules drawn as selected, outlined without dimming anything; in order, each once.
+    /// Architecture view only, as are the fields after it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(inner(pattern(QUALIFIED_ID)))]
+    pub selection: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filters: Option<ReadingFilters>,
+    /// Groups drawn as labelled regions behind their members: `config.yaml` group keys, or
+    /// `"all"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub groups: Option<ReadingGroups>,
+    /// How many relationship hops from the focus stay drawn: 0 the focus alone, 1 its direct
+    /// neighbours too; the rest is left out. Needs a focus; without it every module is drawn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(max = VISIBILITY_MAX))]
+    pub visibility: Option<u32>,
+}
+
+/// What a reading leaves out of the architecture view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReadingFilters {
+    /// The relationship kinds drawn, by `config.yaml` key; the other kinds are hidden.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relationships: Vec<String>,
+    /// Groups, by `config.yaml` key, whose members alone are drawn as usual, with their direct
+    /// neighbours dimmed; the rest is left out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
+}
+
+/// The groups a reading draws regions for: every configured group, or these keys.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum ReadingGroups {
+    All(AllGroups),
+    Keys(Vec<String>),
+}
+
+/// `"all"`: every group `config.yaml` defines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum AllGroups {
+    All,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -587,6 +633,23 @@ pub struct Picture {
     /// never inside `.boundrail` or `.git`.
     #[schemars(pattern(PICTURE_OUTPUT))]
     pub output: String,
+    pub reading: BeatReading,
+}
+
+/// `views/<id>.view.json`: a named reading of the model, kept for opening again; it writes no
+/// file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SavedView {
+    #[schemars(range(min = 1, max = 1))]
+    pub schema_version: u32,
+    #[schemars(pattern(LOCAL_ID))]
+    pub id: String,
+    pub name: String,
+    pub order: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = DESCRIPTION_MAX))]
+    pub description: Option<String>,
     pub reading: BeatReading,
 }
 
@@ -762,7 +825,7 @@ impl Default for VaultConfig {
 pub type SchemaFn = fn() -> Schema;
 
 /// Every vault file format and request, by its `model schema` name.
-pub const SCHEMAS: [(&str, SchemaFn); 11] = [
+pub const SCHEMAS: [(&str, SchemaFn); 12] = [
     ("model-bundle", root::<super::bundle::Bundle>),
     ("model-claim", root::<super::claims::ClaimRequest>),
     ("model-collection", root::<Collection>),
@@ -771,6 +834,7 @@ pub const SCHEMAS: [(&str, SchemaFn); 11] = [
     ("model-picture", root::<Picture>),
     ("model-proposal", root::<Proposal>),
     ("model-release", root::<super::claims::ReleaseRequest>),
+    ("model-view", root::<SavedView>),
     ("model-walkthrough", root::<Walkthrough>),
     ("module", root::<Module>),
     ("vault-config", root::<VaultConfig>),

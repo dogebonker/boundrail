@@ -11,7 +11,8 @@ use serde_json::json;
 use super::flow::insert;
 use super::{Batch, Diff, at, both, request_invalid};
 use crate::arch::types::{
-    Beat, BeatReading, ReadingState, ReadingView, SCHEMA_VERSION, Walkthrough,
+    Beat, BeatReading, ReadingFilters, ReadingGroups, ReadingState, ReadingView, SCHEMA_VERSION,
+    Walkthrough,
 };
 use crate::arch::vault::{self, Model};
 use crate::arch::{Code, Refusal, ids};
@@ -65,6 +66,14 @@ pub struct NewReading {
     /// Kept in order, each module once.
     #[serde(default)]
     pub focus: Vec<String>,
+    /// Kept in order, each module once.
+    #[serde(default)]
+    pub selection: Vec<String>,
+    /// Each kind and group kept once, in order.
+    pub filters: Option<ReadingFilters>,
+    /// `"all"`, or group keys, each kept once, in order.
+    pub groups: Option<ReadingGroups>,
+    pub visibility: Option<u32>,
 }
 
 /// New values for a beat and its reading; references resolve in the state the beat reads after
@@ -74,6 +83,14 @@ pub struct NewReading {
 pub struct BeatSet {
     pub title: Option<String>,
     pub narration: Option<String>,
+    #[serde(flatten)]
+    pub reading: ReadingSet,
+}
+
+/// New values for the fields of a reading, beside the fields of what holds it: a beat, picture or
+/// saved view.
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ReadingSet {
     pub view: Option<ReadingView>,
     pub state: Option<ReadingState>,
     pub against: Option<ReadingState>,
@@ -81,6 +98,10 @@ pub struct BeatSet {
     pub depth: Option<u32>,
     pub flow: Option<String>,
     pub focus: Option<Vec<String>>,
+    pub selection: Option<Vec<String>>,
+    pub filters: Option<ReadingFilters>,
+    pub groups: Option<ReadingGroups>,
+    pub visibility: Option<u32>,
 }
 
 /// A reading field `clear` empties; clearing `state` reads the current state.
@@ -93,6 +114,10 @@ pub enum BeatField {
     Depth,
     Flow,
     Focus,
+    Selection,
+    Filters,
+    Groups,
+    Visibility,
 }
 
 impl WalkthroughField {
@@ -104,7 +129,7 @@ impl WalkthroughField {
 }
 
 impl BeatField {
-    pub(super) fn is_set(self, set: &BeatSet) -> bool {
+    pub(super) fn is_set(self, set: &ReadingSet) -> bool {
         match self {
             Self::State => set.state.is_some(),
             Self::Against => set.against.is_some(),
@@ -112,6 +137,10 @@ impl BeatField {
             Self::Depth => set.depth.is_some(),
             Self::Flow => set.flow.is_some(),
             Self::Focus => set.focus.is_some(),
+            Self::Selection => set.selection.is_some(),
+            Self::Filters => set.filters.is_some(),
+            Self::Groups => set.groups.is_some(),
+            Self::Visibility => set.visibility.is_some(),
         }
     }
 }
@@ -190,17 +219,18 @@ impl Batch<'_> {
         Ok(ids::qualify(self.model, &self.collections[c].flows[f].id))
     }
 
-    /// The focus modules resolved, in order, each once.
-    fn reading_focus(&self, index: usize, current: bool, focus: &[String]) -> Result<Vec<String>> {
-        let mut seen = BTreeSet::new();
+    /// The focus or selection modules resolved, in order, each once.
+    fn reading_modules(
+        &self,
+        index: usize,
+        current: bool,
+        modules: &[String],
+    ) -> Result<Vec<String>> {
         let mut out = Vec::new();
-        for subject in focus {
-            let id = self.reading_module(index, current, subject)?;
-            if seen.insert(id.clone()) {
-                out.push(id);
-            }
+        for subject in modules {
+            out.push(self.reading_module(index, current, subject)?);
         }
-        Ok(out)
+        Ok(once(out))
     }
 
     pub(super) fn build_reading(&self, index: usize, new: NewReading) -> Result<BeatReading> {
@@ -208,15 +238,37 @@ impl Batch<'_> {
         let current = state.is_current();
         let module = |s: String| self.reading_module(index, current, &s);
         let flow = |s: String| self.reading_flow(index, current, &s);
-        Ok(BeatReading {
+        let reading = BeatReading {
             view: new.view,
             against: new.against.map(|a| self.reading_state(a)),
             scope: new.scope.map(module).transpose()?,
             depth: new.depth,
             flow: new.flow.map(flow).transpose()?,
-            focus: self.reading_focus(index, current, &new.focus)?,
+            focus: self.reading_modules(index, current, &new.focus)?,
+            selection: self.reading_modules(index, current, &new.selection)?,
+            filters: new.filters.map(filters_once),
+            groups: new.groups.map(groups_once),
+            visibility: new.visibility,
             state,
-        })
+        };
+        self.refuse_empty_groups(index, &reading)?;
+        Ok(reading)
+    }
+
+    /// Refuses a current-state reading whose group filter names a group no module is in: it would
+    /// draw none of that group. Into another state the drawing refuses it instead.
+    fn refuse_empty_groups(&self, index: usize, reading: &BeatReading) -> Result<()> {
+        if !reading.state.is_current() {
+            return Ok(());
+        }
+        let mut groups = reading.filters.iter().flat_map(|f| &f.groups);
+        match groups.find(|g| !self.modules.iter().any(|m| m.groups.contains(g))) {
+            Some(group) => Err(request_invalid(
+                index,
+                format!("filters.groups names `{group}`, which no module is in"),
+            )),
+            None => Ok(()),
+        }
     }
 
     fn build_beat(&mut self, index: usize, new: NewBeat) -> Result<Beat> {
@@ -337,14 +389,14 @@ impl Batch<'_> {
         set: BeatSet,
         clear: &[BeatField],
     ) -> Result<()> {
-        if let Some(field) = clear.iter().find(|f| f.is_set(&set)) {
+        if let Some(field) = clear.iter().find(|f| f.is_set(&set.reading)) {
             return Err(both(index, field));
         }
         let (w, b) = self.beat_at(index, subject)?;
         let id = self.walkthroughs[w].beats[b].id.clone();
         self.edit_once(index, &id)?;
         let mut reading = self.walkthroughs[w].beats[b].reading.clone();
-        self.apply_reading(index, &mut reading, &set, clear)?;
+        self.apply_reading(index, &mut reading, &set.reading, clear)?;
         let beat = &mut self.walkthroughs[w].beats[b];
         if let Some(title) = set.title {
             beat.title = title;
@@ -364,7 +416,7 @@ impl Batch<'_> {
         &self,
         index: usize,
         reading: &mut BeatReading,
-        set: &BeatSet,
+        set: &ReadingSet,
         clear: &[BeatField],
     ) -> Result<()> {
         if let Some(state) = &set.state {
@@ -390,7 +442,19 @@ impl Batch<'_> {
             reading.flow = Some(self.reading_flow(index, current, flow)?);
         }
         if let Some(focus) = &set.focus {
-            reading.focus = self.reading_focus(index, current, focus)?;
+            reading.focus = self.reading_modules(index, current, focus)?;
+        }
+        if let Some(selection) = &set.selection {
+            reading.selection = self.reading_modules(index, current, selection)?;
+        }
+        if let Some(filters) = &set.filters {
+            reading.filters = Some(filters_once(filters.clone()));
+        }
+        if let Some(groups) = &set.groups {
+            reading.groups = Some(groups_once(groups.clone()));
+        }
+        if set.visibility.is_some() {
+            reading.visibility = set.visibility;
         }
         for field in clear {
             match field {
@@ -400,7 +464,14 @@ impl Batch<'_> {
                 BeatField::Depth => reading.depth = None,
                 BeatField::Flow => reading.flow = None,
                 BeatField::Focus => reading.focus.clear(),
+                BeatField::Selection => reading.selection.clear(),
+                BeatField::Filters => reading.filters = None,
+                BeatField::Groups => reading.groups = None,
+                BeatField::Visibility => reading.visibility = None,
             }
+        }
+        if set.state.is_some() || set.filters.is_some() || clear.contains(&BeatField::State) {
+            self.refuse_empty_groups(index, reading)?;
         }
         Ok(())
     }
@@ -439,7 +510,9 @@ impl Batch<'_> {
             if !reading.state.is_current() || self.edited.contains(id) {
                 continue;
             }
-            let named = reading.scope.iter().chain(&reading.focus);
+            let named = (reading.scope.iter())
+                .chain(&reading.focus)
+                .chain(&reading.selection);
             let broken: Vec<&String> = (named.filter(|m| !modules.contains(*m)))
                 .chain(reading.flow.iter().filter(|f| !flows.contains(*f)))
                 .collect();
@@ -470,6 +543,28 @@ impl Batch<'_> {
     }
 }
 
+/// `list` with each item kept once, at its first place.
+fn once(list: Vec<String>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    list.into_iter()
+        .filter(|i| seen.insert(i.clone()))
+        .collect()
+}
+
+fn filters_once(filters: ReadingFilters) -> ReadingFilters {
+    ReadingFilters {
+        relationships: once(filters.relationships),
+        groups: once(filters.groups),
+    }
+}
+
+fn groups_once(groups: ReadingGroups) -> ReadingGroups {
+    match groups {
+        ReadingGroups::Keys(keys) => ReadingGroups::Keys(once(keys)),
+        all @ ReadingGroups::All(_) => all,
+    }
+}
+
 /// How `refuse_reading_references` refuses: its code, what the count counts, and the details key
 /// listing them.
 pub(super) struct Refused {
@@ -478,8 +573,8 @@ pub(super) struct Refused {
     pub(super) key: &'static str,
 }
 
-/// What the batch diff needs of the files only the current state holds: walkthroughs and
-/// pictures.
+/// What the batch diff needs of the files only the current state holds: walkthroughs, pictures
+/// and views.
 pub(super) trait CurrentOnly: PartialEq {
     fn id(&self) -> &str;
     fn name(&self) -> &str;
@@ -504,10 +599,25 @@ impl CurrentOnly for Walkthrough {
     }
 }
 
-/// Adds to `diff` what the batch changed from `old` to `new`, walkthroughs or pictures: files to
-/// remove, subjects and retired IDs, and returns the files to write. It adds to `touched` the
-/// subjects a claim must cover: one that changes, what is inside it included, the root level when
-/// one comes or goes, and every one whose name an added or renamed one takes.
+impl<T: vault::Named + PartialEq> CurrentOnly for T {
+    fn id(&self) -> &str {
+        vault::Named::id(self)
+    }
+    fn name(&self) -> &str {
+        vault::Named::name(self)
+    }
+    fn ids(&self) -> Vec<&str> {
+        vec![vault::Named::id(self)]
+    }
+    fn file(id: &str) -> String {
+        <T as vault::Named>::file(id)
+    }
+}
+
+/// Adds to `diff` what the batch changed from `old` to `new`, walkthroughs, pictures or views:
+/// files to remove, subjects and retired IDs, and returns the files to write. It adds to `touched`
+/// the subjects a claim must cover: one that changes, what is inside it included, the root level
+/// when one comes or goes, and every one whose name an added or renamed one takes.
 pub(super) fn diff_current_only<'a, T: CurrentOnly>(
     model: &Model,
     old: &'a [T],
@@ -611,6 +721,7 @@ mod tests {
             collections,
             walkthroughs,
             pictures: Vec::new(),
+            views: Vec::new(),
             revision: revision::of(std::iter::empty()),
             proposal: None,
         }

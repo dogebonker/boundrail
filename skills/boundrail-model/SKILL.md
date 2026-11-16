@@ -1,6 +1,6 @@
 ---
 name: boundrail-model
-description: Author the repository's architecture model in .boundrail/model through the boundrail CLI when reading the architecture, changing modules, relationships, flows, walkthroughs or pictures, binding them to code, or reacting to a `model check` warning or refusal code.
+description: Author the repository's architecture model in .boundrail/model through the boundrail CLI when reading the architecture, changing modules, relationships, flows, walkthroughs, pictures or saved views, binding them to code, or reacting to a `model check` warning or refusal code.
 license: MIT OR Apache-2.0
 metadata:
   compatibility: Needs git and the boundrail binary on PATH. Plans and proposals are in boundrail-plan; pull requests in boundrail-pr.
@@ -20,7 +20,8 @@ command prints JSON; add `--format markdown` for a readable summary. A refusal p
    Done when you know the modules, their parts and relationships, and the flows.
 2. **Read what you change.** `boundrail model read <subject>` prints one module with its parts and
    relationships; a subject is a qualified ID (`<model>#<id>`), a local ID, or a unique current or
-   former name. Use `--flow <flow>`, `--walkthrough <id>` or `--picture <id>` for those.
+   former name. Use `--flow <flow>`, `--walkthrough <id>`, `--picture <id>` or `--view <id>` for
+   those.
 3. **Check first.** Run `boundrail model check --format markdown` so you know which warnings were
    there before your change. Exit 1 means at least one warning.
 4. **Write the request.** Print the request schema with `boundrail model schema model-edit`; list
@@ -95,7 +96,7 @@ command prints JSON; add `--format markdown` for a readable summary. A refusal p
 
 Other codes explain themselves in their message. `skips` list what the check could not judge.
 
-## Flows, walkthroughs and pictures
+## Flows, walkthroughs, pictures and views
 
 - A flow lives in a collection: `add-collection`, then `add-flow` with its steps. A message step
   names two modules; `MESSAGE_UNDRAWN` means no relationship covers it. Every `add-flow` needs a
@@ -108,6 +109,13 @@ Other codes explain themselves in their message. `skips` list what the check cou
   a missing one. `--replay <file>.talk --output <file.mp4>` encodes it again without the model.
 - A picture is a reading with an `output` path (`.svg` or `.png`) outside `.boundrail`. Draw stale
   pictures with `boundrail model pictures --write`; `model check --only embeds` lists stale ones.
+- A saved view is a named reading with no file (`add-view`, `edit-view`, `remove-view`). Draw it
+  with `boundrail model render --saved-view <id>`; the browser lists it in the sidebar.
+- In the architecture view a reading may also set `selection` (modules outlined, nothing
+  dimmed), `filters.relationships` (only these relationship kinds), `filters.groups` (only these
+  groups' members, their neighbours dimmed), `groups` (group keys or `"all"`, drawn as labelled
+  regions) and `visibility` (keep only what lies within that many hops of the focus; needs a
+  focus). Kinds and groups are `config.yaml` keys.
 - See the model in a browser with `boundrail model view`.
 
 ## History
@@ -137,7 +145,7 @@ claim ID in every edit. List claims with `boundrail model claims`. Release yours
 | `SUBJECT_NOT_FOUND`, `SUBJECT_AMBIGUOUS` | Name the subject by its ID. |
 | `TARGET_MISMATCH` | `target` names another model or state. Copy it from `model read`. |
 | `CHILDREN_ORPHANED` | Remove or reparent the parts in the same batch. |
-| `REFERENCED_BY_FLOW`, `REFERENCED_BY_WALKTHROUGH`, `REFERENCED_BY_PICTURE` | Edit or remove the steps, flows, beats or pictures in `details` in the same batch. |
+| `REFERENCED_BY_FLOW`, `REFERENCED_BY_WALKTHROUGH`, `REFERENCED_BY_PICTURE`, `REFERENCED_BY_VIEW` | Edit or remove the steps, flows, beats, pictures or views in `details` in the same batch. |
 | `FLOW_SUMMARY_REQUIRED` | Give the flow a one-line `summary` that says what it does; `edit-flow` cannot clear it. |
 | `OPERATION_REUSED` | That `operation_id` applied a different request. Use a new one. |
 | `CLAIM_CONFLICT` | Another writer holds a subject. Wait for the release, or ask a person; revoke only when a person says so. |

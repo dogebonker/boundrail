@@ -51,7 +51,7 @@ pub fn reconcile(
             modules: &modules,
             collections: &collections,
         };
-        let diff = edit::diff(&drawn, &modules, &collections, &[], &[], &[]);
+        let diff = edit::diff(&drawn, &modules, &collections, &[], &[], &[], &[]);
         let mut touched = diff.affected.clone();
         touched.insert(drawn.qualify(&proposal.id));
         claims::check_edit(dir, &drawn, &writer, writing.claim, &touched, &diff.moves)?;
@@ -87,6 +87,7 @@ impl Merged<'_> {
             None,
             &diff.write,
             &diff.write_collections,
+            &[],
             &[],
             &[],
             &diff.remove,
@@ -128,8 +129,7 @@ impl Merged<'_> {
             Some(proposal),
             self.modules,
             self.collections,
-            &[],
-            &[],
+            (&[], &[], &[]),
         );
         if problems.is_empty() {
             return Ok(());

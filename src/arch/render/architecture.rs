@@ -7,8 +7,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::layout::{self, Boxed, Rect, Scene};
 use super::svg::{Anchor, BACKGROUND, DESCENT, FONT_SIZE, Font, Point, Style, Svg};
 use super::{
-    Context, Fallbacks, MARGIN, Mark, SOFT_INK, TITLE_H, class, label, line_style, outline,
-    text_width,
+    BASELINE, Context, Fallbacks, MARGIN, MUTED_LINE, Mark, OUTLINE_WIDTH, SELECTED,
+    SELECTED_WIDTH, SOFT_INK, TITLE_H, class, label, line_style, outline, text_width,
 };
 use crate::arch::index::Index;
 use crate::arch::types::{EXTERNAL_KIND, Emphasis, Module, Traffic};
@@ -27,6 +27,11 @@ const LABEL_RADIUS: f64 = 3.0;
 const NAME_LINE: f64 = 20.0;
 const KIND_LINE: f64 = 37.0;
 const TITLE_GAP: f64 = 2.0;
+/// Space between a group region's edge and the boxes inside it, and between its name and the
+/// boxes below, past the straight start of a route into them.
+const REGION_PAD: f64 = 12.0;
+const REGION_RADIUS: f64 = 10.0;
+const REGION_OPACITY: f64 = 0.1;
 
 /// The boxes drawn, in containment pre-order, down to the depth asked.
 #[derive(Default)]
@@ -40,6 +45,14 @@ struct Visible<'a> {
     containers: Vec<bool>,
     /// The box each drawn or collapsed module shows in, by qualified ID.
     at: BTreeMap<String, usize>,
+}
+
+/// One group's region: the band behind its drawn members, and where its name sits.
+struct Region<'c> {
+    name: &'c str,
+    color: &'c str,
+    band: Rect,
+    label: Rect,
 }
 
 /// The relationships of one kind between two boxes, drawn as one arrow.
@@ -63,7 +76,7 @@ pub(super) fn render(
     modules: &[Module],
     scope: Option<&str>,
     depth: usize,
-    legend: bool,
+    (regions, legend): (&[String], bool),
 ) -> (Svg, Vec<String>, Vec<String>, Fallbacks) {
     let index = Index::new(ctx.model, modules);
     let roots = match scope {
@@ -84,7 +97,7 @@ pub(super) fn render(
             ..r
         })
         .collect();
-    let scene = Scene {
+    let mut scene = Scene {
         parents: visible.boxes.iter().map(|b| b.parent).collect(),
         titles: (0..rects.len())
             .map(|i| visible.containers[i].then(|| title_area(&rects[i], &visible, i)))
@@ -92,6 +105,7 @@ pub(super) fn render(
         fixed: vec![ctx.title_area()],
         rects: &rects,
     };
+    let regions = place_regions(ctx, &visible, &mut scene, regions);
     let (routes, bent) = layout::routes(&scene, &pairs);
     let texts: Vec<String> = arrows.iter().map(|a| arrow_text(ctx, a)).collect();
     let sizes: Vec<(f64, f64)> = (texts.iter())
@@ -100,6 +114,9 @@ pub(super) fn render(
     let (centers, stuck) = layout::labels(&scene, &routes, &sizes);
     let mut svg = Svg::default();
     ctx.title(&mut svg);
+    for region in &regions {
+        draw_region(&mut svg, region);
+    }
     let lit = lit_boxes(ctx, &visible);
     let dims = |i: usize| lit.as_ref().is_some_and(|l| !l.contains(&i));
     for (i, rect) in rects.iter().enumerate() {
@@ -142,6 +159,85 @@ pub(super) fn render(
         labels: stuck,
     };
     (svg, visible.ids, relationships, fallbacks)
+}
+
+/// The regions of the groups `keys` with a drawn member, in that order. Each name sits just
+/// above its members' top left corner, or on the nearest spot that meets no box, title or name
+/// placed before, and joins the scene's fixed areas so routes and labels keep off it.
+fn place_regions<'c>(
+    ctx: &'c Context<'_>,
+    visible: &Visible<'_>,
+    scene: &mut Scene<'_>,
+    keys: &[String],
+) -> Vec<Region<'c>> {
+    let mut out = Vec::new();
+    for key in keys {
+        let Some(group) = ctx.config.groups.get(key) else {
+            continue;
+        };
+        let members = (0..visible.ids.len())
+            .filter(|&i| visible.modules[i].groups.contains(key))
+            .map(|i| scene.rects[i].clone());
+        let Some(bounds) = members.reduce(|a, b| union(&a, &b)) else {
+            continue;
+        };
+        let w = text_width(&group.name) + 2.0 * LABEL_PAD;
+        let above = (bounds.x + w / 2.0, bounds.y - REGION_PAD - LABEL_H / 2.0);
+        let label = layout::free_spot(scene, (w, LABEL_H), above);
+        scene.fixed.push(label.clone());
+        out.push(Region {
+            name: &group.name,
+            color: ctx
+                .group_color(std::slice::from_ref(key))
+                .unwrap_or(MUTED_LINE),
+            band: union(&grow(&bounds, REGION_PAD), &grow(&label, LABEL_PAD)),
+            label,
+        });
+    }
+    out
+}
+
+fn grow(r: &Rect, by: f64) -> Rect {
+    Rect {
+        x: r.x - by,
+        y: r.y - by,
+        w: r.w + 2.0 * by,
+        h: r.h + 2.0 * by,
+    }
+}
+
+fn union(a: &Rect, b: &Rect) -> Rect {
+    let (x, y) = (a.x.min(b.x), a.y.min(b.y));
+    Rect {
+        x,
+        y,
+        w: (a.x + a.w).max(b.x + b.w) - x,
+        h: (a.y + a.h).max(b.y + b.h) - y,
+    }
+}
+
+fn draw_region(svg: &mut Svg, region: &Region<'_>) {
+    svg.group("region", None);
+    let style = Style {
+        fill: Some(region.color),
+        fill_opacity: Some(REGION_OPACITY),
+        stroke: Some(region.color),
+        width: Some(OUTLINE_WIDTH),
+        ..Style::default()
+    };
+    let band = &region.band;
+    svg.rect((band.x, band.y), (band.w, band.h), REGION_RADIUS, &style);
+    let font = Font {
+        bold: true,
+        fill: Some(SOFT_INK),
+        ..Font::default()
+    };
+    let at = (
+        region.label.x + LABEL_PAD,
+        region.label.y + LABEL_H / 2.0 + BASELINE,
+    );
+    svg.text(at, region.name, &font);
+    svg.close_group();
 }
 
 fn title_area(rect: &Rect, visible: &Visible<'_>, i: usize) -> Rect {
@@ -278,8 +374,18 @@ fn arrows<'a>(ctx: &Context<'_>, modules: &'a [Module], visible: &Visible<'_>) -
 fn draw_box(svg: &mut Svg, ctx: &Context<'_>, rect: &Rect, visible: &Visible<'_>, i: usize) {
     let (id, module, container) = (&visible.ids[i], visible.modules[i], visible.containers[i]);
     let mark = ctx.mark(id);
-    svg.group(&class("module", mark), Some(id));
+    let selected = ctx.selection.contains(id);
+    let base = if selected {
+        "module selected"
+    } else {
+        "module"
+    };
+    svg.group(&class(base, mark), Some(id));
     let mut style = outline(mark, ctx.fill(&module.kind));
+    if selected {
+        style.stroke = Some(SELECTED);
+        style.width = Some(SELECTED_WIDTH);
+    }
     if container {
         style.fill_opacity = Some(CONTAINER_OPACITY);
     }

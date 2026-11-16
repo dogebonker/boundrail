@@ -25,12 +25,12 @@ use boundrail::arch::render::{self, View};
 use boundrail::arch::request::INPUT_MAX;
 use boundrail::arch::semantic::{self, States};
 use boundrail::arch::types::{
-    self, BeatReading, Collection, Flow, Picture, ReadingState, ReadingView, SCHEMAS, Step,
-    Walkthrough,
+    self, BeatReading, Collection, Flow, Picture, ReadingGroups, ReadingState, ReadingView,
+    SCHEMAS, SavedView, Step, Walkthrough,
 };
 use boundrail::arch::vault::{
     self, CollectionView, Found, Model, ModuleView, PictureEntry, RelationshipView, Scope,
-    WalkthroughEntry, escape_controls,
+    ViewEntry, WalkthroughEntry, escape_controls,
 };
 use boundrail::arch::{Code, Refusal};
 use boundrail::cochange::MAX_FILES;
@@ -123,7 +123,7 @@ enum Command {
     },
     /// Draw the model as SVG: the architecture, or a flow as a sequence diagram or flowchart,
     /// optionally marked with what it changes against another state
-    Render(RenderArgs),
+    Render(Box<RenderArgs>),
     /// Serve a live, read-only view of the model in the browser on a local port
     View(super::view_cli::ViewArgs),
     /// List the picture recipes with whether each file still matches what the model draws:
@@ -188,6 +188,10 @@ pub(super) struct RenderSpec {
     /// says what to draw
     #[arg(long, conflicts_with = "walkthrough")]
     pub(super) picture: Option<String>,
+    /// Draw what this saved view reads: its ID or unique name; needs no other flag that says
+    /// what to draw
+    #[arg(long = "saved-view", conflicts_with_all = ["walkthrough", "picture"])]
+    pub(super) saved_view: Option<String>,
     /// Draw this proposal, marked against the current state unless --against names another
     #[arg(long)]
     pub(super) proposal: Option<String>,
@@ -220,6 +224,10 @@ pub(super) struct RenderSpec {
     /// nearest container drawn. Repeat for several; architecture view only
     #[arg(long = "hide-kind")]
     pub(super) hide_kind: Vec<String>,
+    /// Draw only the members of this group, its key in config.yaml, and dimmed, the modules
+    /// they have relationships with. Repeat for several; architecture view only
+    #[arg(long)]
+    pub(super) group: Vec<String>,
     /// Name the node and relationship kinds drawn below the picture; architecture view only
     #[arg(long)]
     pub(super) legend: bool,
@@ -289,22 +297,25 @@ enum ModelCmd {
         force: bool,
     },
     /// Print the model, one module with its parts and relationships, a collection, a flow, a
-    /// walkthrough, or a picture recipe
+    /// walkthrough, a picture recipe or a saved view
     Read {
         /// Qualified ID, local ID, or a unique current or former module name; or a collection,
-        /// flow, walkthrough or picture ID
-        #[arg(conflicts_with_all = ["flow", "walkthrough", "picture"])]
+        /// flow, walkthrough, picture or saved view ID
+        #[arg(conflicts_with_all = ["flow", "walkthrough", "picture", "view"])]
         subject: Option<String>,
         /// Print one flow with its steps: its qualified or local ID, or its unique name
-        #[arg(long, conflicts_with_all = ["walkthrough", "picture"])]
+        #[arg(long, conflicts_with_all = ["walkthrough", "picture", "view"])]
         flow: Option<String>,
         /// Print one walkthrough with its beats: its qualified or local ID, or its unique name;
         /// Markdown prints it as a script
-        #[arg(long, conflicts_with = "picture")]
+        #[arg(long, conflicts_with_all = ["picture", "view"])]
         walkthrough: Option<String>,
         /// Print one picture recipe: its qualified or local ID, or its unique name
-        #[arg(long)]
+        #[arg(long, conflicts_with = "view")]
         picture: Option<String>,
+        /// Print one saved view: its qualified or local ID, or its unique name
+        #[arg(long)]
+        view: Option<String>,
         /// Read the model a checkpoint holds: its ID or a unique commit prefix
         #[arg(long)]
         checkpoint: Option<String>,
@@ -319,7 +330,7 @@ enum ModelCmd {
     /// and arguments
     #[command(subcommand)]
     LanguageServer(language_server::LanguageServerCmd),
-    /// Apply a batch of module, relationship, collection, flow, step, walkthrough, beat and picture changes (schema `model-edit`)
+    /// Apply a batch of module, relationship, collection, flow, step, walkthrough, beat, picture and view changes (schema `model-edit`)
     Edit {
         /// Request file; `-` or absent reads standard input
         #[arg(long)]
@@ -716,6 +727,7 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
             flow: None,
             walkthrough: None,
             picture: None,
+            view: None,
             checkpoint,
             proposal,
         } => {
@@ -737,6 +749,7 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
             print_collections(&model.collection_views());
             print_walkthroughs(&model.walkthrough_entries());
             print_pictures(&model.picture_entries());
+            print_views(&model.view_entries());
             print_claims(state.as_deref().and_then(active_claims).as_deref());
             Ok(())
         }
@@ -745,6 +758,7 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
             flow,
             walkthrough,
             picture,
+            view,
             checkpoint,
             proposal,
         } => {
@@ -754,16 +768,17 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
                 pending,
                 checkpoint,
             } = load_reading(root, checkpoint.as_deref(), proposal.as_deref())?;
-            let found = match (&flow, &walkthrough, &picture) {
-                (Some(flow), _, _) => {
+            let found = match (&flow, &walkthrough, &picture, &view) {
+                (Some(flow), _, _, _) => {
                     let (collection, flow) = model.flow(flow)?;
                     Some(Found::Flow(collection, flow))
                 }
-                (None, Some(walkthrough), _) => {
+                (None, Some(walkthrough), _, _) => {
                     Some(Found::Walkthrough(model.walkthrough(walkthrough)?))
                 }
-                (None, None, Some(picture)) => Some(Found::Picture(model.picture(picture)?)),
-                (None, None, None) => subject.as_deref().and_then(|s| model.find_grouping(s)),
+                (None, None, Some(picture), _) => Some(Found::Picture(model.picture(picture)?)),
+                (None, None, None, Some(view)) => Some(Found::View(model.saved_view(view)?)),
+                (None, None, None, None) => subject.as_deref().and_then(|s| model.find_grouping(s)),
             };
             if let Some(found) = found {
                 let read = GroupingRead {
@@ -1218,6 +1233,7 @@ pub(super) fn read_output(
         "collections": model.collection_views(),
         "walkthroughs": model.walkthrough_entries(),
         "pictures": model.picture_entries(),
+        "views": model.view_entries(),
         "revision": model.revision,
     });
     extend(&mut output, json!({ "proposal": model.proposal }))?;
@@ -1296,6 +1312,16 @@ impl GroupingRead<'_> {
                 (
                     entry.id.clone(),
                     json!({"kind": "read-picture", "picture": entry}),
+                )
+            }
+            Found::View(view) => {
+                if self.markdown {
+                    print_view(model, view);
+                }
+                let entry = model.view_entry(view);
+                (
+                    entry.id.clone(),
+                    json!({"kind": "read-view", "view": entry}),
                 )
             }
         };
@@ -1454,21 +1480,32 @@ pub(super) fn render_svg(
     spec: &RenderSpec,
     output: Option<&Path>,
 ) -> Result<(render::Rendered, &'static str)> {
-    if spec.walkthrough.is_none() && spec.beat.is_none() && spec.picture.is_none() {
+    let recipe = spec.picture.is_some() || spec.saved_view.is_some();
+    if spec.walkthrough.is_none() && spec.beat.is_none() && !recipe {
         return draw(root, spec, output);
     }
+    if spec.picture.is_some() && spec.saved_view.is_some() {
+        let message = "--picture and --saved-view each say what to draw; give one";
+        return Err(Refusal::new(Code::RequestInvalid, message).into());
+    }
+    let alone = |why: &str| -> Result<()> {
+        if spec.walkthrough.is_some() || spec.beat.is_some() {
+            let message = format!("{why}; leave out --walkthrough and --beat");
+            return Err(Refusal::new(Code::RequestInvalid, message).into());
+        }
+        spec.refuse_drawing_flags(why)
+    };
     let (current, _) = load_state(root, RenderState::Current)?;
-    let reading = match &spec.picture {
-        Some(picture) => {
-            let why = "--picture draws what its recipe reads";
-            if spec.walkthrough.is_some() || spec.beat.is_some() {
-                let message = format!("{why}; leave out --walkthrough and --beat");
-                return Err(Refusal::new(Code::RequestInvalid, message).into());
-            }
-            spec.refuse_drawing_flags(why)?;
+    let reading = match (&spec.picture, &spec.saved_view) {
+        (Some(picture), _) => {
+            alone("--picture draws what its recipe reads")?;
             &current.picture(picture)?.reading
         }
-        None => spec.beat(&current)?,
+        (None, Some(view)) => {
+            alone("--saved-view draws what the view reads")?;
+            &current.saved_view(view)?.reading
+        }
+        (None, None) => spec.beat(&current)?,
     };
     draw_reading(root, reading, output, &mut States::new(&current))
 }
@@ -1487,8 +1524,10 @@ fn draw(
     let options = render::Options {
         focus: &focus,
         hide: &spec.hide_kind,
+        groups: &spec.group,
         legend: spec.legend,
         theme: spec.theme.map_or(render::Theme::Light, Into::into),
+        ..render::Options::default()
     };
     paint(
         root,
@@ -1519,8 +1558,19 @@ fn draw_reading(
         .map(|b| states.get(b))
         .transpose()
         .map_err(again)?;
+    let regions: Vec<String> = match &reading.groups {
+        Some(ReadingGroups::All(_)) => drawn.0.config.groups.keys().cloned().collect(),
+        Some(ReadingGroups::Keys(keys)) => keys.clone(),
+        None => Vec::new(),
+    };
+    let filters = reading.filters.as_ref();
     let options = render::Options {
         focus: &reading.focus,
+        selection: &reading.selection,
+        relationships: filters.map_or(&[], |f| &f.relationships),
+        groups: filters.map_or(&[], |f| &f.groups),
+        regions: &regions,
+        visibility: reading.visibility.and_then(|v| usize::try_from(v).ok()),
         ..render::Options::default()
     };
     paint(root, &view, &options, drawn, base, output)
@@ -1672,6 +1722,7 @@ impl RenderSpec {
         ];
         let styled = !self.focus.is_empty()
             || !self.hide_kind.is_empty()
+            || !self.group.is_empty()
             || self.legend
             || self.theme.is_some();
         if drawing.iter().any(|flag| flag.is_some())
@@ -2042,8 +2093,11 @@ pub(super) fn run_check(
     let (mut skips, mut units, mut language_server_runs) = (None, None, Vec::new());
     let mut diagnostics = if runs(CheckOnly::Semantic) {
         let mut found = semantic::check(&model.manifest.id, &model.modules, &model.collections);
-        let (judged, skipped) = semantic::walkthroughs(&mut states);
+        let (judged, mut skipped) = semantic::walkthroughs(&mut states);
         found.extend(judged);
+        let (judged, views_skipped) = semantic::views(&mut states);
+        found.extend(judged);
+        skipped.extend(views_skipped);
         if !skipped.is_empty() {
             skips = Some(skipped);
         }
@@ -3555,6 +3609,26 @@ fn print_pictures(pictures: &[PictureEntry<'_>]) {
     }
 }
 
+fn print_views(views: &[ViewEntry<'_>]) {
+    if views.is_empty() {
+        return;
+    }
+    println!("Views:");
+    for view in views {
+        println!("- {} {}", view.name, view.id);
+    }
+}
+
+/// The saved view: its name and one line saying what it shows.
+fn print_view(model: &Model, view: &SavedView) {
+    println!("View {} {}", view.name, model.qualify(&view.id));
+    if let Some(description) = &view.description {
+        println!("{description}");
+    }
+    let shows = describe(&names(model), &flow_names(model), &view.reading);
+    println!("Shows: {shows}");
+}
+
 /// The picture recipe: its file and one line saying what it shows.
 fn print_picture(model: &Model, picture: &Picture) {
     println!("Picture {} {}", picture.name, model.qualify(&picture.id));
@@ -3627,6 +3701,29 @@ fn describe(
     if !reading.focus.is_empty() {
         let focus: Vec<&str> = reading.focus.iter().map(|m| name_of(names, m)).collect();
         text += &format!(", focus on {}", focus.join(", "));
+    }
+    if let Some(visibility) = reading.visibility {
+        let plural = if visibility == 1 { "" } else { "s" };
+        text += &format!(" within {visibility} hop{plural}");
+    }
+    if !reading.selection.is_empty() {
+        let selected: Vec<&str> = (reading.selection.iter())
+            .map(|m| name_of(names, m))
+            .collect();
+        text += &format!(", {} selected", selected.join(", "));
+    }
+    if let Some(filters) = &reading.filters {
+        if !filters.relationships.is_empty() {
+            text += &format!(", only {} relationships", filters.relationships.join(", "));
+        }
+        if !filters.groups.is_empty() {
+            text += &format!(", only groups {}", filters.groups.join(", "));
+        }
+    }
+    match &reading.groups {
+        Some(ReadingGroups::All(_)) => text += ", every group as a region",
+        Some(ReadingGroups::Keys(keys)) => text += &format!(", regions {}", keys.join(", ")),
+        None => {}
     }
     text
 }

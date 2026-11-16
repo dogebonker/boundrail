@@ -1,14 +1,15 @@
-//! The picture changes of a `model edit` batch. Pictures belong to the current state; a proposal
-//! edit refuses them. A picture's reading resolves and validates as a walkthrough beat's does.
+//! The picture changes of a `model edit` batch. A picture is edited as a saved view is, and also
+//! names the file it draws. Pictures belong to the current state; a proposal edit refuses them.
 
 use anyhow::Result;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::walkthrough::{BeatField, BeatSet, CurrentOnly, NewReading, Refused};
-use super::{Batch, at, both};
-use crate::arch::types::{Picture, ReadingState, ReadingView, SCHEMA_VERSION};
-use crate::arch::{Code, vault};
+use super::Batch;
+use super::view::{NamedField, ViewSet};
+use super::walkthrough::{NewReading, ReadingSet, Refused};
+use crate::arch::Code;
+use crate::arch::types::{Picture, SCHEMA_VERSION};
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -30,87 +31,11 @@ pub struct PictureSet {
     pub order: Option<u32>,
     pub description: Option<String>,
     pub output: Option<String>,
-    pub view: Option<ReadingView>,
-    pub state: Option<ReadingState>,
-    pub against: Option<ReadingState>,
-    pub scope: Option<String>,
-    pub depth: Option<u32>,
-    pub flow: Option<String>,
-    pub focus: Option<Vec<String>>,
-}
-
-/// A picture field `clear` empties; clearing `state` reads the current state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum PictureField {
-    Description,
-    State,
-    Against,
-    Scope,
-    Depth,
-    Flow,
-    Focus,
-}
-
-impl PictureField {
-    /// The reading field it clears, `None` for the picture's own.
-    fn reading(self) -> Option<BeatField> {
-        match self {
-            Self::Description => None,
-            Self::State => Some(BeatField::State),
-            Self::Against => Some(BeatField::Against),
-            Self::Scope => Some(BeatField::Scope),
-            Self::Depth => Some(BeatField::Depth),
-            Self::Flow => Some(BeatField::Flow),
-            Self::Focus => Some(BeatField::Focus),
-        }
-    }
-}
-
-impl PictureSet {
-    fn is_set(&self, field: PictureField) -> bool {
-        match field.reading() {
-            Some(field) => field.is_set(&self.reading()),
-            None => self.description.is_some(),
-        }
-    }
-
-    /// The reading fields it sets, as a beat edit names them.
-    fn reading(&self) -> BeatSet {
-        BeatSet {
-            view: self.view,
-            state: self.state.clone(),
-            against: self.against.clone(),
-            scope: self.scope.clone(),
-            depth: self.depth,
-            flow: self.flow.clone(),
-            focus: self.focus.clone(),
-            ..BeatSet::default()
-        }
-    }
-}
-
-impl CurrentOnly for Picture {
-    fn id(&self) -> &str {
-        &self.id
-    }
-    fn name(&self) -> &str {
-        &self.name
-    }
-    fn ids(&self) -> Vec<&str> {
-        vec![&self.id]
-    }
-    fn file(id: &str) -> String {
-        vault::picture_file(id)
-    }
+    #[serde(flatten)]
+    pub reading: ReadingSet,
 }
 
 impl Batch<'_> {
-    fn picture_at(&self, index: usize, subject: &str) -> Result<usize> {
-        let found = vault::picture_position(self.model, &self.pictures, subject);
-        Ok(found.map_err(at(index))?)
-    }
-
     pub(super) fn add_picture(&mut self, index: usize, new: NewPicture) -> Result<()> {
         let id = self.new_id(index, new.name.clone())?;
         let reading = self.build_reading(index, new.reading)?;
@@ -131,42 +56,25 @@ impl Batch<'_> {
         index: usize,
         subject: &str,
         set: PictureSet,
-        clear: &[PictureField],
+        clear: &[NamedField],
     ) -> Result<()> {
-        if let Some(field) = clear.iter().find(|f| set.is_set(**f)) {
-            return Err(both(index, field));
+        let PictureSet {
+            name,
+            order,
+            description,
+            output,
+            reading,
+        } = set;
+        let set = ViewSet {
+            name,
+            order,
+            description,
+            reading,
+        };
+        let p = self.edit_named(index, subject, set, clear, |b| &mut b.pictures)?;
+        if let Some(output) = output {
+            self.pictures[p].output = output;
         }
-        let p = self.picture_at(index, subject)?;
-        let id = self.pictures[p].id.clone();
-        self.edit_once(index, &id)?;
-        let cleared: Vec<BeatField> = clear.iter().filter_map(|f| f.reading()).collect();
-        let mut reading = self.pictures[p].reading.clone();
-        self.apply_reading(index, &mut reading, &set.reading(), &cleared)?;
-        let picture = &mut self.pictures[p];
-        picture.reading = reading;
-        if let Some(name) = set.name {
-            picture.name = name;
-        }
-        if let Some(order) = set.order {
-            picture.order = order;
-        }
-        if let Some(output) = set.output {
-            picture.output = output;
-        }
-        if set.description.is_some() {
-            picture.description = set.description;
-        }
-        if clear.contains(&PictureField::Description) {
-            picture.description = None;
-        }
-        self.touched.insert(id, index);
-        Ok(())
-    }
-
-    pub(super) fn remove_picture(&mut self, index: usize, subject: &str) -> Result<()> {
-        let p = self.picture_at(index, subject)?;
-        let removed = self.pictures.remove(p);
-        self.touched.insert(removed.id, index);
         Ok(())
     }
 
@@ -226,6 +134,7 @@ mod tests {
             collections: Vec::new(),
             walkthroughs: Vec::new(),
             pictures,
+            views: Vec::new(),
             revision: revision::of(std::iter::empty()),
             proposal: None,
         }

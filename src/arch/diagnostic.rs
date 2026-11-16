@@ -20,6 +20,7 @@ pub enum DiagnosticCode {
     PictureStale,
     PictureMissing,
     PictureUnrenderable,
+    ViewTargetMissing,
     BindingPathMissing,
     BindingSymbolMissing,
     AnchorPathMissing,
@@ -50,6 +51,7 @@ impl DiagnosticCode {
             Self::PictureStale => "PICTURE_STALE",
             Self::PictureMissing => "PICTURE_MISSING",
             Self::PictureUnrenderable => "PICTURE_UNRENDERABLE",
+            Self::ViewTargetMissing => "VIEW_TARGET_MISSING",
             Self::BindingPathMissing => "BINDING_PATH_MISSING",
             Self::BindingSymbolMissing => "BINDING_SYMBOL_MISSING",
             Self::AnchorPathMissing => "ANCHOR_PATH_MISSING",
@@ -81,6 +83,7 @@ impl DiagnosticCode {
             | Self::PictureStale
             | Self::PictureMissing
             | Self::PictureUnrenderable
+            | Self::ViewTargetMissing
             | Self::BindingPathMissing
             | Self::BindingSymbolMissing
             | Self::AnchorPathMissing

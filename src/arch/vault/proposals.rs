@@ -253,7 +253,7 @@ pub(crate) fn base_writes(
     let (modules, mut removed) = changed(modules, old_modules, module_id, module_file);
     let (collections, gone) = changed(collections, old_collections, collection_id, collection_file);
     removed.extend(gone);
-    let mut writes = plan_writes(None, &modules, &collections, &[], &[], &removed)?;
+    let mut writes = plan_writes(None, &modules, &collections, &[], &[], &[], &removed)?;
     let base = base_prefix(id);
     for write in &mut writes {
         write.path.insert_str(0, &base);
