@@ -19,52 +19,12 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
-      - run: python3 -B -m unittest discover -s tests -p test_context_hook.py
-      - run: python3 -B -m unittest discover -s ci -p test_bench_daemon.py
-      - run: python3 -B -m unittest ci.test_adr_interop
-      - run: python3 -B -m unittest discover -s bench -p 'test_*.py'
-      - run: python3 -B -m unittest discover -s bench/cases -p 'test_*.py'
-      - run: python3 -B -m unittest discover -s bench/usefulness -p 'test_*.py'
-      - run: python3 -m unittest discover -s benchmarks
-      - run: python3 -m unittest discover -s showcase/tests
-
-  live:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: rustup toolchain install
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 22
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.14"
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: 1.27.1
           cache: false
-      - name: Install Elixir for AST collector tests
-        run: sudo apt-get update && sudo apt-get install --yes elixir
-      - name: Install the pinned collectors
-        run: |
-          rustup component add rust-analyzer rust-src
-          mkdir "$RUNNER_TEMP/tools"
-          cp ci/tools/package.json ci/tools/package-lock.json "$RUNNER_TEMP/tools/"
-          npm ci --prefix "$RUNNER_TEMP/tools" --ignore-scripts --no-audit --no-fund
-          python -m venv "$RUNNER_TEMP/venv"
-          "$RUNNER_TEMP/venv/bin/pip" install --only-binary :all: --require-hashes -r ci/tools/requirements.txt
-          echo "$RUNNER_TEMP/tools/node_modules/.bin" >> "$GITHUB_PATH"
-      - name: Verify symbol collectors
-        run: node --test tests/impact-typescript.test.cjs tests/surface-symbols.test.cjs
-        env:
-          ARCHGRAPH_TYPESCRIPT: ${{ runner.temp }}/tools/node_modules/typescript/package.json
-      - run: cargo test --locked --test live -- --ignored
-        env:
-          ARCHGRAPH_DEPCRUISE: ${{ runner.temp }}/tools/node_modules/.bin/depcruise
-          ARCHGRAPH_PYTHON: ${{ runner.temp }}/venv/bin/python
-      - run: cargo test --locked --test symbols --test surface_go --test go_resolution --test elixir --test elixir_collector --test native_go -- --include-ignored
+      - name: The real go list never runs repository code
+        run: cargo test --locked --test native_go -- --include-ignored
 
   binary:
     runs-on: ubuntu-latest
@@ -92,9 +52,7 @@ jobs:
           name: boundrail-binary
           path: ${{ runner.temp }}/bin
       - run: chmod +x "$RUNNER_TEMP/bin/boundrail"
-      - run: shellcheck install.sh ci/action.sh skills/boundrail-guard/scripts/guard.sh ci/test-install.sh ci/test-elixir-action.sh ci/test-native-action.sh ci/bench-daemon.sh
-      - run: bash ci/test-elixir-action.sh
-      - run: bash ci/test-native-action.sh
+      - run: shellcheck install.sh ci/model-action.sh ci/test-install.sh
       - name: npm/package.json version is Cargo.toml's
         run: |
           cargo=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
@@ -103,8 +61,6 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 18
-      - run: node --test ../tests/comparison-ui.test.cjs ../tests/services-ui.test.cjs ../tests/history-ui.test.cjs ../tests/context-ui.test.cjs ../tests/surface-ui.test.cjs ../tests/package-splits-ui.test.cjs ../tests/target-ui.test.cjs ../tests/review-ui.test.cjs ../tests/whatif-parity.test.cjs ../tests/whatif-ui.test.cjs ../tests/exposure-ui.test.cjs
-        working-directory: npm
       - run: node --test
         working-directory: npm
         env:
@@ -114,106 +70,3 @@ jobs:
           mkdir "$RUNNER_TEMP/install-test"
           sh ci/test-install.sh "$RUNNER_TEMP/bin/boundrail" "$RUNNER_TEMP/install-test"
 
-  action-push:
-    needs: binary
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: boundrail-binary
-          path: ${{ runner.temp }}/bin
-      - run: chmod +x "$RUNNER_TEMP/bin/boundrail" && cp -R tests/fixtures/ts-fda "$RUNNER_TEMP/fda"
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 22
-      - id: boundrail
-        uses: ./
-        continue-on-error: true
-        with:
-          path: ${{ runner.temp }}/fda
-          binary: ${{ runner.temp }}/bin/boundrail
-      - name: The step failed on the fixture's forbidden imports
-        run: |
-          echo "outcome=$OUTCOME forbidden=$FORBIDDEN"
-          [ "$OUTCOME" = failure ] && [ "$FORBIDDEN" -gt 0 ] && [ -f "$JSON" ]
-        env:
-          OUTCOME: ${{ steps.boundrail.outcome }}
-          FORBIDDEN: ${{ steps.boundrail.outputs.forbidden }}
-          JSON: ${{ steps.boundrail.outputs.json }}
-      - name: The step wrote SARIF with the fixture's four broken claims and one forbidden import
-        run: jq -e '.runs[0].results | length == 5' "$SARIF"
-        env:
-          SARIF: ${{ steps.boundrail.outputs.sarif }}
-
-  action-pr:
-    needs: binary
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: boundrail-binary
-          path: ${{ runner.temp }}/bin
-      - run: chmod +x "$RUNNER_TEMP/bin/boundrail"
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 22
-      - name: A repository whose second commit adds a forbidden import
-        id: repo
-        run: |
-          repo=$RUNNER_TEMP/pr
-          cp -R tests/fixtures/ts-fda "$repo"
-          cd "$repo"
-          git init -q
-          git add -A
-          git -c user.name=ci -c user.email=ci@example.invalid commit -qm base
-          echo "base=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          printf 'import { TAX } from "../domains/checkout/types";\nexport const rate = TAX;\n' > src/shared/label.ts
-          git add -A
-          git -c user.name=ci -c user.email=ci@example.invalid commit -qm head
-      - id: boundrail
-        uses: ./
-        continue-on-error: true
-        with:
-          path: ${{ runner.temp }}/pr
-          binary: ${{ runner.temp }}/bin/boundrail
-          base-ref: ${{ steps.repo.outputs.base }}
-      - name: The step failed on the new forbidden import
-        run: |
-          echo "outcome=$OUTCOME new-forbidden=$NEW_FORBIDDEN"
-          [ "$OUTCOME" = failure ] && [ "$NEW_FORBIDDEN" -gt 0 ]
-        env:
-          OUTCOME: ${{ steps.boundrail.outcome }}
-          NEW_FORBIDDEN: ${{ steps.boundrail.outputs.new-forbidden }}
-
-  action-go:
-    needs: binary
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: boundrail-binary
-          path: ${{ runner.temp }}/bin
-      - run: chmod +x "$RUNNER_TEMP/bin/boundrail" && cp -R tests/fixtures/go-layers "$RUNNER_TEMP/layers"
-      # No setup-go: the action installs its pinned Go because the path has a go.mod.
-      - id: boundrail
-        uses: ./
-        continue-on-error: true
-        with:
-          path: ${{ runner.temp }}/layers
-          binary: ${{ runner.temp }}/bin/boundrail
-      - name: The step failed on the fixture's forbidden import
-        run: |
-          echo "outcome=$OUTCOME forbidden=$FORBIDDEN"
-          [ "$OUTCOME" = failure ] && [ "$FORBIDDEN" = 1 ]
-        env:
-          OUTCOME: ${{ steps.boundrail.outcome }}
-          FORBIDDEN: ${{ steps.boundrail.outputs.forbidden }}

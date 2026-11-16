@@ -2,6 +2,75 @@
 
 ## [Unreleased]
 
+### Added
+
+- The authored architecture model, `boundrail model`: modules bound to code, relationships,
+  collections, flows and walkthroughs in `.boundrail/model/`, committed with the code. Batch
+  edits name the revision they read and an operation ID; claims coordinate writers; proposals
+  draft a future state that `compare`, `adopt` and `reconcile` work with; `export` and `import`
+  move drafts and checkpoints as bundles; `retain` keeps checkpoints on `refs/boundrail/history`,
+  which `history push` and `history fetch` publish. `model check` compares the model with the
+  code through built-in tree-sitter collectors and, on request, allowlisted language servers;
+  `inspect`, `footprint` and `locality` report interfaces, a branch's changes and co-change;
+  `render`, `pictures` and `view` draw the model. `model setup` installs the agent skills, and the
+  GitHub Action runs `model check` and comments the footprint.
+- `model footprint --proposal <id>`: the modules a branch changes set beside the modules the
+  proposal names (named and changed, changed but not named, named but not changed), with the
+  changed parts that hold a module's changes in `holds`, `large` for a change of more than 30
+  files, and `--fail-outside`, which exits 1 when a module outside the proposal changed and
+  holds nothing.
+- `model inspect` reads each module's interface from the model as well as the code: entry
+  points, hidden parts, callers, outgoing modules, pass-through parts, relationships on the
+  container and five measures, in `model_interfaces`. `--checkpoint <id>` inspects a retained
+  state from the model alone, and `--group <key>` lists a configured group's members, internal
+  and boundary relationships and neighbouring modules.
+- `model compare` reports `interface_changes`: per module in both states, the entry points,
+  callers, outgoing modules, hidden parts and pass-through parts gained and lost, with the
+  interface measures before and after. `--against-checkpoint <id>` compares with a retained
+  state, and `--beside <proposal>` (repeatable) sets alternatives' subject counts and interface
+  measures side by side.
+- `model check --every-draft` checks the current state and then every draft proposal, reports
+  each, and exits 1 when any has a warning or does not load.
+- The code check, `inspect` and `footprint` scan every language in the checkout, such as a Go
+  backend beside a TypeScript frontend, and TypeScript outside `src/`. A collector that fails
+  skips only its language's code as `scan-failed`, and `SCAN_FAILED` names every module holding
+  that code.
+- A module bound to a compose service, Kubernetes workload or Terraform resource is exempt from
+  `CONTAINER_PARTS_OUTSIDE`, and its parts are judged against the closest ancestor bound to code.
+- `model render` routes arrows around the boxes they do not connect, gives each edge its own
+  port on a shared side, places labels where no two labels, and no label and box, meet, and
+  draws every label over the arrows. New flags: `--focus` (a module and its direct neighbours,
+  the rest dimmed), `--hide-kind`, `--legend`, `--theme light|dark|auto`, and `--png` with
+  `--scale` and `--region`. `--format json` adds the revision, width, height, module and
+  relationship IDs drawn and the SVG's SHA-256. A dark or auto theme in a PNG depends on the
+  rasterizer's CSS support.
+
+### Changed
+
+- The new layout changes the bytes of every architecture picture, so existing pictures report
+  stale until `model pictures --write` draws them again.
+- `model view` has a new interface: dark and light themes that follow the system, an embedded
+  Geist font, kind colours shared by the list, the canvas and the filters, a model summary when
+  nothing is selected, relationships listed as rows, a text filter that dims the canvas, a
+  floating walkthrough bar, and a phone layout with a drawer.
+
+### Removed
+
+- The scan-era commands: `scan`, `report`, `check`, `render`, `simulate`, `diff`, `history`,
+  `bisect`, `hotspots`, `impact`, `surface`, `infer-layout`, `package-splits`, `context`, `tour`,
+  `services`, `show-excludes`, `explain`, `unresolved`, `adr`, `sync-rules`, `init`, `skill`,
+  `propose`, `apply` and `verify`, with the reference collectors and their scan flags
+  (`--rank`, `--all-kinds`, `--legacy-v1`, `--granularity`). `boundrail model` remains.
+- The MCP server (`mcp`, `mcp-call`, `review`), the agent hooks and edit gate (`hook`, `fires`),
+  the daemon (`serve`, `status`, `--no-daemon`) and `--brief`.
+- The GitHub Action's scan mode and its `mode` input; the action runs the model check.
+
+### Never released
+
+The entries below describe scan-era commands built after v0.1.0. Those commands and flags were
+removed before any release (see Removed). The native collectors and the default exclusions they
+describe still back `model check`.
+
 - MCP gains a read-only `services` tool with exact service focus and a repository-contained
   manifest override. It bypasses reference import collection and retains a 4,000-byte response
   cap with explicit counts and omissions.
@@ -77,39 +146,39 @@
 
 - Elixir source-reference collection through `Code.string_to_quoted`, including umbrella apps, aliases, static module calls and type references. Scans do not load Mix projects, evaluate source, compile or expand macros; unresolved dynamic and unavailable dependency references remain visible. Adds runtime selection, shared exclusions and live collector CI coverage.
 
-### Edge quality: kinds and weights
+#### Edge quality: kinds and weights
 
 - New `archgraph/v1.1` exports distinguish runtime, lazy, type and structural re-export imports; TS/JS import tokenization supplements collector metadata, including function-local `require`.
 - Default cycles use runtime edges only. `type_only_cycles` records other cyclic components, including lazy/re-export/mixed cycles and whether they contain a runtime cycle; `--all-kinds` enables broad comparison.
 - Configurable `edge_weights` default to runtime 1.0, lazy 0.3, type 0.1 and reexport 0.0. Weighted coupling/cohesion ratios accompany retained integer counts; `forbid`, `allow` and `public` rules accept optional kind filters, including throughout reachable paths.
-- Upgraded commands read v1 and v1.1. `--legacy-v1` writes the v1 compatibility shape and old kind names for frozen consumers; analysis still uses the new methodology. See [migration details](docs/guide.md#edge-quality-and-migration).
+- Upgraded commands read v1 and v1.1. `--legacy-v1` writes the v1 compatibility shape and old kind names for frozen consumers; analysis still uses the new methodology.
 
-### Edge quality: barrel resolution
+#### Edge quality: barrel resolution
 
 - Named TypeScript/JavaScript and Python imports follow pure forwarding chains to defining files. Python resolution handles relative imports, aliases, static `__all__`, star-bound package attributes and package/submodule precedence without executing source.
 - Pure forwarding nodes carry `barrel: true`; initializers containing executable statements retain runtime load edges. Resolved edges retain `original_to` so layout rules enforce the written boundary.
 - Ambiguous namespace/star imports and chains exceeding ten hops retain their barrel target with low confidence and a diagnostic reason. Forwarding loops produce `reexport-cycle` findings; old collector recordings remain readable.
 
-### Edge quality: exclusions and tests
+#### Edge quality: exclusions and tests
 
 - Shared defaults exclude test, generated/build, fixture/story/example and dependency/vendor content. `show-excludes` lists the policy; `--include-tests`, `--include-generated`, layout `exclude`/`include`, `.gitignore` and `.archgraphignore` control selection.
 - Explicit excludes take precedence; layout includes can override default and ignore-file exclusions. Included tests occupy separate test modules, stay out of cycle detection and provide a minimal importing-test coverage summary.
 - Python test inclusion discovers files outside the selected package through AST inspection, retaining their import edges without executing tests.
 
-### Edge quality: resolution accounting
+#### Edge quality: resolution accounting
 
 - Explicit import ledgers retain specifiers, source lines, kinds and resolution evidence independently of file-reference edges; `report` shows resolution coverage and `unresolved` lists failures with reasons. Legacy recordings keep accounting unavailable until rescanned.
 - Common TypeScript aliases/package maps/workspaces and Python relative, `src/`, namespace and repeatable `--python-path` imports gain resolution evidence. Python inspects external module specs without executing package initializers.
 - Python local module probes require exact path casing, preventing imported class names from creating duplicate modules on case-insensitive filesystems.
 - Known externals use separate `external_nodes`/`external_edges` arrays and stay out of internal cycle/cohesion metrics. Known destinations excluded by scan policy remain resolved in the ledger.
 
-### Edge quality: grab-bags and granularity
+#### Edge quality: grab-bags and granularity
 
 - Configurable `grabbag` thresholds identify low-cohesion, high-fan-in folders with sparse internal edges. `cycle-via-grabbag` findings require a verified per-file split and retain involved-file evidence plus surviving real cycles/cuts; overlapping residuals that recreate the original cycle keep that cycle conservatively.
 - Global `--granularity file|folder` selects graph grouping while preserving folder policy boundaries. The choice persists through historical replay and caches; legacy v1 export regroups file views into a compatible folder view.
 - Included test modules stay out of grab-bag candidates and cycle probes; visible weighted fan-in continues to reflect included test consumers.
 
-### Added
+#### Other additions
 
 - External package policies via `pkg:<glob>` and declared `category:<name>` targets, including kind-filtered reachable checks; per-module occurrence/weighted exposure with an advisory threshold; external-free layer inference; and an inspectable package ring in maps. Missing import accounting remains unavailable, and live what-if previews explicitly defer external verdicts to Rust.
 

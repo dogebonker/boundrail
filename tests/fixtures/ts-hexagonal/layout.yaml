@@ -1,6 +1,0 @@
-# Hexagonal layout, TypeScript: driving and driven adapters do not import each other.
-version: 1
-layers: ["src/domain/**", "src/application/**", "src/adapters/**", "src/main.ts"]
-forbid:
-  - { from: "src/adapters/in/**", to: "src/adapters/out/**" }
-  - { from: "src/adapters/out/**", to: "src/adapters/in/**" }

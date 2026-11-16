@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Boundrail model</title>
+<link rel="preload" href="font.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="identity">
+    <svg class="mark" viewBox="0 0 20 20" aria-hidden="true">
+      <rect x="1.75" y="1.75" width="16.5" height="16.5" rx="4.5" fill="none" stroke="currentColor" stroke-width="1.5"/>
+      <rect class="rail" x="5.5" y="5.5" width="2.5" height="9" rx="1.25"/>
+    </svg>
+    <h1 id="model-name">Loading model</h1>
+    <span id="revision" class="revision" title="Revision"></span>
+    <span id="live" class="live" aria-hidden="true" title="Connecting"></span>
+  </div>
+  <button type="button" id="menu" class="menu icon" aria-expanded="false" aria-controls="state-controls" aria-label="State and comparison">
+    <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 5h10M3 8h10M3 11h10"/></svg>
+  </button>
+  <div class="controls" id="state-controls">
+    <label class="field">State
+      <select id="state" aria-label="State to show"></select>
+    </label>
+    <label class="field">Compare with
+      <select id="against" aria-label="State to compare with"></select>
+    </label>
+  </div>
+</header>
+<main class="workspace">
+  <section class="stage" aria-label="Diagram">
+    <div class="toolbar">
+      <div class="switch" role="group" aria-label="View">
+        <button type="button" data-view="architecture" aria-pressed="true">Architecture</button>
+        <button type="button" data-view="sequence" aria-pressed="false">Sequence</button>
+        <button type="button" data-view="flowchart" aria-pressed="false">Flowchart</button>
+      </div>
+      <span class="spacer"></span>
+      <div class="stepper" role="group" aria-label="Container depth">
+        <span class="stepper-label" aria-hidden="true">Depth</span>
+        <button type="button" id="depth-down" class="icon" aria-label="Less depth" title="Less depth"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 8h8"/></svg></button>
+        <input id="depth" type="number" min="1" max="9" value="2" aria-label="Container depth">
+        <button type="button" id="depth-up" class="icon" aria-label="More depth" title="More depth"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 8h8M8 4v8"/></svg></button>
+      </div>
+      <div class="group" role="group" aria-label="Canvas">
+        <button type="button" id="fit" class="icon" aria-label="Fit diagram to screen" title="Fit (0)"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 6V3.5a1 1 0 0 1 1-1H6M10 2.5h2.5a1 1 0 0 1 1 1V6M13.5 10v2.5a1 1 0 0 1-1 1H10M6 13.5H3.5a1 1 0 0 1-1-1V10"/></svg></button>
+        <button type="button" id="focus" class="icon" aria-pressed="false" aria-label="Focus on selection: dim unconnected modules" title="Focus on selection"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="2.25"/><circle cx="8" cy="8" r="5.5" stroke-dasharray="2 2.3"/></svg></button>
+        <button type="button" id="split" class="icon" aria-pressed="false" aria-label="Split the canvas into two panes" title="Split"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2.5" y="3" width="11" height="10" rx="1.5"/><path d="M8 3v10"/></svg></button>
+      </div>
+    </div>
+    <section id="play" class="play" aria-label="Walkthrough" hidden></section>
+    <div id="panes" class="panes"></div>
+  </section>
+  <div id="drawer" class="drawer">
+  <button type="button" id="drawer-handle" class="handle" aria-expanded="false" aria-controls="drawer" aria-label="Show modules and details"></button>
+  <button type="button" id="drawer-close" class="drawer-close icon" aria-label="Close" title="Close"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"/></svg></button>
+  <nav class="sidebar" aria-label="Model contents">
+    <div class="filter">
+      <div class="search">
+        <input id="filter" type="search" placeholder="Filter modules" aria-label="Filter modules by name" aria-keyshortcuts="/" autocomplete="off">
+        <kbd aria-hidden="true">/</kbd>
+      </div>
+      <div id="kinds" class="chips" role="group" aria-label="Filter by kind"></div>
+    </div>
+    <section aria-labelledby="h-modules">
+      <h2 id="h-modules">Modules</h2>
+      <ul id="tree" class="tree"></ul>
+    </section>
+    <section aria-labelledby="h-flows">
+      <h2 id="h-flows">Flows</h2>
+      <div id="flows"></div>
+    </section>
+    <section aria-labelledby="h-walkthroughs">
+      <h2 id="h-walkthroughs">Walkthroughs</h2>
+      <div id="walkthroughs"></div>
+    </section>
+    <section aria-labelledby="h-pictures" data-none="pictures">
+      <h2 id="h-pictures">Pictures</h2>
+      <div id="pictures"></div>
+    </section>
+    <section aria-labelledby="h-warnings" hidden>
+      <h2 id="h-warnings">Warnings</h2>
+      <div id="warnings"></div>
+    </section>
+    <section id="changes-section" aria-labelledby="h-changes" hidden>
+      <h2 id="h-changes">Changes</h2>
+      <div id="changes"></div>
+    </section>
+    <section aria-labelledby="h-proposals" data-none="proposals">
+      <h2 id="h-proposals">Proposals</h2>
+      <div id="proposals"></div>
+    </section>
+    <section aria-labelledby="h-history" data-none="checkpoints">
+      <h2 id="h-history">History</h2>
+      <div id="history"></div>
+    </section>
+    <p id="empties" class="empties" hidden></p>
+  </nav>
+  <aside id="detail" class="detail" aria-label="Selected module"></aside>
+  </div>
+</main>
+<p id="announce" class="visually-hidden" role="status"></p>
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+<script src="app.js"></script>
+</body>
+</html>

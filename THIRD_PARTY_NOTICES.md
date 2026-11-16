@@ -4,8 +4,6 @@ The native collectors embed the grammar/runtime components below. License texts 
 
 The native Elixir module/application-name catalog was generated from installed Elixir 1.20.1 / Erlang OTP 29 application manifests; it does not embed or execute their runtime code. Projects: [Elixir](https://github.com/elixir-lang/elixir) and [Erlang/OTP](https://github.com/erlang/otp).
 
-The tests validate SARIF output against the OASIS SARIF 2.1.0 errata01 JSON schema, vendored unmodified as `tests/fixtures/sarif-schema-2.1.0.json` from https://docs.oasis-open.org/sarif/sarif/v2.1.0/errata01/os/schemas/sarif-schema-2.1.0.json (sha256 `c3b4bb2d6093897483348925aaa73af03b3e3f4bd4ca38cef26dcb4212a2682e`); it carries no license text of its own and is not embedded in the binary.
-
 ## tree-sitter 0.27.1
 
 Project: https://github.com/tree-sitter/tree-sitter. Source: pinned crate archive `tree-sitter-0.27.1/LICENSE`.
@@ -889,10 +887,6 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-## Daemon filesystem watcher
+## Filesystem watcher
 
 `notify` 8.2.0 is distributed under CC0-1.0; `notify-types` 2.1.0 is MIT or Apache-2.0. Source and license files are included in their pinned crates: https://github.com/notify-rs/notify/tree/8.2.0 . Platform backend dependencies retain their individual licenses in Cargo metadata.
-
-## MCP protocol and runtime
-
-The official Rust MCP SDK, `rmcp` 3.5.1, is Apache-2.0; upstream retains MIT notices for earlier contributions: https://github.com/modelcontextprotocol/rust-sdk/blob/main/LICENSE . `tokio` 1.53.1 is MIT: https://github.com/tokio-rs/tokio/blob/master/tokio/LICENSE . Only server/stdio and the current-thread runtime are enabled; HTTP and OAuth features are disabled. Transitive dependencies retain their individual licenses in Cargo metadata and published source crates.

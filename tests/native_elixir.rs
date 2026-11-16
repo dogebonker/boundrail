@@ -43,23 +43,6 @@ fn native_elixir_matches_recorded_fixture_without_a_vm() {
             .iter()
             .any(|r| r.external.as_deref() == Some("elixir"))
     );
-    let output = common::archgraph(&[
-        "scan",
-        root.to_str().unwrap(),
-        "--engine",
-        "native",
-        "--language",
-        "elixir",
-        "--elixir",
-        "/nonexistent/elixir",
-        "--symbols",
-    ]);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    common::validate(&serde_json::from_slice(&output.stdout).unwrap());
 }
 
 #[test]

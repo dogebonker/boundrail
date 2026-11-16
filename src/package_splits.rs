@@ -916,6 +916,7 @@ mod tests {
             barrel: false,
             class: Some(ModuleClass::Tests),
             owners: vec![],
+            language: None,
         });
         doc.imports.as_mut().unwrap().push(ImportRecord {
             from: "lib/core/test.ts".into(),
@@ -1069,6 +1070,7 @@ mod tests {
             barrel: true,
             class: None,
             owners: vec![],
+            language: None,
         });
         for edge in doc.edges.iter_mut().filter(|e| e.to == "lib/definition.ts") {
             edge.original_to = Some("lib/index.ts".into());

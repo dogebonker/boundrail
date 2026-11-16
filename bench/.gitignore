@@ -1,2 +1,0 @@
-# Full RPC logs can contain prompts and source; publish only the safe report artifacts.
-.private-events/

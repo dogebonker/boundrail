@@ -496,94 +496,6 @@ fn production_back_edges_survive_and_ambiguous_globs_are_structural() {
 }
 
 #[test]
-fn containment_is_not_a_reexport_cycle_but_public_forwarding_cycles_remain() {
-    fn scan(f: &Fixture) -> serde_json::Value {
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_boundrail"))
-            .args([
-                "--no-daemon",
-                "scan",
-                f.0.to_str().unwrap(),
-                "--engine",
-                "native",
-                "--language",
-                "rust",
-            ])
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        serde_json::from_slice(&output.stdout).unwrap()
-    }
-    fn has_reexport_cycle(doc: &serde_json::Value) -> bool {
-        doc["findings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .chain(
-                doc["diagnostics"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|d| &d["finding"]),
-            )
-            .any(|f| f["kind"] == "reexport-cycle")
-    }
-    let containment = Fixture::new(&[
-        ("Cargo.toml", "[package]\nname='sample'\nversion='0.1.0'"),
-        ("src/lib.rs", "mod child;"),
-        ("src/child.rs", "use super::*;"),
-    ]);
-    assert!(!has_reexport_cycle(&scan(&containment)));
-    let forwarding = Fixture::new(&[
-        ("Cargo.toml", "[package]\nname='sample'\nversion='0.1.0'"),
-        ("src/lib.rs", "mod a; mod b;"),
-        ("src/a.rs", "pub use crate::b::Shape;"),
-        ("src/b.rs", "pub use crate::a::Shape;"),
-    ]);
-    assert!(has_reexport_cycle(&scan(&forwarding)));
-}
-
-#[test]
-fn included_cfg_test_files_are_classed_out_of_cycles_even_with_all_kinds() {
-    let f = Fixture::new(&[
-        ("Cargo.toml", "[package]\nname='sample'\nversion='0.1.0'"),
-        ("src/lib.rs", "#[cfg(test)] mod checks; pub fn run() {}"),
-        ("src/checks.rs", "use crate::run;"),
-    ]);
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_boundrail"))
-        .args([
-            "--no-daemon",
-            "scan",
-            f.0.to_str().unwrap(),
-            "--engine",
-            "native",
-            "--language",
-            "rust",
-            "--include-tests",
-            "--all-kinds",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert!(
-        doc["files"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|f| f["path"] == "src/checks.rs" && f["class"] == "tests")
-    );
-    assert!(doc["cycles"].as_array().unwrap().is_empty());
-}
-
-#[test]
 fn bare_local_module_calls_are_dependencies_and_can_close_production_cycles() {
     use boundrail::model::EdgeKind;
     let f = Fixture::new(&[
@@ -617,31 +529,6 @@ fn bare_local_module_calls_are_dependencies_and_can_close_production_cycles() {
             .iter()
             .any(|i| i.specifier.contains("UnknownType") || i.specifier.contains("absent"))
     );
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_boundrail"))
-        .args([
-            "--no-daemon",
-            "scan",
-            f.0.to_str().unwrap(),
-            "--engine",
-            "native",
-            "--language",
-            "rust",
-            "--granularity",
-            "file",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(doc["cycles"].as_array().unwrap().len(), 1);
-    let members = doc["cycles"][0]["members"].as_array().unwrap();
-    assert!(members.iter().any(|m| m == "src/lib.rs"));
-    assert!(members.iter().any(|m| m == "src/charging.rs"));
-    assert!(!members.iter().any(|m| m == "src/unused.rs"));
 }
 
 #[test]
@@ -778,29 +665,4 @@ fn parent_globs_keep_symbols_forwarded_by_nested_stars() {
     assert!(out.raw.edges.iter().any(|e| e.from == "src/shapes.rs"
         && e.to == "src/consumer.rs"
         && e.kind == boundrail::model::EdgeKind::Static));
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_boundrail"))
-        .args([
-            "--no-daemon",
-            "scan",
-            f.0.to_str().unwrap(),
-            "--engine",
-            "native",
-            "--language",
-            "rust",
-            "--granularity",
-            "file",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert!(doc["cycles"].as_array().unwrap().iter().any(|cycle| {
-        let members = cycle["members"].as_array().unwrap();
-        members.iter().any(|m| m == "src/consumer.rs")
-            && members.iter().any(|m| m == "src/shapes.rs")
-    }));
 }

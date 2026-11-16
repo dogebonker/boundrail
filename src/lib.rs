@@ -1,54 +1,30 @@
-macro_rules! eprintln { ($($arg:tt)*) => { $crate::output::stderr(format_args!("{}\n", format_args!($($arg)*))) }; }
-// Library half of the CLI and daemon, shared with integration tests.
+// Library half of the CLI, shared with integration tests.
 
-pub mod adr;
-pub mod apply;
+pub mod arch;
 pub mod bisect;
 pub mod cochange;
 pub mod codeowners;
 pub mod collect;
-pub mod comparison;
-pub mod compat;
-pub mod context;
 pub mod diff;
 pub mod early_smells;
-pub mod edit_audit;
-pub mod edit_gate;
 pub mod exposure;
+pub mod files;
 pub mod findings;
 pub mod git;
 pub mod grabbag;
 pub mod graph;
-pub mod history;
-pub mod hook_agents;
 pub mod hotspots;
-pub mod impact;
-pub mod incremental;
-pub mod infer_layout;
-pub mod infer_services;
 pub mod known;
-pub mod mcp_tools;
 pub mod model;
 pub mod modules;
-pub mod output;
 pub mod package_splits;
-pub mod presets;
-pub mod project_skill;
 pub mod quality;
 pub mod recipes;
-pub mod render;
 pub mod resolution;
-pub mod rewrite;
 pub mod rules;
-pub mod sarif;
-pub mod service_diff;
-pub mod services;
 pub mod simulate;
 pub mod surface;
-pub mod symbols;
-pub mod sync_rules;
 pub mod target;
-pub mod tour;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -56,160 +32,37 @@ use anyhow::{Result, bail};
 use model::{Cochange, Config, Document, Edge, File, SCHEMA, Source, Summary, Tool};
 use rules::Compiled;
 
-/// Rebuild a persisted scan, retaining its optional historical context.
-pub fn restore_scan(mut input: model::ScanInput) -> Result<Document> {
-    validate_scan(&input)?;
-    input.hydrate_config();
-    let mut doc = analyze(
-        input.source,
-        input.config,
-        input.files.into_iter().map(|f| f.path).collect(),
-        input.edges,
-        input.package_entries,
-        input.cochange,
-    )?;
-    let threshold = input
-        .surface
-        .as_ref()
-        .map_or(surface::DEFAULT_MAX_SYMBOLS, |s| s.max_symbols);
-    if let Some(symbols) = input.symbols {
-        surface::attach(&mut doc, symbols, threshold)?;
-    } else if input.surface.is_some() {
-        doc.surface = Some(surface::analyze(&doc, threshold)?);
-    }
-    recipes::attach(&mut doc)?;
-    for saved in input
-        .findings
-        .into_iter()
-        .chain(input.diagnostics.into_iter().map(|d| d.finding))
+/// 64 hex digits (256 bits) from the operating system's random source: `/dev/urandom` on Unix,
+/// the system RNG on Windows. Fails on a target with neither, rather than return a guessable
+/// value.
+#[cfg(any(unix, windows))]
+pub fn token() -> Result<String> {
+    let mut bytes = [0u8; 32];
+    #[cfg(unix)]
     {
-        if let Some(finding) = doc
-            .findings
-            .iter_mut()
-            .chain(doc.diagnostics.iter_mut().map(|d| &mut d.finding))
-            .find(|f| f.subject == saved.subject && f.kind.as_str() == saved.kind)
-        {
-            finding.age_days = saved.age_days;
-            finding.introduced_by = saved.introduced_by;
-            finding.provenance = saved.provenance;
-        }
+        use std::io::Read as _;
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
     }
-    if let Some(report) = input.hotspots {
-        if report
-            .files
-            .iter()
-            .any(|h| !doc.files.iter().any(|f| f.path == h.path))
-        {
-            bail!("hotspot report names a file outside the scan");
-        }
-        apply_hotspots(&mut doc, report);
+    #[cfg(windows)]
+    {
+        #[link(name = "bcrypt")]
+        unsafe extern "system" {
+            fn BCryptGenRandom(h: *mut std::ffi::c_void, p: *mut u8, n: u32, flags: u32) -> i32;
+        } // System RNG, with no algorithm handle.
+        if unsafe { BCryptGenRandom(std::ptr::null_mut(), bytes.as_mut_ptr(), 32, 2) } < 0 {
+            bail!("the system random number generator failed")
+        };
     }
-    if let Some(saved) = input.package_splits {
-        if !model::supported_schema(&saved.schema) || saved.kind != "package-splits" {
-            bail!("expected a package-splits report in the scan attachment");
-        }
-        doc.package_splits = Some(package_splits::analyze(
-            &doc,
-            saved.options,
-            saved.workspace,
-        )?);
-    }
-    Ok(doc)
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-pub fn validate_scan(input: &model::ScanInput) -> Result<()> {
-    if !model::supported_schema(&input.schema) || input.kind != "scan" {
-        bail!("expected an {SCHEMA} scan document");
-    }
-    let rules = rules::compile(&input.config)?;
-    input
-        .config
-        .codeowners
-        .as_ref()
-        .map(codeowners::compile)
-        .transpose()?;
-    let mut config = input.config.clone();
-    config.import_records = input.imports.clone();
-    config.globals = input.globals.clone();
-    // Saved modules follow the document's own granularity, also when exported as legacy v1.
-    config.legacy_module_classes = false;
-    let mut paths = BTreeSet::new();
-    for file in &input.files {
-        if !paths.insert(file.path.as_str()) {
-            bail!("{} is listed twice", file.path);
-        }
-        let module = modules::assigned_file(file, &config, input.source.language, rules.as_ref());
-        if file.module != module {
-            bail!(
-                "{} has module `{}`, its config gives `{module}`",
-                file.path,
-                file.module
-            );
-        }
-    }
-    for path in &input.package_entries {
-        if !paths.contains(path.as_str()) {
-            bail!("package entry {path} is not in files");
-        }
-    }
-    for edge in &input.edges {
-        for path in [&edge.from, &edge.to] {
-            if !paths.contains(path.as_str()) {
-                bail!(
-                    "edge {} -> {} names {path}, which is not in files",
-                    edge.from,
-                    edge.to
-                );
-            }
-        }
-        if let Some(path) = &edge.original_to
-            && (path.starts_with('/')
-                || path
-                    .split('/')
-                    .any(|p| p.is_empty() || p == "." || p == ".."))
-        {
-            bail!("written import destination must be a relative path inside the scan root");
-        }
-    }
-    for pair in &input.source.collector.bound {
-        if !paths.contains(pair.from.as_str()) || !paths.contains(pair.to.as_str()) {
-            bail!(
-                "bound pair {} -> {} names a file outside the scan",
-                pair.from,
-                pair.to
-            );
-        }
-        if pair.names.iter().any(|n| n.chars().any(char::is_control)) {
-            bail!("bound names must not contain control characters");
-        }
-    }
-    resolution::validate(
-        input.imports.as_deref(),
-        input.globals.as_deref(),
-        &input.files,
-    )?;
-    resolution::validate_external_identities(
-        &input.source,
-        input.imports.as_deref(),
-        input.globals.as_deref(),
-        &input.files,
-    )?;
-    resolution::require_policy_accounting(&config)?;
-    Ok(())
+/// Always fails: this target has no operating system random source.
+#[cfg(not(any(unix, windows)))]
+pub fn token() -> Result<String> {
+    bail!("no operating system random source on this target")
 }
 
-pub fn apply_hotspots(doc: &mut Document, mut report: hotspots::Hotspots) {
-    hotspots::attach_findings(&mut report, doc);
-    let priorities = hotspots::finding_priorities(&report, doc.findings.len());
-    for (finding, priority) in doc.findings.iter_mut().zip(priorities) {
-        finding.hotspot_priority = Some(priority);
-    }
-    recipes::rank(doc, recipes::Rank::Recipe);
-    hotspots::attach_findings(&mut report, doc);
-    doc.hotspots = Some(report);
-}
-
-/// The one pipeline every subcommand calls: module assignment, barrels, verdicts under
+/// The scan pipeline the model's live scan runs: module assignment, barrels, verdicts under
 /// `config.rules`, metrics, cycles and findings from collected files and edges (and git
 /// co-changes, when read). Every edge must join two of `files`.
 pub fn analyze(
@@ -220,47 +73,6 @@ pub fn analyze(
     package_entries: Vec<String>,
     cochange: Option<Cochange>,
 ) -> Result<Document> {
-    analyze_inner(
-        source,
-        config,
-        files,
-        edges,
-        package_entries,
-        cochange,
-        None,
-    )
-}
-/// Shared analysis with cached SCC/metric regions for a daemon generation.
-#[allow(clippy::too_many_arguments)]
-pub fn analyze_cached(
-    source: Source,
-    config: Config,
-    files: Vec<String>,
-    edges: Vec<Edge>,
-    package_entries: Vec<String>,
-    cochange: Option<Cochange>,
-    cache: &mut incremental::Analysis,
-) -> Result<Document> {
-    analyze_inner(
-        source,
-        config,
-        files,
-        edges,
-        package_entries,
-        cochange,
-        Some(cache),
-    )
-}
-#[allow(clippy::too_many_arguments)]
-fn analyze_inner(
-    source: Source,
-    config: Config,
-    files: Vec<String>,
-    edges: Vec<Edge>,
-    package_entries: Vec<String>,
-    cochange: Option<Cochange>,
-    cache: Option<&mut incremental::Analysis>,
-) -> Result<Document> {
     let rules = rules::compile(&config)?;
     resolution::require_policy_accounting(&config)?;
     let owners = config
@@ -268,7 +80,7 @@ fn analyze_inner(
         .as_ref()
         .map(codeowners::compile)
         .transpose()?;
-    let mut doc = build_inner(
+    let mut doc = build(
         source,
         config,
         files,
@@ -276,7 +88,6 @@ fn analyze_inner(
         package_entries,
         rules.as_ref(),
         owners.as_ref(),
-        cache,
     );
     if doc.modules.iter().any(|m| {
         ![
@@ -306,28 +117,7 @@ fn analyze_inner(
 }
 
 /// `analyze` without findings, with the rules already compiled from `config.rules`.
-pub fn build(
-    source: Source,
-    config: Config,
-    files: Vec<String>,
-    edges: Vec<Edge>,
-    package_entries: Vec<String>,
-    rules: Option<&Compiled>,
-    owners: Option<&codeowners::Compiled>,
-) -> Document {
-    build_inner(
-        source,
-        config,
-        files,
-        edges,
-        package_entries,
-        rules,
-        owners,
-        None,
-    )
-}
-#[allow(clippy::too_many_arguments)]
-fn build_inner(
+fn build(
     source: Source,
     config: Config,
     files: Vec<String>,
@@ -335,7 +125,6 @@ fn build_inner(
     mut package_entries: Vec<String>,
     rules: Option<&Compiled>,
     owners: Option<&codeowners::Compiled>,
-    cache: Option<&mut incremental::Analysis>,
 ) -> Document {
     let weights = config
         .rules
@@ -419,43 +208,18 @@ fn build_inner(
     let pairs = modules::weighted(&edges, &barrels);
     let entries = modules::cycle_entries(module_of.keys(), &config.source_root, &package_entries);
     let module_edges = graph::module_edges(&module_of, &edges);
-    let (cycles, type_only_cycles, mut metrics) = if let Some(cache) = cache {
-        let work = cache
-            .update(
-                module_of.clone(),
-                edges.clone(),
-                incremental::Options {
-                    entries: entries.clone(),
-                    barrels: barrels.clone(),
-                    tests: tests.clone(),
-                    directory_units: source.language == model::Language::Go,
-                    all_kinds: config.all_kinds,
-                },
-            )
-            .expect("validated analysis endpoints");
-        if let Some(reason) = work.fallback {
-            eprintln!("daemon: full analysis fallback: {reason}");
-        }
-        (
-            cache.cycles().to_vec(),
-            cache.deferred_cycles().to_vec(),
-            cache.modules().to_vec(),
-        )
-    } else {
-        let (cycles, deferred) = quality::cycles(
-            &module_of,
-            edges
-                .iter()
-                .filter(|e| !tests.contains(&e.from) && !tests.contains(&e.to)),
-            &entries,
-            &barrels,
-            source.language == model::Language::Go,
-            config.all_kinds,
-        );
-        let mut metrics = graph::modules(&module_of, pairs.keys());
-        quality::metrics(&mut metrics, &module_of, &pairs);
-        (cycles, deferred, metrics)
-    };
+    let (cycles, type_only_cycles) = quality::cycles(
+        &module_of,
+        edges
+            .iter()
+            .filter(|e| !tests.contains(&e.from) && !tests.contains(&e.to)),
+        &entries,
+        &barrels,
+        source.language == model::Language::Go,
+        config.all_kinds,
+    );
+    let mut metrics = graph::modules(&module_of, pairs.keys());
+    quality::metrics(&mut metrics, &module_of, &pairs);
     for module in &mut metrics {
         if !config.legacy_module_classes
             && module_of
@@ -511,6 +275,7 @@ fn build_inner(
                 class: (!config.legacy_module_classes && tests.contains(path))
                     .then_some(model::ModuleClass::Tests),
                 owners: owners.map(|o| o.owners(path)).unwrap_or_default(),
+                language: Some(source.language),
             })
             .collect(),
         source,
@@ -528,6 +293,7 @@ fn build_inner(
         package_splits: None,
         target: None,
         stale_known: Vec::new(),
+        scan_failures: Vec::new(),
     };
     known::mark(&mut doc);
     if owners.is_some() {

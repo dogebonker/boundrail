@@ -2,15 +2,11 @@
 
 pub mod barrels;
 pub mod depcruise;
-pub mod elixir;
 pub mod excludes;
 pub mod go;
 pub mod grimp;
 pub mod imports;
-pub mod incremental;
-pub mod java;
 pub mod native;
-pub mod rust;
 pub mod typescript_resolution;
 
 use std::collections::HashSet;
@@ -28,29 +24,11 @@ use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 
 use crate::model::{Collector, Edge, Language, NodeMetadata};
 
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    Default,
-    PartialEq,
-    Eq,
-    serde::Serialize,
-    serde::Deserialize,
-    clap::ValueEnum,
-)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Engine {
     #[default]
-    Reference,
     Native,
-    Depcruise,
-}
-
-impl Engine {
-    pub fn is_reference(&self) -> bool {
-        *self == Self::Reference
-    }
 }
 
 pub struct RawGraph {
@@ -63,12 +41,8 @@ pub struct RawGraph {
     pub globals: Option<Vec<crate::model::GlobalUse>>,
 }
 
-/// Extensions dependency-cruiser files must have to count as source; imports of anything else
-/// (stylesheets, JSON, images) are dropped.
+/// Extensions of TypeScript and JavaScript source files, which package entries map back to.
 pub const TS_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "mjs", "cjs"];
-
-// Kept for callers constructing collector-specific discovery globs.
-pub use excludes::{GENERATED_EXCLUDES as DEFAULT_EXCLUDES, TEST_EXCLUDES};
 
 /// Files a root marker makes count for Go in language detection.
 const GO_MARKERS: &[&str] = &["go.mod", "go.work"];
@@ -114,7 +88,11 @@ impl TempDir {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir(&path).with_context(|| format!("creating {}", path.display()))?;
+        let mut builder = fs::DirBuilder::new();
+        // Only the user may read what goes in, such as a copy of the Git index.
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        (builder.create(&path)).with_context(|| format!("creating {}", path.display()))?;
         Ok(Self(path))
     }
 
@@ -135,6 +113,13 @@ pub fn request_timeout(timeout: Option<Duration>) {
 }
 /// Default timeout for library callers without a request override.
 pub static TOOL_TIMEOUT: OnceLock<Option<Duration>> = OnceLock::new();
+
+/// The tool timeout of this thread's request, else the default; `None` waits forever.
+pub fn tool_timeout() -> Option<Duration> {
+    REQUEST_TIMEOUT
+        .with(|t| t.get())
+        .unwrap_or_else(|| TOOL_TIMEOUT.get().copied().flatten())
+}
 
 /// `run_with_input` with no input.
 pub fn run(command: &mut Command) -> Result<Output> {
@@ -160,10 +145,7 @@ pub fn run_with_input(command: &mut Command, input: Vec<u8>) -> Result<Output> {
     let writer = thread::spawn(move || stdin.write_all(&input));
     let stdout = read_all(child.stdout.take().expect("piped stdout"));
     let stderr = read_all(child.stderr.take().expect("piped stderr"));
-    let status = match REQUEST_TIMEOUT
-        .with(|t| t.get())
-        .unwrap_or_else(|| TOOL_TIMEOUT.get().copied().flatten())
-    {
+    let status = match tool_timeout() {
         None => child.wait()?,
         Some(timeout) => {
             let deadline = Instant::now() + timeout;
@@ -218,7 +200,7 @@ pub fn is_relative_path(path: &str, allow_root: bool) -> bool {
 
 /// The program `--<flag> <value>` names: a path made absolute, so it does not depend on the
 /// working directory a child runs in, else a name the spawn looks up on PATH.
-pub fn resolve_executable(flag: &str, value: impl AsRef<Path>) -> Result<PathBuf> {
+pub fn resolve_executable(name: &str, value: impl AsRef<Path>) -> Result<PathBuf> {
     let value = value.as_ref();
     if !value
         .to_string_lossy()
@@ -227,7 +209,74 @@ pub fn resolve_executable(flag: &str, value: impl AsRef<Path>) -> Result<PathBuf
         return Ok(value.to_owned());
     }
     fs::canonicalize(value)
-        .with_context(|| format!("--{flag} {}: no such executable", value.display()))
+        .with_context(|| format!("{name} executable {}: not found", value.display()))
+}
+
+/// The absolute folders of `PATH`.
+fn absolute_dirs() -> Vec<PathBuf> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    (std::env::split_paths(&path))
+        .filter(|dir| dir.is_absolute())
+        .collect()
+}
+
+/// `PATH` without its relative folders, for a child that must not find a program the checkout
+/// plants.
+pub fn absolute_path() -> std::ffi::OsString {
+    std::env::join_paths(absolute_dirs()).unwrap_or_default()
+}
+
+/// The program a bare `command` names: the first executable file of that name in an absolute
+/// folder of `PATH`, `.exe` added on Windows, that does not lie inside `checkout` once links are
+/// resolved. Relative folders and folders inside the checkout are skipped, so a checkout cannot
+/// plant the program.
+pub fn resolve_program(command: &str, checkout: &Path) -> Result<PathBuf> {
+    program_in(absolute_dirs(), command, checkout)
+        .ok_or_else(|| anyhow!("{command} is not on PATH outside the checkout"))
+}
+
+fn program_in(dirs: Vec<PathBuf>, command: &str, checkout: &Path) -> Option<PathBuf> {
+    let name = if cfg!(windows) {
+        format!("{command}.exe")
+    } else {
+        command.to_owned()
+    };
+    let outside = outside_of(checkout);
+    (dirs.into_iter())
+        .map(|dir| dir.join(&name))
+        .find(|candidate| executable(candidate) && outside(candidate))
+}
+
+/// Whether a path exists and lies outside `checkout` once links are resolved.
+fn outside_of(checkout: &Path) -> impl Fn(&Path) -> bool {
+    let checkout = fs::canonicalize(checkout).unwrap_or_else(|_| checkout.to_path_buf());
+    move |path| fs::canonicalize(path).is_ok_and(|p| !p.starts_with(&checkout))
+}
+
+/// `PATH` holding only its absolute folders outside `checkout`, as `resolve_program` judges them,
+/// for a child that must find no program the checkout plants.
+pub fn path_outside(checkout: &Path) -> std::ffi::OsString {
+    std::env::join_paths(dirs_outside(absolute_dirs(), checkout)).unwrap_or_default()
+}
+
+fn dirs_outside(dirs: Vec<PathBuf>, checkout: &Path) -> Vec<PathBuf> {
+    let outside = outside_of(checkout);
+    dirs.into_iter().filter(|dir| outside(dir)).collect()
+}
+
+fn executable(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        metadata.is_file()
+    }
 }
 
 /// `src` when the root has one, else the root itself.
@@ -239,9 +288,8 @@ pub fn source_dir(root: &Path) -> &'static str {
     }
 }
 
-/// The language with the most source files after the default excludes: TypeScript and Python
-/// under `source_dir`, Java/Rust/Go/Elixir under the root. Rust and Go require root manifests.
-/// A tie keeps TypeScript, then Python, Go, Rust, Java and Elixir.
+/// The language with the most source files after the default excludes, as
+/// [`detect_languages`] orders them.
 pub fn detect_language(root: &Path, source_dir: &str) -> Result<Language> {
     detect_language_with_options(root, source_dir, excludes::Options::default())
 }
@@ -251,6 +299,19 @@ pub fn detect_language_with_options(
     source_dir: &str,
     options: excludes::Options,
 ) -> Result<Language> {
+    Ok(detect_languages(root, source_dir, options)?[0].0)
+}
+
+/// Every language with source files after the excludes of the TypeScript policy, with those
+/// files, most files first; a tie keeps TypeScript, then Python, Go, Rust, Java and Elixir.
+/// Python counts under `source_dir` only, where its collector finds its package; the others
+/// count anywhere. Rust needs a `Cargo.toml` and Go a `go.mod` or `go.work` somewhere in the
+/// checkout. Refuses a checkout with none.
+pub fn detect_languages(
+    root: &Path,
+    source_dir: &str,
+    options: excludes::Options,
+) -> Result<Vec<(Language, Vec<String>)>> {
     let generated = options.no_defaults || options.include_generated;
     let has_includes = !options.includes.is_empty();
     let java_output = globset(&excludes::output_globs(Language::Java))?;
@@ -258,10 +319,16 @@ pub fn detect_language_with_options(
     let elixir_output = globset(&excludes::output_globs(Language::Elixir))?;
     let policy = excludes::Policy::new(root, Language::Typescript, options)?;
     let discovery_excludes = globset(policy.patterns())?;
-    let cargo = root.join("Cargo.toml").is_file();
     let mix = root.join("mix.exs").is_file();
-    let (mut ts, mut py, mut rust, mut java, mut go) = (0, 0, 0, 0, 0);
-    let mut elixir = 0;
+    // In tie order.
+    let mut found: [(Language, Vec<String>); 6] = [
+        (Language::Typescript, Vec::new()),
+        (Language::Python, Vec::new()),
+        (Language::Go, Vec::new()),
+        (Language::Rust, Vec::new()),
+        (Language::Java, Vec::new()),
+        (Language::Elixir, Vec::new()),
+    ];
     let mut paths = Vec::new();
     let mut dirs = vec![root.to_path_buf()];
     while let Some(dir) = dirs.pop() {
@@ -291,26 +358,30 @@ pub fn detect_language_with_options(
             paths.push(rel);
         }
     }
-    let has_go = GO_MARKERS.iter().any(|m| root.join(m).is_file());
-    for rel in policy.select(&paths)? {
+    let selected = policy.select(&paths)?;
+    let named = |names: &[&str]| {
+        (selected.iter()).any(|rel| names.contains(&rel.rsplit('/').next().unwrap_or(rel)))
+    };
+    let (cargo, has_go) = (named(&["Cargo.toml"]), named(GO_MARKERS));
+    for rel in selected {
         if mix && !generated && !policy.included(&rel) && elixir_output.is_match(&rel) {
             continue;
         }
         let path = root.join(&rel);
-        match rel.rsplit_once('.').map(|(_, ext)| ext) {
+        let language = match rel.rsplit_once('.').map(|(_, ext)| ext) {
             Some("ex" | "exs")
                 if generated || policy.included(&rel) || !elixir_output.is_match(&rel) =>
             {
-                elixir += 1
+                Language::Elixir
             }
-            Some("py") if path.starts_with(root.join(source_dir)) => py += 1,
+            Some("py") if path.starts_with(root.join(source_dir)) => Language::Python,
             Some("rs")
                 if cargo && (generated || policy.included(&rel) || !rust_output.is_match(&rel)) =>
             {
-                rust += 1
+                Language::Rust
             }
             Some("java") if generated || policy.included(&rel) || !java_output.is_match(&rel) => {
-                java += 1
+                Language::Java
             }
             Some("go")
                 if has_go
@@ -318,35 +389,79 @@ pub fn detect_language_with_options(
                         .split('/')
                         .any(|segment| segment.starts_with('_') || segment == "testdata") =>
             {
-                go += 1
+                Language::Go
             }
-            Some(ext)
-                if TS_EXTENSIONS.contains(&ext) && path.starts_with(root.join(source_dir)) =>
-            {
-                ts += 1
-            }
-            _ => {}
+            Some(ext) if TS_EXTENSIONS.contains(&ext) => Language::Typescript,
+            _ => continue,
+        };
+        if let Some((_, files)) = found.iter_mut().find(|(l, _)| *l == language) {
+            files.push(rel);
         }
     }
-    match (ts, py, go, rust, java, elixir) {
-        (0, 0, 0, 0, 0, 0) => bail!(
-            "no .ts/.js, .py, .java, .ex/.exs, .rs (with Cargo.toml) or .go (with go.mod) files under {}; pass --language",
+    let mut found: Vec<_> = found.into_iter().filter(|(_, f)| !f.is_empty()).collect();
+    if found.is_empty() {
+        bail!(
+            "no .ts/.js, .py, .java, .ex/.exs, .rs (with Cargo.toml) or .go (with go.mod) files under {}",
             root.join(source_dir).display()
-        ),
-        _ if elixir > ts && elixir > py && elixir > go && elixir > rust && elixir > java => {
-            Ok(Language::Elixir)
-        }
-        _ if java > ts && java > py && java > go && java > rust => Ok(Language::Java),
-        _ if rust > ts && rust > py && rust > go => Ok(Language::Rust),
-        _ if go > ts && go > py => Ok(Language::Go),
-        _ if py > ts => Ok(Language::Python),
-        _ => Ok(Language::Typescript),
+        );
     }
+    // Stable, so a tie keeps the order above.
+    found.sort_by_key(|(_, files)| std::cmp::Reverse(files.len()));
+    Ok(found)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn programs_resolve_in_absolute_path_folders_outside_the_checkout() {
+        use std::os::unix::fs::PermissionsExt;
+        let elsewhere = TempDir::new("resolve-elsewhere").unwrap();
+        assert!(
+            resolve_program("sh", elsewhere.path())
+                .unwrap()
+                .is_absolute()
+        );
+        assert!(resolve_program("boundrail-no-such-program", elsewhere.path()).is_err());
+        let path = absolute_path();
+        assert!(std::env::split_paths(&path).all(|dir| dir.is_absolute()));
+
+        let checkout = TempDir::new("resolve-checkout").unwrap();
+        let (inside, outside) = (checkout.path().join("bin"), elsewhere.path().join("bin"));
+        for dir in [&inside, &outside] {
+            fs::create_dir(dir).unwrap();
+            fs::write(dir.join("tool"), "#!/bin/sh\n").unwrap();
+            fs::set_permissions(dir.join("tool"), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let found = program_in(
+            vec![inside.clone(), outside.clone()],
+            "tool",
+            checkout.path(),
+        );
+        assert_eq!(found, Some(outside.join("tool")));
+        assert_eq!(program_in(vec![inside], "tool", checkout.path()), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_child_path_keeps_only_folders_outside_the_checkout() {
+        let (checkout, elsewhere) = (
+            TempDir::new("path-checkout").unwrap(),
+            TempDir::new("path-elsewhere").unwrap(),
+        );
+        let inside = checkout.path().join("node_modules/.bin");
+        fs::create_dir_all(&inside).unwrap();
+        let linked = elsewhere.path().join("linked");
+        std::os::unix::fs::symlink(&inside, &linked).unwrap();
+        let gone = elsewhere.path().join("gone");
+        let dirs = vec![inside, elsewhere.path().to_path_buf(), linked, gone];
+        assert_eq!(
+            dirs_outside(dirs, checkout.path()),
+            [elsewhere.path().to_path_buf()]
+        );
+    }
 
     #[test]
     fn a_tool_exiting_before_reading_its_input_reports_its_own_error() {
@@ -384,6 +499,12 @@ mod tests {
     fn temp_dirs_created_together_are_distinct_and_removed_on_drop() {
         let (first, second) = (TempDir::new("test").unwrap(), TempDir::new("test").unwrap());
         assert_ne!(first.path(), second.path());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(first.path()).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "only the user may read it");
+        }
         let path = first.path().to_owned();
         fs::write(path.join("file"), "").unwrap();
         drop(first);

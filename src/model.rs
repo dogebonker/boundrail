@@ -1,4 +1,4 @@
-//! Schema `archgraph/v1.2`; v1/v1.1 remain readable. See schema/archgraph.v1.2.schema.json.
+//! The scan document the model reads code evidence from, schema `archgraph/v1.2`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -7,9 +7,6 @@ use serde::{Deserialize, Serialize};
 use crate::rules::Rules;
 
 pub const SCHEMA: &str = "archgraph/v1.2";
-pub fn supported_schema(schema: &str) -> bool {
-    matches!(schema, "archgraph/v1" | "archgraph/v1.1" | SCHEMA)
-}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Document {
@@ -66,58 +63,18 @@ pub struct Document {
     /// Entries of the rules' known list that no forbidden import matches.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub stale_known: Vec<crate::known::Entry>,
+    /// The languages of a scan of several whose collector failed; their files are not scanned.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub scan_failures: Vec<ScanFailure>,
 }
 
-/// The parts of a scan document that every other subcommand recomputes the rest from.
-#[derive(Debug, Deserialize)]
-pub struct ScanInput {
-    pub schema: String,
-    pub kind: String,
-    pub source: Source,
-    pub config: Config,
-    pub files: Vec<File>,
-    pub edges: Vec<Edge>,
-    #[serde(default)]
-    pub imports: Option<Vec<ImportRecord>>,
-    #[serde(default)]
-    pub globals: Option<Vec<GlobalUse>>,
-    #[serde(default)]
-    pub package_entries: Vec<String>,
-    #[serde(default)]
-    pub cochange: Option<Cochange>,
-    #[serde(default)]
-    pub hotspots: Option<crate::hotspots::Hotspots>,
-    #[serde(default)]
-    pub findings: Vec<FindingContext>,
-    #[serde(default)]
-    pub diagnostics: Vec<DiagnosticContext>,
-    #[serde(default)]
-    pub symbols: Option<crate::surface::Symbols>,
-    #[serde(default)]
-    pub surface: Option<crate::surface::SurfaceReport>,
-    #[serde(default)]
-    pub package_splits: Option<crate::package_splits::Report>,
-}
-
-impl ScanInput {
-    /// Carries the persisted import records and file attributes into `config` for analysis.
-    pub fn hydrate_config(&mut self) {
-        self.config.import_records = self.imports.clone();
-        self.config.globals = self.globals.clone();
-        self.config.file_metadata = self
-            .files
-            .iter()
-            .map(|f| {
-                (
-                    f.path.clone(),
-                    NodeMetadata {
-                        barrel: f.barrel,
-                        test: f.class == Some(ModuleClass::Tests),
-                    },
-                )
-            })
-            .collect();
-    }
+/// A language whose collector failed while the others' succeeded.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanFailure {
+    pub language: Language,
+    pub error: String,
+    /// The language's source files, which the scan holds none of.
+    pub files: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -146,6 +103,20 @@ pub enum Language {
     Rust,
     Java,
     Elixir,
+}
+
+impl Language {
+    /// The lowercase name the JSON and the command line use.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Typescript => "typescript",
+            Self::Python => "python",
+            Self::Go => "go",
+            Self::Rust => "rust",
+            Self::Java => "java",
+            Self::Elixir => "elixir",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -262,13 +233,11 @@ pub struct NodeMetadata {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollectionOptions {
-    #[serde(default, skip_serializing_if = "crate::collect::Engine::is_reference")]
+    #[serde(default)]
     pub engine: crate::collect::Engine,
     pub python_package: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub python_paths: Vec<String>,
-    pub rust_features: Option<crate::collect::rust::Features>,
-    pub rust_build_scripts: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,6 +260,9 @@ pub struct File {
     pub class: Option<ModuleClass>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub owners: Vec<String>,
+    /// The language whose collector found the file, which a scan of several languages keeps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<Language>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -710,24 +682,6 @@ pub struct Provenance {
     pub scans: usize,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct FindingContext {
-    pub kind: String,
-    pub subject: String,
-    #[serde(default)]
-    pub age_days: Option<u64>,
-    #[serde(default)]
-    pub introduced_by: Option<crate::bisect::Commit>,
-    #[serde(default)]
-    pub provenance: Option<Provenance>,
-}
-
-/// Persist only historical context; current analysis rebuilds diagnostic evidence and reasons.
-#[derive(Debug, Deserialize)]
-pub struct DiagnosticContext {
-    pub finding: FindingContext,
-}
-
 /// One shape per finding kind, each named in the schema's `$defs`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
@@ -893,8 +847,7 @@ pub struct MovedFile {
     pub module: String,
 }
 
-/// Git history read by `scan --cochange`, kept in the document so every subcommand that
-/// recomputes findings sees the same history.
+/// Files that changed together in Git history, as the document's findings read them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Cochange {
     /// The number of most recent commits asked for.

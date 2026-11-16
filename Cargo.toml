@@ -2,7 +2,7 @@
 name = "boundrail"
 version = "0.1.0"
 edition = "2024"
-description = "Source-based architecture evidence: dependency rules, service models, agent workflows and visual diffs"
+description = "An authored architecture model, checked against the code, for developers and coding agents"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/dogebonker/archgraph"
 readme = "README.md"
@@ -14,8 +14,8 @@ globset = "0.4.20"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 serde_yaml_ng = "0.10"
+schemars = "1.2.3"
 sha2 = "0.11.1"
-prost = "0.14.3"
 tree-sitter = "=0.27.1"
 tree-sitter-typescript = "=0.23.2"
 tree-sitter-javascript = "=0.25.0"
@@ -28,8 +28,6 @@ toml = { version = "=1.1.8", default-features = false, features = ["std", "parse
 oxc_resolver = { version = "=11.24.3", default-features = false }
 
 notify = "=8.2.0"
-rmcp = { version = "=3.5.1", default-features = false, features = ["server", "transport-io"] }
-tokio = { version = "=1.53.1", default-features = false, features = ["rt"] }
 
 [dev-dependencies]
 jsonschema = { version = "0.58.6", default-features = false }

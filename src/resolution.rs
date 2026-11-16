@@ -181,9 +181,7 @@ pub fn require_policy_accounting(config: &crate::model::Config) -> anyhow::Resul
         );
     }
     if config.globals.is_none() && config.rules.as_ref().is_some_and(|r| r.doc.names_globals()) {
-        anyhow::bail!(
-            "global rules require a native JavaScript/TypeScript scan, rescan with --engine native"
-        );
+        anyhow::bail!("global rules require a native JavaScript/TypeScript scan");
     }
     Ok(())
 }
