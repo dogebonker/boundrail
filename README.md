@@ -32,6 +32,14 @@ Setup creates `.boundrail/model/` when it is absent and writes the `boundrail-mo
 `claude`, `codex`, `cursor` or `opencode`, and repeats). Running it again changes nothing; files
 you edited stay unless `--force` replaces them. It prints the next steps.
 
+The skills carry the agent workflow. One spec gets one proposal (`boundrail-plan`), sliced into
+tickets; each ticket's branch passes `model footprint --proposal <id> --fail-outside` before review,
+and the last slice's merge adopts the proposal. Each pull request body (`boundrail-pr`) has a
+Summary, Evidence (footprint, check, interface changes, picture) and Merge danger section, plus a
+state marker line, `<!-- boundrail:proposal <id> -->`, that CI reads. A pull request outside any
+plan draws a temporary proposal and shelves it after the merge. `boundrail-model` says when to use
+`inspect`, `locality` and `compare --beside` to find and choose refactors.
+
 Boundrail was previously named **Archgraph**. The repository URL keeps the old name.
 
 ## The model
@@ -247,16 +255,29 @@ The GitHub Action runs `model check`, annotates its findings, and on a pull requ
 branch's footprint:
 
 ```yaml
-- uses: actions/checkout@v7
-  with:
-    fetch-depth: 0
-- uses: dogebonker/archgraph@main
-  with:
-    token: ${{ github.token }}
-    # A release that includes `boundrail model` (default: the action's Cargo.toml version),
-    # or an executable you built:
-    # version: <release>
-    # binary: path/to/boundrail
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+permissions:
+  contents: read
+  pull-requests: write # the footprint comment
+jobs:
+  boundrail:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: dogebonker/archgraph@main
+        with:
+          token: ${{ github.token }}
+          # Fail when the branch changes a module outside the proposal its body's marker names,
+          # and when the body has no marker.
+          # gate: outside
+          # A release that includes `boundrail model` (default: the action's Cargo.toml version),
+          # or an executable you built:
+          # version: <release>
+          # binary: path/to/boundrail
 ```
 
 The action needs a `boundrail` that includes `boundrail model`: set `version` to a release that
@@ -265,6 +286,22 @@ does, or `binary` to an executable you built. `fail-on` is `warnings` (the defau
 `--no-language-servers` so a user's config cannot turn them on, since language servers run code
 from the checkout. Commenting is best effort: a token that cannot write leaves a notice
 instead.
+
+When the pull request body holds one line `<!-- boundrail:proposal <id> -->`, naming by its
+8-character local ID a proposal committed on the branch, the footprint runs with `--proposal <id>`
+and the comment adds the `Against proposal` lists. The token reads the body, which is untrusted:
+any other ID, or a second marker, stops the step with exit 2. `gate` is `none` (the default) or
+`outside`, which adds `--fail-outside`: the step fails when the branch changes a module the
+proposal does not name, unless changed parts hold all of that module's changes. Under `outside`
+the step fails closed (exit 2) on an unreadable body, a body with no marker, and any event but
+`pull_request` (for example `pull_request_target` or `push`), so a gate that did not run never
+reads as a pass. Under `none` a body without a marker runs as before. A marker line inside a
+fenced code block does not count. Keep `edited` in the `pull_request` types so a marker added
+later reruns the step.
+
+The gate checks scope against the proposal the author chose: the marker and the proposal both
+come from the pull request branch. It enforces a plan. It does not protect against a hostile
+author, who can name a proposal that covers their change.
 
 Checkpoint readings resolve only against a fetched history. To judge them, run `boundrail model
 history fetch` in a step before the action, so `model check` sees `refs/boundrail/history`. The

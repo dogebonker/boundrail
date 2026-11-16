@@ -18,11 +18,20 @@ inputs:
   fail-on:
     description: "warnings (the default; any warning fails), information (any finding fails) or never"
     default: warnings
+  gate:
+    description: >-
+      none (the default) or outside. When the pull request body holds one marker line
+      <!-- boundrail:proposal ID -->, naming a proposal committed on the branch by its 8-character local ID, the
+      footprint runs against that proposal and the comment adds what it names. With outside the step also fails when
+      the branch changes a module the proposal does not name, unless that module's changes all lie in changed parts
+      (held subjects), and a body the token cannot read, a body without a marker and any event but pull_request are errors (exit 2). With none and no marker the step runs as before
+    default: none
   token:
     description: >-
-      A token that may comment on the pull request (github.token with pull-requests: write). Comments are posted on
-      pull_request events only, and best effort: without a token, and where the token cannot write (pull requests from
-      forks, Dependabot runs, read-only tokens), the step posts no comment and leaves a notice
+      A token that may comment on the pull request (github.token with pull-requests: write), which also reads the pull
+      request body for its proposal marker (see gate). Comments are posted on pull_request events only, and best effort:
+      without a token, and where the token cannot write (pull requests from forks, Dependabot runs, read-only tokens), the
+      step posts no comment and leaves a notice
     default: ""
   base-ref:
     description: >-
@@ -45,6 +54,7 @@ runs:
       env:
         INPUT_PATH: ${{ inputs.path }}
         INPUT_FAIL_ON: ${{ inputs.fail-on }}
+        INPUT_GATE: ${{ inputs.gate }}
         INPUT_VERSION: ${{ inputs.version }}
         INPUT_BINARY: ${{ inputs.binary }}
         INPUT_BASE_REF: ${{ inputs.base-ref || github.event.pull_request.base.sha }}

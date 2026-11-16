@@ -24,6 +24,7 @@ fn the_action_is_one_model_step() {
     let action = action();
     assert_eq!(action["runs"]["using"], "composite");
     assert_eq!(action["inputs"]["fail-on"]["default"], "warnings");
+    assert_eq!(action["inputs"]["gate"]["default"], "none");
     assert_eq!(action["inputs"]["token"]["default"], "");
     let path = action["inputs"]["path"]["description"].as_str().unwrap();
     assert!(path.contains("never passes --language-servers"), "{path}");
@@ -32,7 +33,9 @@ fn the_action_is_one_model_step() {
         .collect();
     assert_eq!(
         inputs,
-        ["path", "fail-on", "token", "base-ref", "version", "binary"]
+        [
+            "path", "fail-on", "gate", "token", "base-ref", "version", "binary"
+        ]
     );
     assert!(action.get("outputs").is_none());
     let steps = steps(&action);
@@ -108,6 +111,22 @@ fn the_step_runs_real_commands_and_flags_and_never_language_servers() {
         let stdout = String::from_utf8(out.stdout).unwrap();
         assert_eq!(out.status.code(), Some(2), "{stdout}");
         assert!(stdout.contains("CHECKOUT_NOT_FOUND"), "{words:?}: {stdout}");
+    }
+
+    // The flags the footprint takes from a proposal marker exist too.
+    let against: Vec<&str> = (code.iter())
+        .filter(|line| line.contains("against=(") || line.contains("against+=("))
+        .flat_map(|line| line.split(['(', ')', ' ']))
+        .filter(|w| w.starts_with("--"))
+        .collect();
+    assert_eq!(against, ["--proposal", "--fail-outside"]);
+    let help = Command::new(env!("CARGO_BIN_EXE_boundrail"))
+        .args(["model", "footprint", "--help"])
+        .output()
+        .unwrap();
+    let help = String::from_utf8(help.stdout).unwrap();
+    for flag in against {
+        assert!(help.contains(&format!("{flag} ")), "footprint: {flag}");
     }
 }
 
@@ -270,4 +289,193 @@ fn the_summary_fence_outgrows_tilde_runs_in_the_footprint() {
         summary.contains(&format!("\n{fence}\nbefore\n~~~~~~~~\nafter\n{fence}\n")),
         "{summary}"
     );
+}
+
+/// A proposal marker in the pull request body runs the footprint against that proposal, and
+/// gate: outside adds --fail-outside, whose exit 1 fails the step. The body is untrusted: a marker
+/// whose ID is not 8 letters or digits, or a second marker, stops the step before the footprint
+/// runs and nothing in it is evaluated. Without a token, gate: outside cannot read the body.
+#[cfg(unix)]
+#[test]
+fn a_proposal_marker_sets_the_footprint_against_its_proposal_and_the_gate_fails_outside() {
+    let dir = TempDir::new("action-marker").unwrap();
+    let (repo, bin) = (dir.path().join("repo"), dir.path().join("bin"));
+    fs::create_dir_all(&repo).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "base"]);
+    let base = git(&repo, &["rev-parse", "HEAD"]);
+    let (seen, body) = (dir.path().join("seen"), dir.path().join("body"));
+    executable(
+        &bin.join("boundrail"),
+        &format!(
+            "#!/usr/bin/env bash\necho \"$*\" >> '{}'\n\
+             case \"$*\" in\n  --version) echo boundrail 0 ;;\n  \
+             *'model check'*) ;;\n  \
+             *--fail-outside*) printf '<!-- boundrail:footprint -->\\n'; exit 1 ;;\n  \
+             *'model footprint'*) printf '<!-- boundrail:footprint -->\\n' ;;\nesac\n",
+            seen.display()
+        ),
+    );
+    executable(
+        &bin.join("gh"),
+        &format!(
+            "#!/usr/bin/env bash\ncase \"$*\" in\n  'api user'*) exit 1 ;;\n  \
+             *pulls/7*) cat '{}' ;;\nesac\n",
+            body.display()
+        ),
+    );
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("ci/model-action.sh");
+    let run = |text: &str, gate: Option<&str>, token: &str| {
+        fs::write(&body, text).unwrap();
+        let _ = fs::remove_file(&seen);
+        let mut command = Command::new("bash");
+        command
+            .arg(&script)
+            .current_dir(dir.path())
+            .env("PATH", &path)
+            .env("RUNNER_TEMP", dir.path().join("runner"))
+            .env("GITHUB_STEP_SUMMARY", dir.path().join("summary.md"))
+            .env("INPUT_BINARY", bin.join("boundrail"))
+            .env("INPUT_PATH", &repo)
+            .env("INPUT_BASE_REF", base.trim())
+            .env("INPUT_FAIL_ON", "warnings")
+            .env("INPUT_TOKEN", token)
+            .env("GITHUB_EVENT_NAME", "pull_request")
+            .env("GITHUB_REPOSITORY", "owner/repo")
+            .env("PR_NUMBER", "7")
+            .env_remove("INPUT_GATE");
+        if let Some(gate) = gate {
+            command.env("INPUT_GATE", gate);
+        }
+        let out = command.output().unwrap();
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        let footprints: Vec<String> = fs::read_to_string(&seen)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.starts_with("model footprint"))
+            .map(str::to_owned)
+            .collect();
+        (out.status.code(), stdout, footprints)
+    };
+    let range = format!("--root {} --base {}", repo.display(), base.trim());
+    let marked = "Summary\r\n\r\n<!-- boundrail:proposal Ab3dE5gH -->\r\n";
+
+    let (status, stdout, footprints) = run(marked, None, "secret");
+    assert_eq!(status, Some(0), "{stdout}");
+    assert!(
+        stdout.contains("footprint against proposal Ab3dE5gH"),
+        "{stdout}"
+    );
+    assert_eq!(
+        footprints,
+        [format!(
+            "model footprint {range} --proposal Ab3dE5gH --format pr-comment"
+        )]
+    );
+
+    let (status, stdout, footprints) = run(marked, Some("outside"), "secret");
+    assert_eq!(status, Some(1), "{stdout}");
+    assert_eq!(
+        footprints,
+        [format!(
+            "model footprint {range} --proposal Ab3dE5gH --fail-outside --format pr-comment"
+        )]
+    );
+    let summary = fs::read_to_string(dir.path().join("summary.md")).unwrap();
+    assert!(
+        summary.contains("<!-- boundrail:footprint -->"),
+        "{summary}"
+    );
+
+    // Under outside, a pull request without a marker fails; under none it runs as before.
+    let (status, stdout, footprints) = run("No marker.\n", Some("outside"), "secret");
+    assert_eq!(status, Some(2), "{stdout}");
+    assert!(
+        stdout.contains(
+            "::error::boundrail: gate outside needs the pull request body to hold a marker"
+        ),
+        "{stdout}"
+    );
+    assert_eq!(footprints, Vec::<String>::new());
+    let (status, stdout, footprints) = run("No marker.\n", None, "secret");
+    assert_eq!(status, Some(0), "{stdout}");
+    assert_eq!(
+        footprints,
+        [format!("model footprint {range} --format pr-comment")]
+    );
+
+    // A marker line inside a fenced code block is a quotation, not a marker.
+    let quoted = "Example:\n```\n<!-- boundrail:proposal Ab3dE5gH -->\n```\n";
+    let (status, stdout, _) = run(quoted, Some("outside"), "secret");
+    assert_eq!(status, Some(2), "{stdout}");
+    let (status, stdout, footprints) = run(quoted, None, "secret");
+    assert_eq!(status, Some(0), "{stdout}");
+    assert_eq!(
+        footprints,
+        [format!("model footprint {range} --format pr-comment")]
+    );
+
+    let pwned = dir.path().join("pwned");
+    for text in [
+        "<!-- boundrail:proposal $(touch pwned) -->\n",
+        "<!-- boundrail:proposal `touch pwned` -->\n",
+        "<!-- boundrail:proposal Ab3dE5gH; touch pwned -->\n",
+        "<!-- boundrail:proposal Ab3dE5gH9 -->\n",
+        "<!-- boundrail:proposal ../x/../y -->\n",
+        "<!-- boundrail:proposal <proposal> -->\n",
+        "<!-- boundrail:proposal Ab3dE5gH -->\n<!-- boundrail:proposal Zz9yY8xX -->\n",
+    ] {
+        let (status, stdout, footprints) = run(text, None, "secret");
+        assert_eq!(status, Some(2), "{text}: {stdout}");
+        assert!(
+            stdout.contains("::error::boundrail: the pull request body needs one marker line"),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("touch"), "{stdout}");
+        assert_eq!(footprints, Vec::<String>::new(), "{text}");
+        assert!(!pwned.exists(), "{text}");
+    }
+
+    let (status, stdout, _) = run(marked, Some("outside"), "");
+    assert_eq!(status, Some(2), "{stdout}");
+    assert!(
+        stdout.contains("could not read the pull request body"),
+        "{stdout}"
+    );
+    let (status, stdout, footprints) = run(marked, None, "");
+    assert_eq!(status, Some(0), "{stdout}");
+    assert!(
+        stdout.contains("::notice::pull request body not read"),
+        "{stdout}"
+    );
+    assert_eq!(
+        footprints,
+        [format!("model footprint {range} --format pr-comment")]
+    );
+
+    // Under outside, an event that is not pull_request fails: the gate did not run.
+    let out = Command::new("bash")
+        .arg(&script)
+        .current_dir(dir.path())
+        .env("PATH", &path)
+        .env("RUNNER_TEMP", dir.path().join("runner"))
+        .env("GITHUB_STEP_SUMMARY", dir.path().join("summary.md"))
+        .env("INPUT_BINARY", bin.join("boundrail"))
+        .env("INPUT_PATH", &repo)
+        .env("INPUT_GATE", "outside")
+        .env("GITHUB_EVENT_NAME", "pull_request_target")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(2), "{stdout}");
+    assert!(
+        stdout.contains("gate outside runs on pull_request events only"),
+        "{stdout}"
+    );
+
+    let (status, stdout, _) = run(marked, Some("everything"), "secret");
+    assert_eq!(status, Some(2), "{stdout}");
+    assert!(stdout.contains("gate must be none or outside"), "{stdout}");
 }

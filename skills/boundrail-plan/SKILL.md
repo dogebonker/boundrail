@@ -1,6 +1,6 @@
 ---
 name: boundrail-plan
-description: Plan an architecture change in a Boundrail proposal before the code changes. Use when designing a future architecture, comparing options, drawing what a plan adds, removes and changes, adopting a plan as the current model, or shelving it, and on a PREDECESSOR_MOVED refusal.
+description: Plan an architecture change in a Boundrail proposal before the code changes. Use when designing a future architecture, comparing options, drawing what a plan adds, removes and changes, slicing a plan into tickets, gating a ticket's branch against its plan, adopting a plan as the current model, or shelving it, and on a PREDECESSOR_MOVED refusal.
 license: MIT OR Apache-2.0
 metadata:
   compatibility: Needs git and the boundrail binary on PATH. Request rules, claims and refusal codes are in boundrail-model.
@@ -15,7 +15,7 @@ claims and refusals.
 
 ## Steps
 
-1. **Draw.** `boundrail model propose --name "<plan>" --doing "<why>" --operation-id <operation-id>`. Add
+1. **Draw.** One spec gets one proposal. `boundrail model propose --name "<plan>" --doing "<why>" --operation-id <operation-id>`. Add
    `--from <proposal>` to copy another draft instead of the current state, and `--description`
    for the intent. The receipt's `allocated[0].id` is the proposal's qualified ID; its local ID is
    the part after `#`.
@@ -34,6 +34,36 @@ claims and refusals.
    narrow the architecture view. Show the picture to the person deciding.
 6. **Decide.** A person decides whether the plan is adopted. Ask before adopting.
 
+## Slice into tickets
+
+A spec too big for one pull request lands as **slices**, one per ticket. A slice is a small set
+of the modules and relationships the proposal names; every subject `model compare` lists belongs
+to exactly one slice. Commit the proposal folder before the first ticket, so every ticket's
+branch holds it.
+
+1. **Record the slices.** Write each slice's ticket and subjects in `--description` when you
+   draw the proposal. A current-state walkthrough (`add-walkthrough`, one beat per slice, `state`
+   `{"proposal": "<proposal>"}`, `against` `"current"`, `focus` the slice's modules, title naming
+   the ticket) edits the current state: use it only when the description cannot hold the slices,
+   and tell the person that adopt will then refuse `PREDECESSOR_MOVED` until you reconcile. Done
+   when every subject `model compare` lists sits in one slice.
+2. **Gate each ticket.** On the ticket's branch run
+   `boundrail model footprint --proposal <proposal> --fail-outside --format markdown`. Exit 1 names the
+   modules the branch changes outside the proposal. For each, decide:
+   - the change may belong to the plan: ask the person before any edit. The gate compares the
+     branch with the proposal, so editing the proposal until it passes makes the gate agree with
+     the code and checks nothing. With the person's yes, edit the proposal to name it, with the
+     deviation in the doing line:
+     `boundrail model edit --proposal <proposal> --doing "deviation <ticket>: <why>" --input <request.json>`.
+     List each deviation under Merge danger in the pull request body (boundrail-pr);
+   - it does not: move it to its own branch (boundrail-pr, Split).
+
+   Done when the gate exits 0. Put the proposal's marker in the pull request body
+   (boundrail-pr) so CI runs the same gate.
+3. **Adopt with the last slice.** When the last slice's pull request merges, adopt the proposal
+   on the default branch (Adopt, after a person agrees). Slices that edited the current state to
+   keep `model check` clean make adopt refuse `PREDECESSOR_MOVED`: reconcile first.
+
 ## Adopt
 
 Adopt only the revisions you compared. Read both revisions, then run:
@@ -46,7 +76,8 @@ boundrail model adopt <proposal> \
 ```
 
 The proposal's files replace the current state's; the output's `revision` is the current state's
-new revision. The adopted proposal stays, reading only.
+new revision. The adopted proposal stays, reading only. On the default branch, retain and
+publish the adopted model as boundrail-pr says under After the merge.
 
 ## Shelve
 
@@ -71,3 +102,4 @@ Other codes react as boundrail-model says.
 | `PROPOSAL_CLOSED` | The proposal is adopted or shelved. Draw a new one. |
 | `STALE_REVISION` on adopt | Either revision moved. Read both again and compare again before adopting. |
 | `MODEL_INVALID` on adopt | A beat or picture reads a module or flow the plan drops. Edit it first. |
+| `HISTORY_DIVERGED` on `history push` | With `details.related: false` or `details.clashing`, stop and report the message: no fetch converges those. Otherwise run `boundrail model history fetch`, then push again. |

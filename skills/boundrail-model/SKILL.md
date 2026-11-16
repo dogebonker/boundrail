@@ -1,6 +1,6 @@
 ---
 name: boundrail-model
-description: Author the repository's architecture model in .boundrail/model through the boundrail CLI when reading the architecture, changing modules, relationships, flows, walkthroughs, pictures or saved views, binding them to code, or reacting to a `model check` warning or refusal code.
+description: Author the repository's architecture model in .boundrail/model through the boundrail CLI when reading the architecture, changing modules, relationships, flows, walkthroughs, pictures or saved views, binding them to code, finding refactor candidates, or reacting to a `model check` warning or refusal code.
 license: MIT OR Apache-2.0
 metadata:
   compatibility: Needs git and the boundrail binary on PATH. Plans and proposals are in boundrail-plan; pull requests in boundrail-pr.
@@ -141,6 +141,29 @@ reads one. `source_status` says whether the code it was drawn against is here (`
 was mixed with uncommitted changes (`uncommitted`), or is missing (`unavailable`). `publication`
 says whether the history remote holds it. Publish only when the user asks: `boundrail model
 history push` (the remote is `boundrail model history configure --remote <name>`, else `origin`).
+
+## Design
+
+To improve the architecture, find candidates in the measures before you draw a plan. A **deep**
+module hides much behind few entry points; a **shallow** one lets callers reach its parts.
+
+- `boundrail model inspect <module> --format markdown` reads the interface the model draws:
+  - many `entry_points` beside few `hidden_parts`: shallow. Route callers through one part and
+    hide the rest.
+  - a `pass_through` part only forwards from outside to outside. Join its two ends directly, or
+    move real work into it.
+  - `on_container` relationships belong on the part that does the work.
+  - from the scan: `unused` exports are candidates to make internal; `deep_imports` reach past
+    the entry points and want an entry file.
+- `boundrail model locality --format markdown` reads co-change from Git history. A hidden coupling
+  (modules changed together in 3 or more commits with no relationship drawn) is either a
+  relationship the code shows and the model lacks (draw it) or one concern split across modules
+  (merge them, or move the code). A low `local_share` means most changes to the module touch
+  others too.
+- Draw each candidate design as its own proposal (boundrail-plan; `--from` copies another draft),
+  then `boundrail model compare <a> --beside <b> --format markdown`. It sets each alternative's
+  counts and per-module measures side by side and ranks nothing: pick by the counts the design
+  question names, and show the person the table and each proposal's picture.
 
 ## Claims
 

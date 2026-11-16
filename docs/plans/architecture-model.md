@@ -67,7 +67,7 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 | T33 | Browser: multi-select, relationship-kind filter, URL state for proposal, focus and flow with Back and Forward; an agent shows a reading in the user's open pane | open |
 | T34 | `model explain`: ask the local agent about a selection, relationship, flow or proposal | done |
 | T35 | Walkthrough recording: render a walkthrough to MP4 with local voice and replay it | done |
-| T36 | Agent workflow: plan skill slices per ticket with the footprint gate; pull request skill body, state marker, temporary model and split guidance; action reads the proposal and skips held subjects; design guidance for inspect and locality | open |
+| T36 | Agent workflow: plan skill slices per ticket with the footprint gate; pull request skill body, state marker, temporary model and split guidance; action reads the proposal and skips held subjects; design guidance for inspect and locality | done |
 
 ## Notes
 
@@ -335,6 +335,25 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   block, and the pull request comment the same after the model counts. A rebound module keeps the
   head's path too, so a file at its old path still counts for it. Claims are not read: they belong
   to one worktree, and a footprint judges a branch.
+- T36: the action reads the pull request body through `gh api repos/<repo>/pulls/<n>` with the
+  token, on `pull_request` events with a base, rather than the event payload, so an edited body
+  counts. The state marker is one line `<!-- boundrail:proposal <id> -->` (surrounding spaces and
+  CR allowed) whose ID is a local ID, 8 ASCII letters or digits, matched by a bash regular
+  expression and passed as one argument; any other text after `boundrail:proposal`, or a second
+  marker line, stops the step with exit 2 and an error that quotes nothing from the body. With a
+  marker both footprint calls take `--proposal <id>`, so the comment and the whole summary carry
+  `Against proposal`; `gate: outside` (input `gate`, `none` by default, anything else exit 2)
+  adds `--fail-outside`, whose exit 1 joins the fail-on verdict. Held subjects need nothing in the
+  action: `outside` already leaves them out (T19). Without a token the body is not read: a notice
+  under `gate: none`, exit 2 under `gate: outside`. Without a marker every call is as before.
+  `tests/action.rs` checks the flags exist in `model footprint --help`, the calls with and
+  without the gate, and that hostile markers stop before any footprint runs.
+- T36: the skills are the workflow; no command changed. Slices live in the proposal's
+  `--description` (set only at `propose` until T26) or as beats of a current-state walkthrough
+  reading the proposal against the current state with `focus` on the slice's modules, since a
+  proposal edit refuses walkthroughs. A deviation is a proposal edit whose doing line names it.
+  The temporary model is a proposal committed on the branch and shelved after the merge, until
+  T31 gives temporary models their own vault.
 - T11: `model view [--port N] [--no-open]` serves the page and a JSON API on 127.0.0.1 only, port 0
   (a free one) by default, and prints the URL with its token as the first line on stdout. Without
   `--no-open` it starts the platform opener (`open`, `xdg-open`, `cmd /c start ""`) with a one-time

@@ -19,6 +19,16 @@
   changed parts that hold a module's changes in `holds`, `large` for a change of more than 30
   files, and `--fail-outside`, which exits 1 when a module outside the proposal changed and
   holds nothing.
+- The GitHub Action reads a state marker line, `<!-- boundrail:proposal <id> -->`, from the pull
+  request body and runs the footprint against that proposal; the new `gate: outside` input adds
+  `--fail-outside`, so held subjects never fail it. The ID must be 8 letters or digits; any
+  other marker stops the step. Without a marker the action runs as before.
+- The agent skills carry the workflow: `boundrail-plan` slices one proposal per spec into tickets
+  gated by the footprint and adopts with the last slice; `boundrail-pr` writes the body (Summary,
+  Evidence, Merge danger and the state marker), draws a temporary proposal for a pull request
+  outside any plan, and splits a branch that changes modules outside its proposal;
+  `boundrail-model` says when `inspect`, `locality` and `compare --beside` find and choose
+  refactors.
 - `model inspect` reads each module's interface from the model as well as the code: entry
   points, hidden parts, callers, outgoing modules, pass-through parts, relationships on the
   container and five measures, in `model_interfaces`. `--checkpoint <id>` inspects a retained

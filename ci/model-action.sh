@@ -2,14 +2,18 @@
 # The boundrail GitHub Action (action.yml). Every input arrives as an INPUT_* environment
 # variable, so this runs outside Actions too, given RUNNER_TEMP and GITHUB_STEP_SUMMARY:
 #
-#   INPUT_PATH INPUT_FAIL_ON INPUT_VERSION INPUT_BINARY INPUT_BASE_REF INPUT_TOKEN   as in action.yml
+#   INPUT_PATH INPUT_FAIL_ON INPUT_GATE INPUT_VERSION INPUT_BINARY INPUT_BASE_REF INPUT_TOKEN
+#               as in action.yml
 #   PR_NUMBER   the pull request's number, on pull_request events
 #
 # Runs `model check --format annotations` and replays its annotations. With a base ref, writes
 # `model footprint --format pr-comment` to the job summary and, on a pull_request event with a
-# token, posts it as one comment, replacing the comment the same account posted before. It never
+# token, posts it as one comment, replacing the comment the same account posted before. When the
+# pull request body holds a proposal marker, the footprint runs against that proposal, with
+# --fail-outside under gate: outside, which fails closed: a pull request without a marker, and any
+# event but pull_request, exit 2. A marker line inside a fenced code block does not count. It never
 # passes --language-servers, and passes --no-language-servers so a user's config cannot turn them
-# on. Exit 1 when the check finds what fail-on names, 2 on errors.
+# on. Exit 1 when the check finds what fail-on names or the gate fails, 2 on errors.
 set -euo pipefail
 # A failed setup step is a failure to run, not a gate result.
 trap 'exit 2' ERR
@@ -55,6 +59,11 @@ fail_on=${fail_on:-never}
 case $fail_on in
   warnings | information | never) ;;
   *) die "fail-on must be warnings, information or never" ;;
+esac
+gate=${INPUT_GATE:-none}
+case $gate in
+  none | outside) ;;
+  *) die "gate must be none or outside" ;;
 esac
 base_ref=${INPUT_BASE_REF:-}
 work=$RUNNER_TEMP/boundrail-model
@@ -111,7 +120,51 @@ post_comment() {
   fi
 }
 
+# The pull request body, from the API rather than the event payload, so an edited body counts.
+read_body() {
+  [[ -n $gh_token ]] || return 1
+  local -x GH_TOKEN=$gh_token
+  gh api "repos/${GITHUB_REPOSITORY:?}/pulls/$PR_NUMBER" --jq '.body // ""' >"$work/body.md"
+}
+
+# Sets proposal to the ID the body's one marker line `<!-- boundrail:proposal <id> -->` names.
+# The body is untrusted: the ID must be a local ID, 8 letters or digits, and only ever travels
+# as one argument; the error names no text from the body.
+read_marker() {
+  local markers
+  # Fenced code blocks (``` or ~~~) are skipped, so a quoted marker does not count.
+  markers=$(tr -d '\r' <"$work/body.md" | awk '/^[[:space:]]*(```|~~~)/ { fenced = !fenced; next } !fenced' | grep -E '^[[:space:]]*<!--[[:space:]]*boundrail:proposal' || true)
+  [[ -n $markers ]] || return 0
+  local pattern='^[[:space:]]*<!--[[:space:]]*boundrail:proposal[[:space:]]+([A-Za-z0-9]{8})[[:space:]]*-->[[:space:]]*$'
+  [[ $markers =~ $pattern ]] ||
+    die "the pull request body needs one marker line <!-- boundrail:proposal ID --> whose ID is 8 letters or digits"
+  proposal=${BASH_REMATCH[1]}
+}
+
+[[ $gate == none || ${GITHUB_EVENT_NAME:-} == pull_request ]] ||
+  die "gate outside runs on pull_request events only; this event is ${GITHUB_EVENT_NAME:-unknown}, so the gate did not run"
+proposal=
+against=()
+footprint=0
 if [[ -n $base_ref ]]; then
+  if [[ ${GITHUB_EVENT_NAME:-} == pull_request && -n ${PR_NUMBER:-} ]]; then
+    if read_body; then
+      read_marker
+      [[ $gate == none || -n $proposal ]] ||
+        die "gate outside needs the pull request body to hold a marker line <!-- boundrail:proposal ID -->"
+    elif [[ $gate == outside ]]; then
+      die "gate outside could not read the pull request body for its proposal marker; give the step a token that can read it"
+    else
+      resume
+      echo "::notice::pull request body not read: the footprint runs without a proposal"
+      stop
+    fi
+  fi
+  if [[ -n $proposal ]]; then
+    echo "footprint against proposal $proposal"
+    against=(--proposal "$proposal")
+    [[ $gate == none ]] || against+=(--fail-outside)
+  fi
   [[ $base_ref != -* ]] || die "base-ref $base_ref is not a commit"
   # The footprint starts from the merge-base, so it needs the history down to the base.
   if [[ $(git -C "$path" rev-parse --is-shallow-repository) == true ]]; then
@@ -122,17 +175,21 @@ if [[ -n $base_ref ]]; then
     git -C "$path" fetch --no-tags origin "$base_ref" ||
       die "could not fetch $base_ref; check out with fetch-depth: 0"
   fi
-  "$boundrail" model footprint --root "$path" --base "$base_ref" --format pr-comment >"$work/comment.md" || {
+  # Exit 1 is the gate: a module outside the proposal changed and holds nothing.
+  "$boundrail" model footprint --root "$path" --base "$base_ref" ${against[@]+"${against[@]}"} --format pr-comment >"$work/comment.md" || footprint=$?
+  if ((footprint > 1)); then
     cat "$work/comment.md"
     die "model footprint failed"
-  }
+  fi
   cat "$work/comment.md" >>"$GITHUB_STEP_SUMMARY"
   # A comment cut at its size limit points at the summary, which gets the whole footprint.
   if grep -q '^_Truncated at ' "$work/comment.md"; then
-    "$boundrail" model footprint --root "$path" --base "$base_ref" --format markdown >"$work/footprint.md" || {
+    whole=0
+    "$boundrail" model footprint --root "$path" --base "$base_ref" ${against[@]+"${against[@]}"} --format markdown >"$work/footprint.md" || whole=$?
+    if ((whole > 1)); then
       cat "$work/footprint.md"
       die "model footprint failed"
-    }
+    fi
     # A fence longer than any tilde run in the text, which the repository controls.
     fence='~~~'
     longest=$(awk '{
@@ -163,8 +220,10 @@ if [[ -n $base_ref ]]; then
   fi
 fi
 
+verdict=$footprint
 case $fail_on in
-  warnings) ((warnings == 0)) || exit 1 ;;
-  information) ((warnings + notices == 0)) || exit 1 ;;
+  warnings) ((warnings == 0)) || verdict=1 ;;
+  information) ((warnings + notices == 0)) || verdict=1 ;;
   never) ;;
 esac
+exit "$verdict"
