@@ -232,7 +232,7 @@ pub struct Reach {
 }
 
 /// The counts of a [`Drawn`] interface.
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Measures {
     pub entry_points: usize,
     pub hidden_parts: usize,

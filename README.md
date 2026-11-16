@@ -115,6 +115,24 @@ boundrail model inspect Billing --checkpoint <id>   # a retained state; the code
 boundrail model inspect --group payments            # members, internal and boundary relationships, neighbours
 ```
 
+## Compare
+
+`boundrail model compare <proposal>` lists what a proposal adds, removes and changes against the
+current state, another proposal (`--against <id>`) or a retained checkpoint
+(`--against-checkpoint <id>`). `interface_changes` follows: for each module present in both
+states whose drawn interface changed, the entry points added and removed, callers and outgoing
+modules gained and lost, hidden and pass-through parts added and removed, and the five measures
+before and after. `--beside <proposal>`, repeatable, compares alternatives against the same base:
+`alternatives` gives each one's subject counts and number of interface changes, and
+`interface_measures` sets every module's measures side by side, `null` where a state lacks it.
+Markdown prints both as tables, the measures only for modules whose counts differ.
+
+```sh
+boundrail model compare <id> --format markdown
+boundrail model compare <id> --against-checkpoint <checkpoint>   # against a retained state
+boundrail model compare <a> --beside <b> --beside <c>            # rank alternatives
+```
+
 ## In CI
 
 The GitHub Action runs `model check`, annotates its findings, and on a pull request comments the

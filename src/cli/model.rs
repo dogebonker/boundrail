@@ -322,13 +322,21 @@ enum ModelCmd {
     },
     /// List proposals with their status
     Proposals,
-    /// Report what a proposal adds, removes and changes against the current state or another proposal
+    /// Report what a proposal adds, removes and changes against the current state, another
+    /// proposal or a checkpoint, and how each module's drawn interface changes
     Compare {
         /// The proposal's ID
         proposal: String,
         /// Compare against the current state, or this proposal
         #[arg(long, default_value = CURRENT)]
         against: String,
+        /// Compare against the model a checkpoint holds instead: its ID or a unique commit prefix
+        #[arg(long, conflicts_with = "against")]
+        against_checkpoint: Option<String>,
+        /// Compare this alternative proposal against the same state too, and report the
+        /// alternatives' changes and interface measures side by side; repeat for several
+        #[arg(long)]
+        beside: Vec<String>,
     },
     /// Make a proposal the current state
     Adopt {
@@ -919,8 +927,19 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
             print_written(markdown, "shelve", &dir, &receipt, None)
         }
         ModelCmd::Proposals => list_proposals(root, markdown),
-        ModelCmd::Compare { proposal, against } => {
-            compare_proposal(root, markdown, &proposal, &against)
+        ModelCmd::Compare {
+            proposal,
+            against,
+            against_checkpoint,
+            beside,
+        } => {
+            let asked = Compare {
+                proposal: &proposal,
+                against: &against,
+                against_checkpoint: against_checkpoint.as_deref(),
+                beside: &beside,
+            };
+            compare_proposal(root, markdown, &asked)
         }
         ModelCmd::Recover {
             abandon: Some(operation),
@@ -3044,71 +3063,156 @@ pub(super) fn checkpoints_output(root: &Path, limit: Option<usize>) -> Result<Va
 }
 
 /// `model compare`: the proposal `subject` against the current state or the proposal `against`.
-fn compare_proposal(root: &Path, markdown: bool, subject: &str, against: &str) -> Result<()> {
+fn compare_proposal(root: &Path, markdown: bool, asked: &Compare<'_>) -> Result<()> {
     if !markdown {
-        return write(None, &compare_output(root, subject, against)?);
+        return write(None, &compare_output(root, asked)?);
     }
-    let c = compared(root, subject, against)?;
-    print_comparison(&c.proposal, &c.against, &c.comparison);
+    let c = compared(root, asked)?;
+    let first = &c.alternatives[0];
+    print_comparison(&first.side, &c.side, &first.comparison);
+    let mut named = names(&c.against);
+    named.extend(names(&first.model));
+    print_interface_changes(&named, &first.interface_changes);
+    if c.alternatives.len() > 1 {
+        print_alternatives(&c);
+    }
     Ok(())
 }
 
+/// What `model compare` was asked: a proposal against the current state, another proposal or a
+/// checkpoint, beside other proposals.
+pub(super) struct Compare<'a> {
+    pub(super) proposal: &'a str,
+    pub(super) against: &'a str,
+    pub(super) against_checkpoint: Option<&'a str>,
+    pub(super) beside: &'a [String],
+}
+
 /// The JSON output of `model compare`.
-pub(super) fn compare_output(root: &Path, subject: &str, against: &str) -> Result<Value> {
-    let c = compared(root, subject, against)?;
+pub(super) fn compare_output(root: &Path, asked: &Compare<'_>) -> Result<Value> {
+    let c = compared(root, asked)?;
+    let first = &c.alternatives[0];
     let mut output = json!({
         "schema": MODEL_SCHEMA,
         "kind": "compare",
         "success": true,
         "vault": c.vault,
-        "proposal": c.proposal,
-        "against": c.against,
+        "proposal": first.side,
+        "against": c.side,
     });
-    extend(&mut output, &c.comparison)?;
+    extend(&mut output, &first.comparison)?;
+    output["interface_changes"] = json!(first.interface_changes);
+    if c.alternatives.len() > 1 {
+        let alternatives: Vec<Value> = (c.alternatives.iter())
+            .map(|a| {
+                json!({
+                    "proposal": a.side,
+                    "subjects": a.comparison.counts(),
+                    "interface_changes": a.interface_changes.len(),
+                })
+            })
+            .collect();
+        output["alternatives"] = json!(alternatives);
+        output["interface_measures"] = json!(c.measures());
+    }
     Ok(output)
 }
 
 /// What `model compare` found.
 struct Compared {
     vault: PathBuf,
-    /// How the output names the proposal and the state it is compared with.
-    proposal: Value,
-    against: Value,
-    comparison: Comparison,
+    /// The state compared against, how the output names it, and its drawn interfaces.
+    against: Model,
+    side: Value,
+    drawn: Vec<inspect::Drawn>,
+    /// The proposal, then each `--beside` proposal, compared against it.
+    alternatives: Vec<Alternative>,
 }
 
-fn compared(root: &Path, subject: &str, against: &str) -> Result<Compared> {
+struct Alternative {
+    model: Model,
+    side: Value,
+    comparison: Comparison,
+    interface_changes: Vec<compare::InterfaceChange>,
+    drawn: Vec<inspect::Drawn>,
+}
+
+impl Compared {
+    fn measures(&self) -> Vec<compare::MeasuresRow> {
+        let drawn: Vec<&[inspect::Drawn]> =
+            self.alternatives.iter().map(|a| &a.drawn[..]).collect();
+        compare::measures_beside(&self.drawn, &drawn)
+    }
+}
+
+fn compared(root: &Path, asked: &Compare<'_>) -> Result<Compared> {
     let dir = vault::locate(root)?;
-    let after = vault::load_proposal(dir.clone(), subject)?;
-    let before = match against {
-        CURRENT => vault::load_dir(dir.clone())?,
-        other => vault::load_proposal(dir.clone(), other)?,
+    let after = vault::load_proposal(dir.clone(), asked.proposal)?;
+    let (before, checkpoint) = match (asked.against_checkpoint, asked.against) {
+        (Some(which), _) => {
+            let (checkpoint, model) = checkpoint::load(root, which)?;
+            (model, Some(checkpoint))
+        }
+        (None, CURRENT) => (vault::load_dir(dir.clone())?, None),
+        (None, other) => (vault::load_proposal(dir.clone(), other)?, None),
     };
-    let comparison = compare::compare(
-        &after.manifest.id,
-        (&before.modules, &before.collections),
-        (&after.modules, &after.collections),
-    );
+    let mut models = vec![after];
+    for beside in asked.beside {
+        models.push(vault::load_proposal(dir.clone(), beside)?);
+    }
+    let model_id = models[0].manifest.id.clone();
     let side = |model: &Model| match &model.proposal {
         Some(drawn) => {
             json!({"id": model.qualify(&drawn.id), "name": drawn.name, "revision": model.revision.digest})
         }
         None => json!({"id": CURRENT, "revision": model.revision.digest}),
     };
+    let against_side = match &checkpoint {
+        Some(checkpoint) => json!({"checkpoint": checkpoint, "revision": before.revision.digest}),
+        None => side(&before),
+    };
+    let drawn = inspect::drawn(&model_id, &before.modules, None);
+    let alternatives = (models.into_iter())
+        .map(|after| {
+            let comparison = compare::compare(
+                &model_id,
+                (&before.modules, &before.collections),
+                (&after.modules, &after.collections),
+            );
+            let now = inspect::drawn(&model_id, &after.modules, None);
+            Alternative {
+                side: side(&after),
+                comparison,
+                interface_changes: compare::interface_changes(&drawn, &now),
+                drawn: now,
+                model: after,
+            }
+        })
+        .collect();
     Ok(Compared {
-        proposal: side(&after),
-        against: side(&before),
         vault: dir,
-        comparison,
+        against: before,
+        side: against_side,
+        drawn,
+        alternatives,
     })
 }
 
+/// How a Markdown line names a compared state.
+fn state_named(side: &Value) -> String {
+    match (side["name"].as_str(), side["checkpoint"]["id"].as_str()) {
+        (Some(name), _) => format!("{name} ({})", side["id"].as_str().unwrap_or_default()),
+        (None, Some(id)) => format!("checkpoint {}", escape_controls(id)),
+        (None, None) => "the current state".to_owned(),
+    }
+}
+
 fn print_comparison(proposal: &Value, against: &Value, comparison: &Comparison) {
-    let named = |side: &Value| match side["name"].as_str() {
-        Some(name) => format!("{name} ({})", side["id"].as_str().unwrap_or_default()),
-        None => "the current state".to_owned(),
-    };
-    println!("Proposal {} against {}", named(proposal), named(against));
+    println!(
+        "Proposal {} against {}",
+        state_named(proposal),
+        state_named(against)
+    );
     if comparison.is_empty() {
         println!("No differences");
     }
@@ -3133,6 +3237,84 @@ fn print_comparison(proposal: &Value, against: &Value, comparison: &Comparison) 
                 println!("- {verb} {noun} {name}{}{fields}", entry.id);
             }
         }
+    }
+}
+
+/// One line per module whose drawn interface changed, naming what it gained and lost.
+fn print_interface_changes(names: &BTreeMap<String, &str>, changes: &[compare::InterfaceChange]) {
+    if changes.is_empty() {
+        return;
+    }
+    println!("Interface changes:");
+    for c in changes {
+        let mut said: Vec<String> = (c.lists().into_iter())
+            .filter(|(_, ids)| !ids.is_empty())
+            .map(|(label, ids)| {
+                let named: Vec<&str> = ids.iter().map(|id| name_of(names, id)).collect();
+                format!("{label} {}", named.join(", "))
+            })
+            .collect();
+        let m = &c.interface_measures;
+        if m.before != m.after {
+            said.push(format!(
+                "measures {} -> {}",
+                measured(Some(m.before)),
+                measured(Some(m.after))
+            ));
+        }
+        println!("- {} ({}): {}", c.name, c.module, said.join("; "));
+    }
+}
+
+/// Measures as `entry points/hidden parts/callers/outgoing/depth`, or `-` for a missing module.
+fn measured(measures: Option<inspect::Measures>) -> String {
+    measures.map_or("-".to_owned(), |m| {
+        let inspect::Measures {
+            entry_points,
+            hidden_parts,
+            callers,
+            outgoing,
+            depth,
+        } = m;
+        format!("{entry_points}/{hidden_parts}/{callers}/{outgoing}/{depth}")
+    })
+}
+
+/// The alternatives' change counts, then the measures of every module they do not all share.
+fn print_alternatives(c: &Compared) {
+    println!("Alternatives against {}:", state_named(&c.side));
+    println!("| Proposal | Added | Removed | Changed | Interface changes |");
+    println!("|---|---|---|---|---|");
+    for a in &c.alternatives {
+        let n = a.comparison.counts();
+        println!(
+            "| {} | {} | {} | {} | {} |",
+            state_named(&a.side),
+            n.added,
+            n.removed,
+            n.changed,
+            a.interface_changes.len()
+        );
+    }
+    let rows: Vec<_> = (c.measures().into_iter())
+        .filter(|r| r.alternatives.iter().any(|m| *m != r.against))
+        .collect();
+    if rows.is_empty() {
+        return;
+    }
+    println!("Interface measures (entry points/hidden parts/callers/outgoing/depth):");
+    let heads: Vec<String> = iter::once(&c.side)
+        .chain(c.alternatives.iter().map(|a| &a.side))
+        .map(state_named)
+        .collect();
+    println!("| Module | {} |", heads.join(" | "));
+    println!("|---|{}", "---|".repeat(heads.len()));
+    for row in rows {
+        let cells: Vec<String> = iter::once(row.against)
+            .chain(row.alternatives.iter().copied())
+            .map(measured)
+            .collect();
+        println!("| {} ({}) | {} |", row.name, row.module, cells.join(" | "));
     }
 }
 

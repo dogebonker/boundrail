@@ -432,7 +432,13 @@ impl Server {
                 let proposal =
                     param("proposal").ok_or_else(|| invalid("compare needs proposal"))?;
                 let against = param("against").unwrap_or(CURRENT);
-                model_cli::compare_output(root, proposal, against)?
+                let asked = model_cli::Compare {
+                    proposal,
+                    against,
+                    against_checkpoint: None,
+                    beside: &[],
+                };
+                model_cli::compare_output(root, &asked)?
             }
             "/api/inspect" => {
                 let asked = model_cli::Inspect {

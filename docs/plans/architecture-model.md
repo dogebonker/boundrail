@@ -54,7 +54,7 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 | T20 | Check correctness: infrastructure-unit bindings exempt from `CONTAINER_PARTS_OUTSIDE`; the code check scans every language in the checkout, not one; `check --every-draft` | done |
 | T21 | Render quality and options: edges route around boxes and labels never collide; `--focus`, `--hide-kind`, legend, `--theme auto`; JSON receipt with dimensions, placed IDs and digest; direct PNG with `--scale` and `--region` | done |
 | T22 | Model-side inspect: entry points, hidden parts, callers, outgoing, pass-through, container relationships and measures read from the model, `--checkpoint`, and `inspect --group` | done |
-| T23 | Compare: interface changes and interface measures between states, `--beside` alternatives, `--against` a checkpoint | open |
+| T23 | Compare: interface changes and interface measures between states, `--beside` alternatives, `--against` a checkpoint | done |
 | T24 | Schema: relationship traffic, step anchors, authored flow participant order, flow summary required on write (`FLOW_SUMMARY_REQUIRED`) | open |
 | T25 | History on every write: each edit, including in proposals, retains a checkpoint with its doing line; publication destination with per-checkpoint status; source-commit availability on checkpoint reads | open |
 | T26 | Proposal metadata: summary, linked documents, rename and edit through `set`, select by unique name; walkthroughs authored inside proposals | open |
@@ -1072,3 +1072,32 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   nor boundary. A key the config lacks refuses `SUBJECT_NOT_FOUND`. `/api/inspect` serializes
   the same output, so it carries `model_interfaces`; it takes no checkpoint or group yet, and
   the page still shows only the scanned interface.
+- T23: `model compare` adds `interface_changes` after the subject sections, whose keys and order
+  hold: one entry per module present in both states whose drawn interface differs, read with
+  T22's `drawn()` on each state and sorted by qualified ID. Each names the module and its name
+  after the change, then `entry_points_added`/`_removed`, `callers_gained`/`_lost`,
+  `outgoing_gained`/`_lost`, `hidden_parts_added`/`_removed` and `pass_through_added`/`_removed`
+  as qualified module IDs, every list present even when empty, and `interface_measures` with
+  `before` and `after`. Lists compare modules, not the relationships behind them, so a module
+  reaching the same neighbours through other relationships shows no change. A module whose lists
+  hold but whose measures differ (a deeper part added) still shows. Added and removed modules
+  have no entry; their effect shows on the modules around them.
+- T23: the checkpoint base is `--against-checkpoint <id>`, not a prefix inside `--against`: every
+  other command names a checkpoint with its own flag taking an ID or unique commit prefix
+  (`read`, `inspect` and `render --checkpoint`), and a separate flag keeps `--against` an ID or
+  `current`. It conflicts with an explicit `--against` and loads as `read --checkpoint` does;
+  `against` is then `{checkpoint, revision}`, the checkpoint as `read --checkpoint` prints it, and
+  Markdown names it `checkpoint <id>`. An unknown one refuses `CHECKPOINT_NOT_FOUND`.
+- T23: `--beside <proposal>`, repeatable, compares more proposals against the same base. The
+  top-level sections and `interface_changes` stay those of the positional proposal; after them
+  `alternatives` lists the positional proposal, then each `--beside` in order, each with
+  `proposal` (as the top-level key names it), `subjects` (added, removed and changed counts over
+  all five sections) and `interface_changes` (how many modules' interfaces changed).
+  `interface_measures` has one row per module any state draws, sorted by qualified ID: `module`,
+  `name` (from the first state holding it, the base first), `against` and `alternatives`, the
+  measures in the base and in each alternative in `alternatives` order, `null` where the state
+  lacks the module. JSON carries every module; Markdown prints a counts table and a measures
+  table of the modules whose counts are not the same in every state, each cell
+  `entry points/hidden parts/callers/outgoing/depth` or `-`. No ranking is computed: which counts
+  matter depends on the design question. An unknown `--beside` refuses as an unknown proposal
+  does. `/api/compare` passes neither flag.

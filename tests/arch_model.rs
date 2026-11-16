@@ -3619,6 +3619,350 @@ fn a_proposal_is_drawn_edited_and_compared_apart_from_the_current_state() {
     assert_eq!(listed["proposals"][0]["status"], "draft");
 }
 
+/// The shop's proposal Split: Web removed, Gateway added to Platform, relayed both ways with
+/// Bank. Returns the proposal's ID and Gateway's local ID.
+fn split(checkout: &Checkout) -> (String, String) {
+    let id = propose(checkout, "Split", "current");
+    edited_proposal(
+        checkout,
+        &id,
+        json!([
+            {"type": "remove-module", "subject": "Web"},
+            {"type": "add-module", "module": {"name": "Gateway", "kind": "service", "order": 2, "parent": "Platform"}},
+            {"type": "add-relationship", "source": "Bank", "relationship": {"to": "Gateway", "kind": "call", "order": 0}},
+            {"type": "add-relationship", "source": "Gateway", "relationship": {"to": "Bank", "kind": "call", "order": 0}},
+        ]),
+    );
+    let read = checkout.ok(&["read", "--proposal", &id]);
+    let modules = read["modules"].as_array().unwrap();
+    let gateway = modules.iter().find(|m| m["name"] == "Gateway").unwrap();
+    (id, local(gateway["id"].as_str().unwrap()).to_owned())
+}
+
+/// An interface change entry with every list empty but those `lists` names.
+fn interface_change(module: &str, name: &str, lists: Value, before: Value, after: Value) -> Value {
+    let mut entry = json!({"module": module, "name": name});
+    for key in [
+        "entry_points_added",
+        "entry_points_removed",
+        "callers_gained",
+        "callers_lost",
+        "outgoing_gained",
+        "outgoing_lost",
+        "hidden_parts_added",
+        "hidden_parts_removed",
+        "pass_through_added",
+        "pass_through_removed",
+    ] {
+        entry[key] = lists.get(key).cloned().unwrap_or(json!([]));
+    }
+    entry["interface_measures"] = json!({"before": before, "after": after});
+    entry
+}
+
+/// Interface measures in the order entry points, hidden parts, callers, outgoing, depth.
+fn measures(counts: [usize; 5]) -> Value {
+    let [entry_points, hidden_parts, callers, outgoing, depth] = counts;
+    json!({"entry_points": entry_points, "hidden_parts": hidden_parts, "callers": callers, "outgoing": outgoing, "depth": depth})
+}
+
+#[test]
+fn compare_reports_how_each_drawn_interface_changes() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let q = |id: &str| format!("{model}#{id}");
+    let (id, gateway) = split(&checkout);
+    let compared = checkout.ok(&["compare", &id]);
+    let keys: Vec<&str> = compared
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            "schema",
+            "kind",
+            "success",
+            "vault",
+            "proposal",
+            "against",
+            "modules",
+            "relationships",
+            "collections",
+            "flows",
+            "steps",
+            "interface_changes"
+        ]
+    );
+    assert_eq!(
+        compared["interface_changes"],
+        json!([
+            interface_change(
+                &q("BankApi1"),
+                "Bank",
+                json!({"callers_gained": [q(&gateway)], "outgoing_gained": [q(&gateway)]}),
+                measures([1, 0, 1, 0, 0]),
+                measures([1, 0, 2, 1, 0]),
+            ),
+            interface_change(
+                &q("Billing1"),
+                "Billing",
+                json!({"entry_points_removed": [q("Billing1")], "callers_lost": [q("WebApp01")]}),
+                measures([1, 0, 1, 1, 0]),
+                measures([0, 0, 0, 1, 0]),
+            ),
+            interface_change(
+                &q("Platfrm1"),
+                "Platform",
+                json!({
+                    "entry_points_added": [q(&gateway)],
+                    "callers_gained": [q("BankApi1")],
+                    "hidden_parts_removed": [q("WebApp01")],
+                    "pass_through_added": [q(&gateway)],
+                }),
+                measures([0, 2, 0, 1, 1]),
+                measures([1, 1, 1, 1, 1]),
+            ),
+        ])
+    );
+
+    let (code, text) = checkout.run_raw(&["--format", "markdown", "compare", &id]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("Interface changes:\n"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "- Platform ({}): entry points added Gateway; callers gained Bank; hidden parts \
+             removed Web; pass-through added Gateway; measures 0/2/0/1/1 -> 1/1/1/1/1",
+            q("Platfrm1")
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "- Billing ({}): entry points removed Billing; callers lost Web; measures",
+            q("Billing1")
+        )),
+        "{text}"
+    );
+
+    let same = propose(&checkout, "Same", "current");
+    assert_eq!(
+        checkout.ok(&["compare", &same])["interface_changes"],
+        json!([])
+    );
+
+    let moved = propose(&checkout, "Moved", "current");
+    edited_proposal(
+        &checkout,
+        &moved,
+        json!([{"type": "edit-module", "subject": "Web", "set": {"parent": "Billing"}}]),
+    );
+    assert_eq!(
+        checkout.ok(&["compare", &moved])["interface_changes"],
+        json!([
+            interface_change(
+                &q("Billing1"),
+                "Billing",
+                json!({
+                    "entry_points_removed": [q("Billing1")],
+                    "callers_lost": [q("WebApp01")],
+                    "hidden_parts_added": [q("WebApp01")],
+                }),
+                measures([1, 0, 1, 1, 0]),
+                measures([0, 1, 0, 1, 1]),
+            ),
+            interface_change(
+                &q("Platfrm1"),
+                "Platform",
+                json!({"hidden_parts_removed": [q("WebApp01")]}),
+                measures([0, 2, 0, 1, 1]),
+                measures([0, 1, 0, 1, 2]),
+            ),
+            interface_change(
+                &q("WebApp01"),
+                "Web",
+                json!({"outgoing_lost": [q("Billing1")]}),
+                measures([0, 0, 0, 1, 0]),
+                measures([0, 0, 0, 0, 0]),
+            ),
+        ])
+    );
+}
+
+#[test]
+fn compare_against_a_checkpoint_reads_the_retained_state() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let q = |id: &str| format!("{model}#{id}");
+    let retained = checkout.ok(&["retain", "--doing", "the shop as built"])["checkpoint"].clone();
+    let checkpoint = retained["id"].as_str().unwrap();
+    let (id, _) = split(&checkout);
+    checkout.edited(json!([{"type": "remove-relationship", "subject": "RelWeb01"}]));
+
+    let compared = checkout.ok(&["compare", &id, "--against-checkpoint", checkpoint]);
+    assert_eq!(compared["against"]["checkpoint"]["id"], *checkpoint);
+    assert_eq!(compared["against"]["revision"], retained["revision"]);
+    assert_eq!(compared["relationships"]["removed"][0]["id"], q("RelWeb01"));
+    let billing = |out: &Value| -> Value {
+        let changes = out["interface_changes"].as_array().unwrap();
+        (changes.iter())
+            .find(|c| c["module"] == q("Billing1"))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    assert_eq!(billing(&compared)["callers_lost"], json!([q("WebApp01")]));
+    let current = checkout.ok(&["compare", &id]);
+    assert_eq!(current["against"]["id"], "current");
+    assert_eq!(billing(&current), Value::Null);
+    let prefix = &retained["commit"].as_str().unwrap()[..10];
+    let by_commit = checkout.ok(&["compare", &id, "--against-checkpoint", prefix]);
+    assert_eq!(
+        by_commit["interface_changes"],
+        compared["interface_changes"]
+    );
+
+    let (code, text) = checkout.run_raw(&[
+        "--format",
+        "markdown",
+        "compare",
+        &id,
+        "--against-checkpoint",
+        checkpoint,
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.starts_with(&format!(
+            "Proposal Split ({}) against checkpoint {checkpoint}\n",
+            q(&id)
+        )),
+        "{text}"
+    );
+
+    checkout.refused(
+        &["compare", &id, "--against-checkpoint", "Unknown1"],
+        "CHECKPOINT_NOT_FOUND",
+    );
+    let (code, _) = checkout.run_raw(&[
+        "compare",
+        &id,
+        "--against",
+        "current",
+        "--against-checkpoint",
+        checkpoint,
+    ]);
+    assert_eq!(
+        code, 2,
+        "--against and --against-checkpoint each name a base"
+    );
+}
+
+#[test]
+fn compare_beside_reports_alternatives_side_by_side() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let q = |id: &str| format!("{model}#{id}");
+    let (next, ledger) = next(&checkout);
+    let (split, gateway) = split(&checkout);
+    let alone = checkout.ok(&["compare", &next]);
+    let compared = checkout.ok(&["compare", &next, "--beside", &split]);
+    for key in [
+        "proposal",
+        "against",
+        "modules",
+        "relationships",
+        "interface_changes",
+    ] {
+        assert_eq!(compared[key], alone[key], "{key}");
+    }
+    let keys: Vec<&str> = compared
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys[keys.len() - 3..],
+        ["interface_changes", "alternatives", "interface_measures"]
+    );
+    assert_eq!(
+        compared["alternatives"],
+        json!([
+            {"proposal": alone["proposal"], "subjects": {"added": 1, "removed": 2, "changed": 1}, "interface_changes": 2},
+            {
+                "proposal": checkout.ok(&["compare", &split])["proposal"],
+                "subjects": {"added": 3, "removed": 2, "changed": 0},
+                "interface_changes": 3,
+            },
+        ])
+    );
+    let rows = compared["interface_measures"].as_array().unwrap();
+    let ids: Vec<&str> = rows.iter().map(|r| r["module"].as_str().unwrap()).collect();
+    let mut expected = vec![
+        q("BankApi1"),
+        q("Billing1"),
+        q("Platfrm1"),
+        q("WebApp01"),
+        q(&ledger),
+        q(&gateway),
+    ];
+    expected.sort();
+    assert_eq!(ids, expected);
+    let row = |id: &str| rows.iter().find(|r| r["module"] == q(id)).unwrap().clone();
+    assert_eq!(
+        row("Platfrm1"),
+        json!({
+            "module": q("Platfrm1"),
+            "name": "Platform",
+            "against": measures([0, 2, 0, 1, 1]),
+            "alternatives": [measures([0, 2, 0, 0, 1]), measures([1, 1, 1, 1, 1])],
+        })
+    );
+    assert_eq!(row("WebApp01")["alternatives"][1], Value::Null);
+    assert_eq!(row(&ledger)["against"], Value::Null);
+    assert_eq!(row(&ledger)["name"], "Ledger");
+
+    let (code, text) =
+        checkout.run_raw(&["--format", "markdown", "compare", &next, "--beside", &split]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.contains(&format!(
+            "Alternatives against the current state:\n\
+             | Proposal | Added | Removed | Changed | Interface changes |\n\
+             |---|---|---|---|---|\n\
+             | Next ({}) | 1 | 2 | 1 | 2 |\n\
+             | Split ({}) | 3 | 2 | 0 | 3 |\n",
+            q(&next),
+            q(&split)
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "| Platform ({}) | 0/2/0/1/1 | 0/2/0/0/1 | 1/1/1/1/1 |",
+            q("Platfrm1")
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "| Web ({}) | 0/0/0/1/0 | 0/0/0/1/0 | - |",
+            q("WebApp01")
+        )),
+        "{text}"
+    );
+
+    let error = checkout.refused(
+        &["compare", &next, "--beside", "Unknown1"],
+        "SUBJECT_NOT_FOUND",
+    );
+    assert!(
+        error["message"].as_str().unwrap().contains("Unknown1"),
+        "{error:#}"
+    );
+}
+
 #[test]
 fn adopting_a_proposal_replaces_the_current_state_and_retires_what_it_drops() {
     let checkout = Checkout::new();

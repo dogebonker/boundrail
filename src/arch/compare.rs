@@ -3,7 +3,7 @@
 //! a module without its relationships, a collection without its flows, a flow without its
 //! steps, a step without the steps inside it. A relationship's `from` is its owning module, a
 //! flow's `collection` its collection, and a step's `flow` and `parent` the flow and the list
-//! (flow, branch or loop) holding it.
+//! (flow, branch or loop) holding it. Interfaces compare as `model inspect` draws them.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -11,6 +11,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 
 use super::ids;
+use super::inspect::{Drawn, Measures, Reach};
 use super::types::{Collection, Module, Step};
 
 #[derive(Debug, Default, Serialize)]
@@ -41,6 +42,68 @@ pub struct Entry {
     pub fields: Vec<String>,
 }
 
+/// How many items a [`Comparison`] adds, removes and changes, over every section.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct Counts {
+    pub added: usize,
+    pub removed: usize,
+    pub changed: usize,
+}
+
+/// How the drawn interface of a module present in both states differs, by qualified ID.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct InterfaceChange {
+    pub module: String,
+    /// Its name after the change.
+    pub name: String,
+    pub entry_points_added: Vec<String>,
+    pub entry_points_removed: Vec<String>,
+    pub callers_gained: Vec<String>,
+    pub callers_lost: Vec<String>,
+    pub outgoing_gained: Vec<String>,
+    pub outgoing_lost: Vec<String>,
+    pub hidden_parts_added: Vec<String>,
+    pub hidden_parts_removed: Vec<String>,
+    pub pass_through_added: Vec<String>,
+    pub pass_through_removed: Vec<String>,
+    pub interface_measures: BeforeAfter,
+}
+
+impl InterfaceChange {
+    pub fn lists(&self) -> [(&'static str, &Vec<String>); 10] {
+        [
+            ("entry points added", &self.entry_points_added),
+            ("entry points removed", &self.entry_points_removed),
+            ("callers gained", &self.callers_gained),
+            ("callers lost", &self.callers_lost),
+            ("outgoing gained", &self.outgoing_gained),
+            ("outgoing lost", &self.outgoing_lost),
+            ("hidden parts added", &self.hidden_parts_added),
+            ("hidden parts removed", &self.hidden_parts_removed),
+            ("pass-through added", &self.pass_through_added),
+            ("pass-through removed", &self.pass_through_removed),
+        ]
+    }
+}
+
+/// A module's interface measures in the state compared against and in the compared one.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct BeforeAfter {
+    pub before: Measures,
+    pub after: Measures,
+}
+
+/// One module's interface measures in the state compared against and in each alternative,
+/// `None` where the state lacks the module.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct MeasuresRow {
+    pub module: String,
+    /// Its name in the first state holding it, the state compared against first.
+    pub name: String,
+    pub against: Option<Measures>,
+    pub alternatives: Vec<Option<Measures>>,
+}
+
 impl Comparison {
     /// The sections by plural noun, in reading order.
     pub fn sections(&self) -> [(&'static str, &Changes); 5] {
@@ -58,6 +121,92 @@ impl Comparison {
             .iter()
             .all(|(_, c)| **c == Changes::default())
     }
+
+    pub fn counts(&self) -> Counts {
+        let sum = |pick: fn(&Changes) -> usize| self.sections().iter().map(|(_, c)| pick(c)).sum();
+        Counts {
+            added: sum(|c| c.added.len()),
+            removed: sum(|c| c.removed.len()),
+            changed: sum(|c| c.changed.len()),
+        }
+    }
+}
+
+/// The interface changes of every module both `before` and `after` draw, as
+/// [`super::inspect::drawn`] returns them, sorted by qualified ID. A module whose lists and
+/// measures hold is left out.
+pub fn interface_changes(before: &[Drawn], after: &[Drawn]) -> Vec<InterfaceChange> {
+    let was: BTreeMap<&str, &Drawn> = before.iter().map(|d| (d.module.as_str(), d)).collect();
+    let reached =
+        |list: &[Reach]| -> Vec<String> { list.iter().map(|r| r.module.clone()).collect() };
+    let mut found = Vec::new();
+    for now in after {
+        let Some(was) = was.get(now.module.as_str()) else {
+            continue;
+        };
+        let (entry_points_added, entry_points_removed) =
+            diff(&reached(&was.entry_points), &reached(&now.entry_points));
+        let (callers_gained, callers_lost) = diff(&reached(&was.callers), &reached(&now.callers));
+        let (outgoing_gained, outgoing_lost) =
+            diff(&reached(&was.outgoing), &reached(&now.outgoing));
+        let (hidden_parts_added, hidden_parts_removed) = diff(&was.hidden_parts, &now.hidden_parts);
+        let (pass_through_added, pass_through_removed) = diff(&was.pass_through, &now.pass_through);
+        let change = InterfaceChange {
+            module: now.module.clone(),
+            name: now.name.clone(),
+            entry_points_added,
+            entry_points_removed,
+            callers_gained,
+            callers_lost,
+            outgoing_gained,
+            outgoing_lost,
+            hidden_parts_added,
+            hidden_parts_removed,
+            pass_through_added,
+            pass_through_removed,
+            interface_measures: BeforeAfter {
+                before: was.measures,
+                after: now.measures,
+            },
+        };
+        if was.measures != now.measures || change.lists().iter().any(|(_, l)| !l.is_empty()) {
+            found.push(change);
+        }
+    }
+    found
+}
+
+/// What `after` holds that `before` does not, and the other way round, each sorted.
+fn diff(before: &[String], after: &[String]) -> (Vec<String>, Vec<String>) {
+    let (before, after): (BTreeSet<&String>, BTreeSet<&String>) =
+        (before.iter().collect(), after.iter().collect());
+    let only = |a: &BTreeSet<&String>, b: &BTreeSet<&String>| {
+        a.difference(b).map(|s| (*s).clone()).collect()
+    };
+    (only(&after, &before), only(&before, &after))
+}
+
+/// The interface measures of every module any state draws, in `against` and in each of
+/// `alternatives`, sorted by qualified ID.
+pub fn measures_beside(against: &[Drawn], alternatives: &[&[Drawn]]) -> Vec<MeasuresRow> {
+    let states: Vec<BTreeMap<&str, &Drawn>> = (std::iter::once(against))
+        .chain(alternatives.iter().copied())
+        .map(|drawn| drawn.iter().map(|d| (d.module.as_str(), d)).collect())
+        .collect();
+    let modules: BTreeSet<&str> = states.iter().flat_map(|s| s.keys().copied()).collect();
+    (modules.into_iter())
+        .map(|module| {
+            let held: Vec<Option<&&Drawn>> = states.iter().map(|s| s.get(module)).collect();
+            let name = held.iter().flatten().next().map_or("", |d| d.name.as_str());
+            let mut measures = held.iter().map(|d| d.map(|d| d.measures));
+            MeasuresRow {
+                module: module.to_owned(),
+                name: name.to_owned(),
+                against: measures.next().flatten(),
+                alternatives: measures.collect(),
+            }
+        })
+        .collect()
 }
 
 /// What `after` changes against `before`, both modules and collections of the model `model`.

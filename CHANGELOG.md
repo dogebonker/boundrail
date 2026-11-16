@@ -24,6 +24,11 @@
   container and five measures, in `model_interfaces`. `--checkpoint <id>` inspects a retained
   state from the model alone, and `--group <key>` lists a configured group's members, internal
   and boundary relationships and neighbouring modules.
+- `model compare` reports `interface_changes`: per module in both states, the entry points,
+  callers, outgoing modules, hidden parts and pass-through parts gained and lost, with the
+  interface measures before and after. `--against-checkpoint <id>` compares with a retained
+  state, and `--beside <proposal>` (repeatable) sets alternatives' subject counts and interface
+  measures side by side.
 - `model check --every-draft` checks the current state and then every draft proposal, reports
   each, and exits 1 when any has a warning or does not load.
 - The code check, `inspect` and `footprint` scan every language in the checkout, such as a Go
