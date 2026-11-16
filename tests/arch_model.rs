@@ -7219,6 +7219,19 @@ fn footprint_reports_a_base_model_that_does_not_load() {
 }
 
 #[test]
+fn footprint_escapes_control_characters_in_paths_outside_every_binding() {
+    let (checkout, _) = measured();
+    sources(&checkout, &[("notes/\u{1b}[31m.md", "draft\n")]);
+    let (code, text) = checkout.run_raw(&["footprint", "--format", "markdown"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.contains("Outside every binding: notes/\\u{1b}[31m.md\n"),
+        "{text}"
+    );
+    assert!(!text.contains('\u{1b}'), "{text}");
+}
+
+#[test]
 fn footprint_prints_a_pull_request_comment() {
     let (checkout, model) = measured();
     git(&checkout, &["checkout", "-q", "-b", "feature"]);
@@ -12238,4 +12251,377 @@ fn view_asks_the_agent_only_with_allow_explain_and_the_token() {
         200,
         "the place is given back"
     );
+}
+
+/// A Git repository at `dir` with a model named `name` holding the service Gateway (`Gatewy01`),
+/// and that model's ID.
+fn ledger_at(checkout: &Checkout, dir: &Path, name: &str) -> String {
+    fs::create_dir_all(dir).unwrap();
+    for args in [
+        &["init", "-q"][..],
+        &["config", "user.name", "tester"],
+        &["config", "user.email", "tester@example.com"],
+        &["config", "commit.gpgsign", "false"],
+        &["commit", "-q", "--allow-empty", "-m", "initial"],
+    ] {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+    }
+    let root = dir.to_str().unwrap();
+    let out = checkout.ok(&["init", "--root", root, "--name", name]);
+    let model = out["manifest"]["id"].as_str().unwrap().to_owned();
+    let gateway =
+        serde_json::to_string_pretty(&module("Gatewy01", "Gateway", "service", 0)).unwrap();
+    fs::write(
+        dir.join(".boundrail/model/modules/Gatewy01.module.json"),
+        gateway,
+    )
+    .unwrap();
+    model
+}
+
+fn reference_entries(out: &Value) -> Vec<Value> {
+    out["references"].as_array().unwrap().clone()
+}
+
+#[test]
+fn references_are_set_listed_followed_and_cleared() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let ledger = ledger_at(&checkout, &checkout.path().join("vendor/ledger"), "Ledger");
+    let empty = checkout.path().join("vendor/empty");
+    fs::create_dir_all(&empty).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&empty)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let before = checkout.read_module("Billing1");
+    let references = json!([
+        {"model": "vendor/ledger", "subject": format!("{ledger}#Gatewy01")},
+        {"model": "missing/place"},
+        {"model": "vendor/empty"},
+        {"subject": format!("{model}#BankApi1")},
+        {"model": "vendor/ledger", "subject": format!("{ledger}#Nothere1")},
+    ]);
+    checkout.edited(json!([
+        {"type": "edit-module", "subject": "Billing", "set": {"references": references}},
+    ]));
+    assert_eq!(checkout.read_module("Billing1")["references"], references);
+    let read = checkout.ok(&["read", "Billing"]);
+    assert_eq!(read["module"]["references"], references);
+
+    let out = checkout.ok(&["read", "Billing", "--references"]);
+    assert_eq!(out["kind"], "read-references");
+    assert_eq!(out["module"], format!("{model}#Billing1"));
+    let entries = reference_entries(&out);
+    let resolved = &entries[0]["resolved"];
+    assert_eq!(resolved["model"]["name"], "Ledger");
+    assert_eq!(resolved["state"], "current");
+    assert_eq!(
+        resolved["subject"],
+        json!({"id": format!("{ledger}#Gatewy01"), "name": "Gateway", "type": "module", "kind": "service"})
+    );
+    assert_eq!(
+        entries[1]["skipped"]["code"], "CHECKOUT_NOT_FOUND",
+        "{out:#}"
+    );
+    assert_eq!(entries[2]["skipped"]["code"], "VAULT_NOT_FOUND", "{out:#}");
+    assert_eq!(entries[3]["resolved"]["model"]["name"], "Shop");
+    assert_eq!(entries[3]["resolved"]["subject"]["name"], "Bank");
+    assert_eq!(
+        entries[4]["skipped"]["code"], "SUBJECT_NOT_FOUND",
+        "{out:#}"
+    );
+    let (code, text) =
+        checkout.run_raw(&["read", "Billing", "--references", "--format", "markdown"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.contains("0. Ledger (the current state): Gateway [service]"),
+        "{text}"
+    );
+    assert!(text.contains("1. skipped: CHECKOUT_NOT_FOUND: "), "{text}");
+
+    let followed = checkout.ok(&["read", "Billing", "--reference", "0"]);
+    assert_eq!(followed["kind"], "read-module");
+    assert_eq!(followed["module"]["name"], "Gateway");
+    assert_eq!(followed["reference"]["index"], 0);
+    assert_eq!(followed["reference"]["module"], format!("{model}#Billing1"));
+    assert_eq!(followed["reference"]["state"], "current");
+    let whole = checkout.ok(&["read", "Billing", "--reference", "3"]);
+    assert_eq!(whole["module"]["name"], "Bank");
+    checkout.refused(
+        &["read", "Billing", "--reference", "1"],
+        "CHECKOUT_NOT_FOUND",
+    );
+    checkout.refused(&["read", "Billing", "--reference", "9"], "REQUEST_INVALID");
+
+    let view = View::start(&checkout);
+    let t = &view.token;
+    let (status, listed) = view.get(&format!("/api/references?t={t}&subject=Billing"));
+    assert_eq!(status, 200, "{listed}");
+    let listed: Value = serde_json::from_str(View::body(&listed)).unwrap();
+    assert_eq!(listed, checkout.ok(&["read", "Billing", "--references"]));
+    let (status, opened) = view.get(&format!("/api/reference?t={t}&subject=Billing&index=0"));
+    assert_eq!(status, 200, "{opened}");
+    let opened: Value = serde_json::from_str(View::body(&opened)).unwrap();
+    assert_eq!(opened, followed);
+    assert_eq!(
+        view.get(&format!("/api/reference?t={t}&subject=Billing&index=1"))
+            .0,
+        404
+    );
+    assert_eq!(
+        view.get(&format!("/api/reference?t={t}&subject=Billing")).0,
+        400
+    );
+    drop(view);
+
+    checkout.edited(json!([
+        {"type": "edit-module", "subject": "Billing", "clear": ["references"]},
+    ]));
+    let mut after = checkout.read_module("Billing1");
+    assert_eq!(after.get("references"), None);
+    for empty in ["groups", "former_names"] {
+        assert_eq!(
+            after.as_object_mut().unwrap().remove(empty),
+            Some(json!([]))
+        );
+    }
+    assert_eq!(after, before);
+    let out = checkout.ok(&["read", "Billing", "--references"]);
+    assert_eq!(out["references"], json!([]));
+}
+
+#[test]
+fn reference_shapes_are_checked_on_write() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let commit = "a".repeat(40);
+    for bad in [
+        json!({}),
+        json!({"model": "../ledger"}),
+        json!({"model": "/abs/ledger"}),
+        json!({"model": "ledger:../x"}),
+        json!({"subject": "Billing"}),
+        json!({"model": "x", "pin": "abc"}),
+        json!({"model": "x", "pin": commit, "state": {"proposal": "Prop0001"}}),
+        json!({"model": "x", "state": {"proposal": "../../etc"}}),
+    ] {
+        let request = checkout.request(json!([
+            {"type": "edit-module", "subject": "Billing", "set": {"references": [bad]}},
+        ]));
+        checkout.edit_refused(&request, "MODEL_INVALID");
+    }
+    checkout.edited(
+        json!([{"type": "edit-module", "subject": "Billing", "set": {"references": [
+            {"model": "ledger:sub/dir", "pin": commit, "subject": format!("{model}#Billing1")},
+            {"state": {"checkpoint": "Ckpt0001"}},
+        ]}}]),
+    );
+}
+
+#[test]
+fn a_pinned_reference_reads_the_foreign_checkpoint_and_leaves_that_repository_alone() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let other = Checkout::outside();
+    let ledger = ledger_at(&checkout, other.path(), "Ledger");
+    let retained = checkout.ok(&[
+        "retain",
+        "--root",
+        other.path().to_str().unwrap(),
+        "--doing",
+        "ledger as built",
+    ]);
+    let pinned = retained["checkpoint"].clone();
+    let mut gateway = module("Gatewy01", "Front door", "service", 0);
+    gateway["former_names"] = json!(["Gateway"]);
+    fs::write(
+        other
+            .path()
+            .join(".boundrail/model/modules/Gatewy01.module.json"),
+        serde_json::to_string_pretty(&gateway).unwrap(),
+    )
+    .unwrap();
+    let subject = format!("{ledger}#Gatewy01");
+    checkout.edited(
+        json!([{"type": "edit-module", "subject": "Billing", "set": {"references": [
+            {"model": "ledger:", "subject": subject, "pin": pinned["commit"]},
+            {"model": "ledger:", "subject": subject},
+        ]}}]),
+    );
+    let state = |dir: &Path| -> Vec<String> {
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let vault = fs::read_dir(dir.join(".boundrail/model/modules"))
+            .unwrap()
+            .count();
+        vec![
+            git(&["for-each-ref"]),
+            git(&["status", "--porcelain", "--untracked-files=all"]),
+            vault.to_string(),
+        ]
+    };
+    let before = state(other.path());
+
+    let user = Checkout::outside();
+    let (code, out, _) = checkout.run_served(user.path(), &["read", "Billing", "--references"]);
+    assert_eq!(code, 0, "{out:#}");
+    let entries = reference_entries(&out);
+    assert_eq!(
+        entries[0]["skipped"]["code"], "CHECKOUT_NOT_FOUND",
+        "{out:#}"
+    );
+
+    fs::create_dir_all(user.path().join("boundrail")).unwrap();
+    fs::write(
+        user.path().join("boundrail/checkouts.json"),
+        json!([{"name": "ledger", "path": other.path()}]).to_string(),
+    )
+    .unwrap();
+    let (code, out, _) = checkout.run_served(user.path(), &["read", "Billing", "--references"]);
+    assert_eq!(code, 0, "{out:#}");
+    let entries = reference_entries(&out);
+    let held = &entries[0]["resolved"];
+    assert_eq!(held["state"], json!({"checkpoint": pinned["id"]}));
+    assert_eq!(held["checkpoint"]["commit"], pinned["commit"]);
+    assert_eq!(held["subject"]["name"], "Gateway");
+    assert_eq!(entries[1]["resolved"]["state"], "current");
+    assert_eq!(entries[1]["resolved"]["subject"]["name"], "Front door");
+
+    let (code, out, _) = checkout.run_served(user.path(), &["read", "Billing", "--reference", "0"]);
+    assert_eq!(code, 0, "{out:#}");
+    assert_eq!(out["module"]["name"], "Gateway");
+    assert_eq!(out["checkpoint"]["id"], pinned["id"]);
+    assert_eq!(
+        out["reference"]["state"],
+        json!({"checkpoint": pinned["id"]})
+    );
+    assert_eq!(state(other.path()), before);
+}
+
+#[test]
+fn code_targets_resolve_in_the_checkout_and_through_configured_repos() {
+    let checkout = committed();
+    let model = shop(&checkout);
+    bind(&checkout, "Billing1", "src/billing.ts");
+    fs::create_dir_all(checkout.path().join("src")).unwrap();
+    fs::write(
+        checkout.path().join("src/billing.ts"),
+        "export const charge = 1;\n",
+    )
+    .unwrap();
+    let mut bank = checkout.read_module("BankApi1");
+    bank["binding"] = json!({"repo": "payments", "path": "lib/pay.rs", "symbol": "pay"});
+    checkout.module(bank);
+    let root = fs::canonicalize(checkout.path()).unwrap();
+
+    let out = checkout.ok(&["read", "Billing", "--code"]);
+    assert_eq!(out["kind"], "read-code");
+    assert_eq!(out["module"], format!("{model}#Billing1"));
+    assert_eq!(
+        out["code_target"],
+        json!({"repo": null, "path": "src/billing.ts", "symbol": null,
+               "local_path": root.join("src/billing.ts")})
+    );
+
+    let user = Checkout::outside();
+    let (code, out, _) = checkout.run_served(user.path(), &["read", "Bank", "--code"]);
+    assert_eq!(code, 0, "{out:#}");
+    assert_eq!(out["code_target"]["repo"], "payments");
+    assert_eq!(out["code_target"].get("local_path"), None);
+    assert!(
+        out["code_target"]["unavailable"]
+            .as_str()
+            .unwrap()
+            .contains("payments"),
+        "{out:#}"
+    );
+    let (code, out, _) = checkout.run_served(user.path(), &["read", "Bank", "--code", "--open"]);
+    assert_eq!(code, 2, "{out:#}");
+    assert_eq!(out["error"]["code"], "REQUEST_INVALID");
+
+    let payments = Checkout::outside();
+    fs::create_dir_all(user.path().join("boundrail")).unwrap();
+    fs::write(
+        user.path().join("boundrail/checkouts.json"),
+        json!([{"name": "payments", "path": payments.path()}]).to_string(),
+    )
+    .unwrap();
+    let (code, out, _) = checkout.run_served(user.path(), &["read", "Bank", "--code"]);
+    assert_eq!(code, 0, "{out:#}");
+    let payments_root = fs::canonicalize(payments.path()).unwrap();
+    assert_eq!(
+        out["code_target"]["local_path"],
+        json!(payments_root.join("lib/pay.rs"))
+    );
+    assert_eq!(out["code_target"]["symbol"], "pay");
+
+    git(&checkout, &["add", "-A"]);
+    git(&checkout, &["commit", "-q", "-m", "bound"]);
+    let head = git(&checkout, &["rev-parse", "HEAD"]);
+    let retained = checkout.ok(&["retain", "--doing", "bound billing"])["checkpoint"].clone();
+    let id = retained["id"].as_str().unwrap();
+    let out = checkout.ok(&["read", "Billing", "--code", "--checkpoint", id]);
+    assert_eq!(out["code_target"]["commit"], head.trim());
+    assert_eq!(out["checkpoint"]["id"], retained["id"]);
+    checkout.refused(&["read", "Platform", "--code"], "REQUEST_INVALID");
+}
+
+#[test]
+fn printed_reference_and_binding_paths_escape_control_characters() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let odd = "vendor/\u{1b}[31mledger";
+    ledger_at(&checkout, &checkout.path().join(odd), "Ledger");
+    checkout.edited(json!([
+        {"type": "edit-module", "subject": "Billing", "set": {"references": [{"model": odd}]}},
+    ]));
+    for args in [
+        &["read", "Billing", "--references"][..],
+        &["read", "Billing", "--reference", "0"],
+    ] {
+        let (code, text) = checkout.run_raw(&[args, &["--format", "markdown"]].concat());
+        assert_eq!(code, 0, "{text}");
+        assert!(text.contains("vendor/\\u{1b}[31mledger"), "{text}");
+        assert!(!text.contains('\u{1b}'), "{text}");
+    }
+
+    let user = Checkout::outside();
+    let payments = user.path().join("pay\u{1b}[31mments");
+    fs::create_dir_all(payments.join("lib")).unwrap();
+    fs::write(payments.join("lib/pay.rs"), "fn pay() {}\n").unwrap();
+    fs::create_dir_all(user.path().join("boundrail")).unwrap();
+    fs::write(
+        user.path().join("boundrail/checkouts.json"),
+        json!([{"name": "payments", "path": payments}]).to_string(),
+    )
+    .unwrap();
+    let mut bank = checkout.read_module("BankApi1");
+    bank["binding"] = json!({"repo": "payments", "path": "lib/pay.rs"});
+    checkout.module(bank);
+    let out = Command::new(env!("CARGO_BIN_EXE_boundrail"))
+        .args(["model", "read", "Bank", "--code", "--format", "markdown"])
+        .current_dir(checkout.path())
+        .env("XDG_CONFIG_HOME", user.path())
+        .output()
+        .unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("pay\\u{1b}[31mments/lib/pay.rs"), "{text}");
+    assert!(!text.contains('\u{1b}'), "{text}");
 }

@@ -522,6 +522,22 @@ svg g.dimmed:not(.undim) text { opacity: 0.6; }
   transform: translateX(-50%);
   animation: rise 220ms var(--ease-out);
 }
+.foreign {
+  position: absolute; z-index: 2; top: 56px; right: 16px;
+  width: min(380px, calc(100% - 32px)); max-height: calc(100% - 88px); overflow: auto;
+  padding: 8px 8px 10px 14px;
+  border: 1px solid var(--divider-strong); border-radius: var(--radius-l);
+  background: var(--raised); box-shadow: var(--shadow-2);
+}
+.foreign .bar { display: flex; align-items: center; gap: 10px; min-height: var(--control); }
+.foreign .beat-title {
+  flex: 1; min-width: 0; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--text); font: 600 var(--fs-13)/1.3 var(--sans);
+}
+.foreign h3 { margin: 8px 0 4px; font-size: var(--fs-13); }
+.foreign ul { margin: 0 0 6px; padding-left: 18px; font-size: var(--fs-13); }
+.refs { margin: 0; padding-left: 18px; }
+.ref-external { color: var(--text-2); }
 .play .bar { display: flex; align-items: center; gap: 10px; min-height: var(--control); }
 .play .where { flex: none; color: var(--text-3); font-size: var(--fs-12); font-variant-numeric: tabular-nums; }
 .play .beat-title {

@@ -171,21 +171,14 @@ fn refuse_busy(mut stream: TcpStream) {
 
 /// Opens `url` in the default browser through the platform opener, as one argument.
 fn open(url: &str) {
-    let mut command = if cfg!(target_os = "macos") {
-        std::process::Command::new("open")
+    let opened = if cfg!(target_os = "macos") {
+        spawn_detached("open", [url])
     } else if cfg!(windows) {
-        let mut command = std::process::Command::new("cmd");
         // `start` takes its first quoted argument as a window title.
-        command.args(["/c", "start", ""]);
-        command
+        spawn_detached("cmd", ["/c", "start", "", url])
     } else {
-        std::process::Command::new("xdg-open")
+        spawn_detached("xdg-open", [url])
     };
-    let opened = (command.arg(url))
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
     if let Err(error) = opened {
         eprintln!("warning: could not open a browser ({error}); open the URL above");
     }
@@ -449,13 +442,12 @@ impl Server {
     fn api(&self, path: &str, request: &Request) -> Result<Option<Value>> {
         let root = &self.root;
         let param = |name| request.param(name);
+        let reads = matches!(path, "/api/model" | "/api/references" | "/api/reference");
+        if reads && param("checkpoint").is_some() && param("proposal").is_some() {
+            return Err(invalid("read a checkpoint or a proposal, not both"));
+        }
         Ok(Some(match path {
-            "/api/model" => {
-                if param("checkpoint").is_some() && param("proposal").is_some() {
-                    return Err(invalid("read a checkpoint or a proposal, not both"));
-                }
-                model_cli::read_output(root, param("checkpoint"), param("proposal"))?
-            }
+            "/api/model" => model_cli::read_output(root, param("checkpoint"), param("proposal"))?,
             "/api/check" => model_cli::run_check(
                 root,
                 None,
@@ -507,6 +499,18 @@ impl Server {
                     question: param("question").unwrap_or_default(),
                 };
                 model_cli::explain_output(root, &asked)?
+            }
+            "/api/references" => {
+                let subject = param("subject").ok_or_else(|| invalid("references need subject"))?;
+                model_cli::references_output(root, subject, param("checkpoint"), param("proposal"))?
+            }
+            "/api/reference" => {
+                let subject = param("subject").ok_or_else(|| invalid("reference needs subject"))?;
+                let index = (param("index"))
+                    .and_then(|i| i.parse().ok())
+                    .ok_or_else(|| invalid("reference needs index, a whole number"))?;
+                let (checkpoint, proposal) = (param("checkpoint"), param("proposal"));
+                model_cli::reference_output(root, subject, index, checkpoint, proposal)?
             }
             _ => return Ok(None),
         }))

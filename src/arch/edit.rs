@@ -24,8 +24,8 @@ use super::request::{
 use super::revision::{self, Revision};
 use super::state::{self, Locked};
 use super::types::{
-    Anchor, Binding, Collection, Emphasis, Module, Picture, Relationship, SCHEMA_VERSION,
-    SavedView, Step, Traffic, Walkthrough, walk,
+    Anchor, Binding, Collection, Emphasis, Module, Picture, Reference, Relationship,
+    SCHEMA_VERSION, SavedView, Step, Traffic, Walkthrough, walk,
 };
 use super::vault::{self, FileWrite, Model, Scope, relationships};
 use super::{Code, Refusal, ids, proposal};
@@ -287,6 +287,8 @@ pub struct ModuleSet {
     pub description: Option<String>,
     pub groups: Option<Vec<String>>,
     pub binding: Option<Binding>,
+    /// Replaces the whole list.
+    pub references: Option<Vec<Reference>>,
 }
 
 /// A module field `clear` may empty; required fields cannot be cleared.
@@ -298,6 +300,7 @@ pub enum ModuleField {
     Description,
     Groups,
     Binding,
+    References,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -345,6 +348,7 @@ impl ModuleField {
             Self::Description => set.description.is_some(),
             Self::Groups => set.groups.is_some(),
             Self::Binding => set.binding.is_some(),
+            Self::References => set.references.is_some(),
         }
     }
 }
@@ -1404,6 +1408,7 @@ impl<'a> Batch<'a> {
             binding: new.binding,
             former_names: Vec::new(),
             outgoing: Vec::new(),
+            references: Vec::new(),
         });
         Ok(())
     }
@@ -1447,6 +1452,9 @@ impl<'a> Batch<'a> {
         if set.binding.is_some() {
             module.binding = set.binding;
         }
+        if let Some(references) = set.references {
+            module.references = references;
+        }
         for field in clear {
             match field {
                 ModuleField::Parent => module.parent = None,
@@ -1454,6 +1462,7 @@ impl<'a> Batch<'a> {
                 ModuleField::Description => module.description = None,
                 ModuleField::Groups => module.groups.clear(),
                 ModuleField::Binding => module.binding = None,
+                ModuleField::References => module.references.clear(),
             }
         }
         self.touched.insert(id, index);

@@ -60,7 +60,7 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 | T26 | Proposal metadata: summary, linked documents, rename and edit through `set`, select by unique name; walkthroughs authored inside proposals | open |
 | T27 | Proposal families: child proposals of a draft, family reconcile, standing, settle conflicts by mine, theirs or edited; `INHERITANCE_DROPPED` and `PART_RECREATED` confirmations | open |
 | T28 | Readings: group regions and group filter; beat selection apart from focus, relationship filters, groups, visibility; saved views that need no output file | done |
-| T29 | Cross-model references: modules reference another model, state or subject, `read --references`, pinned foreign checkpoints; `read --code` resolves and opens the code target | open |
+| T29 | Cross-model references: modules reference another model, state or subject, `read --references`, pinned foreign checkpoints; `read --code` resolves and opens the code target | done |
 | T30 | History repair and restore: correct a recorded state with source commits and an audit trail; restore a bundle into an empty vault with identities and history | open |
 | T31 | Vaults outside Git: a private history for a vault outside a checkout, used for temporary pull request models | open |
 | T32 | Language servers: `model language-server` add, remove and list; defaults for C-family, C# and Swift; on by default through user config outside the checkout; `unready` diagnostic and step timings | done |
@@ -1459,3 +1459,45 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   endpoint off by default and on with `--allow-explain` and the header token, a POST with the
   token only in the query or a foreign Origin refused, and a second POST during a run refused.
   Tried by hand with the real `claude` and `codex` CLIs on a two-module model.
+- T29: a module's `references` is an optional ordered list, left out of the file when empty, so
+  a vault written before T29 loads, reads and digests as it did. Each is `{model?, state?,
+  subject?, pin?}`: `model` is a repository path relative to the checkout root (the `binding`
+  path rules, so no `..` and nothing absolute) or `<alias>:` with an optional such path, where the
+  alias names an entry of the user's `boundrail/checkouts.json` (the language-server config's
+  folder, a JSON array of `{name, path}` with absolute paths); absent, the reference is to this
+  model. `state` reuses `ReadingState` and defaults to `current`; `subject` is a qualified ID;
+  `pin` is a full commit hash. A write refuses `MODEL_INVALID` for a reference that names nothing,
+  a malformed model, proposal, checkpoint, subject or pin, and a pin beside a non-current state;
+  nothing a reference names is read on write, so a missing vault never refuses one.
+  `edit-module` sets the list whole and clears it as `references`; `model compare` reports it as
+  one module field and reconcile compares it like the other fields.
+- T29: following a reference resolves its model to a folder, refusing a path that symbolic links
+  lead out of the checkout or the alias's folder, then loads the vault of the Git checkout around
+  that folder: the pinned checkpoint from that repository's history ref when `pin` is given, else
+  the state. Reads go through `vault::load` and `checkpoint::load`, so the other repository is
+  read with the hardened Git runner and never written or fetched. `model read <module>
+  --references` lists every reference with `resolved` (`checkout`, `vault`, the other `model`'s
+  ID and name, the `state` read with a proposal qualified and a checkpoint by ID, the
+  `checkpoint`, and the `subject` with `id`, `name`, `type` and a module's `kind`) or `skipped`
+  (the refusal's `code` and `message`), so one missing vault never fails the listing.
+  `--reference N` (from 0) prints what one points at as `model read` prints it there, the whole
+  model without a subject, plus `reference` (`index`, `module`, `checkout`, `state`); one that
+  cannot be followed refuses with its reason. Both read the module from `--checkpoint` or
+  `--proposal` when given.
+- T29: `model read <module> --code` prints `code_target`: `repo`, `path`, `symbol`, `commit` (the
+  checkpoint's source with `--checkpoint`, for a binding without `repo` only), and `local_path`,
+  the canonical path in this checkout, or for a `repo` in the checkout `boundrail/checkouts.json`
+  names so; otherwise `unavailable` says why. A module without a binding refuses
+  `REQUEST_INVALID`. `--open` refuses a target without a local path or that does not exist, then
+  starts the platform opener with one path argument, never through a shell, and prints the
+  command line to stderr and as `opened`. No opener is handed a file it could run: macOS opens a
+  file with `open -t` (the default text editor) and reveals a folder with `open -R`; Windows and
+  Linux open the folder holding a file, or the folder itself, in Explorer or with `xdg-open`.
+  Explorer gets the folder without the `\\?\` prefix, and a folder whose path holds a comma is
+  refused, since Explorer reads commas as option separators.
+- T29: the browser lists a module's references in the detail panel through `/api/references`
+  and shows a followed one read-only in a reference pane through `/api/reference?subject=&index=`
+  (both take `proposal` or `checkpoint`, not both). A reference that cannot be followed is a plain
+  label with the reason and no link. Double-clicking a module without parts but with references
+  selects it. ponytail: the pane shows the reading as text, not a drawing; render the other model
+  when one is needed. The CSP is unchanged and the page makes no request off its own server.

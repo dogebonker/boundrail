@@ -1,5 +1,7 @@
 //! Every Git subprocess boundrail runs, hardened so a repository's config never names a program
-//! Git would run on our behalf (fsmonitor, hooks). The exceptions are the signing program, which
+//! Git would run on our behalf (fsmonitor, hooks), and so Git never discovers a bare repository
+//! implicitly (`safe.bareRepository=explicit`): a bare repository planted in a checkout, such as
+//! one a reference or binding leads into, cannot supply its config. The exceptions are the signing program, which
 //! signs the checkpoints `model retain` writes and those `model history fetch` replays when the
 //! user opts into `commit.gpgSign`, and the clean and process filter drivers repository config
 //! defines, which run when Git content-checks a working-tree entry, for example in `model
@@ -121,6 +123,8 @@ fn output(
             "core.fsmonitor=false",
             "-c",
             "core.hooksPath=/dev/null",
+            "-c",
+            "safe.bareRepository=explicit",
             "-c",
             if index.is_some() {
                 "diff.autoRefreshIndex=true"

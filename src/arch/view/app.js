@@ -37,6 +37,8 @@ const app = {
   checkpoints: [],
   models: new Map(), // state key -> promise of a pane model
   interfaces: new Map(), // state key | module ID -> `model inspect`
+  references: new Map(), // state key | module ID -> `model read --references`
+  foreign: null, // the reference shown read-only: `{ label, data, error }`, null when none is
   // The revision the last change event named, null when the current state did not load; the
   // first load's until an event comes. Kept apart from later loads, which may race the events.
   eventRevision: undefined,
@@ -245,6 +247,7 @@ function loadModel(state) {
 function forget() {
   app.models.clear();
   app.interfaces.clear();
+  app.references.clear();
 }
 
 async function loadLists() {
@@ -798,6 +801,7 @@ function renderModule(box) {
   if (m.former_names.length) facts.push(['Formerly', m.former_names.join(', ')]);
   if (m.children.length) facts.push(['Parts', m.children.flatMap((c, i) => (i ? [', ', link(c)] : [link(c)]))]);
   if (facts.length) box.append(dl(facts));
+  if (m.references?.length) box.append(...section('References', referenceList(m)));
 
   const relationships = model.data.relationships;
   const line = (r, other) => h('li', { class: 'rel' },
@@ -827,6 +831,93 @@ function renderModule(box) {
     : note(app.check ? 'None.' : (app.checkError ?? 'Checking'))));
   box.append(interfaceSection(m));
   if (context) box.append(askSection(m.id, { ...context, subjects: [m.id] }));
+}
+
+/** How a reference reads as authored: where, what and which state. */
+function referenceLabel(r) {
+  const state = r.pin ? `pinned ${r.pin.slice(0, 12)}`
+    : r.state?.proposal ? `proposal ${r.state.proposal}`
+      : r.state?.checkpoint ? `checkpoint ${r.state.checkpoint}` : '';
+  return [r.model ?? 'this model', r.subject, state].filter(Boolean).join(', ');
+}
+
+/** The module's references, each followed once per state: a followed one opens read-only in
+ * the reference pane, one that cannot be followed stays a plain label with the reason. */
+function referenceList(m) {
+  const state = activePane().state;
+  const key = `${stateKey(state)}|${m.id}`;
+  const list = h('ul', { class: 'refs' }, m.references.map((r) => h('li', { text: referenceLabel(r) })));
+  if (!app.references.has(key)) app.references.set(key, attempt(api('references', { subject: m.id, ...stateParams(state) })));
+  app.references.get(key).then(([data, error]) => {
+    if (!data) return list.replaceChildren(note(error));
+    list.replaceChildren(...data.references.map((entry) => {
+      const label = referenceLabel(entry.reference);
+      if (!entry.resolved) {
+        return h('li', {}, h('span', { class: 'ref-external', text: label }),
+          h('div', { class: 'id', text: `Not followed: ${entry.skipped.message}` }));
+      }
+      const { model, subject } = entry.resolved;
+      const name = `${model.name}${subject ? `: ${subject.name}` : ''}`;
+      return h('li', {}, h('button', { class: 'link', onclick: () => openReference(m.id, entry.index, name) }, name),
+        h('div', { class: 'id', text: label }));
+    }));
+  });
+  return list;
+}
+
+/** Reads reference `index` of module `id` and shows it read-only in the reference pane. */
+async function openReference(id, index, label) {
+  app.foreign = { label, data: null, error: null };
+  renderForeign();
+  const [data, error] = await attempt(api('reference', { subject: id, index, ...stateParams(activePane().state) }));
+  if (app.foreign?.label !== label) return;
+  Object.assign(app.foreign, { data, error });
+  renderForeign();
+}
+
+function closeReference() {
+  app.foreign = null;
+  renderForeign();
+}
+
+/** The reference pane: the other model's reading as text, with nothing in it that edits or
+ * leaves the page. */
+function renderForeign() {
+  const panel = $('#foreign');
+  panel.hidden = !app.foreign;
+  if (!app.foreign) return panel.replaceChildren();
+  const { label, data, error } = app.foreign;
+  const close = h('button', { class: 'icon', title: 'Close reference', 'aria-label': 'Close reference', onclick: closeReference }, icon(CLOSE_ICON));
+  const state = data?.reference.state;
+  const stateText = state?.proposal ? `proposal ${state.proposal}` : state?.checkpoint ? `checkpoint ${state.checkpoint}` : 'current state';
+  const where = data ? `${data.reference.checkout}, ${stateText}` : '';
+  const body = [];
+  if (error) body.push(note(error));
+  else if (!data) body.push(note('Reading the referenced model'));
+  else body.push(...foreignBody(data));
+  panel.replaceChildren(
+    h('div', { class: 'bar' }, h('h2', { class: 'beat-title', text: `Reference: ${label}` }), close),
+    where ? h('div', { class: 'id', text: where }) : '',
+    h('div', { class: 'foreign-body' }, body),
+  );
+}
+
+function foreignBody(data) {
+  const modules = (list) => h('ul', {}, list.map((m) => h('li', {}, `${m.name} `, h('span', { class: 'tag', text: m.kind }))));
+  const rels = (list) => h('ul', {}, list.map((r) => h('li', { text: `${r.from} to ${r.to}, ${r.kind}${r.label ? `, ${r.label}` : ''}` })));
+  if (data.kind === 'read-module') {
+    const m = data.module;
+    return [
+      h('h3', { text: `${m.name} (${m.kind})` }),
+      m.responsibility ? h('p', { text: m.responsibility }) : '',
+      ...(data.parts.length ? [h('p', { class: 'id', text: 'Parts' }), modules(data.parts)] : []),
+      ...(data.outgoing.length ? [h('p', { class: 'id', text: 'Outgoing' }), rels(data.outgoing)] : []),
+      ...(data.incoming.length ? [h('p', { class: 'id', text: 'Incoming' }), rels(data.incoming)] : []),
+    ];
+  }
+  if (data.kind === 'read') return [h('h3', { text: data.manifest.name }), modules(data.modules)];
+  const named = data.flow ?? data.collection ?? data.walkthrough ?? data.picture;
+  return [h('h3', { text: named?.name ?? data.kind })];
 }
 
 /** The module's interface from `model inspect`, fetched once per state and module. */
@@ -1329,7 +1420,9 @@ function moduleAt(pane, event) {
 }
 
 function drill(pane, id) {
-  if (!pane.model?.modules.get(id)?.children.length) return;
+  const m = pane.model?.modules.get(id);
+  if (!m?.children.length && m?.references?.length) return select(id, true);
+  if (!m?.children.length) return;
   pane.scope = id;
   pane.view = 'architecture';
   redraw(pane);

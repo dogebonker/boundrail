@@ -1470,6 +1470,7 @@ pub(super) mod tests {
             }),
             former_names: Vec::new(),
             outgoing: Vec::new(),
+            references: Vec::new(),
         }
     }
 

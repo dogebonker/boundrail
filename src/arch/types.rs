@@ -13,13 +13,26 @@ pub const DESCRIPTION_MAX: usize = 2000;
 pub const LABEL_MAX: usize = 60;
 /// The module kind for code outside the checkout, which the code check never judges.
 pub const EXTERNAL_KIND: &str = "external";
+macro_rules! repo_path {
+    () => {
+        r"(?:[^/\\.:][^/\\:]*|\.(?:[^/\\.:][^/\\:]*)?|\.\.[^/\\:]+)(?:/(?:[^/\\.][^/\\]*|\.(?:[^/\\.][^/\\]*)?|\.\.[^/\\]+)?)*"
+    };
+}
 const LOCAL_ID: &str = "^[A-Za-z0-9]{8}$";
 const QUALIFIED_ID: &str = "^[A-Za-z0-9]{8}#[A-Za-z0-9]{8}$";
+const FULL_COMMIT: &str = "^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$";
+const REFERENCE_MODEL: &str = concat!(
+    r"^(?:[A-Za-z0-9._-]+:(?:",
+    repo_path!(),
+    ")?|",
+    repo_path!(),
+    ")$"
+);
 /// A repository path ending in `.svg` or `.png`; `vault` checks the rest of the output rules.
 const PICTURE_OUTPUT: &str = r"^[^/\\:]+(?:/[^\\]*)?\.(?:svg|png)$";
 /// A path relative to the repository root, as `vault::is_repo_path` checks it: no leading `/`, no
 /// `..` segment, no backslash, and no `:` in the first segment.
-const REPO_PATH: &str = r"^(?:[^/\\.:][^/\\:]*|\.(?:[^/\\.:][^/\\:]*)?|\.\.[^/\\:]+)(?:/(?:[^/\\.][^/\\]*|\.(?:[^/\\.][^/\\]*)?|\.\.[^/\\]+)?)*$";
+const REPO_PATH: &str = concat!("^", repo_path!(), "$");
 
 /// `model.json`: the model's identity and its current state.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -213,6 +226,34 @@ pub struct Module {
     pub former_names: Vec<String>,
     #[serde(default)]
     pub outgoing: Vec<Relationship>,
+    /// Other models, states or subjects this module points at, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub references: Vec<Reference>,
+}
+
+/// Another model, state or subject a module points at. Nothing in it is read until the
+/// reference is followed, so a model it names may be missing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Reference {
+    /// Where the other model's checkout is: a path relative to this checkout's root, or
+    /// `<alias>:` and an optional path inside the checkout the user's
+    /// `boundrail/checkouts.json` names `<alias>`. Absent: this model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(pattern(REFERENCE_MODEL))]
+    pub model: Option<String>,
+    /// The state read when no `pin` is given: `current`, `{"proposal": <ID>}` or
+    /// `{"checkpoint": <ID>}`.
+    #[serde(default, skip_serializing_if = "ReadingState::is_current")]
+    pub state: ReadingState,
+    /// Qualified ID of the module, collection or flow pointed at; absent: the whole model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(pattern(QUALIFIED_ID))]
+    pub subject: Option<String>,
+    /// The full commit of the other model's checkpoint to read instead of its current state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(pattern(FULL_COMMIT))]
+    pub pin: Option<String>,
 }
 
 /// The code a module stands for.
@@ -910,6 +951,39 @@ mod tests {
             assert_eq!(
                 validator.is_valid(&Value::from(sample)),
                 crate::arch::vault::is_repo_path(sample),
+                "{sample}"
+            );
+        }
+    }
+
+    #[test]
+    fn reference_model_pattern_agrees_with_the_model_check() {
+        let validator = jsonschema::validator_for(
+            &serde_json::json!({"type": "string", "pattern": REFERENCE_MODEL}),
+        )
+        .unwrap();
+        for sample in [
+            "ledger",
+            "vendor/ledger",
+            "ledger:",
+            "led-ger_1.x:sub/dir",
+            "a/b:c",
+            "..:x",
+            "",
+            ":",
+            ":x",
+            "../ledger",
+            "/abs",
+            "ledger:../x",
+            "ledger:/abs",
+            "ledger:sub/../x",
+            "C:\\x",
+            "a b:x",
+            "vendor/../..",
+        ] {
+            assert_eq!(
+                validator.is_valid(&Value::from(sample)),
+                crate::arch::reference::is_model(sample),
                 "{sample}"
             );
         }

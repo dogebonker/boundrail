@@ -121,6 +121,18 @@
   agent on `PATH` it refuses `REQUEST_INVALID` with `details.reason` `no-agent`; `--print` prints
   the bundle instead. `model view --allow-explain` adds `POST /api/explain` and an `Ask the agent`
   field to the detail panel, which otherwise copies the command line.
+- Module `references`: an optional ordered list of `{model, state, subject, pin}` pointing at
+  another model (a path inside the checkout or `<alias>:` from the user's
+  `boundrail/checkouts.json`), its current state, a proposal or a checkpoint, a subject there, and
+  a pinned checkpoint commit. Set and cleared through `edit-module`, checked for shape on write
+  and followed only on read. `model read <module> --references` lists each with the other model's
+  name, the subject's name and kind and the state read, or why it was skipped; `--reference N`
+  reads what one points at. The other repository is only read, never written or fetched. The
+  browser lists a module's references and shows a followed one read-only in a pane.
+- `model read <module> --code` prints the binding's `code_target`: `repo`, `path`, `symbol`, the
+  commit with `--checkpoint`, and `local_path` in this checkout or in the checkout
+  `boundrail/checkouts.json` names for its repo. `--open` opens it with the platform opener (on
+  Windows and Linux, the folder holding it) and refuses a target that is not on this machine.
 
 ### Changed
 

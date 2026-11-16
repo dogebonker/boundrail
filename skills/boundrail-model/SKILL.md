@@ -67,6 +67,17 @@ command prints JSON; add `--format markdown` for a readable summary. A refusal p
   supported by evidence when the code shows it and skipped otherwise. An `anchor` (`path` and
   `symbol`) pins a relationship to the code site that carries it. `traffic` (`protocol`, `sync`,
   `rate`, `payload`) says what runs over it.
+- `boundrail model read <module> --code` prints where the module's code is on this machine
+  (`code_target.local_path`); `--open` opens it (on Windows and Linux, its folder). A binding
+  with a `repo` resolves only through the user's `boundrail/checkouts.json`
+  (`[{"name": "<repo>", "path": "<absolute path>"}]`).
+- A module's `references` point at another model, state or subject: each is `{model?, state?,
+  subject?, pin?}`, where `model` is a path inside the checkout or `<alias>:` with an optional
+  path, `state` is `current`, `{"proposal": <id>}` or `{"checkpoint": <id>}`, `subject` a
+  qualified ID there, and `pin` the full commit of a checkpoint there. Set the whole list with
+  `edit-module` `set.references`, remove it with `clear: ["references"]`. `model read <module>
+  --references` follows each and says why one is skipped; `--reference N` reads one. A reference
+  to a vault that is not there yet is allowed.
 - Draw what the code does. When the code and the model disagree, decide which one is wrong and
   say so; never draw a relationship only to silence a warning.
 - `model check --language-servers` runs language servers from the checkout. Use it only on a

@@ -148,6 +148,7 @@ fn same_fields(a: &&Module, b: &&Module) -> bool {
         binding,
         former_names,
         outgoing: _,
+        references,
     } = a;
     (schema_version, id, name, kind, order, parent)
         == (
@@ -166,6 +167,7 @@ fn same_fields(a: &&Module, b: &&Module) -> bool {
                 &b.binding,
                 &b.former_names,
             )
+        && references == &b.references
 }
 
 /// Relationships in the order a module's file keeps them when the merge writes it.

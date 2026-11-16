@@ -40,7 +40,9 @@ pub const HISTORY: &str = "refs/boundrail/history";
 /// The journal kind of a `model retain` record.
 const KIND: &str = "retain";
 /// The shortest commit prefix `model read --checkpoint` accepts.
-const PREFIX_MIN: usize = 4;
+pub(crate) const PREFIX_MIN: usize = 4;
+/// The longest: a full SHA-256 commit.
+pub(crate) const PREFIX_MAX: usize = 64;
 /// The only file mode a checkpoint tree holds.
 const MODE: &str = "100644";
 /// The mode of an executable file, which a committed vault may hold.

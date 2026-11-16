@@ -63,3 +63,17 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
     boundrail::files::write_atomic(path, bytes)
         .with_context(|| format!("writing {}", path.display()))
 }
+
+fn spawn_detached<I>(program: &str, args: I) -> std::io::Result<()>
+where
+    I: IntoIterator,
+    I::Item: AsRef<std::ffi::OsStr>,
+{
+    std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(drop)
+}

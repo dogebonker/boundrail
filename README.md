@@ -62,6 +62,21 @@ in an `anchor` (`path` and `symbol`), which `model check` verifies like a relati
 needs a one-line `summary` when it is added, and may list `participants`, the modules its
 sequence diagram draws first, in order.
 
+A module may list `references` to another model, state or subject: a model in another checkout
+(a path inside this one, or `<alias>:` for a checkout named in the user's
+`boundrail/checkouts.json`), a proposal or checkpoint, a module or flow there, and a `pin` to one
+of its checkpoints. References are followed only when read, and only read: the other repository is
+never written or fetched.
+
+```sh
+# Each reference followed: the other model's name, the subject's name and kind, the state read.
+boundrail model read Billing --references
+# What reference 0 points at, as `model read` prints it there.
+boundrail model read Billing --reference 0
+# Where Billing's code is on this machine; --open opens it.
+boundrail model read Billing --code --open
+```
+
 ### Rendering
 
 `model render` draws the architecture, or a flow as a sequence diagram or flowchart. Arrows route

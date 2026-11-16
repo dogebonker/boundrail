@@ -12,13 +12,14 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use super::checkpoint::{PREFIX_MAX, PREFIX_MIN};
 use super::revision::{self, Revision};
 use super::types::{
     Anchor, Binding, Collection, DESCRIPTION_MAX, Emphasis, LABEL_MAX, Manifest, Module, Picture,
-    Proposal, RESPONSIBILITY_MAX, Relationship, SCHEMA_VERSION, SavedView, State, Traffic,
-    VaultConfig, Walkthrough,
+    Proposal, RESPONSIBILITY_MAX, ReadingState, Reference, Relationship, SCHEMA_VERSION, SavedView,
+    State, Traffic, VaultConfig, Walkthrough,
 };
-use super::{Code, Refusal, ids, one_line, state};
+use super::{Code, Refusal, ids, one_line, reference, state};
 use crate::files::{hash, refuse_symlink, write_atomic};
 
 mod flows;
@@ -1084,6 +1085,9 @@ fn check_module(
         check_path(problems, file, id, "binding path", &b.path);
         text(problems, "binding symbol", b.symbol.as_deref(), None, id);
     }
+    for (index, reference) in module.references.iter().enumerate() {
+        check_reference(problems, file, id, index, reference);
+    }
     for r in &module.outgoing {
         text(problems, "kind", Some(&r.kind), None, &r.id);
         text(
@@ -1139,6 +1143,56 @@ fn check_anchor(problems: &mut Problems, file: &str, subject: &str, anchor: &Anc
     text(problems, "anchor path", Some(&anchor.path));
     check_path(problems, file, subject, "anchor path", &anchor.path);
     text(problems, "anchor symbol", Some(&anchor.symbol));
+}
+
+fn check_reference(
+    problems: &mut Problems,
+    file: &str,
+    subject: &str,
+    index: usize,
+    reference: &Reference,
+) {
+    let mut problem =
+        |message: &str| problems.push(file, subject, format!("reference {index} {message}"));
+    let qualified = |id: &str| {
+        id.split_once('#')
+            .is_some_and(|(m, l)| ids::is_local(m) && ids::is_local(l))
+    };
+    let Reference {
+        model,
+        state,
+        subject: target,
+        pin,
+    } = reference;
+    if model.is_none() && state.is_current() && target.is_none() && pin.is_none() {
+        problem("names nothing: give a model, state, subject or pin");
+    }
+    if model.as_deref().is_some_and(|m| !reference::is_model(m)) {
+        problem("model is not a path inside the checkout, nor `<alias>:` with an optional one");
+    }
+    match state {
+        ReadingState::Proposal(p) if !(ids::is_local(p) || qualified(p)) => {
+            problem("state names a proposal by an ID that is not well formed");
+        }
+        ReadingState::Checkpoint(c)
+            if !(PREFIX_MIN..=PREFIX_MAX).contains(&c.len())
+                || !c.bytes().all(|b| b.is_ascii_alphanumeric()) =>
+        {
+            problem("state names a checkpoint by an ID or commit that is not well formed");
+        }
+        _ => {}
+    }
+    if target.as_deref().is_some_and(|t| !qualified(t)) {
+        problem("subject is not a qualified ID");
+    }
+    if let Some(pin) = pin {
+        if !crate::git::is_full_hash(pin) {
+            problem("pin is not a full commit hash");
+        }
+        if !state.is_current() {
+            problem("pins a checkpoint and names a state; leave out the state");
+        }
+    }
 }
 
 /// Traffic gives at least one field, each one line of 1 to `LABEL_MAX` characters.
@@ -1266,6 +1320,8 @@ pub struct ModuleView<'a> {
     pub binding: Option<&'a Binding>,
     pub former_names: &'a [String],
     pub children: Vec<String>,
+    #[serde(skip_serializing_if = "<[Reference]>::is_empty")]
+    pub references: &'a [Reference],
 }
 
 #[derive(Debug, Serialize)]
@@ -1428,6 +1484,7 @@ impl Model {
             groups: &module.groups,
             binding: module.binding.as_ref(),
             former_names: &module.former_names,
+            references: &module.references,
         }
     }
 
@@ -1553,8 +1610,8 @@ mod tests {
         );
     }
 
-    /// Files written before relationship traffic, step anchors and flow participants existed
-    /// read and write back byte for byte, so their digests hold.
+    /// Files written before relationship traffic, step anchors, flow participants and module
+    /// references existed read and write back byte for byte, so their digests hold.
     #[test]
     fn files_without_the_newer_optional_fields_round_trip_unchanged() {
         let module = r#"{

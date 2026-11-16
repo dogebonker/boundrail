@@ -44,10 +44,13 @@ mod language_server;
 mod pictures;
 #[path = "record.rs"]
 mod record;
+#[path = "references.rs"]
+mod references;
 #[path = "setup.rs"]
 mod setup;
 pub(super) use explain::{Asked, explain_output};
 pub(super) use pictures::pictures_output;
+pub(super) use references::{reference_output, references_output};
 use setup::Agent;
 
 const MODEL_SCHEMA: &str = "boundrail/model/v1";
@@ -330,6 +333,22 @@ enum ModelCmd {
         /// Read a proposal instead of the current state: its ID
         #[arg(long, conflicts_with = "checkpoint")]
         proposal: Option<String>,
+        /// List the module's references, each followed: the other model's name, the subject's
+        /// name and kind, and the state read, or why it was skipped
+        #[arg(long, requires = "subject", conflicts_with_all = ["reference", "code"])]
+        references: bool,
+        /// Read what the module's reference at this index (from 0) points at, as `model read`
+        /// reads it there; never writes or fetches in the other repository
+        #[arg(long, requires = "subject", conflicts_with = "code")]
+        reference: Option<usize>,
+        /// Print where the module's binding is on this machine: the path in this checkout, or in
+        /// the checkout the user's boundrail/checkouts.json names for its repo, and with
+        /// --checkpoint the commit it was retained at
+        #[arg(long, requires = "subject")]
+        code: bool,
+        /// With --code, open the local path with the platform opener
+        #[arg(long, requires = "code")]
+        open: bool,
     },
     /// List the vault file and request schemas, or print one as JSON Schema
     Schema { name: Option<String> },
@@ -732,6 +751,37 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
             )
         }
         ModelCmd::Read {
+            subject: Some(subject),
+            references: true,
+            checkpoint,
+            proposal,
+            ..
+        } => {
+            let loaded = load_reading(root, checkpoint.as_deref(), proposal.as_deref())?;
+            references::list(root, loaded, &subject, markdown)
+        }
+        ModelCmd::Read {
+            subject: Some(subject),
+            reference: Some(index),
+            checkpoint,
+            proposal,
+            ..
+        } => {
+            let loaded = load_reading(root, checkpoint.as_deref(), proposal.as_deref())?;
+            references::follow(root, &loaded.model, &subject, index, markdown)
+        }
+        ModelCmd::Read {
+            subject: Some(subject),
+            code: true,
+            open,
+            checkpoint,
+            proposal,
+            ..
+        } => {
+            let loaded = load_reading(root, checkpoint.as_deref(), proposal.as_deref())?;
+            references::code(root, loaded, &subject, open, markdown)
+        }
+        ModelCmd::Read {
             subject: None,
             flow: None,
             walkthrough: None,
@@ -739,28 +789,10 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
             view: None,
             checkpoint,
             proposal,
+            ..
         } => {
-            let (checkpoint, proposal) = (checkpoint.as_deref(), proposal.as_deref());
-            if !markdown {
-                return write(None, &read_output(root, checkpoint, proposal)?);
-            }
-            let Loaded {
-                model,
-                state,
-                checkpoint,
-                ..
-            } = load_reading(root, checkpoint, proposal)?;
-            if let Some(checkpoint) = &checkpoint {
-                print_checkpoint(checkpoint);
-            }
-            print_proposal(&model);
-            print_reading(&model, &model.read());
-            print_collections(&model.collection_views());
-            print_walkthroughs(&model.walkthrough_entries());
-            print_pictures(&model.picture_entries());
-            print_views(&model.view_entries());
-            print_claims(state.as_deref().and_then(active_claims).as_deref());
-            Ok(())
+            let loaded = load_reading(root, checkpoint.as_deref(), proposal.as_deref())?;
+            print_whole(loaded, markdown)
         }
         ModelCmd::Read {
             subject,
@@ -770,96 +802,20 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
             view,
             checkpoint,
             proposal,
+            ..
         } => {
-            let Loaded {
-                model,
-                state,
-                pending,
-                checkpoint,
-            } = load_reading(root, checkpoint.as_deref(), proposal.as_deref())?;
-            let found = match (&flow, &walkthrough, &picture, &view) {
-                (Some(flow), _, _, _) => {
-                    let (collection, flow) = model.flow(flow)?;
-                    Some(Found::Flow(collection, flow))
-                }
-                (None, Some(walkthrough), _, _) => {
-                    Some(Found::Walkthrough(model.walkthrough(walkthrough)?))
-                }
-                (None, None, Some(picture), _) => Some(Found::Picture(model.picture(picture)?)),
-                (None, None, None, Some(view)) => Some(Found::View(model.saved_view(view)?)),
-                (None, None, None, None) => subject.as_deref().and_then(|s| model.find_grouping(s)),
+            let loaded = load_reading(root, checkpoint.as_deref(), proposal.as_deref())?;
+            let named = Named {
+                subject: subject.as_deref(),
+                flow: flow.as_deref(),
+                walkthrough: walkthrough.as_deref(),
+                picture: picture.as_deref(),
+                view: view.as_deref(),
             };
-            if let Some(found) = found {
-                let read = GroupingRead {
-                    model: &model,
-                    state,
-                    pending,
-                    checkpoint,
-                    markdown,
-                };
-                return read.print(found);
+            match read_named(loaded, &named, markdown)? {
+                Some(output) => write(None, &output),
+                None => Ok(()),
             }
-            // The arm above reads the whole model, so a subject is given here.
-            let subject = subject.unwrap_or_default();
-            let selection = model.select(&subject)?;
-            let subjects: Vec<&str> = iter::once(&selection.module.id)
-                .chain(selection.parts.iter().map(|m| &m.id))
-                .chain(selection.incoming.iter().map(|r| &r.id))
-                .chain(selection.outgoing.iter().map(|r| &r.id))
-                .map(String::as_str)
-                .collect();
-            let active = state
-                .as_deref()
-                .and_then(active_claims)
-                .map(|active| claims::holding(&model, active, &subjects));
-            if markdown {
-                if let Some(checkpoint) = &checkpoint {
-                    print_checkpoint(checkpoint);
-                }
-                print_proposal(&model);
-                let names = names(&model);
-                print_module(&selection.module, 0);
-                if let Some(parent) = selection.module.parent {
-                    println!("  part of {}", name_of(&names, parent));
-                }
-                if !selection.parts.is_empty() {
-                    println!("Parts:");
-                    selection.parts.iter().for_each(|m| print_module(m, 1));
-                }
-                for (heading, list) in [
-                    ("Outgoing", &selection.outgoing),
-                    ("Incoming", &selection.incoming),
-                ] {
-                    if !list.is_empty() {
-                        println!("{heading}:");
-                        list.iter().for_each(|r| print_relationship(&names, r));
-                    }
-                }
-                print_claims(active.as_deref());
-                return Ok(());
-            }
-            let mut output = json!({
-                "schema": MODEL_SCHEMA,
-                "kind": "read-module",
-                "success": true,
-                "vault": model.dir,
-                "module": selection.module,
-                "parts": selection.parts,
-                "incoming": selection.incoming,
-                "outgoing": selection.outgoing,
-                "revision": model.revision,
-            });
-            extend(&mut output, json!({ "proposal": model.proposal }))?;
-            if let Some(active) = active {
-                output["claims"] = json!(active);
-            }
-            if let Some(pending) = pending {
-                output["pending_operation"] = pending;
-            }
-            if let Some(checkpoint) = checkpoint {
-                output["checkpoint"] = json!(checkpoint);
-            }
-            write(None, &output)
         }
         ModelCmd::Schema { name: None } => {
             let names: Vec<&str> = SCHEMAS.iter().map(|(name, _)| *name).collect();
@@ -1222,12 +1178,17 @@ pub(super) fn read_output(
     checkpoint: Option<&str>,
     proposal: Option<&str>,
 ) -> Result<Value> {
+    whole_output(load_reading(root, checkpoint, proposal)?)
+}
+
+/// [`read_output`] of a loaded model.
+fn whole_output(loaded: Loaded) -> Result<Value> {
     let Loaded {
         model,
         state,
         pending,
         checkpoint,
-    } = load_reading(root, checkpoint, proposal)?;
+    } = loaded;
     let reading = model.read();
     let mut output = json!({
         "schema": MODEL_SCHEMA,
@@ -1258,6 +1219,132 @@ pub(super) fn read_output(
     Ok(output)
 }
 
+/// Prints the whole loaded model, as JSON or Markdown.
+fn print_whole(loaded: Loaded, markdown: bool) -> Result<()> {
+    if !markdown {
+        return write(None, &whole_output(loaded)?);
+    }
+    let Loaded {
+        model,
+        state,
+        checkpoint,
+        ..
+    } = loaded;
+    if let Some(checkpoint) = &checkpoint {
+        print_checkpoint(checkpoint);
+    }
+    print_proposal(&model);
+    print_reading(&model, &model.read());
+    print_collections(&model.collection_views());
+    print_walkthroughs(&model.walkthrough_entries());
+    print_pictures(&model.picture_entries());
+    print_views(&model.view_entries());
+    print_claims(state.as_deref().and_then(active_claims).as_deref());
+    Ok(())
+}
+
+/// What `model read` names short of the whole model.
+struct Named<'a> {
+    /// A module, or a collection, flow, walkthrough, picture or view ID.
+    subject: Option<&'a str>,
+    flow: Option<&'a str>,
+    walkthrough: Option<&'a str>,
+    picture: Option<&'a str>,
+    view: Option<&'a str>,
+}
+
+/// The JSON output of reading what `named` names in the loaded model, or `None` when it printed
+/// Markdown instead.
+fn read_named(loaded: Loaded, named: &Named<'_>, markdown: bool) -> Result<Option<Value>> {
+    let Loaded {
+        model,
+        state,
+        pending,
+        checkpoint,
+    } = loaded;
+    let found = match (named.flow, named.walkthrough, named.picture, named.view) {
+        (Some(flow), _, _, _) => {
+            let (collection, flow) = model.flow(flow)?;
+            Some(Found::Flow(collection, flow))
+        }
+        (None, Some(walkthrough), _, _) => {
+            Some(Found::Walkthrough(model.walkthrough(walkthrough)?))
+        }
+        (None, None, Some(picture), _) => Some(Found::Picture(model.picture(picture)?)),
+        (None, None, None, Some(view)) => Some(Found::View(model.saved_view(view)?)),
+        (None, None, None, None) => named.subject.and_then(|s| model.find_grouping(s)),
+    };
+    if let Some(found) = found {
+        let read = GroupingRead {
+            model: &model,
+            state,
+            pending,
+            checkpoint,
+            markdown,
+        };
+        return read.output(found);
+    }
+    let selection = model.select(named.subject.unwrap_or_default())?;
+    let subjects: Vec<&str> = iter::once(&selection.module.id)
+        .chain(selection.parts.iter().map(|m| &m.id))
+        .chain(selection.incoming.iter().map(|r| &r.id))
+        .chain(selection.outgoing.iter().map(|r| &r.id))
+        .map(String::as_str)
+        .collect();
+    let active = state
+        .as_deref()
+        .and_then(active_claims)
+        .map(|active| claims::holding(&model, active, &subjects));
+    if markdown {
+        if let Some(checkpoint) = &checkpoint {
+            print_checkpoint(checkpoint);
+        }
+        print_proposal(&model);
+        let names = names(&model);
+        print_module(&selection.module, 0);
+        if let Some(parent) = selection.module.parent {
+            println!("  part of {}", name_of(&names, parent));
+        }
+        if !selection.parts.is_empty() {
+            println!("Parts:");
+            selection.parts.iter().for_each(|m| print_module(m, 1));
+        }
+        for (heading, list) in [
+            ("Outgoing", &selection.outgoing),
+            ("Incoming", &selection.incoming),
+        ] {
+            if !list.is_empty() {
+                println!("{heading}:");
+                list.iter().for_each(|r| print_relationship(&names, r));
+            }
+        }
+        print_claims(active.as_deref());
+        return Ok(None);
+    }
+    let mut output = json!({
+        "schema": MODEL_SCHEMA,
+        "kind": "read-module",
+        "success": true,
+        "vault": model.dir,
+        "module": selection.module,
+        "parts": selection.parts,
+        "incoming": selection.incoming,
+        "outgoing": selection.outgoing,
+        "revision": model.revision,
+    });
+    extend(&mut output, json!({ "proposal": model.proposal }))?;
+    if let Some(active) = active {
+        output["claims"] = json!(active);
+    }
+    if let Some(pending) = pending {
+        output["pending_operation"] = pending;
+    }
+    if let Some(checkpoint) = checkpoint {
+        output["checkpoint"] = json!(checkpoint);
+    }
+    Ok(Some(output))
+}
+
 /// A `model read` of one collection or flow.
 struct GroupingRead<'a> {
     model: &'a Model,
@@ -1268,14 +1355,6 @@ struct GroupingRead<'a> {
 }
 
 impl GroupingRead<'_> {
-    /// Prints the collection, flow or walkthrough with the active claims holding it.
-    fn print(self, found: Found<'_>) -> Result<()> {
-        match self.output(found)? {
-            Some(output) => write(None, &output),
-            None => Ok(()),
-        }
-    }
-
     /// The JSON output of reading `found`, or `None` when it printed Markdown instead.
     fn output(self, found: Found<'_>) -> Result<Option<Value>> {
         let model = self.model;
@@ -2834,7 +2913,8 @@ fn print_footprint(
         println!("- {}: {}{parts}", m.name, count(m.files.len(), "file"));
     }
     if !report.outside.is_empty() {
-        println!("Outside every binding: {}", report.outside.join(", "));
+        let outside: Vec<String> = report.outside.iter().map(|p| escape_controls(p)).collect();
+        println!("Outside every binding: {}", outside.join(", "));
     }
     for c in report.crossings.iter().flatten() {
         let (from, to) = (name_of(&names, &c.from), name_of(&names, &c.to));
