@@ -5033,6 +5033,269 @@ fn footprint_prints_a_pull_request_comment() {
     checkout.refused(&["check", "--format", "pr-comment"], "REQUEST_INVALID");
 }
 
+/// The measured shop with a committed proposal on main that adds Fees, bound to the fee inside
+/// Billing, describes Docs and makes the changes `more`; the checkout is left on a new branch
+/// `feature`. The proposal's local ID.
+fn fees_proposal(checkout: &Checkout, more: &[Value]) -> String {
+    let id = propose(checkout, "Fees", "current");
+    let mut changes = vec![
+        json!({"type": "add-module", "module": {"name": "Fees", "kind": "module", "order": 4, "parent": "Billing", "binding": {"path": "src/billing/fee.ts"}}}),
+        json!({"type": "edit-module", "subject": "Docs", "set": {"description": "How to pay"}}),
+    ];
+    changes.extend_from_slice(more);
+    edited_proposal(checkout, &id, Value::from(changes));
+    git(checkout, &["add", "-A"]);
+    git(checkout, &["commit", "-q", "-m", "plan fees"]);
+    git(checkout, &["checkout", "-q", "-b", "feature"]);
+    id
+}
+
+/// The qualified IDs of a footprint's proposal subjects under `key`, with their `holds`.
+fn subjects(out: &Value, key: &str) -> Vec<(String, Value)> {
+    let listed = out["proposal"][key].as_array().unwrap();
+    (listed.iter())
+        .map(|s| (s["module"].as_str().unwrap().to_owned(), s["holds"].clone()))
+        .collect()
+}
+
+#[test]
+fn footprint_sets_the_changes_beside_what_a_proposal_names() {
+    let (checkout, model) = measured();
+    let q = |id: &str| format!("{model}#{id}");
+    let id = fees_proposal(&checkout, &[]);
+    let drawn = checkout.ok(&["read", "--proposal", &id]);
+    let fees = (drawn["modules"].as_array().unwrap().iter())
+        .find(|m| m["name"] == "Fees")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // Without a proposal the key is null, and a small change is not large.
+    let out = checkout.ok(&["footprint"]);
+    assert_eq!(out["proposal"], Value::Null);
+    assert_eq!(out["large"], false);
+
+    // The fee belongs to Fees, which only the proposal binds: Fees is named and changed, and
+    // Billing changed only through it, so Fees holds Billing's change. Docs is named but its
+    // code never changed.
+    change(&checkout, &["src/billing/fee.ts"], "fees");
+    let out = checkout.ok(&["footprint", "--proposal", &id]);
+    let against = &out["proposal"];
+    assert_eq!(against["id"], q(&id));
+    assert_eq!(against["name"], "Fees");
+    assert_eq!(
+        subjects(&out, "named_and_changed"),
+        [(fees.clone(), json!([]))]
+    );
+    assert_eq!(
+        subjects(&out, "changed_not_named"),
+        [(q("Billing1"), json!([fees]))]
+    );
+    assert_eq!(
+        subjects(&out, "named_not_changed"),
+        [(q("Docs0001"), json!([]))]
+    );
+    assert_eq!(against["outside"], json!([]));
+    assert_eq!(against["changed_not_named"][0]["name"], "Billing");
+    // The head's own modules keep the head's bindings.
+    assert_eq!(out["modules"][0]["files"], json!(["src/billing/fee.ts"]));
+    let (code, _) = checkout.run(&["footprint", "--proposal", &id, "--fail-outside"]);
+    assert_eq!(code, 0);
+
+    // A change Billing holds itself leaves nothing held, and Web is outside the proposal.
+    change(
+        &checkout,
+        &["src/billing/charge.ts", "src/web/index.ts"],
+        "more",
+    );
+    let out = checkout.ok(&["footprint", "--proposal", &id]);
+    assert_eq!(
+        subjects(&out, "changed_not_named"),
+        [(q("Billing1"), json!([])), (q("WebApp01"), json!([]))]
+    );
+    assert_eq!(
+        out["proposal"]["outside"],
+        json!([q("Billing1"), q("WebApp01")])
+    );
+    let gate = Command::new(env!("CARGO_BIN_EXE_boundrail"))
+        .args(["model", "footprint", "--proposal", &id, "--fail-outside"])
+        .current_dir(checkout.path())
+        .output()
+        .unwrap();
+    assert_eq!(gate.status.code(), Some(1), "{gate:?}");
+    let stdout: Value = serde_json::from_slice(&gate.stdout).unwrap();
+    assert_eq!(stdout["success"], true);
+    let stderr = String::from_utf8(gate.stderr).unwrap();
+    let web = format!("Web ({}) changed outside the proposal", q("WebApp01"));
+    assert!(stderr.contains(&web), "{stderr}");
+    assert!(stderr.contains("Billing ("), "{stderr}");
+
+    // The branch's model changes count: describing Docs in the vault changes it.
+    let mut docs = checkout.read_module("Docs0001");
+    docs["description"] = "How to pay".into();
+    checkout.module(docs);
+    let out = checkout.ok(&["footprint", "--proposal", &id]);
+    let named: Vec<String> = (subjects(&out, "named_and_changed").into_iter())
+        .map(|s| s.0)
+        .collect();
+    // Lists are in ID order, and Fees has a random ID.
+    let (docs, fees) = (q("Docs0001"), fees);
+    let mut both = [(docs.as_str(), "Docs"), (fees.as_str(), "Fees")];
+    both.sort_unstable();
+    let ids: Vec<&str> = both.iter().map(|(id, _)| *id).collect();
+    assert_eq!(named, ids);
+    assert_eq!(out["proposal"]["named_not_changed"], json!([]));
+
+    let args = ["footprint", "--proposal", &id, "--format", "markdown"];
+    let (code, text) = checkout.run_raw(&args);
+    assert_eq!(code, 0, "{text}");
+    let [(_, first), (_, second)] = both;
+    let expected = format!(
+        "Against proposal Fees ({}):\n\
+         - Named and changed: {first}, {second}\n\
+         - Changed, not named: Billing, Web\n\
+         - Named, not changed: none\n",
+        q(&id)
+    );
+    assert!(text.ends_with(&expected), "{text}");
+    let args = ["footprint", "--proposal", &id, "--format", "pr-comment"];
+    let (code, text) = checkout.run_raw(&args);
+    assert_eq!(code, 0, "{text}");
+    let expected = format!(
+        "\nAgainst proposal `Fees` (`{}`):\n\n\
+         - Named and changed: `{first}`, `{second}`\n\
+         - Changed, not named: `Billing`, `Web`\n\
+         - Named, not changed: none\n",
+        q(&id)
+    );
+    assert!(text.ends_with(&expected), "{text}");
+}
+
+#[test]
+fn footprint_names_what_a_proposal_removes_rebinds_or_relates() {
+    let (checkout, model) = measured();
+    let q = |id: &str| format!("{model}#{id}");
+    sources(
+        &checkout,
+        &[("src/pages/home.ts", "export const home = 1;\n")],
+    );
+    let id = fees_proposal(
+        &checkout,
+        &[
+            json!({"type": "remove-module", "subject": "Bank"}),
+            json!({"type": "edit-module", "subject": "Web", "set": {"binding": {"path": "src/pages"}}}),
+        ],
+    );
+    change(
+        &checkout,
+        &["src/bank/index.ts", "src/pages/home.ts"],
+        "pages",
+    );
+
+    // Bank, which the proposal removes, counts where the head still binds it; the page, which
+    // no head binding holds, maps to Web through the proposal's binding. Both are named.
+    let out = checkout.ok(&["footprint", "--proposal", &id]);
+    assert_eq!(out["outside"], json!(["src/pages/home.ts"]));
+    assert_eq!(
+        subjects(&out, "named_and_changed"),
+        [(q("BankApi1"), json!([])), (q("WebApp01"), json!([]))]
+    );
+    assert_eq!(out["proposal"]["changed_not_named"], json!([]));
+    assert_eq!(out["proposal"]["outside"], json!([]));
+
+    // A proposal that only adds a relationship names both its ends.
+    let links = propose(&checkout, "Links", "current");
+    edited_proposal(
+        &checkout,
+        &links,
+        json!([{"type": "add-relationship", "source": "Billing", "relationship": {"to": "Bank", "kind": "call", "order": 0}}]),
+    );
+    let out = checkout.ok(&["footprint", "--proposal", &links]);
+    assert_eq!(
+        subjects(&out, "named_and_changed"),
+        [(q("BankApi1"), json!([]))]
+    );
+    assert_eq!(
+        subjects(&out, "named_not_changed"),
+        [(q("Billing1"), json!([]))]
+    );
+}
+
+#[test]
+fn footprint_shows_held_parts_and_flags_a_large_change() {
+    let (checkout, _) = measured();
+    let id = fees_proposal(&checkout, &[]);
+    change(&checkout, &["src/billing/fee.ts"], "fees");
+    let args = ["footprint", "--proposal", &id, "--format", "markdown"];
+    let (code, text) = checkout.run_raw(&args);
+    assert_eq!(code, 0, "{text}");
+    let held = "- Changed, not named: Billing (held by Fees)\n";
+    assert!(text.contains(held), "{text}");
+    assert!(!text.contains("Large change"), "{text}");
+    let args = ["footprint", "--proposal", &id, "--format", "pr-comment"];
+    let (code, text) = checkout.run_raw(&args);
+    assert_eq!(code, 0, "{text}");
+    let held = "- Changed, not named: `Billing` (held by `Fees`)\n";
+    assert!(text.contains(held), "{text}");
+    assert!(!text.contains("Large change"), "{text}");
+
+    // More files than a sweep holds make the change large; files outside every binding count.
+    let notes: Vec<String> = (0..=boundrail::cochange::MAX_FILES)
+        .map(|n| format!("notes/{n}.md"))
+        .collect();
+    let notes: Vec<(&str, &str)> = notes.iter().map(|p| (p.as_str(), "note\n")).collect();
+    sources(&checkout, &notes);
+    let out = checkout.ok(&["footprint", "--proposal", &id]);
+    assert_eq!(out["large"], true);
+    // Files no binding holds never fail the gate.
+    assert_eq!(out["proposal"]["outside"], json!([]));
+    let (code, _) = checkout.run(&["footprint", "--proposal", &id, "--fail-outside"]);
+    assert_eq!(code, 0);
+    let (code, text) = checkout.run_raw(&["footprint", "--format", "markdown"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.contains("Large change: more than 30 files\n"),
+        "{text}"
+    );
+    let (code, text) = checkout.run_raw(&["footprint", "--format", "pr-comment"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.contains("\nLarge change: more than 30 files.\n"),
+        "{text}"
+    );
+}
+
+#[test]
+fn footprint_refuses_an_unreadable_ref_or_an_unknown_proposal() {
+    let (checkout, _) = measured();
+    let id = fees_proposal(&checkout, &[]);
+    for args in [
+        &["footprint", "--proposal", &id, "--head", "nowhere"][..],
+        &["footprint", "--proposal", &id, "--base", "nowhere"],
+        &[
+            "footprint",
+            "--proposal",
+            &id,
+            "--fail-outside",
+            "--base",
+            "nowhere",
+        ],
+    ] {
+        let error = checkout.refused(args, "REQUEST_INVALID");
+        let message = error["message"].as_str().unwrap();
+        assert!(message.contains("nowhere"), "{error:#}");
+    }
+    checkout.refused(
+        &["footprint", "--proposal", "Nope0000"],
+        "SUBJECT_NOT_FOUND",
+    );
+    let args = ["footprint", "--proposal", "Nope0000", "--fail-outside"];
+    checkout.refused(&args, "SUBJECT_NOT_FOUND");
+    // The gate needs a proposal to judge against.
+    let (code, _) = checkout.run_raw(&["footprint", "--fail-outside"]);
+    assert_eq!(code, 2);
+}
+
 #[test]
 fn a_shallow_checkout_needs_a_base_and_drops_its_boundary_commit() {
     let (origin, _) = measured();

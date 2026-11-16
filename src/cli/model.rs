@@ -11,7 +11,9 @@ use boundrail::arch::code::{self, CodeReport, NoScan, Skip, SkipReason, UnitStat
 use boundrail::arch::compare::{self, Comparison};
 use boundrail::arch::diagnostic::{Diagnostic, Severity};
 use boundrail::arch::edit::{self, Receipt};
-use boundrail::arch::footprint::{self, CrossingsSkipped, FootprintReport, Range};
+use boundrail::arch::footprint::{
+    self, AgainstProposal, CrossingsSkipped, FootprintReport, Proposed, Range,
+};
 use boundrail::arch::github;
 use boundrail::arch::infra::{self, Infra};
 use boundrail::arch::inspect::{self, InspectReport};
@@ -30,6 +32,7 @@ use boundrail::arch::vault::{
     WalkthroughEntry, escape_controls,
 };
 use boundrail::arch::{Code, Refusal};
+use boundrail::cochange::MAX_FILES;
 use serde_json::{Value, json};
 
 #[path = "pictures.rs"]
@@ -80,7 +83,8 @@ enum Command {
         language_servers: bool,
     },
     /// Report the modules a branch changes, the relationships its changed imports cross, and
-    /// what it changes in the model
+    /// what it changes in the model; with --fail-outside, exits 1 when it changes a module the
+    /// proposal does not name
     Footprint {
         /// The revision the branch starts from [default: the merge-base of HEAD with
         /// origin/HEAD, main or master, else HEAD]
@@ -89,6 +93,14 @@ enum Command {
         /// The branch's last commit [default: HEAD with the working tree]
         #[arg(long)]
         head: Option<String>,
+        /// Set the changes beside what this proposal names: modules named and changed, changed
+        /// but not named, named but not changed. Read from the checkout's vault
+        #[arg(long)]
+        proposal: Option<String>,
+        /// Exit 1 when a changed module is outside what --proposal names and none of its
+        /// changed parts holds its changes
+        #[arg(long, requires = "proposal")]
+        fail_outside: bool,
     },
     /// Draw the model as SVG: the architecture, or a flow as a sequence diagram or flowchart,
     /// optionally marked with what it changes against another state
@@ -501,9 +513,15 @@ pub(super) fn run(args: ModelArgs) -> Result<ExitCode> {
         Command::Pictures { write, only } => {
             pictures::list(&args.root, markdown, only.as_deref(), write)
         }
-        Command::Footprint { base, head } => {
+        Command::Footprint {
+            base,
+            head,
+            proposal,
+            fail_outside,
+        } => {
             let (base, head) = (base.as_deref(), head.as_deref());
-            model_footprint(&args.root, args.format, base, head).map(|()| ExitCode::SUCCESS)
+            let report = model_footprint(&args.root, args.format, base, head, proposal.as_deref())?;
+            Ok(footprint_verdict(report.as_ref(), fail_outside))
         }
         Command::Model(command) => {
             execute(&args.root, markdown, command).map(|()| ExitCode::SUCCESS)
@@ -2014,16 +2032,49 @@ fn print_locality(model: &Model, history: &History, report: &LocalityReport) {
     }
 }
 
-/// `model footprint`: the modules a branch's changes touch and its model changes. A base model
-/// that does not load leaves `model` null with `model_error`.
+/// Exit 1 under `--fail-outside` when the branch changes a module outside the proposal, naming
+/// each on standard error; 0 otherwise.
+fn footprint_verdict(against: Option<&AgainstProposal>, fail_outside: bool) -> ExitCode {
+    let Some(against) = against.filter(|a| fail_outside && !a.outside.is_empty()) else {
+        return ExitCode::SUCCESS;
+    };
+    let changed = against.changed_not_named.iter();
+    for s in changed.filter(|s| against.outside.contains(&s.module)) {
+        eprintln!(
+            "boundrail: {} ({}) changed outside the proposal",
+            escape_controls(&s.name),
+            s.module
+        );
+    }
+    ExitCode::from(1)
+}
+
+/// `model footprint`: the modules a branch's changes touch and its model changes, set beside
+/// what `proposal` names when given; returns that comparison. A base model that does not load
+/// leaves `model` null with `model_error`.
 fn model_footprint(
     root: &Path,
     format: Option<ModelFormat>,
     base: Option<&str>,
     head: Option<&str>,
-) -> Result<()> {
+    proposal: Option<&str>,
+) -> Result<Option<AgainstProposal>> {
     let checkout = checkpoint::checkout(&vault::path(root)?)?;
     let range = footprint::range(&checkout, base, head)?;
+    // The proposal is read from the checkout's vault, whatever head the footprint reads.
+    let drawn = proposal
+        .map(|p| vault::load_proposal(vault::locate(root)?, p))
+        .transpose()?;
+    let predecessor = match &drawn {
+        Some(drawn) => match vault::load_base(drawn)? {
+            Some(base) => Some(base),
+            None => {
+                let current = vault::load_dir(drawn.dir.clone())?;
+                Some((current.modules, current.collections))
+            }
+        },
+        None => None,
+    };
     let model = match &range.head {
         None => load_for_read(root, None)?.0,
         Some(head) => checkpoint::load_committed(&checkout, head)?.ok_or_else(|| {
@@ -2051,9 +2102,31 @@ fn model_footprint(
     let base_state = (before.as_ref()).map(|m| (&m.modules[..], &m.collections[..]));
     let (id, scan) = (&model.manifest.id, doc.as_ref().map_err(|s| *s));
     let report = footprint::measure(id, head_state, base_state, &files, scan, &infra);
+    let against = match (&drawn, &predecessor) {
+        (Some(d), Some((m, c))) => {
+            let p = (d.proposal.as_ref()).context("a loaded proposal has its manifest")?;
+            let proposed = Proposed {
+                id: d.qualify(&p.id),
+                name: &p.name,
+                predecessor: (&m[..], &c[..]),
+                drawn: (&d.modules[..], &d.collections[..]),
+            };
+            let branch = base_state.zip(report.model.as_ref());
+            Some(footprint::against(
+                id, &proposed, &files, head_state, branch,
+            ))
+        }
+        _ => None,
+    };
     if format == Some(ModelFormat::Markdown) {
-        print_footprint(&model, &range, &report, model_error.as_deref());
-        return Ok(());
+        print_footprint(
+            &model,
+            &range,
+            &report,
+            against.as_ref(),
+            model_error.as_deref(),
+        );
+        return Ok(against);
     }
     let mut output = json!({
         "schema": MODEL_SCHEMA,
@@ -2065,21 +2138,24 @@ fn model_footprint(
         "head": range.head,
     });
     extend(&mut output, &report)?;
+    extend(&mut output, json!({ "proposal": against }))?;
     // Absent parts stay as null, so the output keeps one shape.
     output["crossings"] = json!(report.crossings);
     output["crossings_skipped"] = json!(report.crossings_skipped);
     output["model"] = json!(report.model);
     output["model_error"] = json!(model_error);
     output["scan_error"] = json!(scan_error);
+    output["proposal"] = json!(against);
     if format == Some(ModelFormat::PrComment) {
         let mut names: BTreeMap<String, String> = (names(&model).into_iter())
             .map(|(id, name)| (id, name.to_owned()))
             .collect();
         names.extend(relationship_names(&model));
         print!("{}", github::pr_comment(&output, &names));
-        return Ok(());
+    } else {
+        write(None, &output)?;
     }
-    write(None, &output)
+    Ok(against)
 }
 
 /// The scan footprint crossings read, or why there is none, with the error of a failed scan.
@@ -2102,7 +2178,13 @@ fn footprint_scan(
     })
 }
 
-fn print_footprint(model: &Model, range: &Range, report: &FootprintReport, error: Option<&str>) {
+fn print_footprint(
+    model: &Model,
+    range: &Range,
+    report: &FootprintReport,
+    against: Option<&AgainstProposal>,
+    error: Option<&str>,
+) {
     let names = names(model);
     let relationships = relationship_names(model);
     let head = range.head.as_deref().unwrap_or("the working tree");
@@ -2145,6 +2227,40 @@ fn print_footprint(model: &Model, range: &Range, report: &FootprintReport, error
     }
     if let Some(error) = error {
         println!("Model changes not compared: {error}");
+    }
+    if report.large {
+        println!("Large change: more than {} files", MAX_FILES);
+    }
+    if let Some(against) = against {
+        println!("Against proposal {} ({}):", against.name, against.id);
+        let changed = (against.named_and_changed.iter()).chain(&against.changed_not_named);
+        let called: BTreeMap<&str, &str> = changed
+            .map(|s| (s.module.as_str(), s.name.as_str()))
+            .collect();
+        let lists = [
+            &against.named_and_changed,
+            &against.changed_not_named,
+            &against.named_not_changed,
+        ];
+        for ((_, heading), subjects) in footprint::AGAINST_LISTS.iter().zip(lists) {
+            let listed: Vec<String> = (subjects.iter())
+                .map(|s| match s.holds.as_slice() {
+                    [] => s.name.clone(),
+                    holds => {
+                        let held: Vec<&str> = (holds.iter())
+                            .map(|h| called.get(h.as_str()).copied().unwrap_or(h))
+                            .collect();
+                        format!("{} (held by {})", s.name, held.join(", "))
+                    }
+                })
+                .collect();
+            let listed = if listed.is_empty() {
+                "none".to_owned()
+            } else {
+                listed.join(", ")
+            };
+            println!("- {heading}: {listed}");
+        }
     }
 }
 

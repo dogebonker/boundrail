@@ -56,6 +56,22 @@ inspect` reports each module's interface from the code; `model locality` reads G
 modules that change together; `model render` draws the model as SVG. `boundrail model --help`
 lists every command. [Design notes](docs/plans/architecture-model.md).
 
+## Footprint
+
+`boundrail model footprint` lists the modules a branch changes, the relationships its changed
+imports cross and what it changes in the model, and marks a change of more than 30 files as
+`large`. With `--proposal <id>` it sets those changes beside what the proposal names: modules
+named and changed, changed but not named, and named but not changed. A changed module whose
+changes all lie in changed parts lists those parts in `holds`. `--fail-outside` is the merge gate:
+
+```sh
+boundrail model footprint --base main --head ticket --proposal <id> --fail-outside
+```
+
+It exits 1 when a module the proposal does not name changed and holds nothing, naming each on
+standard error, and 0 otherwise. Changed files that no module binds are listed but never fail
+the gate. A ref or proposal it cannot read refuses with exit 2.
+
 ## In CI
 
 The GitHub Action runs `model check`, annotates its findings, and on a pull request comments the

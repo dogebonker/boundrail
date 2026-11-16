@@ -7,6 +7,9 @@ use std::fmt::Write as _;
 
 use serde_json::Value;
 
+use super::footprint::AGAINST_LISTS;
+use crate::cochange::MAX_FILES;
+
 /// The hidden first line of the footprint comment, which CI looks for to update its comment.
 pub const COMMENT_MARKER: &str = "<!-- boundrail:footprint -->";
 
@@ -153,7 +156,8 @@ fn more(out: &mut String, items: &[Value], noun: &str) {
 
 /// A Markdown pull request comment from a `model footprint` JSON output: the modules touched,
 /// the files outside every binding, the crossings with the relationships drawn for them or
-/// "undrawn", why crossings were not checked, and what the branch changes in the model. `names`
+/// "undrawn", why crossings were not checked, what the branch changes in the model, whether it
+/// is large, and the modules set beside a proposal's when the footprint has one. `names`
 /// maps qualified module and relationship IDs to how the comment shows them. The first line is
 /// [`COMMENT_MARKER`]; a comment longer than [`COMMENT_MAX`] bytes is cut at a line and ends with
 /// [`TRUNCATED`].
@@ -164,6 +168,10 @@ pub fn pr_comment(footprint: &Value, names: &BTreeMap<String, String>) -> String
     outside_section(&mut out, items(footprint, "outside"));
     crossings_section(&mut out, footprint, names);
     model_section(&mut out, footprint);
+    if footprint["large"].as_bool() == Some(true) {
+        let _ = writeln!(out, "\nLarge change: more than {MAX_FILES} files.");
+    }
+    proposal_section(&mut out, &footprint["proposal"]);
     if out.len() > COMMENT_MAX {
         let mut cut = COMMENT_MAX - TRUNCATED.len();
         while !out.is_char_boundary(cut) {
@@ -280,6 +288,52 @@ fn model_section(out: &mut String, footprint: &Value) {
     }
     if !changed {
         out.push_str("No model changes.\n");
+    }
+}
+
+/// The modules named and changed, changed but not named, and named but not changed against the
+/// proposal, each with the parts holding its changes; nothing without a proposal.
+fn proposal_section(out: &mut String, proposal: &Value) {
+    if proposal.is_null() {
+        return;
+    }
+    let name = code(proposal["name"].as_str().unwrap_or_default(), false);
+    let id = code(proposal["id"].as_str().unwrap_or_default(), false);
+    let _ = writeln!(out, "\nAgainst proposal {name} ({id}):\n");
+    let mut called = BTreeMap::new();
+    for key in ["named_and_changed", "changed_not_named"] {
+        for s in items(proposal, key) {
+            let (id, name) = (s["module"].as_str(), s["name"].as_str());
+            if let (Some(id), Some(name)) = (id, name) {
+                called.insert(id.to_owned(), name.to_owned());
+            }
+        }
+    }
+    for (key, heading) in AGAINST_LISTS {
+        let subjects = items(proposal, key);
+        let mut shown: Vec<String> = (subjects.iter().take(ROWS_MAX))
+            .map(|s| {
+                let name = code(s["name"].as_str().unwrap_or_default(), false);
+                let holds = items(s, "holds");
+                if holds.is_empty() {
+                    return name;
+                }
+                let held: Vec<String> = (holds.iter())
+                    .map(|h| h.as_str().unwrap_or_default())
+                    .map(|h| code(called.get(h).map_or(h, String::as_str), false))
+                    .collect();
+                format!("{name} (held by {})", held.join(", "))
+            })
+            .collect();
+        if subjects.len() > ROWS_MAX {
+            shown.push(format!("and {} more", subjects.len() - ROWS_MAX));
+        }
+        let listed = if shown.is_empty() {
+            "none".to_owned()
+        } else {
+            shown.join(", ")
+        };
+        let _ = writeln!(out, "- {heading}: {listed}");
     }
 }
 

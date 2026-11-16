@@ -1,7 +1,8 @@
 //! `model footprint`: the modules a branch's changes touch. Changed paths map to modules by
 //! binding path, the deepest binding winning as in the code check, and roll up to the modules
 //! containing them. Import edges of the changed files show which relationships the change
-//! crosses, and the vault's own changes compare the branch's model with its base's.
+//! crosses, and the vault's own changes compare the branch's model with its base's. Against a
+//! proposal, the modules the branch changes are set beside the modules the proposal names.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -15,10 +16,10 @@ use super::compare::{self, Comparison};
 use super::index::Index;
 use super::infra::{self, Infra};
 use super::types::{Collection, EXTERNAL_KIND, Module};
-use super::{Code, Refusal, vault};
+use super::{Code, Refusal, ids, vault};
 use crate::collect::TempDir;
-use crate::git;
 use crate::model::{Document, Edge};
+use crate::{cochange, git};
 
 #[derive(Debug, Default, Serialize)]
 pub struct FootprintReport {
@@ -32,6 +33,48 @@ pub struct FootprintReport {
     pub crossings_skipped: Option<CrossingsSkipped>,
     /// What the model changes against the base's; `None` when the base has no model.
     pub model: Option<Comparison>,
+    /// Whether more files changed than a sweep holds ([`cochange::MAX_FILES`]).
+    pub large: bool,
+}
+
+/// A proposal a footprint sets its changes beside.
+pub struct Proposed<'a> {
+    /// Qualified ID.
+    pub id: String,
+    pub name: &'a str,
+    /// The state the proposal was drawn from.
+    pub predecessor: State<'a>,
+    /// The state the proposal draws.
+    pub drawn: State<'a>,
+}
+
+/// The modules a branch changes beside the modules a proposal names, by qualified ID.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct AgainstProposal {
+    pub id: String,
+    pub name: String,
+    pub named_and_changed: Vec<Subject>,
+    pub changed_not_named: Vec<Subject>,
+    pub named_not_changed: Vec<Subject>,
+    /// The modules of `changed_not_named` whose `holds` is empty: what `--fail-outside` fails on.
+    pub outside: Vec<String>,
+}
+
+/// The subject lists of an [`AgainstProposal`] by JSON key, with their headings, in the order the
+/// reports show them.
+pub const AGAINST_LISTS: [(&str, &str); 3] = [
+    ("named_and_changed", "Named and changed"),
+    ("changed_not_named", "Changed, not named"),
+    ("named_not_changed", "Named, not changed"),
+];
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct Subject {
+    pub module: String,
+    pub name: String,
+    /// The changed modules inside this one, when they hold every changed file it holds; empty
+    /// when it holds a changed file itself, changes in the model, or did not change.
+    pub holds: Vec<String>,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -231,10 +274,35 @@ pub fn measure(
     let bound = code::bound_paths(model, head.0);
     let owners = PathOwners::new(bound.iter().map(|(i, p)| (i.as_str(), p.as_str())));
     let mut report = FootprintReport::default();
+    (report.modules, report.outside) = touched(&index, &owners, files);
+    report.large = files.len() > cochange::MAX_FILES;
+    // Without a scan, only modules bound to units hold anything to cross.
+    let units = (head.0.iter())
+        .any(|m| m.kind != EXTERNAL_KIND && m.binding.as_ref().is_some_and(infra::is_unit_binding));
+    match scan {
+        _ if files.is_empty() => report.crossings = Some(Vec::new()),
+        Ok(doc) => report.crossings = Some(crossings(&index, &owners, files, &doc.edges, infra)),
+        Err(CrossingsSkipped::NotNeeded) if units => {
+            report.crossings = Some(crossings(&index, &owners, files, &[], infra));
+        }
+        Err(skipped) => report.crossings_skipped = Some(skipped),
+    }
+    report.model = base.map(|base| compare::compare(model, base, head));
+    report
+}
+
+/// The modules holding a changed file or containing one that does, and the changed files no
+/// module holds.
+fn touched(
+    index: &Index<'_>,
+    owners: &PathOwners<'_, '_>,
+    files: &[String],
+) -> (Vec<Touched>, Vec<String>) {
+    let mut outside = Vec::new();
     let mut touched: BTreeMap<&str, Touched> = BTreeMap::new();
     for file in files {
         let Some(id) = owners.owner(file) else {
-            report.outside.push(file.clone());
+            outside.push(file.clone());
             continue;
         };
         for (depth, above) in index.chain(id).into_iter().enumerate() {
@@ -250,20 +318,105 @@ pub fn measure(
             }
         }
     }
-    report.modules = touched.into_values().collect();
-    // Without a scan, only modules bound to units hold anything to cross.
-    let units = (head.0.iter())
-        .any(|m| m.kind != EXTERNAL_KIND && m.binding.as_ref().is_some_and(infra::is_unit_binding));
-    match scan {
-        _ if files.is_empty() => report.crossings = Some(Vec::new()),
-        Ok(doc) => report.crossings = Some(crossings(&index, &owners, files, &doc.edges, infra)),
-        Err(CrossingsSkipped::NotNeeded) if units => {
-            report.crossings = Some(crossings(&index, &owners, files, &[], infra));
-        }
-        Err(skipped) => report.crossings_skipped = Some(skipped),
+    (touched.into_values().collect(), outside)
+}
+
+/// The modules the branch changes, `files` on the state `head` of model `model`, beside those
+/// `proposal` names. A changed file counts for its owner in the proposal or in the head's model,
+/// the deeper binding winning, so a module the proposal adds or rebinds counts once its code
+/// changes, and one it removes counts where the head still binds it. The branch's model changes,
+/// `branch` against its base, count too.
+pub fn against(
+    model: &str,
+    proposal: &Proposed<'_>,
+    files: &[String],
+    head: State<'_>,
+    branch: Option<(State<'_>, &Comparison)>,
+) -> AgainstProposal {
+    let drawn = proposal.drawn;
+    let kept: BTreeSet<&str> = drawn.0.iter().map(|m| m.id.as_str()).collect();
+    let head_only = (head.0.iter()).filter(|m| !kept.contains(m.id.as_str()));
+    let modules: Vec<Module> = drawn.0.iter().chain(head_only).cloned().collect();
+    let index = Index::new(model, &modules);
+    let (in_drawn, in_head) = (
+        code::bound_paths(model, drawn.0),
+        code::bound_paths(model, head.0),
+    );
+    let bound = in_drawn.iter().chain(&in_head);
+    let owners = PathOwners::new(bound.map(|(i, p)| (i.as_str(), p.as_str())));
+    let (touches, _) = touched(&index, &owners, files);
+    // Each changed module with the changed parts holding all its changes.
+    let mut changed: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for t in &touches {
+        let holds = if t.files.is_empty() {
+            (touches.iter())
+                .filter(|o| !o.files.is_empty())
+                .filter(|o| index.is_below(&o.module, &t.module))
+                .map(|o| o.module.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        changed.insert(t.module.clone(), holds);
     }
-    report.model = base.map(|base| compare::compare(model, base, head));
+    if let Some((base, comparison)) = branch {
+        for id in subjects(model, comparison, [base, head]) {
+            changed.insert(id, Vec::new());
+        }
+    }
+    let comparison = compare::compare(model, proposal.predecessor, drawn);
+    let named = subjects(model, &comparison, [proposal.predecessor, drawn]);
+    let before = Index::new(model, proposal.predecessor.0);
+    let subject = |id: &str, holds: Vec<String>| Subject {
+        module: id.to_owned(),
+        name: match index.by_id.get(id) {
+            Some(m) => m.name.clone(),
+            None => before.name(id).to_owned(),
+        },
+        holds,
+    };
+    let mut report = AgainstProposal {
+        id: proposal.id.clone(),
+        name: proposal.name.to_owned(),
+        named_and_changed: Vec::new(),
+        changed_not_named: Vec::new(),
+        named_not_changed: (named.iter())
+            .filter(|id| !changed.contains_key(*id))
+            .map(|id| subject(id, Vec::new()))
+            .collect(),
+        outside: Vec::new(),
+    };
+    for (id, holds) in changed {
+        if named.contains(&id) {
+            report.named_and_changed.push(subject(&id, holds));
+        } else {
+            if holds.is_empty() {
+                report.outside.push(id.clone());
+            }
+            report.changed_not_named.push(subject(&id, holds));
+        }
+    }
     report
+}
+
+/// The modules `comparison` names: those it adds, removes or changes, and both ends of each
+/// relationship it adds, removes or changes, as either of `states` draws it.
+fn subjects(model: &str, comparison: &Comparison, states: [State<'_>; 2]) -> BTreeSet<String> {
+    let all = |c: &compare::Changes| -> Vec<String> {
+        let entries = c.added.iter().chain(&c.removed).chain(&c.changed);
+        entries.map(|e| e.id.clone()).collect()
+    };
+    let mut found: BTreeSet<String> = all(&comparison.modules).into_iter().collect();
+    let lines: BTreeSet<String> = all(&comparison.relationships).into_iter().collect();
+    for module in states.iter().flat_map(|(modules, _)| modules.iter()) {
+        for r in &module.outgoing {
+            if lines.contains(&ids::qualify(model, &r.id)) {
+                found.insert(ids::qualify(model, &module.id));
+                found.insert(r.to.clone());
+            }
+        }
+    }
+    found
 }
 
 /// The module pairs, neither containing the other, that an import edge with a changed file at

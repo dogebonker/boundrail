@@ -14,6 +14,11 @@
   `inspect`, `footprint` and `locality` report interfaces, a branch's changes and co-change;
   `render`, `pictures` and `view` draw the model. `model setup` installs the agent skills, and the
   GitHub Action runs `model check` and comments the footprint.
+- `model footprint --proposal <id>`: the modules a branch changes set beside the modules the
+  proposal names (named and changed, changed but not named, named but not changed), with the
+  changed parts that hold a module's changes in `holds`, `large` for a change of more than 30
+  files, and `--fail-outside`, which exits 1 when a module outside the proposal changed and
+  holds nothing.
 
 ### Removed
 

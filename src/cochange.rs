@@ -9,7 +9,7 @@ use crate::{git, hotspots};
 
 /// A commit touching more files is a sweep (formatting, renames, vendoring) and says nothing
 /// about which files belong together.
-pub(crate) const MAX_FILES: usize = 30;
+pub const MAX_FILES: usize = 30;
 /// How many of the most recent commits a history measure reads unless told otherwise.
 pub const HISTORY_LIMIT: usize = 500;
 /// Fewer shared commits than this is coincidence more often than coupling.

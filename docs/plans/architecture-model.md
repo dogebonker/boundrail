@@ -50,7 +50,7 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 | T16 | Agent integration: `model setup`, skills for authoring/planning/PRs, CI action with PR annotations and footprint comment | done |
 | T17 | Reconcile drafts after current changes, export/import bundles, history publication | done |
 | T18 | Remove scan-era code that the model does not use | done |
-| T19 | Footprint against a proposal: modules the proposal names and the branch changes, changes outside it, named but unchanged, held subjects, large changes, `--fail-outside` exit 1, exit 2 on an unreadable ref | open |
+| T19 | Footprint against a proposal: modules the proposal names and the branch changes, changes outside it, named but unchanged, held subjects, large changes, `--fail-outside` exit 1, exit 2 on an unreadable ref | done |
 | T20 | Check correctness: infrastructure-unit bindings exempt from `CONTAINER_PARTS_OUTSIDE`; the code check scans every language in the checkout, not one; `check --every-draft` | open |
 | T21 | Render quality and options: edges route around boxes and labels never collide; `--focus`, `--hide-kind`, legend, `--theme auto`; JSON receipt with dimensions, placed IDs and digest; direct PNG with `--scale` and `--region` | open |
 | T22 | Model-side inspect: entry points, hidden parts, callers, outgoing, pass-through, container relationships and measures read from the model, `--checkpoint`, and `inspect --group` | open |
@@ -307,7 +307,33 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   the base holds no model, or null with `model_error` naming the commit when its model does not
   load. With `--head` the model is the one committed there. The JSON always has every key, null when
   unset: `schema`, `kind`, `success`, `vault`, `revision`, `base`, `head`, `modules`, `outside`,
-  `crossings`, `crossings_skipped`, `model`, `model_error` and `scan_error`.
+  `crossings`, `crossings_skipped`, `model`, `model_error`, `scan_error`, `large` and `proposal`
+  (T19).
+- T19: `large` is true when more files changed than a sweep holds (`cochange::MAX_FILES`, 30, the
+  size past which locality leaves a commit out), files outside every binding included; it is
+  information and never changes the exit status. `model footprint --proposal <id>` reads the
+  proposal from the checkout's vault, whatever head the footprint reads, and sets `proposal` to
+  `{id, name, named_and_changed, changed_not_named, named_not_changed, outside}`, each list of
+  `{module, name, holds}` in ID order and `outside` a list of qualified IDs; an unknown proposal
+  refuses `SUBJECT_NOT_FOUND`. Named: the modules the draft adds, removes or changes against the
+  proposal's base snapshot (the checkout's current state when the draft has no base), and both ends
+  of each relationship it adds, removes or changes. Changed: changed files map to modules through
+  the proposal's bindings and the head's together, the deeper binding winning and the proposal's
+  on an equal path, rolled up through the proposal's containment (the head's for modules the
+  proposal removed), so a module the proposal adds or rebinds counts once its code
+  changes and one it removes counts where the head still binds it; and the modules the branch
+  changes in the model, by the same rule as named. Flows and steps name no module. `holds` (the
+  held-subject rule) lists the changed modules inside a changed module when it holds none of the
+  changed files itself, so every change it has lies in a part; it is empty for a module that holds
+  a changed file, changes in the model, or did not change. `outside` is `changed_not_named` with
+  empty `holds`. `--fail-outside` (needs `--proposal`, else clap exits 2) exits 1 when `outside` is
+  not empty, after printing the output and naming each such module on stderr; files outside every
+  binding never fail it, and without the flag the verdict never changes the exit status. A base or
+  head that names no commit, or a base sharing no ancestor with the head, refuses
+  `REQUEST_INVALID` (exit 2) as before. Markdown adds `Large change` and an `Against proposal`
+  block, and the pull request comment the same after the model counts. A rebound module keeps the
+  head's path too, so a file at its old path still counts for it. Claims are not read: they belong
+  to one worktree, and a footprint judges a branch.
 - T11: `model view [--port N] [--no-open]` serves the page and a JSON API on 127.0.0.1 only, port 0
   (a free one) by default, and prints the URL with its token as the first line on stdout. Without
   `--no-open` it starts the platform opener (`open`, `xdg-open`, `cmd /c start ""`) with a one-time
