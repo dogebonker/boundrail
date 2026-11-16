@@ -8,7 +8,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::{Batch, Diff, at, both, rename, request_invalid};
-use crate::arch::types::{Branch, Collection, Emphasis, Flow, SCHEMA_VERSION, Step, find_step};
+use crate::arch::types::{
+    Anchor, Branch, Collection, Emphasis, Flow, SCHEMA_VERSION, SUMMARY_MAX, Step, find_step,
+};
 use crate::arch::vault::{self, Model};
 use crate::arch::{Code, Refusal, ids};
 
@@ -40,8 +42,14 @@ pub enum CollectionField {
 pub struct NewFlow {
     pub name: String,
     pub order: u32,
+    /// Required: an `add-flow` without a non-blank summary refuses `FLOW_SUMMARY_REQUIRED`.
+    #[schemars(required, length(min = 1, max = SUMMARY_MAX))]
     pub summary: Option<String>,
     pub description: Option<String>,
+    /// Modules the sequence view draws first, in order, referenced like module subjects.
+    #[serde(default)]
+    #[schemars(extend("uniqueItems" = true))]
+    pub participants: Vec<String>,
     #[serde(default)]
     pub steps: Vec<NewStep>,
 }
@@ -51,16 +59,22 @@ pub struct NewFlow {
 pub struct FlowSet {
     pub name: Option<String>,
     pub order: Option<u32>,
+    /// A blank summary refuses `FLOW_SUMMARY_REQUIRED`.
     pub summary: Option<String>,
     pub description: Option<String>,
+    /// Replaces the participant list; modules are referenced like module subjects.
+    #[schemars(extend("uniqueItems" = true))]
+    pub participants: Option<Vec<String>>,
 }
 
-/// A flow field `clear` may empty; required fields cannot be cleared.
+/// A flow field `clear` may empty; required fields cannot be cleared. Clearing the summary
+/// refuses `FLOW_SUMMARY_REQUIRED`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FlowField {
     Summary,
     Description,
+    Participants,
 }
 
 /// A step to add, with the steps inside it. Modules are referenced like module subjects, a
@@ -78,6 +92,7 @@ pub enum NewStep {
         emphasis: Option<Emphasis>,
         repeat: Option<u32>,
         note: Option<String>,
+        anchor: Option<Anchor>,
     },
     Decision {
         label: String,
@@ -110,6 +125,7 @@ pub struct StepSet {
     pub emphasis: Option<Emphasis>,
     pub repeat: Option<u32>,
     pub note: Option<String>,
+    pub anchor: Option<Anchor>,
 }
 
 /// A message field `clear` may empty; required fields cannot be cleared.
@@ -121,6 +137,7 @@ pub enum StepField {
     Emphasis,
     Repeat,
     Note,
+    Anchor,
 }
 
 impl CollectionField {
@@ -136,6 +153,7 @@ impl FlowField {
         match self {
             Self::Summary => set.summary.is_some(),
             Self::Description => set.description.is_some(),
+            Self::Participants => set.participants.is_some(),
         }
     }
 }
@@ -148,6 +166,7 @@ impl StepField {
             Self::Emphasis => set.emphasis.is_some(),
             Self::Repeat => set.repeat.is_some(),
             Self::Note => set.note.is_some(),
+            Self::Anchor => set.anchor.is_some(),
         }
     }
 }
@@ -161,6 +180,7 @@ impl StepSet {
             || self.emphasis.is_some()
             || self.repeat.is_some()
             || self.note.is_some()
+            || self.anchor.is_some()
     }
 }
 
@@ -280,7 +300,11 @@ impl Batch<'_> {
 
     pub(super) fn add_flow(&mut self, index: usize, collection: &str, new: NewFlow) -> Result<()> {
         let c = self.collection_at(index, collection)?;
+        if new.summary.as_deref().is_none_or(is_blank) {
+            return Err(summary_required(index, &new.name));
+        }
         let id = self.new_id(index, new.name.clone())?;
+        let participants = self.module_ids(index, &new.participants)?;
         let steps = self.build_steps(index, new.steps)?;
         self.collections[c].flows.push(Flow {
             id,
@@ -288,6 +312,7 @@ impl Batch<'_> {
             order: new.order,
             summary: new.summary,
             description: new.description,
+            participants,
             former_names: Vec::new(),
             steps,
         });
@@ -305,8 +330,15 @@ impl Batch<'_> {
             return Err(both(index, field));
         }
         let (c, f) = self.flow_at(index, subject)?;
+        if clear.contains(&FlowField::Summary) || set.summary.as_deref().is_some_and(is_blank) {
+            return Err(summary_required(index, subject));
+        }
         let id = self.collections[c].flows[f].id.clone();
         self.edit_once(index, &id)?;
+        let participants = set
+            .participants
+            .map(|list| self.module_ids(index, &list))
+            .transpose()?;
         let flow = &mut self.collections[c].flows[f];
         if let Some(name) = set.name {
             rename(&mut flow.name, &mut flow.former_names, name);
@@ -320,10 +352,14 @@ impl Batch<'_> {
         if set.description.is_some() {
             flow.description = set.description;
         }
+        if let Some(participants) = participants {
+            flow.participants = participants;
+        }
         for field in clear {
             match field {
                 FlowField::Summary => flow.summary = None,
                 FlowField::Description => flow.description = None,
+                FlowField::Participants => flow.participants.clear(),
             }
         }
         self.touched.insert(id, index);
@@ -367,6 +403,7 @@ impl Batch<'_> {
                 emphasis,
                 repeat,
                 note,
+                anchor,
             } => Step::Message {
                 from: self.module_id(index, &from)?,
                 to: self.module_id(index, &to)?,
@@ -377,6 +414,7 @@ impl Batch<'_> {
                 emphasis,
                 repeat,
                 note,
+                anchor,
             },
             NewStep::Decision { label, branches } => Step::Decision {
                 id: self.new_id(index, format!("decision {label}"))?,
@@ -404,6 +442,10 @@ impl Batch<'_> {
 
     pub(super) fn module_id(&self, index: usize, subject: &str) -> Result<String> {
         self.module(index, subject).map(|at| self.qualify(at))
+    }
+
+    fn module_ids(&self, index: usize, subjects: &[String]) -> Result<Vec<String>> {
+        subjects.iter().map(|s| self.module_id(index, s)).collect()
     }
 
     fn relationship_id(&self, index: usize, subject: Option<&str>) -> Result<Option<String>> {
@@ -557,6 +599,7 @@ fn apply_set(step: &mut Step, set: StepSet, clear: &[StepField]) {
         emphasis,
         repeat,
         note,
+        anchor,
         ..
     } = step
     else {
@@ -588,6 +631,9 @@ fn apply_set(step: &mut Step, set: StepSet, clear: &[StepField]) {
     if set.note.is_some() {
         *note = set.note;
     }
+    if set.anchor.is_some() {
+        *anchor = set.anchor;
+    }
     for field in clear {
         match field {
             StepField::Relationship => *relationship = None,
@@ -595,8 +641,20 @@ fn apply_set(step: &mut Step, set: StepSet, clear: &[StepField]) {
             StepField::Emphasis => *emphasis = None,
             StepField::Repeat => *repeat = None,
             StepField::Note => *note = None,
+            StepField::Anchor => *anchor = None,
         }
     }
+}
+
+fn is_blank(text: &str) -> bool {
+    text.trim().is_empty()
+}
+
+/// `FLOW_SUMMARY_REQUIRED` for change `index`, which adds the flow `flow` without a summary or
+/// clears or blanks its summary.
+fn summary_required(index: usize, flow: &str) -> anyhow::Error {
+    let message = format!("flow {flow} needs a summary: one line saying what the flow does");
+    at(index)(Refusal::new(Code::FlowSummaryRequired, message)).into()
 }
 
 /// Inserts `item` at `position` of `list`, at its end when absent.
@@ -780,9 +838,10 @@ mod tests {
         format!("{M}#{local}")
     }
 
-    /// Web calls Api (`Rel00001`), Api calls Db; Ops stands alone. Orders holds Checkout: Web
-    /// asks Api (`Step0001`), decision `Decide01` with branches `Branch01` (Api asks Db,
-    /// `Step0002`) and `Branch02` (empty), then loop `Loop0001`. Billing is empty.
+    /// Web calls Api (`Rel00001`), Api calls Db; Ops stands alone. Orders holds Checkout, which
+    /// has no summary: Web asks Api (`Step0001`), decision `Decide01` with branches `Branch01`
+    /// (Api asks Db, `Step0002`, anchored in `src/api.ts`) and `Branch02` (empty), then loop
+    /// `Loop0001`. Billing is empty.
     fn model() -> Model {
         let module = |id: &str, name: &str, outgoing: Value| {
             serde_json::from_value(json!({
@@ -796,10 +855,12 @@ mod tests {
         let message = |id: &str, from: &str, to: &str| json!({"kind": "message", "id": id, "from": q(from), "to": q(to), "label": "ask"});
         let mut ask = message("Step0001", "WebApp01", "ApiSrv01");
         ask["relationship"] = q("Rel00001").into();
+        let mut store = message("Step0002", "ApiSrv01", "DbStore1");
+        store["anchor"] = json!({"path": "src/api.ts", "symbol": "store"});
         let steps = json!([
             ask,
             {"kind": "decision", "id": "Decide01", "label": "paid?", "branches": [
-                {"id": "Branch01", "label": "yes", "steps": [message("Step0002", "ApiSrv01", "DbStore1")]},
+                {"id": "Branch01", "label": "yes", "steps": [store]},
                 {"id": "Branch02", "label": "no"},
             ]},
             {"kind": "loop", "id": "Loop0001", "label": "retry"},
@@ -870,7 +931,7 @@ mod tests {
     fn adding_a_collection_with_a_flow_and_steps_touches_only_the_root_level() {
         let (record, affected) = plan_of(json!([
             {"type": "add-collection", "collection": {"name": "Payments", "order": 2}},
-            {"type": "add-flow", "collection": "Payments", "flow": {"name": "Refund", "order": 0, "steps": [
+            {"type": "add-flow", "collection": "Payments", "flow": {"name": "Refund", "order": 0, "summary": "Money goes back", "steps": [
                 {"kind": "message", "from": "Web", "to": "Api", "label": "refund", "relationship": "Rel00001"},
                 {"kind": "loop", "label": "poll", "steps": [
                     {"kind": "message", "from": "Api", "to": "Db", "label": "check", "repeat": 3},
@@ -1070,6 +1131,102 @@ mod tests {
             {"type": "edit-flow", "subject": "Buy", "set": {"order": 1}},
         ]);
         assert_eq!(refusal(twice).0, Code::RequestInvalid);
+    }
+
+    #[test]
+    fn a_flow_needs_a_summary_when_added_and_keeps_it_when_edited() {
+        let step = json!({"kind": "message", "from": "Web", "to": "Api", "label": "ask"});
+        for flow in [
+            json!({"name": "Refund", "order": 0, "steps": [step]}),
+            json!({"name": "Refund", "order": 0, "summary": "  "}),
+        ] {
+            let change = json!({"type": "add-flow", "collection": "Billing", "flow": flow});
+            let (code, details) = refusal(json!([change]));
+            assert_eq!(
+                (code, details["change"].as_u64()),
+                (Code::FlowSummaryRequired, Some(0)),
+                "{change}"
+            );
+        }
+        for change in [
+            json!({"type": "edit-flow", "subject": "Checkout", "clear": ["summary"]}),
+            json!({"type": "edit-flow", "subject": "Checkout", "set": {"summary": ""}}),
+        ] {
+            assert_eq!(
+                refusal(json!([change.clone()])).0,
+                Code::FlowSummaryRequired,
+                "{change}"
+            );
+        }
+        plan_of(json!([{"type": "edit-flow", "subject": "Checkout", "set": {"order": 3}}]))
+            .unwrap();
+    }
+
+    #[test]
+    fn participants_name_modules_and_a_removed_one_refuses() {
+        let (record, _) = plan_of(json!([
+            {"type": "edit-flow", "subject": "Checkout", "set": {"participants": ["Db", "WebApp01"]}},
+        ]))
+        .unwrap();
+        let flow = &orders(&record)["flows"][0];
+        assert_eq!(flow["participants"], json!([q("DbStore1"), q("WebApp01")]));
+
+        let (code, _) = refusal(json!([
+            {"type": "edit-flow", "subject": "Checkout", "set": {"participants": ["Nobody"]}},
+        ]));
+        assert_eq!(code, Code::SubjectNotFound);
+        let (code, details) = refusal(json!([
+            {"type": "edit-flow", "subject": "Checkout", "set": {"participants": ["Ops", "Ops"]}},
+        ]));
+        assert_eq!(code, Code::ModelInvalid);
+        assert_eq!(
+            details["problems"][0]["message"],
+            format!("participant {} is listed twice", q("OpsSvc01"))
+        );
+
+        let listed =
+            json!({"type": "edit-flow", "subject": "Checkout", "set": {"participants": ["Ops"]}});
+        let (code, details) = refusal(json!([
+            listed,
+            {"type": "remove-module", "subject": "Ops"},
+        ]));
+        assert_eq!(code, Code::ModelInvalid, "{details}");
+        let (record, _) = plan_of(json!([listed])).unwrap();
+        assert_eq!(
+            orders(&record)["flows"][0]["participants"],
+            json!([q("OpsSvc01")])
+        );
+    }
+
+    #[test]
+    fn a_message_step_takes_an_anchor_and_clears_it() {
+        let anchor = json!({"path": "src/web.ts", "symbol": "ask"});
+        let (record, _) = plan_of(json!([
+            {"type": "edit-step", "subject": "Step0001", "set": {"anchor": anchor}},
+            {"type": "add-step", "flow": "Checkout", "step": {"kind": "message", "from": "Api", "to": "Db", "label": "store", "anchor": anchor}},
+        ]))
+        .unwrap();
+        let steps = &orders(&record)["flows"][0]["steps"];
+        assert_eq!(steps[0]["anchor"], anchor);
+        assert_eq!(steps[3]["anchor"], anchor);
+
+        let (record, _) = plan_of(json!([
+            {"type": "edit-step", "subject": "Step0002", "clear": ["anchor"]},
+        ]))
+        .unwrap();
+        let cleared = &orders(&record)["flows"][0]["steps"][1]["branches"][0]["steps"][0];
+        assert_eq!(cleared.get("anchor"), None, "{cleared}");
+        let on_loop =
+            json!({"type": "edit-step", "subject": "Loop0001", "set": {"anchor": anchor}});
+        assert_eq!(refusal(json!([on_loop])).0, Code::RequestInvalid);
+        let (code, details) = refusal(json!([
+            {"type": "edit-step", "subject": "Step0001", "set": {"anchor": {"path": "../x", "symbol": "a"}}},
+        ]));
+        assert_eq!(code, Code::ModelInvalid);
+        assert_eq!(
+            details["problems"][0]["message"],
+            "anchor path is not a relative path inside the repository"
+        );
     }
 
     #[test]

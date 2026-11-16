@@ -1,6 +1,7 @@
 //! The code check: compares the authored model with the checkout and its scanned import graph.
-//! Bindings and anchors must name existing code, code edges between bound modules need a drawn
-//! relationship, and relationships whose kind expects code evidence need edges that support them.
+//! Bindings and the anchors of relationships and message steps must name existing code, code
+//! edges between bound modules need a drawn relationship, and relationships whose kind expects
+//! code evidence need edges that support them.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -13,9 +14,11 @@ use super::diagnostic::{Diagnostic, DiagnosticCode};
 use super::index::{Index, Line};
 use super::infra::{self, Hop, Infra, Joined, Unit};
 use super::lsp::{Facts, Reference};
-use super::segments;
-use super::types::{Binding, EXTERNAL_KIND, Evidence, Module, VaultConfig};
+use super::types::{
+    Anchor, Binding, Collection, EXTERNAL_KIND, Evidence, Module, Step, VaultConfig, walk,
+};
 use super::vault::parse_message;
+use super::{ids, segments};
 use crate::model::{Document, Edge, EdgeKind, Language};
 use crate::modules::dir_of;
 use crate::surface::{SymbolExport, is_entry_file};
@@ -79,8 +82,9 @@ impl SkipReason {
     }
 }
 
-/// What a skip concerns: a module's binding, a relationship's anchor, the relationship, a
-/// language server (its name, or the config file), a walkthrough's beat, or a picture.
+/// What a skip concerns: a module's binding, a relationship's or message step's anchor, the
+/// relationship, a language server (its name, or the config file), a walkthrough's beat, or a
+/// picture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SkipSite {
@@ -107,7 +111,8 @@ impl SkipSite {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct Skip {
-    /// Qualified ID of the module, relationship, beat or picture, or a language server's name.
+    /// Qualified ID of the module, relationship, step, beat or picture, or a language server's
+    /// name.
     pub subject: String,
     pub site: SkipSite,
     pub reason: SkipReason,
@@ -227,9 +232,9 @@ pub enum NoScan {
 }
 
 /// Whether a binding of a module that is not external, other than to an infrastructure unit,
-/// or any anchor, names an existing path of this repository under `root`: without one there is
-/// no code to compare, so no scan is needed.
-pub fn needs_scan(modules: &[Module], root: &Path) -> bool {
+/// or any anchor of a relationship or a message step in `collections`, names an existing path of
+/// this repository under `root`: without one there is no code to compare, so no scan is needed.
+pub fn needs_scan(modules: &[Module], collections: &[Collection], root: &Path) -> bool {
     let bindings = modules
         .iter()
         .filter(|m| m.kind != EXTERNAL_KIND)
@@ -240,23 +245,42 @@ pub fn needs_scan(modules: &[Module], root: &Path) -> bool {
         .iter()
         .flat_map(|m| &m.outgoing)
         .filter_map(|r| r.anchor.as_ref())
+        .chain(step_anchors(collections).map(|(_, _, anchor)| anchor))
         .map(|a| (&a.repo, &a.path));
     bindings
         .chain(anchors)
         .any(|(repo, path)| repo.is_none() && root.join(path).exists())
 }
 
-/// Every code diagnostic of model `model` against the checkout at `root`, its scan, its
-/// infrastructure and what language servers found, sorted, with what was not judged. Without a
-/// scan, existing paths are skipped as `not-scanned`, or as `scan-failed` with a `SCAN_FAILED`
-/// warning; so are paths holding only code of a language whose collector failed while others
-/// succeeded, and a path holding scanned code beside such code is judged on the scanned files
-/// and named by the `SCAN_FAILED` too. Infrastructure that failed to read does the same to
-/// modules bound to units. The modules must have loaded, so parents and targets exist and
-/// containment has no cycle.
+/// Every anchored message step of `collections` at any depth: its local ID, its message's
+/// sender and receiver, and its anchor.
+fn step_anchors(collections: &[Collection]) -> impl Iterator<Item = (&str, (&str, &str), &Anchor)> {
+    (collections.iter())
+        .flat_map(|c| &c.flows)
+        .flat_map(|f| walk(&f.steps))
+        .filter_map(|(step, _)| match step {
+            Step::Message {
+                id,
+                from,
+                to,
+                anchor: Some(anchor),
+                ..
+            } => Some((id.as_str(), (from.as_str(), to.as_str()), anchor)),
+            _ => None,
+        })
+}
+
+/// Every code diagnostic of model `model`, its modules and collections, against the checkout at
+/// `root`, its scan, its infrastructure and what language servers found, sorted, with what was
+/// not judged. Without a scan, existing paths are skipped as `not-scanned`, or as `scan-failed`
+/// with a `SCAN_FAILED` warning; so are paths holding only code of a language whose collector
+/// failed while others succeeded, and a path holding scanned code beside such code is judged on
+/// the scanned files and named by the `SCAN_FAILED` too. Infrastructure that failed to read does
+/// the same to modules bound to units. The modules must have loaded, so parents and targets
+/// exist and containment has no cycle.
 pub fn check(
     model: &str,
-    modules: &[Module],
+    (modules, collections): (&[Module], &[Collection]),
     config: &VaultConfig,
     root: &Path,
     scan: Result<&Document, NoScan>,
@@ -268,7 +292,7 @@ pub fn check(
     let mut report = CodeReport::default();
     report.skips.extend(lsp.skips.iter().cloned());
     let status = bindings(&index, root, &scan, infra, lsp, &mut report);
-    anchors(&index, root, &scan, lsp, &mut report);
+    anchors(model, &index, collections, root, &scan, lsp, &mut report);
     let paths = path_owners(&status);
     let joined = joined(&index, &status, infra, &paths);
     let owners = owners(&status, &paths);
@@ -889,17 +913,26 @@ fn symbol_bindings(index: &Index<'_>, status: &mut Status<'_, '_, '_>) {
     }
 }
 
-/// `ANCHOR_PATH_MISSING` and `ANCHOR_SYMBOL_MISSING`.
-fn anchors(index: &Index<'_>, root: &Path, scan: &Scan<'_>, lsp: &Facts, report: &mut CodeReport) {
-    for line in &index.lines {
-        let Some(anchor) = line.anchor else {
-            continue;
-        };
+/// `ANCHOR_PATH_MISSING` and `ANCHOR_SYMBOL_MISSING` of relationships and message steps.
+fn anchors(
+    model: &str,
+    index: &Index<'_>,
+    collections: &[Collection],
+    root: &Path,
+    scan: &Scan<'_>,
+    lsp: &Facts,
+    report: &mut CodeReport,
+) {
+    let lines = (index.lines.iter())
+        .filter_map(|line| Some((line.id.clone(), (line.from.as_str(), line.to), line.anchor?)));
+    let steps =
+        step_anchors(collections).map(|(id, ends, anchor)| (ids::qualify(model, id), ends, anchor));
+    for (subject, (from, to), anchor) in lines.chain(steps) {
         let site = Site {
             site: SkipSite::Anchor,
-            subject: &line.id,
-            from: index.name(&line.from),
-            to: Some(index.name(line.to)),
+            subject: &subject,
+            from: index.name(from),
+            to: Some(index.name(to)),
             repo: anchor.repo.as_deref(),
             path: &anchor.path,
             symbol: Some(&anchor.symbol),
@@ -1453,6 +1486,7 @@ pub(super) mod tests {
             label: None,
             description: None,
             emphasis: None,
+            traffic: None,
             anchor: None,
         });
         from.outgoing.last_mut().unwrap()
@@ -1566,7 +1600,7 @@ pub(super) mod tests {
     fn run(modules: &[Module], doc: &Document, root: &Path) -> CodeReport {
         check(
             M,
-            modules,
+            (modules, &[]),
             &VaultConfig::default(),
             root,
             Ok(doc),
@@ -1668,7 +1702,7 @@ pub(super) mod tests {
         let modules = [app, web, billing, bank];
         let report = check(
             M,
-            &modules,
+            (&modules, &[]),
             &config,
             dir.path(),
             Ok(&doc),
@@ -1714,7 +1748,7 @@ pub(super) mod tests {
         };
         let report = check(
             M,
-            &modules,
+            (&modules, &[]),
             &VaultConfig::default(),
             dir.path(),
             Ok(&doc),
@@ -1730,7 +1764,7 @@ pub(super) mod tests {
         };
         let report = check(
             M,
-            &modules,
+            (&modules, &[]),
             &VaultConfig::default(),
             dir.path(),
             Ok(&doc),
@@ -1866,7 +1900,7 @@ pub(super) mod tests {
         let without = |scan| {
             check(
                 M,
-                &modules,
+                (&modules, &[]),
                 &VaultConfig::default(),
                 dir.path(),
                 Err(scan),
@@ -1900,7 +1934,7 @@ pub(super) mod tests {
         let failed = NoScan::Failed("no source".to_owned());
         let report = check(
             M,
-            &ghost,
+            (&ghost, &[]),
             &VaultConfig::default(),
             dir.path(),
             Err(failed),
@@ -1926,6 +1960,48 @@ pub(super) mod tests {
         link(&mut web, "NoSymbol", "Billing", "call").anchor = anchor("app/billing", "refund");
         link(&mut web, "NoPath", "Billing", "call").anchor = anchor("app/gone.ts", "charge");
         let report = run(&[app, web, billing, bank], &doc, dir.path());
+        assert_eq!(subjects(&report, AnchorPathMissing), [vec![q("NoPath")]]);
+        assert_eq!(
+            of(&report, AnchorPathMissing)[0].message,
+            "Web -> Billing is anchored at app/gone.ts, which does not exist"
+        );
+        assert_eq!(
+            subjects(&report, AnchorSymbolMissing),
+            [vec![q("NoSymbol")]]
+        );
+        assert!(skips(&report).contains(&(q("NoPath"), "anchor", "path-missing")));
+    }
+
+    #[test]
+    fn step_anchors_are_judged_like_relationship_anchors() {
+        let (dir, doc) = checkout();
+        let modules = shop();
+        let message = |id: &str, path: &str, symbol: &str| {
+            serde_json::json!({"kind": "message", "id": id, "from": q("Web"), "to": q("Billing"),
+                "label": "pay", "anchor": {"path": path, "symbol": symbol}})
+        };
+        let collections: Vec<Collection> = serde_json::from_value(serde_json::json!([
+            {"schema_version": 1, "id": "Orders", "name": "Orders", "order": 0, "flows": [
+                {"id": "Checkout", "name": "Checkout", "order": 0, "steps": [
+                    message("Good", "app/billing/charge.ts", "charge"),
+                    {"kind": "loop", "id": "Again", "label": "again", "steps": [
+                        message("NoSymbol", "app/billing", "refund"),
+                        message("NoPath", "app/gone.ts", "charge"),
+                    ]},
+                ]},
+            ]},
+        ]))
+        .unwrap();
+        assert!(needs_scan(&[], &collections, dir.path()));
+        let report = check(
+            M,
+            (&modules, &collections),
+            &VaultConfig::default(),
+            dir.path(),
+            Ok(&doc),
+            &Infra::default(),
+            &Facts::default(),
+        );
         assert_eq!(subjects(&report, AnchorPathMissing), [vec![q("NoPath")]]);
         assert_eq!(
             of(&report, AnchorPathMissing)[0].message,
@@ -1967,13 +2043,13 @@ pub(super) mod tests {
         vendor.kind = EXTERNAL_KIND.to_owned();
         let mut missing = module("Missing", None, Some("gone"));
         let modules = [remote.clone(), vendor, missing.clone()];
-        assert!(!needs_scan(&modules, dir.path()));
+        assert!(!needs_scan(&modules, &[], dir.path()));
         link(&mut missing, "R1", "Remote", "call").anchor = Some(Anchor {
             repo: None,
             path: "src".to_owned(),
             symbol: "x".to_owned(),
         });
-        assert!(needs_scan(&[remote, missing], dir.path()));
+        assert!(needs_scan(&[remote, missing], &[], dir.path()));
 
         // An anchor counts whatever kind of module owns it.
         let mut vendor = module("Vendor", None, None);
@@ -1983,7 +2059,7 @@ pub(super) mod tests {
             path: "src".to_owned(),
             symbol: "x".to_owned(),
         });
-        assert!(needs_scan(&[vendor], dir.path()));
+        assert!(needs_scan(&[vendor], &[], dir.path()));
     }
 
     #[test]

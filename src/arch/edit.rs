@@ -22,7 +22,7 @@ use super::revision::{self, Revision};
 use super::state::{self, Locked};
 use super::types::{
     Anchor, Binding, Collection, Emphasis, Module, Picture, Relationship, SCHEMA_VERSION, Step,
-    Walkthrough, walk,
+    Traffic, Walkthrough, walk,
 };
 use super::vault::{self, FileWrite, Model, Scope, relationships};
 use super::{Code, Refusal, ids, proposal};
@@ -284,6 +284,7 @@ pub struct NewRelationship {
     pub label: Option<String>,
     pub description: Option<String>,
     pub emphasis: Option<Emphasis>,
+    pub traffic: Option<Traffic>,
     pub anchor: Option<Anchor>,
 }
 
@@ -296,6 +297,7 @@ pub struct RelationshipSet {
     pub label: Option<String>,
     pub description: Option<String>,
     pub emphasis: Option<Emphasis>,
+    pub traffic: Option<Traffic>,
     pub anchor: Option<Anchor>,
 }
 
@@ -306,6 +308,7 @@ pub enum RelationshipField {
     Label,
     Description,
     Emphasis,
+    Traffic,
     Anchor,
 }
 
@@ -327,6 +330,7 @@ impl RelationshipField {
             Self::Label => set.label.is_some(),
             Self::Description => set.description.is_some(),
             Self::Emphasis => set.emphasis.is_some(),
+            Self::Traffic => set.traffic.is_some(),
             Self::Anchor => set.anchor.is_some(),
         }
     }
@@ -1344,6 +1348,7 @@ impl<'a> Batch<'a> {
             label: new.label,
             description: new.description,
             emphasis: new.emphasis,
+            traffic: new.traffic,
             anchor: new.anchor,
         });
         Ok(())
@@ -1398,6 +1403,9 @@ impl<'a> Batch<'a> {
         if set.emphasis.is_some() {
             relationship.emphasis = set.emphasis;
         }
+        if set.traffic.is_some() {
+            relationship.traffic = set.traffic;
+        }
         if set.anchor.is_some() {
             relationship.anchor = set.anchor;
         }
@@ -1406,6 +1414,7 @@ impl<'a> Batch<'a> {
                 RelationshipField::Label => relationship.label = None,
                 RelationshipField::Description => relationship.description = None,
                 RelationshipField::Emphasis => relationship.emphasis = None,
+                RelationshipField::Traffic => relationship.traffic = None,
                 RelationshipField::Anchor => relationship.anchor = None,
             }
         }
@@ -1457,8 +1466,9 @@ impl<'a> Batch<'a> {
     }
 
     /// Refuses when a message step the batch did not edit references a module the batch removes,
-    /// or a relationship it removes or moves, and the reference no longer holds. A step the batch
-    /// edited is judged by validation instead.
+    /// or a relationship it removes or moves, and the reference no longer holds, or when a flow it
+    /// did not edit lists a removed module as a participant. A step or flow the batch edited is
+    /// judged by validation instead.
     fn refuse_flow_references(&self, gone: &BTreeSet<String>) -> Result<()> {
         if gone.is_empty() && self.moved.is_empty() {
             return Ok(());
@@ -1467,7 +1477,8 @@ impl<'a> Batch<'a> {
         let moved: BTreeSet<String> = (self.moved.iter())
             .map(|id| ids::qualify(self.model, id))
             .collect();
-        // The changes that removed or moved what each broken step references.
+        let local = |subject: &String| ids::local(self.model, subject).to_owned();
+        // The changes that removed or moved what each broken step or flow references.
         let mut causes: BTreeSet<usize> = BTreeSet::new();
         let mut steps = Vec::new();
         for (step, _) in (self.collections.iter())
@@ -1495,7 +1506,6 @@ impl<'a> Batch<'a> {
             {
                 continue;
             }
-            let local = |subject: &String| ids::local(self.model, subject).to_owned();
             causes.extend(
                 broken
                     .into_iter()
@@ -1503,17 +1513,33 @@ impl<'a> Batch<'a> {
             );
             steps.push(ids::qualify(self.model, id));
         }
-        if steps.is_empty() {
+        let mut flows = Vec::new();
+        for flow in self.collections.iter().flat_map(|c| &c.flows) {
+            let broken: Vec<&String> = (flow.participants.iter())
+                .filter(|m| gone.contains(*m))
+                .collect();
+            if broken.is_empty() || self.edited.contains(&flow.id) {
+                continue;
+            }
+            causes.extend(
+                broken
+                    .into_iter()
+                    .filter_map(|s| self.touched.get(&local(s)).copied()),
+            );
+            flows.push(ids::qualify(self.model, &flow.id));
+        }
+        if steps.is_empty() && flows.is_empty() {
             return Ok(());
         }
         let refusal = Refusal::new(
             Code::ReferencedByFlow,
             format!(
-                "{} flow step(s) reference modules or relationships the batch removes or moves; edit or remove them in the same batch",
-                steps.len()
+                "{} flow step(s) and {} flow participant list(s) reference modules or relationships the batch removes or moves; edit or remove them in the same batch",
+                steps.len(),
+                flows.len()
             ),
         )
-        .with_details(json!({ "steps": steps }));
+        .with_details(json!({ "steps": steps, "flows": flows }));
         Err(match causes.into_iter().collect::<Vec<_>>().as_slice() {
             [index] => at(*index)(refusal),
             _ => refusal,

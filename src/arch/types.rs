@@ -246,6 +246,8 @@ pub struct Relationship {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub emphasis: Option<Emphasis>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic: Option<Traffic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<Anchor>,
 }
 
@@ -257,7 +259,64 @@ pub enum Emphasis {
     Muted,
 }
 
-/// The code site that carries a relationship.
+/// What travels over a relationship when it runs. Every field is optional; at least one is given.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(extend("minProperties" = 1))]
+pub struct Traffic {
+    /// The protocol, as `HTTPS` or `gRPC`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String", length(min = 1, max = LABEL_MAX), pattern("\\S"))]
+    pub protocol: Option<String>,
+    /// Whether the source waits for the target's answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Delivery")]
+    pub sync: Option<Delivery>,
+    /// How often it runs, as `200/s` or `nightly`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String", length(min = 1, max = LABEL_MAX), pattern("\\S"))]
+    pub rate: Option<String>,
+    /// What it carries, as `order JSON`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String", length(min = 1, max = LABEL_MAX), pattern("\\S"))]
+    pub payload: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Delivery {
+    Sync,
+    Async,
+}
+
+impl Delivery {
+    /// The name the model file uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Delivery::Sync => "sync",
+            Delivery::Async => "async",
+        }
+    }
+}
+
+impl Traffic {
+    /// The given fields in order, joined by commas: `HTTPS, async, 200/s, order JSON`.
+    pub fn text(&self) -> String {
+        let sync = self.sync.map(Delivery::as_str);
+        [
+            self.protocol.as_deref(),
+            sync,
+            self.rate.as_deref(),
+            self.payload.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(", ")
+    }
+}
+
+/// The code site that carries a relationship or a message step.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Anchor {
@@ -306,13 +365,19 @@ pub struct Flow {
     pub id: String,
     pub name: String,
     pub order: u32,
-    /// One line saying what the flow does.
+    /// One line saying what the flow does. Edits require it; flows written before they did
+    /// may lack it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = SUMMARY_MAX))]
     pub summary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = DESCRIPTION_MAX))]
     pub description: Option<String>,
+    /// Qualified IDs of the modules the sequence view draws first, in this order, each once;
+    /// modules the steps use and this leaves out follow in first-use order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(inner(pattern(QUALIFIED_ID)), extend("uniqueItems" = true))]
+    pub participants: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub former_names: Vec<String>,
     #[serde(default)]
@@ -352,6 +417,9 @@ pub enum Step {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[schemars(length(max = DESCRIPTION_MAX))]
         note: Option<String>,
+        /// The code that sends the message.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        anchor: Option<Anchor>,
     },
     /// The flow takes one of two or more branches.
     Decision {

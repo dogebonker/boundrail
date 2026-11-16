@@ -2816,12 +2816,15 @@ fn check_reports_flows_without_a_summary_and_undrawn_messages() {
     let checkout = Checkout::new();
     let model = shop(&checkout);
     bind(&checkout, "Platfrm1", "shop");
-    checkout.edited(json!([
-        {"type": "add-collection", "collection": {"name": "Orders", "order": 0}},
-        {"type": "add-flow", "collection": "Orders", "flow": {"name": "Refund", "order": 0, "steps": [
-            {"kind": "message", "from": "Web", "to": "Bank", "label": "refund"},
-        ]}},
-    ]));
+    let collection = json!({"schema_version": 1, "id": "Coll0001", "name": "Orders", "order": 0,
+    "flows": [{"id": "Flow0001", "name": "Refund", "order": 0, "steps": [
+        {"kind": "message", "id": "Step0001", "from": format!("{model}#WebApp01"),
+         "to": format!("{model}#BankApi1"), "label": "refund"},
+    ]}]});
+    checkout.write(
+        "collections/Coll0001.collection.json",
+        &serde_json::to_string_pretty(&collection).unwrap(),
+    );
     let out = checkout.ok(&["check", "--only", "semantic"]);
     assert_eq!(out["passed"], true);
     assert_eq!(out["counts"], json!({"warning": 0, "information": 2}));
@@ -2863,7 +2866,7 @@ fn taking_a_claimed_collections_or_flows_name_conflicts() {
             None,
             json!([
                 {"type": "add-collection", "collection": {"name": "Returns", "order": 1}},
-                {"type": "add-flow", "collection": "Returns", "flow": {"name": "Checkout", "order": 0}},
+                {"type": "add-flow", "collection": "Returns", "flow": {"name": "Checkout", "order": 0, "summary": "A return"}},
             ]),
         ),
         "CLAIM_CONFLICT",
@@ -2894,7 +2897,7 @@ fn a_renamed_flow_keeps_its_old_name() {
 
     // A claim on the renamed flow protects its old name.
     let claim = checkout.claim("alice", json!([flow]));
-    let take = json!([{"type": "add-flow", "collection": "Orders", "flow": {"name": "Checkout", "order": 1}}]);
+    let take = json!([{"type": "add-flow", "collection": "Orders", "flow": {"name": "Checkout", "order": 1, "summary": "Another"}}]);
     let error = checkout.edit_refused(
         &checkout.request_by("bob", None, take.clone()),
         "CLAIM_CONFLICT",
@@ -2911,6 +2914,232 @@ fn a_renamed_flow_keeps_its_old_name() {
         checkout.ok(&["read", "--flow", "Purchase"])["flow"]["id"],
         *flow
     );
+}
+
+#[test]
+fn a_flow_needs_a_summary_when_added_and_keeps_it() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let ids = add_checkout(&checkout);
+    let (orders, flow) = (&ids[0], &ids[1]);
+    for added in [
+        json!({"name": "Refund", "order": 1}),
+        json!({"name": "Refund", "order": 1, "summary": " "}),
+    ] {
+        let request =
+            checkout.request(json!([{"type": "add-flow", "collection": orders, "flow": added}]));
+        let error = checkout.edit_refused(&request, "FLOW_SUMMARY_REQUIRED");
+        assert_eq!(error["details"]["change"], 0);
+    }
+    for change in [
+        json!({"type": "edit-flow", "subject": flow, "clear": ["summary"]}),
+        json!({"type": "edit-flow", "subject": flow, "set": {"summary": ""}}),
+    ] {
+        checkout.edit_refused(&checkout.request(json!([change])), "FLOW_SUMMARY_REQUIRED");
+    }
+    checkout.edited(json!([
+        {"type": "edit-flow", "subject": flow, "set": {"summary": "A customer pays by card"}},
+        {"type": "add-flow", "collection": orders, "flow": {"name": "Refund", "order": 1,
+            "summary": "Billing pays a customer back", "participants": ["Bank"]}},
+    ]));
+    let read = checkout.ok(&["read", "--flow", "Refund"]);
+    assert_eq!(
+        read["flow"]["participants"],
+        json!([format!("{model}#BankApi1")])
+    );
+}
+
+#[test]
+fn flow_participants_order_the_sequence_lifelines() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let q = |id: &str| format!("{model}#{id}");
+    let ids = add_checkout(&checkout);
+    let flow = ids[1].as_str();
+    let lifelines = |svg: &str| -> Vec<String> {
+        (svg.split("<g class=\"lifeline\" data-id=\"").skip(1))
+            .map(|rest| rest[..rest.find('"').unwrap()].to_owned())
+            .collect()
+    };
+    let first_use = [q("WebApp01"), q("Billing1"), q("BankApi1")];
+    assert_eq!(lifelines(&checkout.render(&["--flow", flow])), first_use);
+
+    let out = checkout.edited(json!([
+        {"type": "add-module", "module": {"name": "Ledger", "kind": "datastore", "order": 3}},
+        {"type": "edit-flow", "subject": flow, "set": {"participants": ["Bank", "Ledger", "Billing"]}},
+    ]));
+    let ledger = out["allocated"][0]["id"].as_str().unwrap().to_owned();
+    let read = checkout.ok(&["read", "--flow", flow]);
+    assert_eq!(
+        read["flow"]["participants"],
+        json!([q("BankApi1"), ledger, q("Billing1")])
+    );
+    let (_, text) = checkout.run_raw(&["read", "--flow", flow, "--format", "markdown"]);
+    assert!(
+        text.contains("A customer pays\nParticipants: Bank, Ledger, Billing\n"),
+        "{text}"
+    );
+    assert_eq!(
+        lifelines(&checkout.render(&["--flow", flow])),
+        [q("BankApi1"), ledger.clone(), q("Billing1"), q("WebApp01")]
+    );
+    checkout.render(&["--flow", flow, "--view", "flowchart"]);
+
+    let unknown =
+        json!([{"type": "edit-flow", "subject": flow, "set": {"participants": ["Nobody"]}}]);
+    let error = checkout.edit_refused(&checkout.request(unknown), "SUBJECT_NOT_FOUND");
+    assert_eq!(error["details"]["change"], 0);
+    let remove = json!([{"type": "remove-module", "subject": "Ledger"}]);
+    let error = checkout.edit_refused(&checkout.request(remove), "REFERENCED_BY_FLOW");
+    assert_eq!(error["details"]["flows"], json!([flow]));
+    assert_eq!(error["details"]["steps"], json!([]));
+    checkout.edited(json!([
+        {"type": "edit-flow", "subject": flow, "clear": ["participants"]},
+        {"type": "remove-module", "subject": "Ledger"},
+    ]));
+    assert_eq!(
+        checkout.ok(&["read", "--flow", flow])["flow"].get("participants"),
+        None
+    );
+    assert_eq!(lifelines(&checkout.render(&["--flow", flow])), first_use);
+}
+
+#[test]
+fn relationship_traffic_is_edited_read_compared_and_drawn() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let q = |id: &str| format!("{model}#{id}");
+    let traffic =
+        json!({"protocol": "HTTPS", "sync": "sync", "rate": "50/s", "payload": "order JSON"});
+    checkout.edited(json!([
+        {"type": "edit-relationship", "subject": q("RelWeb01"), "set": {"traffic": traffic}},
+    ]));
+    let file = checkout.read_module("WebApp01");
+    assert_eq!(file["outgoing"][0]["traffic"], traffic);
+    let read = checkout.ok(&["read"]);
+    let listed = read["relationships"].as_array().unwrap();
+    let web = listed.iter().find(|r| r["id"] == q("RelWeb01")).unwrap();
+    assert_eq!(web["traffic"], traffic);
+    let (_, text) = checkout.run_raw(&["read", "--format", "markdown"]);
+    let line = format!(
+        "  Web -> Billing [http] charges (HTTPS, sync, 50/s, order JSON) {}\n",
+        q("RelWeb01")
+    );
+    assert!(text.contains(&line), "{text}");
+    let svg = checkout.render(&[]);
+    assert!(
+        svg.contains(">charges (HTTPS, sync, 50/s, order JSON)</text>"),
+        "{svg}"
+    );
+    assert!(svg.contains(">Call</text>"), "{svg}");
+
+    let (_, schema) = checkout.run(&["schema", "module"]);
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    assert!(validator.is_valid(&file));
+    for bad in [
+        json!({}),
+        json!({"sync": "later"}),
+        json!({"colour": "red"}),
+    ] {
+        let mut changed = file.clone();
+        changed["outgoing"][0]["traffic"] = bad.clone();
+        assert!(!validator.is_valid(&changed), "{bad}");
+    }
+    let empty = checkout.request(json!([
+        {"type": "add-relationship", "source": "Billing", "relationship": {"to": "Web", "kind": "event", "order": 1, "traffic": {}}},
+    ]));
+    let error = checkout.edit_refused(&empty, "MODEL_INVALID");
+    assert_eq!(
+        error["details"]["problems"][0]["message"],
+        "traffic needs at least one field"
+    );
+
+    let id = propose(&checkout, "Next", "current");
+    edited_proposal(
+        &checkout,
+        &id,
+        json!([{"type": "edit-relationship", "subject": q("RelWeb01"), "set": {"traffic": {"protocol": "gRPC"}}}]),
+    );
+    let compared = checkout.ok(&["compare", &id]);
+    assert_eq!(
+        compared["relationships"]["changed"],
+        json!([{"id": q("RelWeb01"), "name": "charges", "fields": ["traffic"]}])
+    );
+
+    checkout.edited(json!([
+        {"type": "edit-relationship", "subject": q("RelWeb01"), "clear": ["traffic"]},
+    ]));
+    assert_eq!(
+        checkout.read_module("WebApp01")["outgoing"][0].get("traffic"),
+        None
+    );
+}
+
+#[test]
+fn a_message_step_anchor_is_read_back_and_checked_against_the_code() {
+    let checkout = Checkout::new();
+    typescript(&checkout);
+    shop(&checkout);
+    let ids = add_checkout(&checkout);
+    let (place, charge) = (&ids[2], &ids[5]);
+    let page = json!({"path": "src/web/index.ts", "symbol": "page"});
+    checkout.edited(json!([
+        {"type": "edit-step", "subject": place, "set": {"anchor": page}},
+        {"type": "edit-step", "subject": charge, "set": {"anchor": {"path": "src/billing/gone.ts", "symbol": "pay"}}},
+    ]));
+    let read = checkout.ok(&["read", "--flow", &ids[1]]);
+    assert_eq!(read["flow"]["steps"][0]["anchor"], page);
+    let (code, out) = checkout.run(&["check", "--only", "code"]);
+    assert_eq!(code, 1, "{out:#}");
+    assert_eq!(
+        found(&out),
+        [format!("ANCHOR_PATH_MISSING {}", local(charge))]
+    );
+    checkout.edited(json!([{"type": "edit-step", "subject": charge, "clear": ["anchor"]}]));
+    let out = checkout.ok(&["check", "--only", "code"]);
+    assert_eq!(out["passed"], true, "{out:#}");
+}
+
+#[test]
+fn a_vault_written_before_traffic_anchors_and_participants_loads_unchanged() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let collection = json!({"schema_version": 1, "id": "Coll0001", "name": "Orders", "order": 0,
+    "flows": [{"id": "Flow0001", "name": "Refund", "order": 0, "steps": [
+        {"kind": "message", "id": "Step0001", "from": format!("{model}#Billing1"),
+         "to": format!("{model}#BankApi1"), "label": "refund",
+         "relationship": format!("{model}#RelBil01")},
+    ]}]});
+    let path = "collections/Coll0001.collection.json";
+    checkout.write(path, &serde_json::to_string_pretty(&collection).unwrap());
+    let digest_of = |read: &Value, path: &str| -> Value {
+        let files = read["revision"]["files"].as_array().unwrap();
+        files.iter().find(|f| f["path"] == path).unwrap()["sha256"].clone()
+    };
+    let before = checkout.ok(&["read"]);
+    let read = checkout.ok(&["read", "--flow", "Refund"]);
+    assert_eq!(read["flow"].get("participants"), None);
+    assert_eq!(read["flow"].get("summary"), None);
+    checkout.run(&["check", "--only", "semantic"]);
+    checkout.render(&["--flow", "Refund"]);
+    assert_eq!(checkout.ok(&["read"])["revision"], before["revision"]);
+
+    checkout.edited(json!([
+        {"type": "edit-module", "subject": "Bank", "set": {"responsibility": "Moves money"}},
+    ]));
+    let after = checkout.ok(&["read"]);
+    for untouched in [
+        path,
+        "modules/WebApp01.module.json",
+        "modules/Billing1.module.json",
+    ] {
+        assert_eq!(
+            digest_of(&after, untouched),
+            digest_of(&before, untouched),
+            "{untouched}"
+        );
+    }
+    checkout.edited(json!([{"type": "edit-flow", "subject": "Refund", "set": {"order": 1}}]));
 }
 
 /// A checkout with an initial commit and a local identity, so checkpoints can be committed.

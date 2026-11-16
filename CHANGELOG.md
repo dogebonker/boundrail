@@ -45,8 +45,26 @@
   and `--png` with `--scale` and `--region`. `--format json` adds the revision, width, height,
   module and relationship IDs drawn, the SVG's SHA-256, and `fallbacks: {routes, labels}`; a note on
   stderr names any fallback. A dark or auto theme in a PNG depends on the rasterizer's CSS support.
+- Relationship `traffic`: an optional `{protocol, sync, rate, payload}` (`sync` is `sync` or
+  `async`; at least one field), set and cleared through `edit-relationship`, shown by `model read`,
+  a changed field in `model compare`, and drawn in brackets after the label of an arrow that
+  stands for one relationship.
+- Message step `anchor`: the same `{path, symbol}` as a relationship's, set and cleared through
+  `add-step` and `edit-step`; the code check reports `ANCHOR_PATH_MISSING` and
+  `ANCHOR_SYMBOL_MISSING` for it with the step as subject.
+- Flow `participants`: an optional ordered list of modules, set and cleared through `add-flow` and
+  `edit-flow`. The sequence view draws them first in that order, a listed module no step uses
+  included, then the other modules in first-use order. A participant that is not a module refuses
+  `SUBJECT_NOT_FOUND`, and removing a listed module refuses `REFERENCED_BY_FLOW` with the flow in
+  `details.flows`.
+- A vault that uses `traffic`, `participants` or step `anchor` cannot be read by a binary older
+  than this change, which refuses the unknown fields.
 
 ### Changed
+
+- `add-flow` without a non-blank `summary` refuses `FLOW_SUMMARY_REQUIRED` (exit 2), and
+  `edit-flow` cannot clear or blank one. Flows written before keep loading and keep raising
+  `FLOW_SUMMARY_MISSING`.
 
 - The new layout changes the bytes of every architecture picture, so existing pictures report
   stale until `model pictures --write` draws them again.

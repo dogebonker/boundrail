@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Serialize;
 use serde_json::json;
 
-use super::{Model, Problems, check_file, check_name, check_text};
+use super::{Model, Problems, check_anchor, check_file, check_name, check_text};
 use crate::arch::types::{
     BRANCHES_MIN, Collection, DESCRIPTION_MAX, FLOW_STEPS_MAX, Flow, LABEL_MAX, Module,
     NESTING_MAX, Picture, REPEAT_MIN, SUMMARY_MAX, Step, Walkthrough, walk,
@@ -127,6 +127,23 @@ fn check_flow(file: &str, flow: &Flow, ends: Option<&Ends>, problems: &mut Probl
         true,
     );
     check_former_names(problems, file, id, &flow.former_names);
+    let mut listed = BTreeSet::new();
+    for participant in &flow.participants {
+        if !listed.insert(participant) {
+            problems.push(
+                file,
+                id,
+                format!("participant {participant} is listed twice"),
+            );
+        }
+        if ends.is_some_and(|e| !e.modules.contains(participant)) {
+            problems.push(
+                file,
+                id,
+                format!("participant {participant} is not a module"),
+            );
+        }
+    }
     let steps = walk(&flow.steps);
     if steps.len() > FLOW_STEPS_MAX {
         let message = format!("has {} steps, more than {FLOW_STEPS_MAX}", steps.len());
@@ -141,7 +158,15 @@ fn check_step(file: &str, step: &Step, depth: usize, ends: Option<&Ends>, proble
     let id = step.id();
     check_label(problems, file, id, step.label());
     match step {
-        Step::Message { repeat, note, .. } => {
+        Step::Message {
+            repeat,
+            note,
+            anchor,
+            ..
+        } => {
+            if let Some(anchor) = anchor {
+                check_anchor(problems, file, id, anchor);
+            }
             if repeat.is_some_and(|n| n < REPEAT_MIN) {
                 problems.push(file, id, format!("repeat needs at least {REPEAT_MIN}"));
             }
@@ -302,6 +327,8 @@ pub struct FlowView<'a> {
     pub summary: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<&'a str>,
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    pub participants: &'a [String],
     pub steps: Vec<Step>,
 }
 
@@ -353,6 +380,7 @@ impl Model {
             order: flow.order,
             summary: flow.summary.as_deref(),
             description: flow.description.as_deref(),
+            participants: &flow.participants,
             steps,
         }
     }

@@ -55,7 +55,7 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 | T21 | Render quality and options: edges route around boxes when a grid path exists, else take the T9 bend; labels avoid each other and boxes when there is room, else sit at the middle of the middle segment; `--focus`, `--hide-kind`, legend, `--theme auto`; JSON receipt with dimensions, placed IDs, digest and fallback counts; direct PNG with `--scale` and `--region` | done |
 | T22 | Model-side inspect: entry points, hidden parts, callers, outgoing, pass-through, container relationships and measures read from the model, `--checkpoint`, and `inspect --group` | done |
 | T23 | Compare: interface changes and interface measures between states, `--beside` alternatives, `--against` a checkpoint | done |
-| T24 | Schema: relationship traffic, step anchors, authored flow participant order, flow summary required on write (`FLOW_SUMMARY_REQUIRED`) | open |
+| T24 | Schema: relationship traffic, step anchors, authored flow participant order, flow summary required on write (`FLOW_SUMMARY_REQUIRED`) | done |
 | T25 | History on every write: each edit, including in proposals, retains a checkpoint with its doing line; publication destination with per-checkpoint status; source-commit availability on checkpoint reads | open |
 | T26 | Proposal metadata: summary, linked documents, rename and edit through `set`, select by unique name; walkthroughs authored inside proposals | open |
 | T27 | Proposal families: child proposals of a draft, family reconcile, standing, settle conflicts by mine, theirs or edited; `INHERITANCE_DROPPED` and `PART_RECREATED` confirmations | open |
@@ -1111,3 +1111,27 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   `entry points/hidden parts/callers/outgoing/depth` or `-`. No ranking is computed: which counts
   matter depends on the design question. An unknown `--beside` refuses as an unknown proposal
   does. `/api/compare` passes neither flag.
+- T24: every new field is optional and left out of a file when absent, so a vault written before
+  T24 loads, reads and digests as it did, and an edit rewrites only the files it changes.
+  Relationship `traffic` is `{protocol?, sync?, rate?, payload?}`: `sync` is `sync` or `async`,
+  the others one line of 1 to 60 characters, and at least one field is given (`MODEL_INVALID`
+  otherwise). `edit-relationship` sets it whole and clears it as `traffic`; `model compare` reports
+  it as one field. The architecture view appends `(protocol, sync, rate, payload)`, the fields
+  given in that order, to the label of an arrow standing for one relationship; a merged
+  `Kind xN` arrow shows none. Labels are placed on the full text, so the placement rules hold.
+- T24: a message step's `anchor` reuses the relationship anchor type, `{repo?, path, symbol}` with
+  `symbol` required, so both are validated and judged by the same code: the code check reports
+  `ANCHOR_PATH_MISSING` and `ANCHOR_SYMBOL_MISSING` and the `anchor` skips with the step's
+  qualified ID as subject, worded `From -> To is anchored at` as for a relationship. A step anchor
+  on an existing path makes the check scan, as a relationship anchor does.
+- T24: a flow's `participants` are qualified module IDs, each once. Writes resolve them like
+  module subjects (`SUBJECT_NOT_FOUND` for an unknown one); `edit-flow` sets the list whole and
+  clears it as `participants`. Removing a listed module refuses `REFERENCED_BY_FLOW` with the
+  flow in `details.flows` beside `details.steps`, unless the batch edits that flow, which
+  validation then judges. The sequence view draws the listed modules first, in order, a listed
+  module no step uses included, then the other message ends in first-use order; the render
+  receipt's modules follow the same order. The flowchart ignores the list.
+- T24: `add-flow` without a summary, or with a blank one, refuses `FLOW_SUMMARY_REQUIRED`, as do
+  `edit-flow` clearing it and setting it blank. The check runs after the collection or flow resolves, so a missing subject refuses `SUBJECT_NOT_FOUND` first. Other
+  writes to a flow without a summary still apply, and the semantic check keeps reporting it as
+  `FLOW_SUMMARY_MISSING`.

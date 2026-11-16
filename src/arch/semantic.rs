@@ -485,6 +485,7 @@ mod tests {
             label: None,
             description: None,
             emphasis: None,
+            traffic: None,
             anchor: None,
         });
     }

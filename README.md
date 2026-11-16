@@ -56,6 +56,12 @@ inspect` reports each module's interface from the code; `model locality` reads G
 modules that change together; `model render` draws the model as SVG. `boundrail model --help`
 lists every command. [Design notes](docs/plans/architecture-model.md).
 
+A relationship may describe its `traffic` (`protocol`, `sync` or `async`, `rate`, `payload`),
+which reads, compares and draws after its label. A message step may name the code that sends it
+in an `anchor` (`path` and `symbol`), which `model check` verifies like a relationship's. A flow
+needs a one-line `summary` when it is added, and may list `participants`, the modules its
+sequence diagram draws first, in order.
+
 ### Rendering
 
 `model render` draws the architecture, or a flow as a sequence diagram or flowchart. Arrows route

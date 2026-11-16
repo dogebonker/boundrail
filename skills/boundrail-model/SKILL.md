@@ -62,7 +62,8 @@ command prints JSON; add `--format markdown` for a readable summary. A refusal p
   `symbol` for one exported name. A container's binding holds its parts' bindings.
 - A relationship of kind `call` or `render` needs import or call evidence. Other kinds are
   supported by evidence when the code shows it and skipped otherwise. An `anchor` (`path` and
-  `symbol`) pins a relationship to the code site that carries it.
+  `symbol`) pins a relationship to the code site that carries it. `traffic` (`protocol`, `sync`,
+  `rate`, `payload`) says what runs over it.
 - Draw what the code does. When the code and the model disagree, decide which one is wrong and
   say so; never draw a relationship only to silence a warning.
 - `model check --language-servers` runs language servers from the checkout. Use it only on a
@@ -84,7 +85,9 @@ Other codes explain themselves in their message. `skips` list what the check cou
 ## Flows, walkthroughs and pictures
 
 - A flow lives in a collection: `add-collection`, then `add-flow` with its steps. A message step
-  names two modules; `MESSAGE_UNDRAWN` means no relationship covers it. Give each flow a summary.
+  names two modules; `MESSAGE_UNDRAWN` means no relationship covers it. Every `add-flow` needs a
+  one-line `summary` saying what the flow does. Put the sending code in a message's `anchor`, and
+  list a flow's `participants` to fix the order of its sequence diagram.
 - A walkthrough is ordered beats, each with a narration and a reading (what to draw). Preview a
   beat with `boundrail model render --walkthrough <id> --beat <n> --output <file.svg>`.
 - A picture is a reading with an `output` path (`.svg` or `.png`) outside `.boundrail`. Draw stale
@@ -108,7 +111,8 @@ claim ID in every edit. List claims with `boundrail model claims`. Release yours
 | `SUBJECT_NOT_FOUND`, `SUBJECT_AMBIGUOUS` | Name the subject by its ID. |
 | `TARGET_MISMATCH` | `target` names another model or state. Copy it from `model read`. |
 | `CHILDREN_ORPHANED` | Remove or reparent the parts in the same batch. |
-| `REFERENCED_BY_FLOW`, `REFERENCED_BY_WALKTHROUGH`, `REFERENCED_BY_PICTURE` | Edit or remove the steps, beats or pictures in `details` in the same batch. |
+| `REFERENCED_BY_FLOW`, `REFERENCED_BY_WALKTHROUGH`, `REFERENCED_BY_PICTURE` | Edit or remove the steps, flows, beats or pictures in `details` in the same batch. |
+| `FLOW_SUMMARY_REQUIRED` | Give the flow a one-line `summary` that says what it does; `edit-flow` cannot clear it. |
 | `OPERATION_REUSED` | That `operation_id` applied a different request. Use a new one. |
 | `CLAIM_CONFLICT` | Another writer holds a subject. Wait for the release, or ask a person; revoke only when a person says so. |
 | `CLAIM_INCOMPLETE` | Extend your claim to every subject the batch touches. |

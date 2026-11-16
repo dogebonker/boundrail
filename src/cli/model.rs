@@ -2014,7 +2014,7 @@ impl Checked {
 /// The model's checkout and its scan, made only when a binding or anchor names code there.
 fn scan_checkout(model: &Model) -> Result<(PathBuf, Result<Document, NoScan>)> {
     let checkout = checkpoint::checkout(&model.dir)?;
-    let doc = if code::needs_scan(&model.modules, &checkout) {
+    let doc = if code::needs_scan(&model.modules, &model.collections, &checkout) {
         live_scan(&checkout)
     } else {
         Err(NoScan::NotNeeded)
@@ -2055,7 +2055,7 @@ fn read_infra(checkout: &Path) -> Infra {
 fn code_check(model: &Model, language_servers: bool, scan: &SharedScan) -> Result<CodeReport> {
     let checkout = checkpoint::checkout(&model.dir)?;
     let checkout = checkout.as_path();
-    let doc = if code::needs_scan(&model.modules, checkout) {
+    let doc = if code::needs_scan(&model.modules, &model.collections, checkout) {
         (scan.get_or_init(|| live_scan(checkout)).as_ref()).map_err(Clone::clone)
     } else {
         Err(NoScan::NotNeeded)
@@ -2065,7 +2065,7 @@ fn code_check(model: &Model, language_servers: bool, scan: &SharedScan) -> Resul
     let lsp = language_server_facts(model, checkout, scanned, &infra, language_servers)?;
     Ok(code::check(
         &model.manifest.id,
-        &model.modules,
+        (&model.modules, &model.collections),
         &model.config,
         checkout,
         doc,
@@ -3515,7 +3515,14 @@ fn print_flow(model: &Model, collection: &Collection, flow: &Flow) {
     if let Some(summary) = &flow.summary {
         println!("{summary}");
     }
-    print_steps(&names(model), &flow.steps, 0);
+    let names = names(model);
+    if !flow.participants.is_empty() {
+        let listed: Vec<&str> = (flow.participants.iter())
+            .map(|m| name_of(&names, m))
+            .collect();
+        println!("Participants: {}", listed.join(", "));
+    }
+    print_steps(&names, &flow.steps, 0);
 }
 
 fn print_steps(names: &BTreeMap<String, &str>, steps: &[Step], depth: usize) {
@@ -3567,11 +3574,14 @@ fn print_module(module: &ModuleView<'_>, depth: usize) {
 
 fn print_relationship(names: &BTreeMap<String, &str>, r: &RelationshipView<'_>) {
     println!(
-        "  {} -> {} [{}]{} {}",
+        "  {} -> {} [{}]{}{} {}",
         name_of(names, &r.from),
         name_of(names, r.to),
         r.kind,
         r.label.map(|l| format!(" {l}")).unwrap_or_default(),
+        (r.traffic)
+            .map(|t| format!(" ({})", t.text()))
+            .unwrap_or_default(),
         r.id
     );
 }

@@ -422,6 +422,31 @@ mod tests {
     }
 
     #[test]
+    fn traffic_participants_and_step_anchors_are_changed_fields() {
+        let call = |traffic: Value| json!([{"id": "Rel00001", "to": q("ApiSrv01"), "kind": "call", "order": 0, "traffic": traffic}]);
+        let before = modules(
+            json!([{"id": "WebApp01", "name": "Web", "outgoing": call(json!({"protocol": "HTTPS"}))}]),
+        );
+        let after = modules(
+            json!([{"id": "WebApp01", "name": "Web", "outgoing": call(json!({"protocol": "HTTPS", "sync": "async"}))}]),
+        );
+        let mut anchored = message("Step0001", "ask");
+        anchored["anchor"] = json!({"path": "src/web.ts", "symbol": "ask"});
+        let was = collections(
+            json!([{"id": "Flow0001", "name": "Checkout", "order": 0, "steps": [message("Step0001", "ask")]}]),
+        );
+        let now = collections(json!([{"id": "Flow0001", "name": "Checkout", "order": 0,
+            "participants": [q("ApiSrv01")], "steps": [anchored]}]));
+        let comparison = compare(M, (&before, &was), (&after, &now));
+        let fields = |changes: &Changes| -> Vec<Vec<String>> {
+            changes.changed.iter().map(|e| e.fields.clone()).collect()
+        };
+        assert_eq!(fields(&comparison.relationships), [["traffic"]]);
+        assert_eq!(fields(&comparison.flows), [["participants"]]);
+        assert_eq!(fields(&comparison.steps), [["anchor"]]);
+    }
+
+    #[test]
     fn flows_and_steps_compare_on_their_own_fields_and_places() {
         let mods = modules(json!([]));
         let before = collections(

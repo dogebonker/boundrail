@@ -10,7 +10,7 @@ mod sequence;
 mod svg;
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Write as _;
 
 use super::compare::{self, Changes, Comparison, Entry};
@@ -531,12 +531,15 @@ pub fn render(
                 Some((before, c)) => with_removed_steps(id, flow, before, &c.steps),
                 None => Cow::Borrowed(flow.steps.as_slice()),
             };
-            let svg = match view {
-                View::Sequence(_) => sequence::render(&context, &steps),
-                _ => flowchart::render(&context, &steps),
+            let (svg, shown) = match view {
+                View::Sequence(_) => {
+                    let names = lineup(&flow.participants, &steps);
+                    (sequence::render(&context, &names, &steps), names)
+                }
+                _ => (flowchart::render(&context, &steps), participants(&steps)),
             };
-            let shown = participants(&steps).into_iter().map(str::to_owned);
-            (svg, shown.collect(), Vec::new(), Fallbacks::default())
+            let shown = shown.into_iter().map(str::to_owned).collect();
+            (svg, shown, Vec::new(), Fallbacks::default())
         }
     };
     let (_, _, width, height) = svg.frame();
@@ -798,6 +801,19 @@ fn participants(steps: &[Step]) -> Vec<&str> {
                     order.push(end);
                 }
             }
+        }
+    }
+    order
+}
+
+/// The modules `listed` in order, then every other message end of `steps` in first-appearance
+/// order.
+pub(super) fn lineup<'a>(listed: &'a [String], steps: &'a [Step]) -> Vec<&'a str> {
+    let mut order: Vec<&str> = listed.iter().map(String::as_str).collect();
+    let mut seen: HashSet<&str> = order.iter().copied().collect();
+    for end in participants(steps) {
+        if seen.insert(end) {
+            order.push(end);
         }
     }
     order

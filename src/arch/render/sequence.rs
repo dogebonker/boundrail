@@ -1,4 +1,5 @@
-//! The sequence view of a flow: a lifeline per module in first-appearance order, messages top to
+//! The sequence view of a flow: a lifeline per module, the flow's participants first and then
+//! the other modules its messages use in first-appearance order, messages top to
 //! bottom, decisions as alt frames with a section per branch, loops as loop frames, and notes in
 //! boxes beside their message.
 
@@ -81,7 +82,7 @@ impl Frame<'_> {
 /// The diagram under construction: the lifeline columns and how far down the steps reach.
 struct Lanes<'a> {
     ctx: &'a Context<'a>,
-    /// Participants in first-appearance order, each with its lifeline's x.
+    /// Participants in drawing order, each with its lifeline's x.
     columns: Vec<(&'a str, f64)>,
     x: BTreeMap<&'a str, f64>,
     col: f64,
@@ -90,12 +91,11 @@ struct Lanes<'a> {
     y: f64,
 }
 
-pub(super) fn render(ctx: &Context<'_>, steps: &[Step]) -> Svg {
-    let names = participants(steps);
+pub(super) fn render(ctx: &Context<'_>, names: &[&str], steps: &[Step]) -> Svg {
     let col = (names.iter())
         .map(|id| text_width(ctx.name(id)) + COL_GAP)
         .fold(COL_MIN, f64::max);
-    let columns: Vec<(&str, f64)> = (names.into_iter().enumerate())
+    let columns: Vec<(&str, f64)> = (names.iter().copied().enumerate())
         .map(|(k, id)| (id, MARGIN + col * (k as f64 + 0.5)))
         .collect();
     let mut lanes = Lanes {
@@ -184,6 +184,7 @@ impl Lanes<'_> {
                     emphasis,
                     repeat,
                     note,
+                    anchor: _,
                 } => self.message(&Message {
                     id,
                     from,

@@ -11,7 +11,7 @@ use super::{
     text_width,
 };
 use crate::arch::index::Index;
-use crate::arch::types::{EXTERNAL_KIND, Emphasis, Module};
+use crate::arch::types::{EXTERNAL_KIND, Emphasis, Module, Traffic};
 
 const BOX_MIN_W: f64 = 120.0;
 const BOX_H: f64 = 50.0;
@@ -51,6 +51,7 @@ struct Arrow<'a> {
     ids: Vec<String>,
     kind: &'a str,
     label: Option<&'a str>,
+    traffic: Option<&'a Traffic>,
     count: usize,
     hero: bool,
     muted: bool,
@@ -262,6 +263,7 @@ fn arrows<'a>(ctx: &Context<'_>, modules: &'a [Module], visible: &Visible<'_>) -
                     id,
                     kind: &r.kind,
                     label: r.label.as_deref(),
+                    traffic: r.traffic.as_ref(),
                     count: 1,
                     hero,
                     muted,
@@ -313,12 +315,17 @@ fn draw_box(svg: &mut Svg, ctx: &Context<'_>, rect: &Rect, visible: &Visible<'_>
     svg.close_group();
 }
 
+/// The relationship's label, else its kind name, with its traffic in brackets; `Kind xN` for an
+/// arrow standing for several.
 fn arrow_text(ctx: &Context<'_>, arrow: &Arrow<'_>) -> String {
     let kind = ctx.relationship_name(arrow.kind);
-    match (arrow.count, arrow.label) {
-        (1, Some(label)) => label.to_owned(),
-        (1, None) => kind.to_owned(),
-        (n, _) => format!("{kind} x{n}"),
+    let text = match arrow.count {
+        1 => arrow.label.unwrap_or(kind),
+        n => return format!("{kind} x{n}"),
+    };
+    match arrow.traffic {
+        Some(traffic) => format!("{text} ({})", traffic.text()),
+        None => text.to_owned(),
     }
 }
 

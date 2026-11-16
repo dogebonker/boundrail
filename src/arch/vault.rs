@@ -15,7 +15,8 @@ use serde_json::json;
 use super::revision::{self, Revision};
 use super::types::{
     Anchor, Binding, Collection, DESCRIPTION_MAX, Emphasis, LABEL_MAX, Manifest, Module, Picture,
-    Proposal, RESPONSIBILITY_MAX, Relationship, SCHEMA_VERSION, State, VaultConfig, Walkthrough,
+    Proposal, RESPONSIBILITY_MAX, Relationship, SCHEMA_VERSION, State, Traffic, VaultConfig,
+    Walkthrough,
 };
 use super::{Code, Refusal, ids, one_line, state};
 use crate::files::{hash, refuse_symlink, write_atomic};
@@ -1053,11 +1054,11 @@ fn check_module(
             &r.id,
         );
         description(problems, r.description.as_deref(), &r.id);
-        if let Some(a) = &r.anchor {
-            text(problems, "anchor repo", a.repo.as_deref(), None, &r.id);
-            text(problems, "anchor path", Some(&a.path), None, &r.id);
-            check_path(problems, file, &r.id, "anchor path", &a.path);
-            text(problems, "anchor symbol", Some(&a.symbol), None, &r.id);
+        if let Some(traffic) = &r.traffic {
+            check_traffic(problems, file, &r.id, traffic);
+        }
+        if let Some(anchor) = &r.anchor {
+            check_anchor(problems, file, &r.id, anchor);
         }
     }
     let Some(config) = config else {
@@ -1086,6 +1087,34 @@ fn check_module(
                 &r.id,
                 format!("kind `{}` is not a relationship kind in {CONFIG}", r.kind),
             );
+        }
+    }
+}
+
+fn check_anchor(problems: &mut Problems, file: &str, subject: &str, anchor: &Anchor) {
+    let text = |problems: &mut Problems, field: &str, value: Option<&str>| {
+        check_text(problems, file, subject, field, value, None, false);
+    };
+    text(problems, "anchor repo", anchor.repo.as_deref());
+    text(problems, "anchor path", Some(&anchor.path));
+    check_path(problems, file, subject, "anchor path", &anchor.path);
+    text(problems, "anchor symbol", Some(&anchor.symbol));
+}
+
+/// Traffic gives at least one field, each one line of 1 to `LABEL_MAX` characters.
+fn check_traffic(problems: &mut Problems, file: &str, subject: &str, traffic: &Traffic) {
+    let fields = [
+        ("protocol", traffic.protocol.as_deref()),
+        ("rate", traffic.rate.as_deref()),
+        ("payload", traffic.payload.as_deref()),
+    ];
+    if traffic.sync.is_none() && fields.iter().all(|(_, value)| value.is_none()) {
+        problems.push(file, subject, "traffic needs at least one field");
+    }
+    for (field, value) in fields {
+        if value.is_some_and(|v| !one_line(v, LABEL_MAX)) {
+            let message = format!("traffic {field} needs one line of 1 to {LABEL_MAX} characters");
+            problems.push(file, subject, message);
         }
     }
 }
@@ -1212,6 +1241,8 @@ pub struct RelationshipView<'a> {
     pub description: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub emphasis: Option<Emphasis>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub traffic: Option<&'a Traffic>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub anchor: Option<&'a Anchor>,
 }
@@ -1369,6 +1400,7 @@ impl Model {
             label: r.label.as_deref(),
             description: r.description.as_deref(),
             emphasis: r.emphasis,
+            traffic: r.traffic.as_ref(),
             anchor: r.anchor.as_ref(),
         }
     }
@@ -1478,6 +1510,63 @@ mod tests {
 }
 "#
         );
+    }
+
+    /// Files written before relationship traffic, step anchors and flow participants existed
+    /// read and write back byte for byte, so their digests hold.
+    #[test]
+    fn files_without_the_newer_optional_fields_round_trip_unchanged() {
+        let module = r#"{
+  "schema_version": 1,
+  "id": "Mod00001",
+  "name": "Billing",
+  "kind": "service",
+  "order": 2,
+  "groups": [],
+  "former_names": [],
+  "outgoing": [
+    {
+      "id": "Rel00001",
+      "to": "Mdl00001#Mod00002",
+      "kind": "call",
+      "order": 0,
+      "label": "charges",
+      "anchor": {
+        "path": "src/billing.ts",
+        "symbol": "charge"
+      }
+    }
+  ]
+}
+"#;
+        let collection = r#"{
+  "schema_version": 1,
+  "id": "Coll0001",
+  "name": "Orders",
+  "order": 0,
+  "flows": [
+    {
+      "id": "Flow0001",
+      "name": "Checkout",
+      "order": 0,
+      "steps": [
+        {
+          "kind": "message",
+          "id": "Step0001",
+          "from": "Mdl00001#Mod00001",
+          "to": "Mdl00001#Mod00002",
+          "label": "charge",
+          "relationship": "Mdl00001#Rel00001"
+        }
+      ]
+    }
+  ]
+}
+"#;
+        let read: Module = serde_json::from_str(module).unwrap();
+        assert_eq!(file_json(&read).unwrap(), module);
+        let read: Collection = serde_json::from_str(collection).unwrap();
+        assert_eq!(file_json(&read).unwrap(), collection);
     }
 
     #[test]
