@@ -66,6 +66,19 @@ pub struct Document {
     /// The languages of a scan of several whose collector failed; their files are not scanned.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub scan_failures: Vec<ScanFailure>,
+    /// Each language's symbol coverage in a scan of several; empty for one language.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub symbol_languages: Vec<LanguageSymbols>,
+}
+
+/// One language's symbol coverage in a scan of several.
+#[derive(Debug, Clone, Serialize)]
+pub struct LanguageSymbols {
+    pub language: Language,
+    /// Whether the language's symbol data is complete.
+    pub complete: bool,
+    /// Its symbol limitations that name no file it scanned.
+    pub limitations: Vec<String>,
 }
 
 /// A language whose collector failed while the others' succeeded.

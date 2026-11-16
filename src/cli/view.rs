@@ -370,9 +370,7 @@ impl Server {
             "/" => asset("text/html; charset=utf-8", page::INDEX_HTML),
             "/app.js" => asset("text/javascript; charset=utf-8", page::APP_JS),
             "/style.css" => asset("text/css; charset=utf-8", page::STYLE_CSS),
-            "/font.woff2" => {
-                page::response(200, "font/woff2", page::FONT_WOFF2, &[page::LONG_CACHE])
-            }
+            "/font.woff2" => page::response(200, "font/woff2", page::FONT_WOFF2, &[]),
             "/launch" => match self.launch.redeem(request.param("c")) {
                 page::Redeem::Fresh => {
                     let location = format!("/?t={}", self.token);

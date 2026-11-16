@@ -294,6 +294,7 @@ fn build(
         target: None,
         stale_known: Vec::new(),
         scan_failures: Vec::new(),
+        symbol_languages: Vec::new(),
     };
     known::mark(&mut doc);
     if owners.is_some() {

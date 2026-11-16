@@ -7,7 +7,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::layout::{self, Boxed, Rect, Scene};
 use super::svg::{Anchor, BACKGROUND, DESCENT, FONT_SIZE, Font, Point, Style, Svg};
 use super::{
-    Context, MARGIN, Mark, SOFT_INK, TITLE_H, class, label, line_style, outline, text_width,
+    Context, Fallbacks, MARGIN, Mark, SOFT_INK, TITLE_H, class, label, line_style, outline,
+    text_width,
 };
 use crate::arch::index::Index;
 use crate::arch::types::{EXTERNAL_KIND, Emphasis, Module};
@@ -62,7 +63,7 @@ pub(super) fn render(
     scope: Option<&str>,
     depth: usize,
     legend: bool,
-) -> (Svg, Vec<String>, Vec<String>) {
+) -> (Svg, Vec<String>, Vec<String>, Fallbacks) {
     let index = Index::new(ctx.model, modules);
     let roots = match scope {
         Some(scope) if index.is_container(scope) => index.parts_of(scope).to_vec(),
@@ -90,12 +91,12 @@ pub(super) fn render(
         fixed: vec![ctx.title_area()],
         rects: &rects,
     };
-    let routes = layout::routes(&scene, &pairs);
+    let (routes, bent) = layout::routes(&scene, &pairs);
     let texts: Vec<String> = arrows.iter().map(|a| arrow_text(ctx, a)).collect();
     let sizes: Vec<(f64, f64)> = (texts.iter())
         .map(|t| (text_width(t) + 2.0 * LABEL_PAD, LABEL_H))
         .collect();
-    let centers = layout::labels(&scene, &routes, &sizes);
+    let (centers, stuck) = layout::labels(&scene, &routes, &sizes);
     let mut svg = Svg::default();
     ctx.title(&mut svg);
     let lit = lit_boxes(ctx, &visible);
@@ -135,7 +136,11 @@ pub(super) fn render(
         ctx.kinds(&mut svg, &nodes, &lines);
     }
     let relationships = (arrows.into_iter()).flat_map(|a| a.ids).collect();
-    (svg, visible.ids, relationships)
+    let fallbacks = Fallbacks {
+        routes: bent,
+        labels: stuck,
+    };
+    (svg, visible.ids, relationships, fallbacks)
 }
 
 fn title_area(rect: &Rect, visible: &Visible<'_>, i: usize) -> Rect {

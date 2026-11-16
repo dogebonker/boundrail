@@ -85,6 +85,16 @@ pub struct Rendered {
     pub modules: Vec<String>,
     /// Qualified IDs of the relationships the arrows stand for.
     pub relationships: Vec<String>,
+    pub fallbacks: Fallbacks,
+}
+
+/// Arrows and labels the architecture layout could not place as it prefers; zero for flows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Fallbacks {
+    /// Routes that found no path around the boxes and took the plain bend.
+    pub routes: usize,
+    /// Labels that found no free spot and sit at the middle of their route's middle segment.
+    pub labels: usize,
 }
 
 /// How a title names the current state.
@@ -510,7 +520,7 @@ pub fn render(
         focus: Focus::new(id, &modules, options.focus),
         title: title(drawn, base),
     };
-    let (svg, drawn_modules, relationships) = match *view {
+    let (svg, drawn_modules, relationships, fallbacks) = match *view {
         View::Architecture { scope, depth } => {
             draw_architecture(&mut context, model, &modules, (scope, depth), options)?
         }
@@ -526,7 +536,7 @@ pub fn render(
                 _ => flowchart::render(&context, &steps),
             };
             let shown = participants(&steps).into_iter().map(str::to_owned);
-            (svg, shown.collect(), Vec::new())
+            (svg, shown.collect(), Vec::new(), Fallbacks::default())
         }
     };
     let (_, _, width, height) = svg.frame();
@@ -538,6 +548,7 @@ pub fn render(
         height,
         modules: drawn_modules,
         relationships,
+        fallbacks,
     })
 }
 
@@ -612,7 +623,7 @@ fn draw_architecture(
     modules: &[Module],
     (scope, depth): (Option<&str>, usize),
     options: &Options<'_>,
-) -> Result<(Svg, Vec<String>, Vec<String>), Refusal> {
+) -> Result<(Svg, Vec<String>, Vec<String>, Fallbacks), Refusal> {
     if depth == 0 {
         return Err(Refusal::new(
             Code::RequestInvalid,

@@ -5360,6 +5360,8 @@ fn render_json_is_a_receipt_of_what_it_drew() {
     let root = &svg[..svg.find('>').unwrap()];
     assert_eq!(out["width"].as_f64(), Some(number(root, "width")));
     assert_eq!(out["height"].as_f64(), Some(number(root, "height")));
+    // Every arrow found a path and every label a free spot.
+    assert_eq!(out["fallbacks"], json!({"routes": 0, "labels": 0}));
     let sorted = |list: &Value| {
         let mut ids: Vec<String> = (list.as_array().unwrap().iter())
             .map(|id| id.as_str().unwrap().to_owned())
@@ -7036,6 +7038,27 @@ fn footprint_skips_crossings_when_a_changed_file_is_of_a_failed_language() {
         error.starts_with("go: native Go metadata failed: go: broken toolchain"),
         "{error}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn inspect_reports_a_failed_language_only_for_modules_it_touches() {
+    let checkout = Checkout::new();
+    let bin = polyglot(&checkout, true);
+    let inspect = |args: &[&str]| {
+        let (code, out, _) = checkout.run_served_after(&[bin.path()], bin.path(), args);
+        assert_eq!(code, 0, "{out:#}");
+        out
+    };
+    let out = inspect(&["inspect"]);
+    let error = out["scan_error"].as_str().unwrap();
+    assert!(
+        error.starts_with("go: native Go metadata failed: go: broken toolchain"),
+        "{error}"
+    );
+    // App's code is all TypeScript, which the scan read.
+    let out = inspect(&["inspect", "WebApp01"]);
+    assert_eq!(out["scan_error"], Value::Null, "{out:#}");
 }
 
 #[test]

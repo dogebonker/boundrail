@@ -10,7 +10,7 @@ use serde::Serialize;
 
 use super::code::{self, NoScan, Ownership, SkipReason};
 use super::index::{Index, Line};
-use super::infra::Infra;
+use super::infra::{self, Infra};
 use super::lsp::Facts;
 use super::types::{Evidence, Module};
 use crate::model::Document;
@@ -24,6 +24,10 @@ pub struct InspectReport {
     pub skips: Vec<Skip>,
     /// Language servers that failed, or the config when language servers are not enabled.
     pub language_servers: Vec<code::Skip>,
+    /// The errors of the languages whose collector failed, when a reported module's code is
+    /// skipped or judged in part for it, as the code check's `SCAN_FAILED` names it.
+    #[serde(skip)]
+    pub scan_error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -76,8 +80,9 @@ pub struct Symbols {
     /// `language-server`.
     pub used: usize,
     /// Exported symbols no file outside the module imports: candidates to make internal.
-    /// `None` when the scan's symbol coverage is incomplete, as the scan's surface withholds
-    /// its could-be-internal list.
+    /// `None` when symbol coverage is incomplete, as the scan's surface withholds its
+    /// could-be-internal list; in a scan of several languages, when the coverage of the language
+    /// of a file the module owns is.
     pub unused: Option<Vec<SymbolExport>>,
     pub source: Source,
 }
@@ -129,10 +134,19 @@ pub fn inspect(
         language_servers: lsp.skips.clone(),
         ..InspectReport::default()
     };
+    let mut failed = false;
     for (id, status) in &own.status {
         if subject.is_some_and(|s| s != id) {
             continue;
         }
+        let unit = (index.by_id.get(id))
+            .and_then(|m| m.binding.as_ref())
+            .is_some_and(infra::is_unit_binding);
+        failed |= !unit
+            && match status {
+                Err(reason) => *reason == SkipReason::ScanFailed,
+                Ok(()) => own.partly_failed.contains(id),
+            };
         match status {
             Err(reason) => report.skips.push(Skip {
                 module: id.clone(),
@@ -144,6 +158,7 @@ pub fn inspect(
             }
         }
     }
+    report.scan_error = doc.filter(|_| failed).and_then(code::failed_languages);
     report
 }
 
@@ -527,6 +542,8 @@ struct Uses<'d> {
     by_file: HashMap<&'d str, Vec<&'d str>>,
     /// Whether a limitation names no scanned file, so coverage is incomplete everywhere.
     incomplete: bool,
+    /// In a scan of several languages, the files of those whose coverage is incomplete.
+    incomplete_files: HashSet<&'d str>,
     /// Scanned files referring to each definition, by its file and name, as language servers
     /// found them.
     referrers: HashMap<(&'d str, &'d str), Vec<&'d str>>,
@@ -542,6 +559,7 @@ impl<'d> Uses<'d> {
             by_name: HashMap::new(),
             by_file: HashMap::new(),
             incomplete: false,
+            incomplete_files: HashSet::new(),
             referrers: HashMap::new(),
             served: &lsp.queried,
         };
@@ -573,12 +591,28 @@ impl<'d> Uses<'d> {
             let key = (r.file.as_str(), r.name.as_str());
             uses.referrers.entry(key).or_default().push(&r.from);
         }
-        uses.incomplete = !data.complete
-            && (data.limitations.iter()).any(|l| {
-                l.split_once(':')
-                    .is_none_or(|(path, _)| !scanned.contains(path))
-            });
+        if doc.symbol_languages.is_empty() {
+            uses.incomplete = !data.complete
+                && (data.limitations.iter()).any(|l| {
+                    l.split_once(':')
+                        .is_none_or(|(path, _)| !scanned.contains(path))
+                });
+        } else {
+            let incomplete: Vec<_> = (doc.symbol_languages.iter())
+                .filter(|l| !l.complete && !l.limitations.is_empty())
+                .map(|l| l.language)
+                .collect();
+            uses.incomplete_files = (doc.files.iter())
+                .filter(|f| f.language.is_some_and(|l| incomplete.contains(&l)))
+                .map(|f| f.path.as_str())
+                .collect();
+        }
         uses
+    }
+
+    /// Whether symbol coverage is incomplete for a module owning `owned`.
+    fn incomplete_for(&self, owned: &BTreeSet<&str>) -> bool {
+        self.incomplete || owned.iter().any(|f| self.incomplete_files.contains(f))
     }
 
     /// Whether a file outside `owned` imports `export`.
@@ -628,7 +662,7 @@ fn symbols(
     Ok(Symbols {
         exported: exported.len(),
         used: exported.len() - unused.len(),
-        unused: (served || !uses.incomplete).then_some(unused),
+        unused: (served || !uses.incomplete_for(owned)).then_some(unused),
         source: if served {
             Source::LanguageServer
         } else {
@@ -641,6 +675,7 @@ fn symbols(
 mod tests {
     use super::*;
     use crate::arch::code::tests::{M, checkout, link, module, q, shop};
+    use crate::model::{Language, LanguageSymbols, ScanFailure};
     use crate::surface::{SymbolImport, SymbolTarget};
 
     fn export(file: &str, name: &str, target: &str) -> SymbolExport {
@@ -749,6 +784,106 @@ mod tests {
             .map(|s| (s.module.as_str(), s.reason))
             .collect();
         assert_eq!(skips, [(q("Loose").as_str(), SkipReason::Unbound)]);
+    }
+
+    /// A Go and TypeScript checkout: Bank is Go, whose symbols are incomplete; the rest is
+    /// TypeScript, whose symbols are complete.
+    #[test]
+    fn unused_candidates_are_withheld_only_for_modules_of_an_incomplete_language() {
+        let (dir, mut doc) = checkout();
+        let go = "Go syntax references do not resolve methods";
+        for file in doc.files.iter_mut().filter(|f| f.path.starts_with("bank/")) {
+            file.language = Some(Language::Go);
+        }
+        let refund = export("app/billing/index.ts", "refund", "app/billing/index.ts");
+        let symbols = doc.symbols.as_mut().unwrap();
+        symbols.complete = false;
+        symbols.limitations = vec![go.into()];
+        symbols.exports.push(refund.clone());
+        symbols.imports = vec![import(
+            "app/web/index.ts",
+            "app/billing/index.ts",
+            "charge",
+            "app/billing/charge.ts",
+        )];
+        doc.symbol_languages = vec![
+            LanguageSymbols {
+                language: Language::Typescript,
+                complete: true,
+                limitations: Vec::new(),
+            },
+            LanguageSymbols {
+                language: Language::Go,
+                complete: false,
+                limitations: vec![go.into()],
+            },
+        ];
+        let modules = shop();
+        let none = Facts::default();
+        let report = inspect(
+            M,
+            &modules,
+            dir.path(),
+            Ok(&doc),
+            &Infra::default(),
+            None,
+            &none,
+        );
+        let unused = |local: &str| of(&report, local).symbols.as_ref().unwrap().unused.clone();
+        assert_eq!(unused("Bank"), None);
+        assert_eq!(unused("Billing"), Some(vec![refund.clone()]));
+        assert_eq!(report.scan_error, None);
+
+        // Without per-language coverage the scan's own incompleteness withholds every list.
+        doc.symbol_languages.clear();
+        let report = inspect(
+            M,
+            &modules,
+            dir.path(),
+            Ok(&doc),
+            &Infra::default(),
+            None,
+            &none,
+        );
+        assert_eq!(
+            of(&report, "Billing").symbols.as_ref().unwrap().unused,
+            None
+        );
+    }
+
+    /// Bank's Go went unread while the TypeScript scanned: inspecting Bank names the error,
+    /// whether Bank is judged on the rest or skipped; inspecting Web, all TypeScript, does not.
+    #[test]
+    fn scan_error_names_failed_languages_when_a_reported_module_holds_their_files() {
+        let (dir, mut doc) = checkout();
+        doc.scan_failures = vec![ScanFailure {
+            language: Language::Go,
+            error: "go: broken toolchain".into(),
+            files: vec!["bank/main.go".into()],
+        }];
+        let modules = shop();
+        let run = |doc: &Document, subject: &str| {
+            let subject = q(subject);
+            inspect(
+                M,
+                &modules,
+                dir.path(),
+                Ok(doc),
+                &Infra::default(),
+                Some(&subject),
+                &Facts::default(),
+            )
+        };
+        // Bank is judged on its scanned file, but its Go went unread.
+        let bank = run(&doc, "Bank");
+        assert_eq!(bank.modules.len(), 1);
+        assert_eq!(bank.scan_error.as_deref(), Some("go: go: broken toolchain"));
+        assert_eq!(run(&doc, "Web").scan_error, None);
+
+        doc.files.retain(|f| !f.path.starts_with("bank/"));
+        let bank = run(&doc, "Bank");
+        assert_eq!(bank.skips[0].reason, SkipReason::ScanFailed);
+        assert_eq!(bank.scan_error.as_deref(), Some("go: go: broken toolchain"));
     }
 
     #[test]

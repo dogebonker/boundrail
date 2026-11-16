@@ -59,8 +59,10 @@ lists every command. [Design notes](docs/plans/architecture-model.md).
 ### Rendering
 
 `model render` draws the architecture, or a flow as a sequence diagram or flowchart. Arrows route
-around the boxes they do not connect, no two labels, and no label and box, overlap, and labels
-are drawn over the arrows. The same model always draws the same bytes.
+around the boxes they do not connect when a path exists, and otherwise take a plain bend that may
+cross a box. Labels avoid each other and the boxes when there is room, and otherwise sit at the
+middle of their arrow's middle segment. Labels are drawn over the arrows. The JSON receipt counts
+both fallbacks, and a note on stderr names them. The same model always draws the same bytes.
 
 ```sh
 # Billing and what it talks to, the rest dimmed, with a legend of the kinds drawn.
@@ -72,7 +74,8 @@ boundrail model render --hide-kind job --theme auto --output model.svg
 # A PNG at twice the size, cut to one region (x,y,w,h in picture units).
 boundrail model render --png model.png --scale 2 --region 0,0,600,400
 
-# A receipt: revision, width, height, the module and relationship IDs drawn, the SVG's digest.
+# A receipt: revision, width, height, the module and relationship IDs drawn, the SVG's digest,
+# and how many arrows and labels fell back.
 boundrail model render --format json
 ```
 

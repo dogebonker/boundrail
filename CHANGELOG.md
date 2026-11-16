@@ -37,20 +37,22 @@
   that code.
 - A module bound to a compose service, Kubernetes workload or Terraform resource is exempt from
   `CONTAINER_PARTS_OUTSIDE`, and its parts are judged against the closest ancestor bound to code.
-- `model render` routes arrows around the boxes they do not connect, gives each edge its own
-  port on a shared side, places labels where no two labels, and no label and box, meet, and
-  draws every label over the arrows. New flags: `--focus` (a module and its direct neighbours,
-  the rest dimmed), `--hide-kind`, `--legend`, `--theme light|dark|auto`, and `--png` with
-  `--scale` and `--region`. `--format json` adds the revision, width, height, module and
-  relationship IDs drawn and the SVG's SHA-256. A dark or auto theme in a PNG depends on the
-  rasterizer's CSS support.
+- `model render` routes arrows around the boxes they do not connect when a path exists, and
+  otherwise falls back to a plain bend; gives each edge its own port on a shared side; places labels
+  where no two labels, and no label and box, meet when there is room, and otherwise at the middle of
+  the arrow's middle segment; and draws every label over the arrows. New flags: `--focus` (a module
+  and its direct neighbours, the rest dimmed), `--hide-kind`, `--legend`, `--theme light|dark|auto`,
+  and `--png` with `--scale` and `--region`. `--format json` adds the revision, width, height,
+  module and relationship IDs drawn, the SVG's SHA-256, and `fallbacks: {routes, labels}`; a note on
+  stderr names any fallback. A dark or auto theme in a PNG depends on the rasterizer's CSS support.
 
 ### Changed
 
 - The new layout changes the bytes of every architecture picture, so existing pictures report
   stale until `model pictures --write` draws them again.
 - `model view` has a new interface: dark and light themes that follow the system, an embedded
-  Geist font, kind colours shared by the list, the canvas and the filters, a model summary when
+  Geist font, kind colours shared by the list, the canvas and the filters (a node kind's
+  configured `#rgb` or `#rrggbb` colour, else the palette's), a model summary when
   nothing is selected, relationships listed as rows, a text filter that dims the canvas, a
   floating walkthrough bar, and a phone layout with a drawer.
 

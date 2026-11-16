@@ -1299,6 +1299,14 @@ fn render_model(root: &Path, format: Option<ModelFormat>, args: &RenderArgs) -> 
         }
     }
     let (rendered, view) = render_svg(root, &args.spec, output)?;
+    let render::Fallbacks { routes, labels } = rendered.fallbacks;
+    if routes + labels > 0 {
+        eprintln!(
+            "note: render fallbacks: {} with no path around the boxes drawn with a plain bend, {} with no free spot placed at the middle of the route's middle segment",
+            count(routes, "arrow"),
+            count(labels, "label")
+        );
+    }
     let png = match png {
         Some(path) => {
             let framed = picture::reframe(&rendered.svg, scale, region).map_err(invalid)?;
@@ -1324,6 +1332,10 @@ fn render_model(root: &Path, format: Option<ModelFormat>, args: &RenderArgs) -> 
             "modules": rendered.modules,
             "relationships": rendered.relationships,
             "digest": boundrail::files::hash(rendered.svg.as_bytes()),
+            "fallbacks": {
+                "routes": rendered.fallbacks.routes,
+                "labels": rendered.fallbacks.labels,
+            },
             "svg": rendered.svg,
         });
         if let Some((path, _)) = &png {
@@ -2230,7 +2242,9 @@ fn inspected(root: &Path, asked: &Inspect<'_>) -> Result<Inspected> {
     let lsp = language_server_facts(&model, &checkout, scanned, &infra, asked.language_servers)?;
     let modules = &model.modules;
     let report = inspect::inspect(id, modules, &checkout, scan, &infra, subject, &lsp);
-    let scan_error = (scan_error(&doc).or(infra.error.as_deref())).map(str::to_owned);
+    let scan_error = (scan_error(&doc).map(str::to_owned))
+        .or_else(|| report.scan_error.clone())
+        .or_else(|| infra.error.clone());
     Ok(Inspected {
         model,
         checkpoint,

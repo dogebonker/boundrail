@@ -12,8 +12,6 @@ pub const STYLE_CSS: &str = include_str!("style.css");
 /// Geist, the page's one typeface: a variable font under the SIL Open Font License, whose text
 /// sits beside it in `geist-OFL.txt`.
 pub const FONT_WOFF2: &[u8] = include_bytes!("geist.woff2");
-/// How a response that never changes within one build may be cached: the font.
-pub const LONG_CACHE: (&str, &str) = ("Cache-Control", "public, max-age=31536000");
 
 /// The most a request line and its headers may take.
 pub const HEAD_MAX: usize = 16 * 1024;
@@ -259,23 +257,14 @@ impl Launch {
     }
 }
 
-/// A complete response that closes the connection. Every response forbids sniffing, and caching
-/// unless `extra` names its own Cache-Control.
+/// A complete response that closes the connection. Every response forbids caching and sniffing.
 pub fn response(status: u16, content_type: &str, body: &[u8], extra: &[(&str, &str)]) -> Vec<u8> {
-    let cached = extra
-        .iter()
-        .any(|(name, _)| name.eq_ignore_ascii_case("cache-control"));
     let mut head = format!(
         "HTTP/1.1 {status} {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
-         Connection: close\r\n{}X-Content-Type-Options: nosniff\r\n\
+         Connection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n\
          Referrer-Policy: no-referrer\r\n",
         reason(status),
-        body.len(),
-        if cached {
-            ""
-        } else {
-            "Cache-Control: no-store\r\n"
-        },
+        body.len()
     );
     for (name, value) in extra {
         head.push_str(&format!("{name}: {value}\r\n"));
@@ -476,8 +465,5 @@ mod tests {
             assert!(out.contains(&format!("{line}\r\n")), "{out}");
         }
         assert!(out.ends_with("\r\n\r\nno"));
-        let font = String::from_utf8(response(200, "font/woff2", b"f", &[LONG_CACHE])).unwrap();
-        assert!(font.contains("Cache-Control: public, max-age=31536000\r\n"));
-        assert!(!font.contains("no-store"), "one Cache-Control only: {font}");
     }
 }

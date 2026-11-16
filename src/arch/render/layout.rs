@@ -421,7 +421,8 @@ fn snap(v: f64) -> f64 {
     (v * scale).round() / scale
 }
 
-pub(super) fn routes(scene: &Scene<'_>, edges: &[(usize, usize)]) -> Vec<Vec<Point>> {
+/// Each edge's route, and how many found no path around the boxes and took the plain bend.
+pub(super) fn routes(scene: &Scene<'_>, edges: &[(usize, usize)]) -> (Vec<Vec<Point>>, usize) {
     let rects = scene.rects;
     let sides: Vec<(Side, Side)> = (edges.iter())
         .map(|&(a, b)| sides(&rects[a], &rects[b]))
@@ -462,7 +463,7 @@ pub(super) fn routes(scene: &Scene<'_>, edges: &[(usize, usize)]) -> Vec<Vec<Poi
         (a.0 - b.0).abs() + (a.1 - b.1).abs()
     };
     order.sort_by(|&x, &y| span(x).total_cmp(&span(y)).then(x.cmp(&y)));
-    let mut out = vec![Vec::new(); edges.len()];
+    let (mut out, mut bent) = (vec![Vec::new(); edges.len()], 0);
     for e in order {
         let (a, b) = edges[e];
         let (sa, sb) = sides[e];
@@ -480,10 +481,13 @@ pub(super) fn routes(scene: &Scene<'_>, edges: &[(usize, usize)]) -> Vec<Vec<Poi
                 points.push(pb);
                 simplify(points)
             }
-            None => bend(pa, pb, sa, sb),
+            None => {
+                bent += 1;
+                bend(pa, pb, sa, sb)
+            }
         };
     }
-    out
+    (out, bent)
 }
 
 fn simplify(points: Vec<Point>) -> Vec<Point> {
@@ -838,9 +842,15 @@ impl Used {
     }
 }
 
-pub(super) fn labels(scene: &Scene<'_>, routes: &[Vec<Point>], sizes: &[Point]) -> Vec<Point> {
+/// Each label's center, and how many found no free spot and sit at the middle of their route's
+/// middle segment.
+pub(super) fn labels(
+    scene: &Scene<'_>,
+    routes: &[Vec<Point>],
+    sizes: &[Point],
+) -> (Vec<Point>, usize) {
     let mut placed: Vec<Rect> = Vec::new();
-    let mut centers = Vec::with_capacity(routes.len());
+    let (mut centers, mut stuck) = (Vec::with_capacity(routes.len()), 0);
     for (k, (route, &(w, h))) in routes.iter().zip(sizes).enumerate() {
         let rect = |c: Point| Rect {
             x: c.0 - w / 2.0,
@@ -886,11 +896,12 @@ pub(super) fn labels(scene: &Scene<'_>, routes: &[Vec<Point>], sizes: &[Point]) 
                     .find(|&c| free(c, false))
             })
             .or_else(|| rings(ring_center_and_fallback).find(|&c| free(c, false)));
+        stuck += usize::from(found.is_none());
         let center = found.unwrap_or(ring_center_and_fallback);
         placed.push(rect(center));
         centers.push(center);
     }
-    centers
+    (centers, stuck)
 }
 
 fn along(a: Point, b: Point) -> Vec<Point> {
@@ -1051,7 +1062,8 @@ mod tests {
                 h: 40.0,
             },
         ];
-        let routes = routes(&scene(&rects), &[(0, 1), (1, 0)]);
+        let (routes, bent) = routes(&scene(&rects), &[(0, 1), (1, 0)]);
+        assert_eq!(bent, 0);
         assert_eq!(routes[0].first().unwrap().1, 40.0);
         assert_eq!(routes[0].last().unwrap().1, 100.0);
         // The two edges between the same boxes take different ports.
@@ -1088,7 +1100,7 @@ mod tests {
             rect(0.0, 200.0, 100.0, 40.0),
             rect(-20.0, 100.0, 140.0, 40.0),
         ];
-        let route = &routes(&scene(&rects), &[(0, 1)])[0];
+        let route = &routes(&scene(&rects), &[(0, 1)]).0[0];
         assert_eq!((route[0].1, route.last().unwrap().1), (40.0, 200.0));
         for pair in route.windows(2) {
             assert!(
@@ -1097,7 +1109,31 @@ mod tests {
             );
             assert!(!cuts(pair[0], pair[1], &rects[2]), "{route:?}");
         }
-        assert_eq!(&routes(&scene(&rects), &[(0, 1)])[0], route);
+        assert_eq!(&routes(&scene(&rects), &[(0, 1)]).0[0], route);
+    }
+
+    #[test]
+    fn a_route_with_no_path_takes_the_bend_and_is_counted() {
+        // Box 2 walls box 1 in without holding it, so no path reaches box 1.
+        let rects = [
+            rect(0.0, 0.0, 100.0, 40.0),
+            rect(0.0, 200.0, 100.0, 40.0),
+            rect(-50.0, 150.0, 200.0, 140.0),
+        ];
+        let (routes, bent) = routes(&scene(&rects), &[(0, 1)]);
+        assert_eq!(bent, 1);
+        assert_eq!(
+            routes[0],
+            [(50.0, 40.0), (50.0, 120.0), (50.0, 120.0), (50.0, 200.0)]
+        );
+    }
+
+    #[test]
+    fn a_label_with_no_free_spot_sits_mid_route_and_is_counted() {
+        let line = vec![(0.0, 0.0), (300.0, 0.0)];
+        let boxes = [rect(-5000.0, -5000.0, 10000.0, 10000.0)];
+        let (centers, stuck) = labels(&scene(&boxes), &[line], &[(80.0, 16.0)]);
+        assert_eq!((centers, stuck), (vec![(150.0, 0.0)], 1));
     }
 
     #[test]
@@ -1105,7 +1141,8 @@ mod tests {
         let line = vec![(0.0, 0.0), (300.0, 0.0)];
         let boxes = [rect(130.0, -20.0, 40.0, 40.0)];
         let sizes = [(80.0, 16.0); 3];
-        let centers = labels(&scene(&boxes), &[line.clone(), line.clone(), line], &sizes);
+        let (centers, stuck) = labels(&scene(&boxes), &[line.clone(), line.clone(), line], &sizes);
+        assert_eq!(stuck, 0);
         let placed: Vec<Rect> = (centers.iter())
             .map(|c| rect(c.0 - 40.0, c.1 - 8.0, 80.0, 16.0))
             .collect();

@@ -143,8 +143,11 @@ function toneOf(kind = '') {
   for (const c of kind) hash = (hash * 31 + c.charCodeAt(0)) >>> 0;
   return BORROWED[hash % BORROWED.length];
 }
-function paint(node, kind) {
-  node.style.setProperty('--tone', `var(--k-${toneOf(kind)})`);
+const HEX_COLOR = /^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i;
+function paint(node, kind, model = shown()) {
+  const color = model.data?.config?.['node-kinds']?.[kind]?.color;
+  const configured = typeof color === 'string' && HEX_COLOR.test(color);
+  node.style.setProperty('--tone', configured ? color : `var(--k-${toneOf(kind)})`);
   return node;
 }
 const kindDot = (kind) => paint(h('span', { class: 'dot', 'aria-hidden': 'true' }), kind);
@@ -943,7 +946,7 @@ function dress(svg, model) {
     const box = group.querySelector(':scope > rect');
     const [title, kindLine] = group.querySelectorAll(':scope > text');
     if (!kind || !box || !title) continue;
-    paint(group, kind);
+    paint(group, kind, model);
     const [x, y, width] = ['x', 'y', 'width'].map((a) => Number(box.getAttribute(a)));
     const left = x + 14;
     const titleY = kindLine ? y + 22 : Number(title.getAttribute('y'));

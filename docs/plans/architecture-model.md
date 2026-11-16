@@ -52,7 +52,7 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 | T18 | Remove scan-era code that the model does not use | done |
 | T19 | Footprint against a proposal: modules the proposal names and the branch changes, changes outside it, named but unchanged, held subjects, large changes, `--fail-outside` exit 1, exit 2 on an unreadable ref | done |
 | T20 | Check correctness: infrastructure-unit bindings exempt from `CONTAINER_PARTS_OUTSIDE`; the code check scans every language in the checkout, not one; `check --every-draft` | done |
-| T21 | Render quality and options: edges route around boxes and labels never collide; `--focus`, `--hide-kind`, legend, `--theme auto`; JSON receipt with dimensions, placed IDs and digest; direct PNG with `--scale` and `--region` | done |
+| T21 | Render quality and options: edges route around boxes when a grid path exists, else take the T9 bend; labels avoid each other and boxes when there is room, else sit at the middle of the middle segment; `--focus`, `--hide-kind`, legend, `--theme auto`; JSON receipt with dimensions, placed IDs, digest and fallback counts; direct PNG with `--scale` and `--region` | done |
 | T22 | Model-side inspect: entry points, hidden parts, callers, outgoing, pass-through, container relationships and measures read from the model, `--checkpoint`, and `inspect --group` | done |
 | T23 | Compare: interface changes and interface measures between states, `--beside` alternatives, `--against` a checkpoint | done |
 | T24 | Schema: relationship traffic, step anchors, authored flow participant order, flow summary required on write (`FLOW_SUMMARY_REQUIRED`) | open |
@@ -267,11 +267,13 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   candidates to make internal, withheld as null when symbol coverage is incomplete (not
   `complete` and a limitation naming no scanned file), as the surface withholds its
   could-be-internal list; TypeScript scans report that today, so they show counts without
-  candidates. Without symbol data `symbols` is null with `symbols_skipped`
-  `language-unsupported`; a file a symbol limitation names makes it `symbols-incomplete`. Deep
-  imports are the runtime edges `ENTRY_POINT_UNEXPOSED` reports. Incoming and outgoing entries
-  count import edges between files of two owners, type-only edges included, and list the
-  relationships drawn that way between the two or modules containing them.
+  candidates. In a scan of several languages the rule applies per language (T20): a module's
+  candidates are withheld only when a language of a file it owns is incomplete. Without symbol data
+  `symbols` is null with `symbols_skipped` `language-unsupported`; a file a symbol limitation names
+  makes it `symbols-incomplete`. Deep imports are the runtime edges `ENTRY_POINT_UNEXPOSED`
+  reports. Incoming and outgoing entries count import edges between files of two owners, type-only
+  edges included, and list the relationships drawn that way between the two or modules containing
+  them.
 - T10: `model locality` and `model footprint` map paths by binding alone, without a scan, so
   deleted files and unscanned languages count: the deepest binding in this repository that is not
   external wins (one path lookup per folder), a module bound with a symbol to a path another
@@ -340,8 +342,9 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   out of every process's arguments. The code is a second OS-random value, never the token. The first
   request naming it gets a 303 to `/?t=<token>` and spends it; an unknown or spent code gets 403.
   Connection threads run with the invoking thread's tool timeout. The page
-  (`src/arch/view/index.html`, `app.js`, `style.css`) is embedded with `include_str!`, uses no
-  framework and loads nothing from other origins, so it works offline.
+  (`src/arch/view/index.html`, `app.js`, `style.css`) is embedded with `include_str!`, and its font
+  (`geist.woff2`, served at `/font.woff2`) with `include_bytes!`; it uses no framework and loads
+  nothing from other origins, so it works offline.
 - T11: the API answers with the command outputs through the same functions the CLI prints:
   `/api/model?proposal=&checkpoint=` is `model read` (both at once refuse `REQUEST_INVALID`, 400),
   `/api/render?view=&flow=&scope=&depth=&proposal=&checkpoint=&against=` is `model render` as
@@ -367,25 +370,27 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   `lib::token`; a target with neither refuses to start. Every `/api/` request carries it as
   `t` or the `X-Boundrail-Token` header, compared in constant time, or gets 403. The page drops the
   token from the address bar once read and keeps it in the tab's session storage, so a reload works.
-  The page and its two assets carry no data and need no token. Every request must name exactly one
+  The page and its three assets carry no data and need no token. Every request must name exactly one
   Host, `127.0.0.1:<port>` or `localhost:<port>`, else 403, which stops DNS rebinding. Only GET is
   served (405 with `Allow: GET` otherwise). A request head is capped at 16 KiB (431) and must arrive
   whole within 10 s (408), however slowly it drips. At most 64 connections are served at once
   besides 16 event streams; more get 503, and a failed thread start or accept never stops the
   server. Every response sends `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`,
-  `Referrer-Policy: no-referrer` and `Connection: close`. The page's Content-Security-Policy allows
-  only its own script, style and connections; SVG is parsed with `DOMParser` and imported, never
-  run, and `/api/render` opened on its own carries `default-src 'none'; style-src 'unsafe-inline'`.
+  `Referrer-Policy: no-referrer` and `Connection: close`, the font included. The page's
+  Content-Security-Policy allows only its own script, style, font (`font-src 'self'`) and
+  connections; SVG is parsed with `DOMParser` and imported, never run, and `/api/render` opened on
+  its own carries `default-src 'none'; style-src 'unsafe-inline'`.
   The server writes nothing: every endpoint is a read the CLI already does. The hardening exception
   of T7 covers its reads too: a clean or process filter driver repository config defines may run
   when Git content-checks a working-tree entry.
-- T11: limits. ponytail: a thread per connection under the caps, fine for one person's pages; a
-  pool if many share a server. The vault watch is set at start: a vault folder deleted and made
-  again is not followed. Checks and interfaces scan the checkout on each request, as the commands
-  do, so `/api/check` and `/api/inspect` take as long as `model check` and `model inspect`;
-  checkpoints have neither. Dark mode inverts the rendered SVG with a CSS filter rather than
-  drawing it in other colors. `#<qualified module ID>` after the URL selects that module when the
-  page opens.
+- T11: limits. ponytail: a thread per connection under the caps, fine for one person's pages; a pool
+  if many share a server. The vault watch is set at start: a vault folder deleted and made again is
+  not followed. Checks and interfaces scan the checkout on each request, as the commands do, so
+  `/api/check` and `/api/inspect` take as long as `model check` and `model inspect`; checkpoints
+  have neither. The page no longer inverts the rendered SVG for dark mode: its CSS maps the
+  renderer's colours to the theme's tokens, and each kind's tone is the configured node-kind colour
+  when it is `#rgb` or `#rrggbb`, else the palette's. `#<qualified module ID>` after the URL selects
+  that module when the page opens.
 - T12: a module binds an infrastructure unit with the existing binding fields, no schema change:
   `path` names a compose, Kubernetes or Terraform file the collector reads and `symbol` names the
   unit, a compose service, a workload or `TYPE.NAME`. What a binding means is inferred from where
@@ -966,8 +971,11 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   error (`go: ...; python: ...`). A path holding scanned files beside such files is judged on
   the scanned ones and named by that `SCAN_FAILED` too, so the check fails rather than passing
   on part of the code. Only when every language fails does the whole scan fail. `inspect` sees
-  the merged scan; `footprint` skips its crossings as `scan-failed`, with each failed language's
-  error in `scan_error`, when a changed file is one of a failed language's.
+  the merged scan, with each language's `complete` and limitations naming none of its files kept
+  in `Document::symbol_languages` (empty for one language), and sets `scan_error` to the failed
+  languages' errors when a module it reports is one `SCAN_FAILED` would name; `footprint` skips
+  its crossings as `scan-failed`, with each failed language's error in `scan_error`, when a
+  changed file is one of a failed language's.
 - T20: `model check --every-draft` (not with `--proposal`) runs `run_check` on the current
   state, then on every proposal whose `proposal.json` reads as a draft or does not read, and
   prints `{"kind": "check-every-draft", "passed", "states"}` with each state's check output, or
@@ -1014,15 +1022,17 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   refuse with `--walkthrough` and `--picture`, whose readings say what to draw.
 - T21: `--format json` adds `revision` (the drawn state's digest), `width` and `height` (the
   viewBox), `modules` (boxes drawn, or a flow's participants), `relationships` (every relationship
-  an arrow stands for, empty for flows) and `digest` (SHA-256 of the SVG, computed only for the
-  receipt). `--png <file>` checks its folder as `--output` does, refuses the same file as
-  `--output`, rasterizes with the T15 discovery, writes the PNG with its source chunk after the
-  output file (before printing, when there is none), and prints nothing unless `--output` or
+  an arrow stands for, empty for flows), `digest` (SHA-256 of the SVG, computed only for the
+  receipt) and `fallbacks: {routes, labels}`, the arrows that took the T9 bend and the labels set at
+  the middle of the middle segment (zero for flows); when either is non-zero a note goes to stderr,
+  and the SVG is unchanged. `--png <file>` checks its folder as `--output` does, refuses the same
+  file as `--output`, rasterizes with the T15 discovery, writes the PNG with its source chunk after
+  the output file (before printing, when there is none), and prints nothing unless `--output` or
   `--format json` asks (the receipt adds `png`). `--scale` (default 1, at most 8) and `--region
-  x,y,w,h` (exactly four finite numbers, picture units from the top-left corner, inside the
-  picture) rewrite the root's size and viewBox before rasterizing, so every rasterizer honors
-  them. A missing or failing rasterizer refuses `REQUEST_INVALID` with `details.reason`
-  `no-rasterizer` or `rasterizer-failed`.
+  x,y,w,h` (exactly four finite numbers, picture units from the top-left corner, inside the picture)
+  rewrite the root's size and viewBox before rasterizing, so every rasterizer honors them. A missing
+  or failing rasterizer refuses `REQUEST_INVALID` with `details.reason` `no-rasterizer` or
+  `rasterizer-failed`.
 - Open after T21 and the view redesign:
   - The view's CSS keys on the renderer's hex color literals and baked opacity values. The
     renderer should emit classes or CSS variables for the note, the kind line, containers,

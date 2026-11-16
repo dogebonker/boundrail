@@ -320,6 +320,8 @@ pub(super) struct Ownership<'d> {
     pub(super) limited: HashSet<&'d str>,
     /// Infrastructure hops between two modules, as (source, target, hop).
     pub(super) hops: Vec<(String, String, &'d Hop)>,
+    /// Judged modules whose path also holds files of a language whose collector failed.
+    pub(super) partly_failed: BTreeSet<String>,
 }
 
 impl Ownership<'_> {
@@ -369,7 +371,8 @@ pub(super) fn ownership<'d>(
 ) -> Ownership<'d> {
     let (scan, _) = Scan::of(scan);
     let none = Facts::default();
-    let status = bindings(index, root, &scan, infra, &none, &mut CodeReport::default());
+    let mut report = CodeReport::default();
+    let status = bindings(index, root, &scan, infra, &none, &mut report);
     let paths = path_owners(&status);
     let hops = (joined(index, &status, infra, &paths).hops.into_iter())
         .map(|(from, to, hop)| (from.to_owned(), to.to_owned(), hop))
@@ -402,6 +405,7 @@ pub(super) fn ownership<'d>(
         deep,
         limited: scan.limited.clone(),
         hops,
+        partly_failed: report.partly_failed,
     }
 }
 
@@ -503,6 +507,15 @@ fn scan_failed(what: &str, error: &str, left: impl Fn(&str) -> bool, report: &mu
     report.warn(DiagnosticCode::ScanFailed, subjects, message);
 }
 
+/// The errors of the languages whose collector failed in `doc`, each after its language, or
+/// `None` when none failed.
+pub(super) fn failed_languages(doc: &Document) -> Option<String> {
+    let failed: Vec<String> = (doc.scan_failures.iter())
+        .map(|f| format!("{}: {}", f.language.as_str(), parse_message(&f.error)))
+        .collect();
+    (!failed.is_empty()).then(|| failed.join("; "))
+}
+
 /// The parts of a scan the check reads, empty without one.
 struct Scan<'d> {
     /// Sorted.
@@ -527,13 +540,7 @@ impl<'d> Scan<'d> {
     /// in it.
     fn of(scan: Result<&'d Document, NoScan>) -> (Self, Option<String>) {
         match scan {
-            Ok(doc) => {
-                let failed: Vec<String> = (doc.scan_failures.iter())
-                    .map(|f| format!("{}: {}", f.language.as_str(), parse_message(&f.error)))
-                    .collect();
-                let error = (!failed.is_empty()).then(|| failed.join("; "));
-                (Self::new(Ok(doc)), error)
-            }
+            Ok(doc) => (Self::new(Ok(doc)), failed_languages(doc)),
             Err(NoScan::NotNeeded) => (Self::new(Err(SkipReason::NotScanned)), None),
             Err(NoScan::Failed(error)) => (Self::new(Err(SkipReason::ScanFailed)), Some(error)),
         }
