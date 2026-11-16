@@ -474,23 +474,40 @@ enum ModelCmd {
         /// Export the model a checkpoint holds: its ID or a unique commit prefix
         #[arg(long)]
         checkpoint: Option<String>,
+        /// Add every proposal and the checkpoint history, which `model import --restore`
+        /// recreates
+        #[arg(long, conflicts_with_all = ["proposal", "checkpoint"])]
+        with_history: bool,
         /// Write to this file instead of standard output; its folder must exist, outside the
         /// model vault and the Git folder
         #[arg(long)]
         output: Option<PathBuf>,
     },
-    /// Import a bundle of this model as a new draft proposal; the current state does not change
+    /// Import a bundle of this model as a new draft proposal; the current state does not change.
+    /// With --restore, recreate the exported vault and history in a checkout that has neither
     Import {
         /// The bundle file; `-` reads standard input
         file: PathBuf,
+        /// Restore a current-state bundle into a checkout with no vault and no history: the same
+        /// model, state, module and other IDs, its proposals, and the history it carries as new
+        /// commits naming their originals in a Restored-From trailer
+        #[arg(long, conflicts_with_all = ["expected_revision", "name", "doing", "writer", "operation_id"])]
+        restore: bool,
         /// The current state's revision digest the import is for
-        #[arg(long)]
-        expected_revision: String,
+        #[arg(long, required_unless_present = "restore")]
+        expected_revision: Option<String>,
         /// The draft's name [default: the bundle's proposal or state name]
         #[arg(long)]
         name: Option<String>,
-        #[command(flatten)]
-        writing: WritingArgs,
+        /// One line saying why, 1 to 140 characters
+        #[arg(long, required_unless_present = "restore")]
+        doing: Option<String>,
+        /// Who writes; defaults to the Git author name
+        #[arg(long)]
+        writer: Option<String>,
+        /// Repeating an operation ID with the same arguments returns the same receipt
+        #[arg(long, required_unless_present = "restore")]
+        operation_id: Option<String>,
     },
     /// Push (fast-forward only) or fetch the checkpoint history on a configured Git remote, or
     /// name the remote they publish to
@@ -645,6 +662,24 @@ enum HistoryCmd {
         /// A remote `git remote` lists [default: the configured history remote, else origin]
         #[arg(long)]
         remote: Option<String>,
+    },
+    /// Correct the source commit a checkpoint recorded: a new checkpoint naming it in a Corrects
+    /// trailer, whose source readers take for it, keeping the earlier facts as its audit trail
+    Correct {
+        /// The checkpoint: its ID or a unique commit prefix
+        checkpoint: String,
+        /// The full hash of a commit this repository holds
+        #[arg(long)]
+        source: String,
+        /// One line saying why, 1 to 140 characters
+        #[arg(long)]
+        doing: String,
+        /// Who corrects it; defaults to the Git author name
+        #[arg(long)]
+        writer: Option<String>,
+        /// Repeating an operation ID with the same arguments returns the same correction
+        #[arg(long)]
+        operation_id: Option<String>,
     },
 }
 
@@ -969,30 +1004,69 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
         ModelCmd::Export {
             proposal,
             checkpoint,
+            with_history,
             output,
         } => {
             let what = match (&proposal, &checkpoint) {
                 (Some(proposal), _) => Exported::Proposal(proposal),
                 (None, Some(checkpoint)) => Exported::Checkpoint(checkpoint),
-                (None, None) => Exported::Current,
+                (None, None) => Exported::Current {
+                    history: with_history,
+                },
             };
             export_bundle(root, markdown, what, output.as_deref())
         }
         ModelCmd::Import {
             file,
-            expected_revision,
+            restore: true,
+            ..
+        } => {
+            let restored = bundle::restore(root, &read_request(Some(&file))?)?;
+            if markdown {
+                println!(
+                    "Restored model {} ({}) at {}",
+                    restored.model.name,
+                    restored.model.id,
+                    restored.vault.display()
+                );
+                println!("revision {}", restored.revision.digest);
+                println!(
+                    "{} proposal(s), {} checkpoint(s)",
+                    restored.proposals.len(),
+                    restored.checkpoints.len()
+                );
+                return Ok(());
+            }
+            let mut output = json!({ "schema": MODEL_SCHEMA, "kind": "restore", "success": true });
+            extend(&mut output, &restored)?;
+            write(None, &output)
+        }
+        ModelCmd::Import {
+            file,
+            expected_revision: Some(expected_revision),
             name,
-            writing,
+            doing: Some(doing),
+            writer,
+            operation_id: Some(operation_id),
+            ..
         } => {
             let dir = vault::locate(root)?;
             let input = read_request(Some(&file))?;
-            let writing = writing.writing(None);
+            let writing = Writing {
+                doing: &doing,
+                writer: writer.as_deref(),
+                operation_id: &operation_id,
+                claim: None,
+            };
             let (receipt, finished) =
                 bundle::import(&dir, &writing, &input, &expected_revision, name.as_deref())?;
             if let Some(scope) = &finished {
                 warn_unloadable(&dir, &[(scope, &receipt)]);
             }
             print_written(markdown, "import", &dir, &receipt, None)
+        }
+        ModelCmd::Import { .. } => {
+            anyhow::bail!("model import needs --expected-revision, --doing and --operation-id")
         }
         ModelCmd::History { command } => match command {
             HistoryCmd::Configure { remote } => {
@@ -1019,6 +1093,31 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
             HistoryCmd::Fetch { remote } => {
                 let published = checkpoint::fetch(root, remote.as_deref())?;
                 print_published(markdown, false, &published)
+            }
+            HistoryCmd::Correct {
+                checkpoint: which,
+                source,
+                doing,
+                writer,
+                operation_id,
+            } => {
+                let corrected = checkpoint::correct(
+                    root,
+                    &which,
+                    &source,
+                    &doing,
+                    writer.as_deref(),
+                    operation_id.as_deref(),
+                )?;
+                if markdown {
+                    print_checkpoint(&corrected.checkpoint);
+                    print_checkpoint(&corrected.corrected);
+                    return Ok(());
+                }
+                let mut output =
+                    json!({ "schema": MODEL_SCHEMA, "kind": "history-correct", "success": true });
+                extend(&mut output, &corrected)?;
+                write(None, &output)
             }
         },
         ModelCmd::Shelve {
@@ -3370,6 +3469,21 @@ fn print_checkpoint(checkpoint: &Checkpoint) {
         .publication
         .map_or("unknown", Publication::as_str);
     println!("  source {source} ({status}), {publication}");
+    if let Some(corrected) = &checkpoint.corrects {
+        println!("  corrects {}", escape_controls(corrected));
+    }
+    let shown = |source: &Option<String>| source.as_deref().map_or("none".into(), escape_controls);
+    for c in &checkpoint.corrections {
+        println!(
+            "  corrected by {} ({} at {}): {}; source {} -> {}",
+            escape_controls(&c.checkpoint),
+            escape_controls(&c.writer),
+            c.time,
+            escape_controls(&c.doing),
+            shown(&c.previous),
+            shown(&c.source)
+        );
+    }
 }
 
 /// Prints a journaled write's receipt inside the output envelope, with the current state's

@@ -248,6 +248,17 @@ commit lacks, and `unavailable` when no commit was recorded or this repository l
 local refs only, never the network. A write interrupted before its checkpoint landed refuses
 `RECOVERY_REQUIRED`; `boundrail model recover` retains it once.
 
+A checkpoint that recorded the wrong source commit is corrected, never rewritten: `model history
+correct <checkpoint> --source <full commit hash> --doing <why>` appends a checkpoint naming it in
+a `Corrects` trailer. Readings then show the corrected source, and the checkpoint's `corrections`
+list who corrected it, when, why and the source before. To move a whole model, proposals and
+history included, to a checkout without one, export it with its history and restore it there:
+
+```sh
+boundrail model export --with-history --output shop.bundle.json
+boundrail model import --restore shop.bundle.json     # in a checkout with no vault and no history
+```
+
 ## Explain
 
 `boundrail model explain` asks a local agent CLI about the model and prints its answer. Boundrail

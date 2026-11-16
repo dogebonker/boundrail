@@ -2,11 +2,14 @@
 //! the current state, one proposal with its base, or one checkpoint's tree, so a model state
 //! moves between clones without Git. `model export` writes one; `model import` reads one into a
 //! new draft proposal, so review and adoption stay explicit and the current state never changes.
+//! `model export --with-history` adds the proposals and the checkpoint history, and `model import
+//! --restore` recreates such a vault and history in a checkout that has neither.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::ErrorKind;
 use std::iter;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use schemars::JsonSchema;
@@ -23,7 +26,7 @@ use super::types::{
 use super::vault::{self, Model, Problem, Scope};
 use super::{Code, Refusal, checkpoint, claims, ids};
 use crate::collect::TempDir;
-use crate::files::hash;
+use crate::files::{hash, refuse_symlink};
 
 /// The `schema` every bundle names.
 pub const SCHEMA: &str = "boundrail/bundle/v1";
@@ -36,11 +39,15 @@ pub struct Bundle {
     pub schema: String,
     pub model: BundleModel,
     pub source: Source,
-    /// Each file's text by path: vault-relative for the current state and a checkpoint,
-    /// proposal-relative (`proposal.json`, `modules/...`, `base/modules/...`) for a proposal.
+    /// Each file's text by path: vault-relative for the current state (with `--with-history`
+    /// its proposals' folders too) and a checkpoint, proposal-relative (`proposal.json`,
+    /// `modules/...`, `base/modules/...`) for a proposal.
     pub files: BTreeMap<String, String>,
     /// The SHA-256 (lowercase hex) of each file's bytes, by the same paths.
     pub digests: BTreeMap<String, String>,
+    /// The checkpoint history, exported with the current state by `--with-history`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<checkpoint::Chain>,
 }
 
 /// The model a bundle belongs to.
@@ -80,7 +87,10 @@ pub enum Source {
 
 /// What `model export` exports.
 pub enum Exported<'a> {
-    Current,
+    /// The current state, and with `history` its proposals and the checkpoint history.
+    Current {
+        history: bool,
+    },
     Proposal(&'a str),
     Checkpoint(&'a str),
 }
@@ -89,12 +99,22 @@ pub enum Exported<'a> {
 type Text = (String, String, String);
 
 /// The bundle of what `what` names in the checkout around `start`. A proposal's checkpoint
-/// exports as that proposal does, with its own files.
+/// exports as that proposal does, with its own files. The current state with history takes the
+/// files of every proposal, each of which must load, and every checkpoint (see
+/// [`checkpoint::export_history`]).
 pub fn export(start: &Path, what: Exported<'_>) -> Result<Bundle> {
+    let mut history = None;
     let (model, source, files) = match what {
-        Exported::Current => {
+        Exported::Current { history: with } => {
             let model = vault::load(start)?;
-            let files = vault_files(&model.dir, &model.revision, "")?;
+            let mut files = vault_files(&model.dir, &model.revision, "")?;
+            if with {
+                for id in vault::proposals(&model.dir)? {
+                    let drawn = vault::load_proposal(model.dir.clone(), &id)?;
+                    files.extend(vault_files(&model.dir, &drawn.revision, "")?);
+                }
+                history = checkpoint::export_history(start)?;
+            }
             let state = model.manifest.current.as_ref().map(|c| c.id.clone());
             let revision = model.revision.digest.clone();
             (model, Source::Current { state, revision }, files)
@@ -151,6 +171,7 @@ pub fn export(start: &Path, what: Exported<'_>) -> Result<Bundle> {
         source,
         files: BTreeMap::new(),
         digests: BTreeMap::new(),
+        history,
     };
     for (path, sha256, text) in files {
         bundle.digests.insert(path.clone(), sha256);
@@ -203,7 +224,8 @@ fn text(path: String, sha256: String, bytes: Vec<u8>) -> Result<Text> {
 
 /// Imports the bundle `input` as a new draft of the vault folder `vault`, named `name` or after
 /// what the bundle holds. A current-state or checkpoint bundle gives its modules and collections,
-/// with the current state as predecessor and base. A proposal bundle gives its proposal's, its
+/// with the current state as predecessor and base; the proposals and history a current-state
+/// bundle carries are not imported. A proposal bundle gives its proposal's, its
 /// walkthroughs, summary and documents too, with that proposal's predecessor, base and dropped
 /// IDs, so adopting it after the current state moved refuses `PREDECESSOR_MOVED` until
 /// `model reconcile` merges the two. A beat that read the bundled proposal reads the draft. `expected` is the
@@ -271,6 +293,113 @@ pub fn import(
     })
 }
 
+/// What `model import --restore` made: the vault with its model, current revision and proposals,
+/// and the checkpoints the history ref holds, newest first.
+#[derive(Debug, Serialize)]
+pub struct Restored {
+    pub vault: PathBuf,
+    pub model: BundleModel,
+    pub revision: Revision,
+    pub proposals: Vec<String>,
+    pub checkpoints: Vec<String>,
+}
+
+/// Restores the bundle `input` of a current state, as `model export` writes it, into the checkout
+/// around `start`, which must have no vault (`VAULT_EXISTS`) and no history ref
+/// (`HISTORY_DIVERGED`). The vault gets the bundle's files as they are, so the model, state,
+/// module and every other ID stay, proposals included, and a bundled history is recreated (see
+/// [`checkpoint::rebuild`]) and put on the ref. The bundle is checked as `import` checks one, its
+/// current state must load at its source's revision, each proposal must load with its base, and
+/// nothing is written before all of it holds. Refuses `BUNDLE_INVALID` for a bundle of a proposal
+/// or a checkpoint.
+pub fn restore(start: &Path, input: &[u8]) -> Result<Restored> {
+    let dir = vault::path(start)?;
+    if fs::symlink_metadata(&dir).is_ok() {
+        return Err(vault_exists(&dir));
+    }
+    if checkpoint::history_is_local(start)? {
+        return Err(Refusal::new(
+            Code::HistoryDiverged,
+            format!(
+                "{} already holds a history; a restore needs a checkout without one",
+                checkpoint::HISTORY
+            ),
+        )
+        .into());
+    }
+    let bundle = parse_bundle(input)?;
+    check(&bundle, &bundle.model.id)?;
+    let Bundle {
+        model,
+        source,
+        files,
+        history,
+        ..
+    } = bundle;
+    let Source::Current { revision, .. } = &source else {
+        let message =
+            "a restore needs a current-state bundle, exported without --proposal or --checkpoint";
+        return Err(invalid(message, json!({ "bundle": source })));
+    };
+    let temp = TempDir::new("restore")?;
+    let staged = temp.path().join("model");
+    let files = bytes(files, "");
+    checkpoint::put(&staged, slices(&files))?;
+    let found = json!({ "bundle": source });
+    let located = |e| checkpoint::located(e, PLACE, &found);
+    let current = vault::load_dir(staged.clone()).map_err(located)?;
+    if current.manifest.id != model.id || current.revision.digest != *revision {
+        let message = "its manifest or revision is not the one its header names";
+        return Err(invalid(message, json!({ "bundle": source })));
+    }
+    let proposals = vault::proposals(&staged)?;
+    for id in &proposals {
+        let drawn = vault::load_proposal(staged.clone(), id).map_err(located)?;
+        checked_base(&current, &drawn, &proposal::proposal_of(&drawn)?)?;
+    }
+    let rebuilt = (history.as_ref())
+        .map(|chain| checkpoint::rebuild(start, chain))
+        .transpose()?;
+    if let Some(state) = dir.parent() {
+        refuse_symlink(state)?;
+        fs::create_dir_all(state).with_context(|| format!("creating {}", state.display()))?;
+    }
+    refuse_symlink(&dir)?;
+    match fs::create_dir(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => return Err(vault_exists(&dir)),
+        Err(e) => return Err(e).with_context(|| format!("creating {}", dir.display())),
+    }
+    let landed = checkpoint::put(&dir, slices(&files))
+        .and_then(|()| rebuilt.as_ref().map_or(Ok(()), checkpoint::Rebuilt::land));
+    if let Err(error) = landed {
+        let _ = fs::remove_dir_all(&dir);
+        return Err(error);
+    }
+    let checkpoints = (rebuilt.into_iter())
+        .flat_map(|r| r.checkpoints)
+        .map(|c| c.id)
+        .collect();
+    Ok(Restored {
+        vault: dir,
+        model,
+        revision: current.revision,
+        proposals,
+        checkpoints,
+    })
+}
+
+fn vault_exists(dir: &Path) -> anyhow::Error {
+    Refusal::new(
+        Code::VaultExists,
+        format!(
+            "a model vault already exists at {}; a restore needs a checkout without one",
+            dir.display()
+        ),
+    )
+    .into()
+}
+
 /// A bundle read and loaded: the state it holds, the draft's default name, and for a proposal
 /// its base and the proposal itself (`drawn`).
 struct Opened {
@@ -288,13 +417,16 @@ const PLACE: &str = "the bundle";
 fn open(input: &[u8], current: &Model) -> Result<Opened> {
     let bundle = parse_bundle(input)?;
     check(&bundle, &current.manifest.id)?;
-    let Bundle { source, files, .. } = bundle;
+    let Bundle {
+        source, mut files, ..
+    } = bundle;
     let temp = TempDir::new("bundle")?;
     let dir = temp.path().join("model");
     let found = json!({ "bundle": source });
     if let Source::Proposal { proposal: id, .. } = &source {
         return open_proposal(current, &dir, id, files, &found);
     }
+    files.retain(|path, _| vault::is_vault_file(path));
     let files = bytes(files, "");
     checkpoint::put(&dir, slices(&files))?;
     let model = vault::load_dir(dir).map_err(|e| checkpoint::located(e, PLACE, &found))?;
@@ -361,7 +493,24 @@ fn open_proposal(
     let model = vault::load_proposal(dir.to_path_buf(), id)
         .map_err(|e| checkpoint::located(e, PLACE, found))?;
     let drawn = proposal::proposal_of(&model)?;
-    let base = vault::load_base(&model).map_err(|e| match problems_of(e) {
+    let base = checked_base(current, &model, &drawn)?;
+    Ok(Opened {
+        model,
+        name: drawn.name.clone(),
+        base,
+        drawn: Some(drawn),
+    })
+}
+
+/// The base of the proposal `drawn` that `model` loaded, parsed and checked by the rules of
+/// `current`'s vault (`BUNDLE_INVALID`).
+fn checked_base(
+    current: &Model,
+    model: &Model,
+    drawn: &Proposal,
+) -> Result<Option<(Vec<Module>, Vec<Collection>)>> {
+    let id = &drawn.id;
+    let base = vault::load_base(model).map_err(|e| match problems_of(e) {
         Ok(problems) => base_invalid(id, problems),
         Err(e) => e,
     })?;
@@ -369,7 +518,7 @@ fn open_proposal(
         let problems = vault::problems(
             &current.manifest,
             &current.config,
-            Some(&drawn),
+            Some(drawn),
             modules,
             collections,
             (&[], &[], &[]),
@@ -378,12 +527,7 @@ fn open_proposal(
             return Err(base_invalid(id, problems));
         }
     }
-    Ok(Opened {
-        model,
-        name: drawn.name.clone(),
-        base,
-        drawn: Some(drawn),
-    })
+    Ok(base)
 }
 
 /// The problems of a `MODEL_INVALID` refusal, or the error itself when it is something else.
@@ -449,7 +593,11 @@ fn check(bundle: &Bundle, model: &str) -> Result<()> {
             let message = "its proposal ID is not 8 base62 characters";
             return Err(invalid(message, json!({ "proposal": proposal })));
         }
-        _ => (vault::is_vault_file, &[vault::MANIFEST, vault::CONFIG]),
+        Source::Current { .. } => (
+            |path| vault::is_vault_file(path) || vault::is_proposal_vault_file(path),
+            &[vault::MANIFEST, vault::CONFIG],
+        ),
+        Source::Checkpoint { .. } => (vault::is_vault_file, &[vault::MANIFEST, vault::CONFIG]),
     };
     let mut seen = BTreeSet::new();
     for path in bundle.files.keys() {
@@ -466,10 +614,13 @@ fn check(bundle: &Bundle, model: &str) -> Result<()> {
             ));
         }
     }
-    if let Some(path) = required
-        .iter()
-        .find(|path| !bundle.files.contains_key(**path))
-    {
+    let proposals = (bundle.files.keys())
+        .filter_map(|path| vault::split_proposal(path))
+        .map(|(id, _)| vault::proposal_file(id));
+    let missing = (required.iter().map(|path| (*path).to_owned()))
+        .chain(proposals)
+        .find(|path| !bundle.files.contains_key(path));
+    if let Some(path) = missing {
         return Err(invalid(
             "it lacks a file its source needs",
             json!({ "path": path }),
@@ -529,6 +680,7 @@ mod tests {
             },
             files: BTreeMap::from([("model.json".to_owned(), "x".repeat(size))]),
             digests: BTreeMap::new(),
+            history: None,
         };
         let error = to_text(&bundle).unwrap_err();
         let refusal = error.downcast_ref::<Refusal>().expect("a refusal");

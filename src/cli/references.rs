@@ -307,8 +307,7 @@ pub(super) fn code(
         let message = format!("{} {id} has no binding", module.name);
         Refusal::new(Code::RequestInvalid, message)
     })?;
-    let source = checkpoint.as_ref().and_then(|c| c.source.as_deref());
-    let target = reference::code_target(&checkout_root(root)?, binding, source);
+    let target = reference::code_target(&checkout_root(root)?, binding, checkpoint.as_ref());
     let opened = open.then(|| open_local(&target)).transpose()?;
     if markdown {
         let repo = (target.repo.as_deref()).map_or_else(String::new, |r| format!("{r}: "));
@@ -325,6 +324,13 @@ pub(super) fn code(
         }
         if let Some(commit) = &target.commit {
             println!("  retained at commit {commit}");
+        }
+        if let Some(c) = &target.correction {
+            println!(
+                "  the commit is from correction {} by {} (as its Writer trailer says, unverified)",
+                escape_controls(&c.checkpoint),
+                escape_controls(&c.writer)
+            );
         }
         return Ok(());
     }

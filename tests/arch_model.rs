@@ -12708,6 +12708,24 @@ fn fetch_refuses_remote_checkpoint_trailers_retain_never_writes() {
             trailers("Unco0001", FORGED_REVISION),
             tip.trim()
         ),
+        format!(
+            "corrects itself\n\n{}Source: {}\nCorrects: Self0001\n",
+            trailers("Self0001", FORGED_REVISION),
+            tip.trim()
+        ),
+        format!(
+            "corrects nothing\n\n{}Source: {}\nCorrects: Gone0001\n",
+            trailers("Corr0001", FORGED_REVISION),
+            tip.trim()
+        ),
+        format!(
+            "corrects without a source\n\n{}Corrects: {base}\n",
+            trailers("Corr0002", FORGED_REVISION)
+        ),
+        format!(
+            "bad restored-from\n\n{}Restored-From: main\n",
+            trailers("Rest0001", FORGED_REVISION)
+        ),
     ];
     for message in cases {
         let args = ["commit-tree", tree.trim(), "-p", tip.trim(), "-m", &message];
@@ -12718,6 +12736,371 @@ fn fetch_refuses_remote_checkpoint_trailers_retain_never_writes() {
         assert_eq!(error["details"]["object"], forged.trim(), "{message:?}");
         assert_eq!(history_tip(&checkout), tip, "{message:?}");
     }
+}
+
+#[test]
+fn a_correction_holding_another_tree_than_its_target_is_refused_and_never_applied() {
+    let remote = bare();
+    let checkout = with_origin(&remote);
+    shop(&checkout);
+    let base = retain(&checkout, "drawn");
+    checkout.ok(&["history", "push"]);
+    let tip = history_tip(&checkout);
+    let list = checkpoints(&checkout);
+    let drawn = list.iter().find(|c| c["id"] == base).unwrap().clone();
+    let code = git(&checkout, &["rev-parse", "HEAD"]);
+    let message = format!(
+        "forged\n\nCheckpoint: Tree0001\nRevision: {}\nSource: {}\nWriter: tester\nCorrects: {base}\n",
+        drawn["revision"].as_str().unwrap(),
+        code.trim()
+    );
+    let forge = |tree: &str| {
+        let peeled = format!("{tree}^{{tree}}");
+        let tree = git(&checkout, &["rev-parse", &peeled]);
+        let args = ["commit-tree", tree.trim(), "-p", tip.trim(), "-m", &message];
+        git(&checkout, &args).trim().to_owned()
+    };
+
+    let forged = forge("HEAD");
+    let refspec = format!("+{forged}:refs/boundrail/history");
+    git(&checkout, &["push", "-q", "origin", &refspec]);
+    let error = checkout.refused(&["history", "fetch"], "MODEL_INVALID");
+    assert_eq!(error["details"]["object"], forged);
+    assert_eq!(history_tip(&checkout), tip);
+
+    // Read locally, the forged correction is listed but not applied.
+    git(
+        &checkout,
+        &["update-ref", "refs/boundrail/history", &forged],
+    );
+    let read = checkpoints(&checkout);
+    assert_eq!(read[0]["corrects"], base);
+    assert_eq!(read[1]["source"], drawn["source"]);
+    assert!(read[1].get("corrections").is_none(), "{:#}", read[1]);
+    git(
+        &checkout,
+        &["update-ref", "refs/boundrail/history", tip.trim()],
+    );
+
+    // The same correction holding its target's tree is taken and applied.
+    let held = forge(tip.trim());
+    let refspec = format!("+{held}:refs/boundrail/history");
+    git(&checkout, &["push", "-q", "origin", &refspec]);
+    checkout.ok(&["history", "fetch"]);
+    let read = checkpoints(&checkout);
+    assert_eq!(read[1]["source"], code.trim());
+    assert_eq!(read[1]["corrections"][0]["checkpoint"], "Tree0001");
+}
+
+fn head(checkout: &Checkout) -> String {
+    git(checkout, &["rev-parse", "HEAD"]).trim().to_owned()
+}
+
+/// A new empty commit on the checkout's branch: its hash.
+fn release(checkout: &Checkout) -> String {
+    git(
+        checkout,
+        &["commit", "-q", "--allow-empty", "-m", "release"],
+    );
+    head(checkout)
+}
+
+/// `model history correct` of `checkpoint` to `source` by fixer: the exit code and output.
+fn correct(checkout: &Checkout, checkpoint: &str, source: &str, operation: &str) -> (i32, Value) {
+    checkout.run(&[
+        "history",
+        "correct",
+        checkpoint,
+        "--source",
+        source,
+        "--doing",
+        "it was drawn from the release",
+        "--writer",
+        "fixer",
+        "--operation-id",
+        operation,
+    ])
+}
+
+#[test]
+fn a_correction_appends_a_checkpoint_whose_source_readers_take_with_its_audit_trail() {
+    let remote = bare();
+    let checkout = with_origin(&remote);
+    shop(&checkout);
+    let recorded = head(&checkout);
+    let drawn = retain(&checkout, "the shop as drawn");
+    let release = release(&checkout);
+    let before = history_tip(&checkout);
+
+    let (code, out) = correct(&checkout, &drawn, &release, "fix-1");
+    assert_eq!(code, 0, "{out:#}");
+    assert_eq!(out["kind"], "history-correct");
+    let correction = &out["checkpoint"];
+    assert_eq!(correction["corrects"], drawn);
+    assert_eq!(correction["source"], release);
+    assert_eq!(correction["parent"], drawn);
+    let corrected = &out["corrected"];
+    assert_eq!(corrected["id"], drawn);
+    assert_eq!(corrected["source"], release);
+    assert_eq!(corrected["source_status"], "available");
+    let trail = &corrected["corrections"];
+    assert_eq!(trail.as_array().unwrap().len(), 1, "{trail:#}");
+    assert_eq!(trail[0]["checkpoint"], correction["id"]);
+    assert_eq!(trail[0]["writer"], "fixer");
+    assert_eq!(trail[0]["doing"], "it was drawn from the release");
+    assert_eq!(trail[0]["time"], correction["time"]);
+    assert_eq!(trail[0]["previous"], recorded);
+    assert_eq!(trail[0]["source"], release);
+    // The history only moved forward: the correction sits on the tip it read with the same tree.
+    let tip = history_tip(&checkout);
+    let rev = |rev: String| git(&checkout, &["rev-parse", &rev]);
+    assert_eq!(rev(format!("{}^", tip.trim())), before);
+    assert_eq!(
+        rev(format!("{}^{{tree}}", tip.trim())),
+        rev(format!("{}^{{tree}}", before.trim()))
+    );
+
+    let list = checkpoints(&checkout);
+    assert_eq!(list[0], *correction);
+    assert_eq!(list[1]["source"], release);
+    assert_eq!(list[1]["corrections"], *trail);
+    let read = checkout.ok(&["read", "--checkpoint", &drawn]);
+    assert_eq!(read["checkpoint"], list[1]);
+    let (code, text) = checkout.run_raw(&["checkpoints", "--format", "markdown"]);
+    assert_eq!(code, 0, "{text}");
+    let by = format!(
+        "corrected by {} (fixer at",
+        correction["id"].as_str().unwrap()
+    );
+    assert!(text.contains(&by), "{text}");
+    assert!(
+        text.contains(&format!("source {recorded} -> {release}")),
+        "{text}"
+    );
+
+    // A repeat returns the correction; the operation reused for another source refuses.
+    let (code, again) = correct(&checkout, &drawn, &release, "fix-1");
+    assert_eq!(code, 0, "{again:#}");
+    assert_eq!(again["checkpoint"]["id"], correction["id"]);
+    assert_eq!(history_tip(&checkout), tip);
+    let (code, out) = correct(&checkout, &drawn, &recorded, "fix-1");
+    assert_eq!(
+        (code, &out["error"]["code"]),
+        (2, &json!("OPERATION_REUSED"))
+    );
+
+    // A push checks it as a fetch does, and a fetch into another repository applies it.
+    checkout.ok(&["history", "push"]);
+    let other = with_origin(&remote);
+    other.ok(&["history", "fetch"]);
+    let fetched = checkpoints(&other);
+    assert_eq!(fetched[1]["source"], release);
+    assert_eq!(fetched[1]["corrections"][0]["checkpoint"], correction["id"]);
+}
+
+#[test]
+fn history_correct_refuses_unknown_checkpoints_bad_sources_and_corrections_of_corrections() {
+    let checkout = committed();
+    shop(&checkout);
+    let recorded = head(&checkout);
+    let drawn = retain(&checkout, "the shop as drawn");
+    let release = release(&checkout);
+    let tip = history_tip(&checkout);
+    let args = |which: &str, source: &str| -> Vec<String> {
+        [
+            "history",
+            "correct",
+            which,
+            "--source",
+            source,
+            "--doing",
+            "fix the source",
+        ]
+        .map(str::to_owned)
+        .to_vec()
+    };
+    let refused = |which: &str, source: &str, code: &str| {
+        let args = args(which, source);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        checkout.refused(&args, code)
+    };
+    refused("Unknown1", &release, "CHECKPOINT_NOT_FOUND");
+    refused(&drawn, &release[..12], "REQUEST_INVALID");
+    refused(&drawn, "main", "REQUEST_INVALID");
+    refused(&drawn, &"0".repeat(40), "REQUEST_INVALID");
+    refused(&drawn, &recorded, "NOTHING_TO_RETAIN");
+    assert_eq!(history_tip(&checkout), tip);
+
+    let args = args(&drawn, &release);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let correction = checkout.ok(&args)["checkpoint"]["id"].clone();
+    let tip = history_tip(&checkout);
+    let error = refused(correction.as_str().unwrap(), &recorded, "REQUEST_INVALID");
+    assert_eq!(error["details"]["corrects"], drawn);
+    assert_eq!(history_tip(&checkout), tip);
+}
+
+/// `model import --restore` of `bundle` in `checkout`: the exit code and output.
+fn restore(checkout: &Checkout, bundle: &Value) -> (i32, Value) {
+    let path = checkout.path().join("restore.bundle.json");
+    fs::write(&path, bundle.to_string()).unwrap();
+    checkout.run(&["import", "--restore", path.to_str().unwrap()])
+}
+
+/// `list` without what a restored copy of a history changes: commits and publication.
+fn by_content(list: &[Value]) -> Vec<Value> {
+    let mut list = list.to_vec();
+    for checkpoint in &mut list {
+        let object = checkpoint.as_object_mut().unwrap();
+        for key in ["commit", "restored_from", "publication"] {
+            object.remove(key);
+        }
+        let corrections = object.get_mut("corrections").and_then(Value::as_array_mut);
+        for correction in corrections.into_iter().flatten() {
+            correction.as_object_mut().unwrap().remove("commit");
+        }
+    }
+    list
+}
+
+/// A clone of `checkout`'s branch, without its vault or history.
+fn bare_clone(checkout: &Checkout) -> Checkout {
+    let clone = Checkout::outside();
+    let out = Command::new("git")
+        .args(["clone", "-q"])
+        .arg(checkout.path())
+        .arg(clone.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    for (key, value) in [
+        ("user.name", "tester"),
+        ("user.email", "tester@example.com"),
+        ("commit.gpgsign", "false"),
+    ] {
+        git(&clone, &["config", key, value]);
+    }
+    clone
+}
+
+#[test]
+fn a_bundle_with_its_history_restores_identities_proposals_and_checkpoints() {
+    let first = committed();
+    shop(&first);
+    let drawn = retain(&first, "the shop as drawn");
+    first.edited(json!([{"type": "edit-module", "subject": "Web", "set": {"order": 3}}]));
+    let (id, _) = next(&first);
+    let child = propose_child(&first, "Child", &id);
+    let release = release(&first);
+    let (code, out) = correct(&first, &drawn, &release, "fix-1");
+    assert_eq!(code, 0, "{out:#}");
+    let bundle = export(&first, &["--with-history"]);
+    let (_, schema) = first.run(&["schema", "model-bundle"]);
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    assert!(validator.is_valid(&bundle), "{bundle:#}");
+    assert!(bundle["files"][format!("proposals/{id}/proposal.json")].is_string());
+    let theirs = checkpoints(&first);
+    let chain = bundle["history"]["checkpoints"].as_array().unwrap();
+    assert_eq!(chain.len(), theirs.len());
+    assert_eq!(chain[0]["commit"], theirs.last().unwrap()["commit"]);
+    // A plain export carries neither.
+    let plain = export(&first, &[]);
+    assert!(plain["history"].is_null());
+    assert!(plain["files"][format!("proposals/{id}/proposal.json")].is_null());
+
+    let second = bare_clone(&first);
+    let (code, out) = restore(&second, &bundle);
+    assert_eq!(code, 0, "{out:#}");
+    assert_eq!(out["kind"], "restore");
+    assert_eq!(out["model"], bundle["model"]);
+    assert_eq!(out["revision"]["digest"], first.digest());
+    let mut drafts = vec![id.clone(), child.clone()];
+    drafts.sort();
+    assert_eq!(out["proposals"], json!(drafts));
+    assert_eq!(listed(&second, &child)["parent"], id.as_str());
+    let without_vault = |checkout: &Checkout, args: &[&str]| {
+        let mut read = checkout.ok(args);
+        read.as_object_mut().unwrap().remove("vault");
+        read
+    };
+    let reads = [
+        &["read"][..],
+        &["read", "--proposal", &id],
+        &["read", "--proposal", &child],
+        &["proposals"],
+    ];
+    for args in reads {
+        assert_eq!(without_vault(&second, args), without_vault(&first, args));
+    }
+
+    let ours = checkpoints(&second);
+    let ids: Vec<&Value> = ours.iter().map(|c| &c["id"]).collect();
+    assert_eq!(out["checkpoints"], json!(ids));
+    assert_eq!(by_content(&ours), by_content(&theirs));
+    assert_eq!(ours.last().unwrap()["source"], release);
+    for (restored, original) in ours.iter().zip(&theirs) {
+        assert_eq!(restored["restored_from"], original["commit"]);
+        assert_ne!(restored["commit"], original["commit"]);
+    }
+    let message = git(
+        &second,
+        &["log", "-1", "--format=%B", "refs/boundrail/history"],
+    );
+    let trailer = format!("Restored-From: {}", theirs[0]["commit"].as_str().unwrap());
+    assert!(message.contains(&trailer), "{message}");
+    let read =
+        |checkout: &Checkout| checkout.ok(&["read", "--checkpoint", &drawn])["modules"].clone();
+    assert_eq!(read(&second), read(&first));
+}
+
+#[test]
+fn restore_refuses_a_vault_a_history_or_a_bundle_it_cannot_recreate() {
+    let first = committed();
+    shop(&first);
+    retain(&first, "the shop as drawn");
+    let bundle = export(&first, &["--with-history"]);
+    let (code, out) = restore(&first, &bundle);
+    assert_eq!((code, &out["error"]["code"]), (2, &json!("VAULT_EXISTS")));
+
+    let empty = committed();
+    git(&empty, &["update-ref", "refs/boundrail/history", "HEAD"]);
+    let (code, out) = restore(&empty, &bundle);
+    assert_eq!(
+        (code, &out["error"]["code"]),
+        (2, &json!("HISTORY_DIVERGED")),
+        "{out:#}"
+    );
+    git(&empty, &["update-ref", "-d", "refs/boundrail/history"]);
+
+    let (id, _) = next(&first);
+    let tampered = export(&first, &["--proposal", &id]);
+    let digest = bundle["history"]["blobs"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+    let mut changed = bundle.clone();
+    changed["history"]["blobs"][&digest] = "{}".into();
+    let mut forged = bundle.clone();
+    forged["history"]["checkpoints"][0]["message"] = "not a checkpoint\n".into();
+    let mut stray = bundle.clone();
+    stray["history"]["checkpoints"][0]["files"]["../escape.json"] = digest.into();
+    let mut dated = bundle.clone();
+    dated["history"]["checkpoints"][0]["author_date"] = "yesterday".into();
+    for bad in [&tampered, &changed, &forged, &stray, &dated] {
+        let (code, out) = restore(&empty, bad);
+        assert_eq!(
+            (code, &out["error"]["code"]),
+            (2, &json!("BUNDLE_INVALID")),
+            "{out:#}"
+        );
+        assert!(!empty.vault().exists());
+        assert_eq!(git(&empty, &["for-each-ref", "refs/boundrail"]), "");
+    }
+    let (code, out) = restore(&empty, &bundle);
+    assert_eq!(code, 0, "{out:#}");
 }
 
 #[test]
@@ -13760,8 +14143,28 @@ fn code_targets_resolve_in_the_checkout_and_through_configured_repos() {
     let id = retained["id"].as_str().unwrap();
     let out = checkout.ok(&["read", "Billing", "--code", "--checkpoint", id]);
     assert_eq!(out["code_target"]["commit"], head.trim());
+    assert_eq!(out["code_target"].get("correction"), None);
     assert_eq!(out["checkpoint"]["id"], retained["id"]);
     checkout.refused(&["read", "Platform", "--code"], "REQUEST_INVALID");
+
+    // A corrected source says which correction it comes from and who wrote it.
+    let release = release(&checkout);
+    let (code, out) = correct(&checkout, id, &release, "fix-code");
+    assert_eq!(code, 0, "{out:#}");
+    let fixed = out["checkpoint"]["id"].as_str().unwrap().to_owned();
+    let out = checkout.ok(&["read", "Billing", "--code", "--checkpoint", id]);
+    assert_eq!(out["code_target"]["commit"], release);
+    assert_eq!(out["code_target"]["correction"]["checkpoint"], fixed);
+    assert_eq!(out["code_target"]["correction"]["writer"], "fixer");
+    let args = ["read", "Billing", "--code", "--checkpoint", id];
+    let (code, text) = checkout.run_raw(&[&args[..], &["--format", "markdown"]].concat());
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.contains(&format!("retained at commit {release}")),
+        "{text}"
+    );
+    let by = format!("the commit is from correction {fixed} by fixer");
+    assert!(text.contains(&by), "{text}");
 }
 
 #[test]

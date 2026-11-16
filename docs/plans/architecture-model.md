@@ -61,7 +61,7 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 | T27 | Proposal families: child proposals of a draft, family reconcile, standing, settle conflicts by mine, theirs or edited; `INHERITANCE_DROPPED` and `PART_RECREATED` confirmations | done |
 | T28 | Readings: group regions and group filter; beat selection apart from focus, relationship filters, groups, visibility; saved views that need no output file | done |
 | T29 | Cross-model references: modules reference another model, state or subject, `read --references`, pinned foreign checkpoints; `read --code` resolves and opens the code target | done |
-| T30 | History repair and restore: correct a recorded state with source commits and an audit trail; restore a bundle into an empty vault with identities and history | open |
+| T30 | History repair and restore: correct a recorded state with source commits and an audit trail; restore a bundle into an empty vault with identities and history | done |
 | T31 | Vaults outside Git: a private history for a vault outside a checkout, used for temporary pull request models | open |
 | T32 | Language servers: `model language-server` add, remove and list; defaults for C-family, C# and Swift; on by default through user config outside the checkout; `unready` diagnostic and step timings | done |
 | T33 | Browser: multi-select, relationship-kind filter, URL state for proposal, focus and flow with Back and Forward; an agent shows a reading in the user's open pane | done |
@@ -1726,3 +1726,55 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   draft alone, then run `--family` from it. JSON is the named draft's receipt with `family`, each
   descendant `{proposal, operation_id, reconciled, receipt?}`; Markdown prints a receipt per
   reconciled draft and `<id> is up to date` for the others.
+- T30: correction. `model history correct <checkpoint> --source <commit> --doing [--writer]
+  [--operation-id]` appends a checkpoint holding the named one's tree, `Revision` and `Proposal`,
+  with `Source: <commit>` and `Corrects: <its ID>`, on the tip it read: the ref moves by
+  compare-and-swap (`HISTORY_MOVED`), the commit is signed per `commit.gpgSign`
+  (`SIGNING_FAILED`), and nothing is rewritten. `Source` is the only correctable trailer; a
+  proposal's checkpoint, shelved or not, corrects the same way. The source must be a full 40- or
+  64-hex hash of a commit this repository holds (`REQUEST_INVALID` otherwise), so a correction is
+  never `uncommitted`. Refusals: `CHECKPOINT_NOT_FOUND` or `SUBJECT_AMBIGUOUS` for the
+  checkpoint, `REQUEST_INVALID` for a checkpoint that is itself a correction (`details.corrects`
+  names the one to correct), `NOTHING_TO_RETAIN` when it already records that source, and
+  `OPERATION_REUSED` for an operation ID that made another checkpoint; the same operation with
+  the same arguments returns the correction it made. Corrections chain one level only, so no
+  cycle can form. `Corrects` needs a local ID, a `Source` and no `Uncommitted`, else the commit
+  is not a checkpoint. Every reading (`checkpoints`, `read --checkpoint`, source availability,
+  `read --code`) applies the corrections when it walks the history, oldest first, to the earlier
+  non-correction checkpoint each names: its `source` is the latest correction's, `uncommitted`
+  false, and `corrections` lists each as `{checkpoint, commit, writer, time, doing, previous,
+  source}`; the correction itself lists with `corrects`. A correction naming no earlier
+  checkpoint, or a correction, or one whose revision, proposal or tree (`<commit>^{tree}`)
+  differs from that checkpoint's, is not applied. `since()` (push, fetch, replay, export and
+  restore) refuses `MODEL_INVALID` for such a correction and for a `Restored-From` that is not a
+  full commit hash. `read --code` says when its commit comes from a correction, naming the
+  correcting checkpoint and its writer, in markdown and as `code_target.correction`. Corrections
+  are attributed by their `Writer` trailer, not verified: no read checks a signature, since that
+  would run the signing program on read paths. Retain's `NOTHING_TO_RETAIN` skips corrections, its cross-worktree replay
+  refuses `OPERATION_REUSED` for one, and a write never takes one for its own checkpoint. Histories without the new trailers read as
+  before.
+- T30: restore. `model export --with-history` (current state only) adds every proposal's files at
+  their vault-relative paths, each proposal loading first, and `history`: `{checkpoints, blobs}`,
+  the checkpoints oldest first as `{commit, author_date, committer_date, message, files}` (dates
+  as Git records them, `<seconds> <zone>`; `files` maps vault-relative paths to SHA-256 keys of
+  `blobs`, which holds each text once). Every first-parent commit must pass `since()` and every
+  tree a checkpoint read (`MODEL_INVALID`). A plain export is unchanged. `model import --restore
+  <bundle>` takes no revision, operation ID or doing line: it refuses `VAULT_EXISTS` when the
+  checkout has a vault and `HISTORY_DIVERGED` when `refs/boundrail/history` exists, then checks
+  the bundle as import does (`BUNDLE_INVALID` also for a proposal or checkpoint bundle), loads its
+  current state through a temporary vault at the header's model ID and source revision, and each
+  proposal with its base (`MODEL_INVALID`, `BUNDLE_INVALID`). The history is rebuilt before
+  anything is written: the texts are checked against their digests, paths against the vault
+  files a checkpoint may hold, commits and dates against what Git writes, each message with its
+  `Restored-From` as `since()` checks it and each correction against its target's revision,
+  proposal and tree (`BUNDLE_INVALID`), all before anything is signed; then each checkpoint is
+  committed on the one before with its tree, message and dates and a
+  `Restored-From: <original commit>` trailer replacing any earlier one, signed per
+  `commit.gpgSign`; the result passes `since()` and every tree a checkpoint read, the same checks
+  a fetch applies. Then the vault folder is created (as `init` claims it) with the bundle's files
+  byte for byte, so every ID and the revision stay, and the ref moves from absent by
+  compare-and-swap; a failure there removes the vault it made. The output is `{kind: "restore",
+  vault, model, revision, proposals, checkpoints}`. Claims, the journal, receipts and the history
+  remote are not carried. A retry refuses `VAULT_EXISTS`. ponytail: the whole history travels in
+  one bundle under the 4 MiB `INPUT_MAX`; page it into several files if real histories outgrow
+  it.

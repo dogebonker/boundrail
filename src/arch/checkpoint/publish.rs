@@ -7,7 +7,7 @@
 //! and each records what the remote holds in local refs, which checkpoint readings judge
 //! publication by without the network.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -158,13 +158,12 @@ pub fn push(start: &Path, remote: Option<&str>) -> Result<Published> {
         record_published(&root, remote, &object)?;
         return Ok(unchanged(remote, theirs));
     }
-    let known = id_counts(&list);
     if !holds(&root, &commit, theirs.as_deref())? {
-        return Err(refused_push(&root, remote, (&object, &commit), &known)?);
+        return Err(refused_push(&root, remote, (&object, &commit), &list)?);
     }
     let base = theirs.as_deref().and_then(|theirs| peel(&root, theirs));
     let refuse = |object: &str, reason: &str| unpublishable(remote, object, reason);
-    let new = since(&root, &commit, base.as_deref(), &known, refuse)?;
+    let new = since(&root, &commit, base.as_deref(), &list, refuse)?;
     // The object checked above is what lands, even if the local ref moves meanwhile.
     let refspec = refspec(&object, HISTORY);
     let lease = format!(
@@ -192,7 +191,7 @@ pub fn push(start: &Path, remote: Option<&str>) -> Result<Published> {
         git::run(&root, &["update-ref", "-d", &pushing])?;
         // The remote moved between the check and the push.
         if !holds(&root, &commit, now.as_deref())? {
-            return Err(refused_push(&root, remote, (&object, &commit), &known)?);
+            return Err(refused_push(&root, remote, (&object, &commit), &list)?);
         }
         return Err(error);
     }
@@ -205,19 +204,19 @@ pub fn push(start: &Path, remote: Option<&str>) -> Result<Published> {
 }
 
 /// The `HISTORY_DIVERGED` refusal of a push of the local history, the ref holding `object` that
-/// peels to `commit` with the checkpoint IDs `known`, judged against the remote's history fetched
-/// onto a per-run ref: with no local checkpoints the remote lacks, it is only ahead.
+/// peels to `commit` with the checkpoints `all` from it, judged against the remote's history
+/// fetched onto a per-run ref: with no local checkpoints the remote lacks, it is only ahead.
 fn refused_push(
     root: &Path,
     remote: &str,
     (object, commit): (&str, &str),
-    known: &BTreeMap<String, usize>,
+    all: &[Checkpoint],
 ) -> Result<anyhow::Error> {
     fetched(root, remote, |theirs, fetched_commit| {
         if !git::have_merge_base(root, commit, fetched_commit)? {
             return Ok(unrelated(remote));
         }
-        let local = since(root, commit, Some(fetched_commit), known, |o, r| {
+        let local = since(root, commit, Some(fetched_commit), all, |o, r| {
             unpublishable(remote, o, r)
         })?;
         let local_only: Vec<&str> = local.iter().map(|c| c.id.as_str()).collect();
@@ -284,7 +283,8 @@ fn fetched<T>(root: &Path, remote: &str, then: impl FnOnce(&str, &str) -> Result
 /// checkpoints replayed onto it, after checking it, recomputing when a checkpoint landed locally
 /// meanwhile.
 fn take(root: &Path, remote: &str, object: &str, commit: &str) -> Result<Published> {
-    let known = id_counts(&walk(root, commit, None)?);
+    let all = walk(root, commit, None)?;
+    let known = id_counts(&all);
     let mut lost = None;
     for _ in 0..ATTEMPTS {
         let local = tip(root)?;
@@ -297,7 +297,7 @@ fn take(root: &Path, remote: &str, object: &str, commit: &str) -> Result<Publish
         {
             return Ok(unchanged(remote, local));
         }
-        let gained = since(root, commit, ours.as_deref(), &known, |o, r| {
+        let gained = since(root, commit, ours.as_deref(), &all, |o, r| {
             foreign(remote, o, r)
         })?;
         let (new, replayed) = match &ours {
@@ -343,8 +343,8 @@ fn replay(
     if !git::have_merge_base(root, ours, commit)? {
         return Err(unrelated(remote));
     }
-    let known = id_counts(&walk(root, ours, None)?);
-    let local = since(root, ours, Some(commit), &known, |o, r| {
+    let all = walk(root, ours, None)?;
+    let local = since(root, ours, Some(commit), &all, |o, r| {
         unpublishable(remote, o, r)
     })?;
     let clashing: Vec<&str> = (local.iter())
@@ -365,31 +365,56 @@ fn replay(
 /// The commit `original` copied onto `parent`: its tree, message and author and committer dates,
 /// signed when `sign` says so, as `model retain` signs.
 fn copy(root: &Path, original: &str, parent: &str, sign: bool) -> Result<String> {
-    let raw = git::text(root, &["cat-file", "commit", original])?;
-    let (head, message) = raw.split_once("\n\n").context("parsing a commit")?;
-    let field = |key: &str| {
-        head.lines()
-            .find_map(|line| line.strip_prefix(key))
-            .with_context(|| format!("commit {original} has no {key}"))
-    };
-    // An identity line ends with `> <seconds> <zone>`, the date Git reads back.
-    let date = |key: &str| -> Result<String> {
-        let line = field(key)?;
-        let (_, date) = line
-            .rsplit_once("> ")
-            .context("parsing a commit identity")?;
-        Ok(date.to_owned())
-    };
-    let env = [
-        ("GIT_AUTHOR_DATE", date("author ")?),
-        ("GIT_COMMITTER_DATE", date("committer ")?),
-    ];
-    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    commit_tree(root, field("tree ")?, message, Some(parent), sign, &env)
+    let parts = Parts::read(root, original)?;
+    let env = parts.dates();
+    commit_tree(root, &parts.tree, &parts.message, Some(parent), sign, &env)
+}
+
+/// What a copy of a commit keeps: its tree, author and committer dates (`<seconds> <zone>`, as
+/// Git reads them back) and message.
+pub(super) struct Parts {
+    pub(super) tree: String,
+    pub(super) author_date: String,
+    pub(super) committer_date: String,
+    pub(super) message: String,
+}
+
+impl Parts {
+    pub(super) fn read(root: &Path, commit: &str) -> Result<Self> {
+        let raw = git::text(root, &["cat-file", "commit", commit])?;
+        let (head, message) = raw.split_once("\n\n").context("parsing a commit")?;
+        let field = |key: &str| {
+            head.lines()
+                .find_map(|line| line.strip_prefix(key))
+                .with_context(|| format!("commit {commit} has no {key}"))
+        };
+        // An identity line ends with `> <seconds> <zone>`, the date Git reads back.
+        let date = |key: &str| -> Result<String> {
+            let line = field(key)?;
+            let (_, date) = line
+                .rsplit_once("> ")
+                .context("parsing a commit identity")?;
+            Ok(date.to_owned())
+        };
+        Ok(Self {
+            tree: field("tree ")?.to_owned(),
+            author_date: date("author ")?,
+            committer_date: date("committer ")?,
+            message: message.to_owned(),
+        })
+    }
+
+    /// The environment that gives a new commit these dates.
+    pub(super) fn dates(&self) -> [(&str, &str); 2] {
+        [
+            ("GIT_AUTHOR_DATE", self.author_date.as_str()),
+            ("GIT_COMMITTER_DATE", self.committer_date.as_str()),
+        ]
+    }
 }
 
 /// Each checkpoint ID of `list` in ASCII lowercase, with how many checkpoints hold it.
-fn id_counts(list: &[Checkpoint]) -> BTreeMap<String, usize> {
+pub(super) fn id_counts(list: &[Checkpoint]) -> BTreeMap<String, usize> {
     let mut counts = BTreeMap::new();
     for checkpoint in list {
         *counts
@@ -399,17 +424,18 @@ fn id_counts(list: &[Checkpoint]) -> BTreeMap<String, usize> {
     counts
 }
 
-/// The checkpoints along first parents from `commit` that `base` does not reach, newest first.
-/// Each must be one `model retain` could have written, else `refuse` gets its commit and why: it
-/// has at most one parent, carries checkpoint trailers, its `--doing`, `Writer` and `Operation`
-/// pass retain's checks, its `Revision` is a SHA-256 digest in lowercase hex and its `Source`,
-/// when present, a full commit hash, and its ID is a well-formed local ID that `known`, the
-/// counts of the checkpoint IDs from `commit`, holds once in any case.
-fn since(
+/// The checkpoints along first parents from `commit` that `base` does not reach, newest first;
+/// `all` is [`walk`] from `commit`. Each must be one `model retain` could have written, else
+/// `refuse` gets its commit and why: it has at most one parent, carries checkpoint trailers, its
+/// `--doing`, `Writer` and `Operation` pass retain's checks, its `Revision` is a SHA-256 digest in
+/// lowercase hex and its `Source` and `Restored-From`, when present, full commit hashes, its ID is
+/// a well-formed local ID that `all` holds once in any case, and its `Corrects`, when present,
+/// names an earlier checkpoint that is no correction and holds its revision, proposal and tree.
+pub(super) fn since(
     root: &Path,
     commit: &str,
     base: Option<&str>,
-    known: &BTreeMap<String, usize>,
+    all: &[Checkpoint],
     refuse: impl Fn(&str, &str) -> anyhow::Error,
 ) -> Result<Vec<Checkpoint>> {
     let exclude = base.map(|base| format!("^{base}"));
@@ -423,29 +449,44 @@ fn since(
     args.extend(["--format=%H%x1f%cI%x1f%B%x1e", "--end-of-options", commit]);
     args.extend(exclude.as_deref());
     let log = git::text(root, &args)?;
+    let known = id_counts(all);
+    let applied: BTreeSet<&str> = (all.iter())
+        .flat_map(|c| &c.corrections)
+        .map(|c| c.commit.as_str())
+        .collect();
     let mut found = Vec::new();
     for entry in log.split('\x1e').filter(|e| !e.trim().is_empty()) {
         let object = entry.trim_start().split('\x1f').next().unwrap_or_default();
         let checkpoint = parse(entry).ok_or_else(|| refuse(object, "is not a checkpoint"))?;
-        let id = checkpoint.id.to_ascii_lowercase();
-        if !ids::is_local(&id) || known.get(&id) != Some(&1) {
-            return Err(refuse(object, "has a malformed or repeated checkpoint ID"));
+        if let Some(reason) = refused(&checkpoint, &known) {
+            return Err(refuse(object, reason));
         }
-        let operation = checkpoint.operation_id.as_deref();
-        if check_doing(&checkpoint.doing).is_err()
-            || check_writer(&checkpoint.writer).is_err()
-            || operation.map(check_operation).transpose().is_err()
-            || !is_digest(&checkpoint.revision)
-            || checkpoint
-                .source
-                .as_deref()
-                .is_some_and(|s| !git::is_full_hash(s))
-        {
-            return Err(refuse(object, "has a trailer value `model retain` refuses"));
+        if checkpoint.corrects.is_some() && !applied.contains(object) {
+            let reason = "corrects no earlier checkpoint that is no correction and holds its revision, proposal and tree";
+            return Err(refuse(object, reason));
         }
         found.push(checkpoint);
     }
     Ok(found)
+}
+
+pub(super) fn refused(
+    checkpoint: &Checkpoint,
+    known: &BTreeMap<String, usize>,
+) -> Option<&'static str> {
+    let id = checkpoint.id.to_ascii_lowercase();
+    if !ids::is_local(&id) || known.get(&id) != Some(&1) {
+        return Some("has a malformed or repeated checkpoint ID");
+    }
+    let operation = checkpoint.operation_id.as_deref();
+    let bad = check_doing(&checkpoint.doing).is_err()
+        || check_writer(&checkpoint.writer).is_err()
+        || operation.map(check_operation).transpose().is_err()
+        || !is_digest(&checkpoint.revision)
+        || [&checkpoint.source, &checkpoint.restored_from]
+            .iter()
+            .any(|hash| hash.as_deref().is_some_and(|h| !git::is_full_hash(h)));
+    bad.then_some("has a trailer value `model retain` refuses")
 }
 
 /// Whether `text` is a SHA-256 digest as `model retain` writes one: 64 lowercase hex characters.

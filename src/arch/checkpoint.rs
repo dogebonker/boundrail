@@ -10,7 +10,9 @@
 //! the checkout's HEAD, index and working tree never change; every worktree of the repository
 //! shares the one history ref. With `commit.gpgSign` set, checkpoints are signed with the user's
 //! signing program and key; a write's checkpoint is committed, and signed, before the write
-//! changes the vault.
+//! changes the vault. `model history correct` appends a checkpoint with a `Corrects` trailer
+//! whose `Source` readers take for the checkpoint it names, and a restore recreates checkpoints
+//! with a `Restored-From` trailer naming their original commit.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -33,7 +35,9 @@ use crate::files::hash;
 use crate::git;
 
 mod publish;
+mod repair;
 pub use publish::{DEFAULT_REMOTE, Destination, Published, configure, destination, fetch, push};
+pub use repair::{Bundled, Chain, Corrected, Rebuilt, correct, export_history, rebuild};
 
 /// The history ref, one per repository.
 pub const HISTORY: &str = "refs/boundrail/history";
@@ -84,6 +88,28 @@ pub struct Checkpoint {
     /// Whether the history remote holds it, read from refs when the checkpoint is read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publication: Option<Publication>,
+    /// The ID of the earlier checkpoint whose source this one corrects; it holds that one's tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub corrects: Option<String>,
+    /// The corrections of its source, oldest first; `source` is the latest one's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub corrections: Vec<Correction>,
+    /// The commit it was restored from, when a restore recreated it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored_from: Option<String>,
+}
+
+/// One correction of a checkpoint's source: the correcting checkpoint, who made it, when and why,
+/// and the source before and after.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Correction {
+    pub checkpoint: String,
+    pub commit: String,
+    pub writer: String,
+    pub time: String,
+    pub doing: String,
+    pub previous: Option<String>,
+    pub source: Option<String>,
 }
 
 /// Whether the code a checkpoint was drawn against can be read here.
@@ -188,7 +214,7 @@ pub fn retain(
     if snapshot.revision != model.revision.digest {
         return Err(changed_meanwhile(&snapshot.revision));
     }
-    let latest = history.iter().find(|c| c.proposal.is_none());
+    let latest = (history.iter()).find(|c| c.proposal.is_none() && c.corrects.is_none());
     if let Some(latest) = latest
         && latest.revision == model.revision.digest
         && latest.doing == doing
@@ -402,6 +428,8 @@ struct Draft {
     doing: String,
     writer: String,
     operation: Option<String>,
+    /// The checkpoint whose source it corrects.
+    corrects: Option<String>,
 }
 
 impl Draft {
@@ -428,6 +456,7 @@ impl Draft {
             doing: doing.to_owned(),
             writer: writer.to_owned(),
             operation: operation.map(str::to_owned),
+            corrects: None,
         })
     }
 
@@ -464,13 +493,17 @@ impl Draft {
         if let Some(operation) = &self.operation {
             writeln!(message, "Operation: {operation}")?;
         }
+        if let Some(corrected) = &self.corrects {
+            writeln!(message, "Corrects: {corrected}")?;
+        }
         Ok(message)
     }
 
     /// Whether `checkpoint` is the one this draft retains: the same operation, writer, state,
-    /// revision and doing line.
+    /// revision and doing line, and no correction.
     fn made(&self, checkpoint: &Checkpoint) -> bool {
-        checkpoint.operation_id == self.operation
+        checkpoint.corrects.is_none()
+            && checkpoint.operation_id == self.operation
             && checkpoint.writer == self.writer
             && checkpoint.proposal == self.proposal
             && checkpoint.revision == self.revision
@@ -534,7 +567,7 @@ pub fn load(start: &Path, which: &str) -> Result<(Checkpoint, Model)> {
 /// [`load`], with the bytes of every file of the checkpoint's tree.
 pub fn load_files(start: &Path, which: &str) -> Result<(Checkpoint, Model, Blobs)> {
     let (vault, root) = locations(start)?;
-    let checkpoint = annotated(&root, find(history(&root, None)?.list, which)?)?;
+    let checkpoint = annotated(&root, find(&history(&root, None)?.list, which)?)?;
     let files = blobs(&root, &files(&root, &checkpoint)?)?;
     let temp = TempDir::new("checkpoint")?;
     let dir = temp.path().join("model");
@@ -707,8 +740,8 @@ pub fn checkout(vault: &Path) -> Result<PathBuf> {
 
 /// The checkpoint an earlier attempt of `operation` from another worktree left on the shared
 /// history ref, since each worktree keeps its own journal. Refuses `OPERATION_REUSED` when it
-/// was made for another writer or reason, from another revision than `expected`, or holds a
-/// proposal.
+/// was made for another writer or reason, from another revision than `expected`, holds a
+/// proposal or is a correction.
 fn retained_elsewhere<'a>(
     history: &'a [Checkpoint],
     operation: Option<&str>,
@@ -723,6 +756,7 @@ fn retained_elsewhere<'a>(
         return Ok(None);
     };
     if found.proposal.is_some()
+        || found.corrects.is_some()
         || found.writer != writer
         || found.doing != doing
         || expected.is_some_and(|e| e != found.revision)
@@ -749,24 +783,23 @@ fn as_held(history: &[Checkpoint], checkpoint: Checkpoint) -> Checkpoint {
     held.cloned().unwrap_or(checkpoint)
 }
 
-fn find(history: Vec<Checkpoint>, which: &str) -> Result<Checkpoint> {
+fn find(history: &[Checkpoint], which: &str) -> Result<Checkpoint> {
     let prefix = which.to_ascii_lowercase();
     let hex = prefix.len() >= PREFIX_MIN && prefix.bytes().all(|b| b.is_ascii_hexdigit());
-    let by_id: Vec<Checkpoint> = history
+    let by_id: Vec<&Checkpoint> = history
         .iter()
         .filter(|c| c.id.eq_ignore_ascii_case(which))
-        .cloned()
         .collect();
-    let mut matches: Vec<Checkpoint> = if by_id.is_empty() && hex {
+    let matches: Vec<&Checkpoint> = if by_id.is_empty() && hex {
         history
-            .into_iter()
+            .iter()
             .filter(|c| c.commit.starts_with(&prefix))
             .collect()
     } else {
         by_id
     };
     match matches.len() {
-        1 => Ok(matches.remove(0)),
+        1 => Ok(matches[0].clone()),
         0 => Err(Refusal::new(
             Code::CheckpointNotFound,
             format!("no checkpoint has the ID or commit `{which}`"),
@@ -1119,16 +1152,77 @@ fn walk(root: &Path, commit: &str, limit: Option<usize>) -> Result<Vec<Checkpoin
     for checkpoint in list.iter_mut().rev() {
         checkpoint.parent = parent.replace(checkpoint.id.clone());
     }
+    apply_corrections(root, &mut list)?;
     if let Some(limit) = limit {
         list.truncate(limit);
     }
     Ok(list)
 }
 
+/// Applies each correction of `list`, newest first, oldest correction first: the earlier
+/// checkpoint it names takes its source, without `uncommitted`, and records it in `corrections`.
+/// A correction is applied only to an earlier checkpoint that is no correction and holds its
+/// revision, proposal and tree.
+fn apply_corrections(root: &Path, list: &mut [Checkpoint]) -> Result<()> {
+    let pairs = correctable(list);
+    if pairs.is_empty() {
+        return Ok(());
+    }
+    let peeled: Vec<String> = (pairs.iter())
+        .flat_map(|&(at, target)| [at, target])
+        .map(|i| format!("{}^{{tree}}", list[i].commit))
+        .collect();
+    let mut args = vec!["rev-parse"];
+    args.extend(peeled.iter().map(String::as_str));
+    let trees = git::text(root, &args)?;
+    let trees: Vec<&str> = trees.lines().collect();
+    for (&(at, target), trees) in pairs.iter().zip(trees.chunks(2)) {
+        if trees.first() == trees.last() {
+            let (newer, older) = list.split_at_mut(target);
+            apply_correction(&mut older[0], &newer[at]);
+        }
+    }
+    Ok(())
+}
+
+fn apply_correction(corrected: &mut Checkpoint, correction: &Checkpoint) {
+    let previous = std::mem::replace(&mut corrected.source, correction.source.clone());
+    corrected.uncommitted = false;
+    corrected.corrections.push(Correction {
+        checkpoint: correction.id.clone(),
+        commit: correction.commit.clone(),
+        writer: correction.writer.clone(),
+        time: correction.time.clone(),
+        doing: correction.doing.clone(),
+        previous,
+        source: correction.source.clone(),
+    });
+}
+
+fn correctable(list: &[Checkpoint]) -> Vec<(usize, usize)> {
+    let mut earlier: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut pairs = Vec::new();
+    for at in (0..list.len()).rev() {
+        let c = &list[at];
+        let Some(corrected) = &c.corrects else {
+            earlier.insert(&c.id, at);
+            continue;
+        };
+        if let Some(&target) = earlier.get(corrected.as_str())
+            && list[target].revision == c.revision
+            && list[target].proposal == c.proposal
+        {
+            pairs.push((at, target));
+        }
+    }
+    pairs
+}
+
 /// One `git log` entry of [`walk`]: commit, time and message, the message's first line the
-/// `--doing` and its other lines `Key: value` trailers. A `Proposal` that is not a local ID, or
-/// an `Uncommitted` other than `true` after a `Source`, is not one a retain writes, so the commit
-/// is not a checkpoint.
+/// `--doing` and its other lines `Key: value` trailers. A `Proposal` that is not a local ID, an
+/// `Uncommitted` other than `true` after a `Source`, or a `Corrects` that is not a local ID or
+/// comes without a `Source` or with `Uncommitted`, is not one a retain or correction writes, so
+/// the commit is not a checkpoint.
 fn parse(entry: &str) -> Option<Checkpoint> {
     let mut fields = entry.trim_start_matches('\n').splitn(3, '\x1f');
     let (commit, time, message) = (fields.next()?, fields.next()?, fields.next()?);
@@ -1145,6 +1239,13 @@ fn parse(entry: &str) -> Option<Checkpoint> {
         Some(&"true") if trailers.contains_key("Source") => true,
         Some(_) => return None,
     };
+    let corrects = value("Corrects");
+    if corrects
+        .as_deref()
+        .is_some_and(|c| !ids::is_local(c) || !trailers.contains_key("Source") || uncommitted)
+    {
+        return None;
+    }
     Some(Checkpoint {
         id: value("Checkpoint")?,
         commit: commit.to_owned(),
@@ -1159,6 +1260,9 @@ fn parse(entry: &str) -> Option<Checkpoint> {
         uncommitted,
         source_status: None,
         publication: None,
+        corrects,
+        corrections: Vec::new(),
+        restored_from: value("Restored-From"),
     })
 }
 

@@ -49,10 +49,11 @@
 //! same accepted scope as the signing program, and only on that explicit command. Hooks stay off
 //! there too, `pre-push` and `reference-transaction` included.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 /// The references naming a repository's default branch, in the order they are tried.
 pub const DEFAULT_BRANCHES: [&str; 3] = ["origin/HEAD", "main", "master"];
@@ -68,12 +69,23 @@ pub fn run(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
 /// A disposable index permits Git's own stat cache without changing the user's staging index,
 /// so `git diff` refreshes it: an entry whose stat changed is content-checked, not listed.
 pub fn run_with_index(root: &Path, args: &[&str], index: Option<&Path>) -> Result<Vec<u8>> {
-    checked(root, args, index, &[])
+    checked(root, args, index, &[], None)
+}
+
+/// `run_with_index` with `input` on Git's standard input, such as the paths `--stdin-paths`
+/// reads.
+pub fn run_with_input(
+    root: &Path,
+    args: &[&str],
+    index: Option<&Path>,
+    input: Vec<u8>,
+) -> Result<Vec<u8>> {
+    checked(root, args, index, &[], Some(input))
 }
 
 /// `run` with `env` set for Git, such as the dates a copied commit keeps.
 pub fn run_with_env(root: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<Vec<u8>> {
-    checked(root, args, None, env)
+    checked(root, args, None, env, None)
 }
 
 fn checked(
@@ -81,8 +93,9 @@ fn checked(
     args: &[&str],
     index: Option<&Path>,
     env: &[(&str, &str)],
+    input: Option<Vec<u8>>,
 ) -> Result<Vec<u8>> {
-    let out = output(root, args, index, env)?;
+    let out = output(root, args, index, env, input)?;
     if !out.status.success() {
         bail!(
             "git {}: {}",
@@ -99,6 +112,7 @@ fn output(
     args: &[&str],
     index: Option<&Path>,
     env: &[(&str, &str)],
+    input: Option<Vec<u8>>,
 ) -> Result<Output> {
     let mut command = Command::new("git");
     command.envs(env.iter().copied());
@@ -132,9 +146,24 @@ fn output(
                 "diff.autoRefreshIndex=false"
             },
         ])
-        .args(args)
-        .output()
-        .context("running git (is it installed?)")
+        .args(args);
+    let Some(input) = input else {
+        return command.output().context("running git (is it installed?)");
+    };
+    let mut child = (command.stdin(Stdio::piped()).stdout(Stdio::piped()))
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("running git (is it installed?)")?;
+    let mut stdin = child.stdin.take().context("git's standard input")?;
+    let writer = std::thread::spawn(move || stdin.write_all(&input));
+    let out = child.wait_with_output().context("running git")?;
+    let written = writer
+        .join()
+        .map_err(|_| anyhow!("writing git's input panicked"))?;
+    if out.status.success() {
+        written.context("writing git's input")?;
+    }
+    Ok(out)
 }
 
 /// Whether the commit `ancestor` is `descendant` or one of its ancestors. Git answers with exit
@@ -152,7 +181,7 @@ pub fn have_merge_base(root: &Path, a: &str, b: &str) -> Result<bool> {
 /// Whether `git merge-base args` answers yes (exit 0) or no (exit 1).
 fn merge_base(root: &Path, args: &[&str]) -> Result<bool> {
     let args = [&["merge-base"][..], args].concat();
-    let out = output(root, &args, None, &[])?;
+    let out = output(root, &args, None, &[], None)?;
     match out.status.code() {
         Some(0) => Ok(true),
         Some(1) => Ok(false),

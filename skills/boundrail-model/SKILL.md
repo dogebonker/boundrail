@@ -148,6 +148,11 @@ reads one. `source_status` says whether the code it was drawn against is here (`
 was mixed with uncommitted changes (`uncommitted`), or is missing (`unavailable`). `publication`
 says whether the history remote holds it. Publish only when the user asks: `boundrail model
 history push` (the remote is `boundrail model history configure --remote <name>`, else `origin`).
+When a checkpoint recorded the wrong source commit, correct it with `boundrail model history
+correct <checkpoint> --source <full commit hash> --doing "<why>"`; never rewrite the history ref.
+To move the whole model to a checkout without a vault, run `boundrail model export
+--with-history --output <file>` in the old checkout and `boundrail model import --restore <file>`
+in the new one.
 
 ## Design
 

@@ -186,6 +186,14 @@
   commit with `--checkpoint`, and `local_path` in this checkout or in the checkout
   `boundrail/checkouts.json` names for its repo. `--open` opens it with the platform opener (on
   Windows and Linux, the folder holding it) and refuses a target that is not on this machine.
+- History repair: `model history correct <checkpoint> --source <commit> --doing <why>` appends a
+  checkpoint with a `Corrects` trailer instead of rewriting history. Checkpoint readings take its
+  source for the corrected checkpoint and list the audit trail (who, when, why, the source before
+  and after) in `corrections`. Push and fetch check the new trailers as they check the others.
+- Restore: `model export --with-history` adds every proposal and the checkpoint history as data,
+  and `model import --restore <bundle>` recreates the vault (the same model, state and every
+  other ID) and the history in a checkout that has neither. Restored checkpoints keep their
+  trailers and dates and name their original commit in a `Restored-From` trailer.
 
 ### Changed
 

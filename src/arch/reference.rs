@@ -148,6 +148,11 @@ pub struct CodeTarget {
     /// The checkout's commit when the model read was retained: the source of a checkpoint.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
+    /// The latest correction `commit` comes from, when one changed the source the checkpoint
+    /// recorded. Its `writer` is what the correcting checkpoint's `Writer` trailer asserts; no
+    /// signature is checked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correction: Option<checkpoint::Correction>,
     /// The absolute path on this machine: in this checkout, or for a `repo` in the checkout the
     /// user's [`CHECKOUTS`] names so.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -157,9 +162,9 @@ pub struct CodeTarget {
     pub unavailable: Option<String>,
 }
 
-/// The code target of `binding` read from the checkout root `root`; `source` is the commit of
-/// this checkout the model was retained at, which names no commit of another `repo`.
-pub fn code_target(root: &Path, binding: &Binding, source: Option<&str>) -> CodeTarget {
+/// The code target of `binding` read from the checkout root `root`; `checkpoint` is the one the
+/// model read was retained at, whose source is a commit of this checkout, not of another `repo`.
+pub fn code_target(root: &Path, binding: &Binding, checkpoint: Option<&Checkpoint>) -> CodeTarget {
     let local = match &binding.repo {
         None => below(root, &binding.path),
         Some(repo) => configured(repo).and_then(|base| below(&base, &binding.path)),
@@ -168,11 +173,13 @@ pub fn code_target(root: &Path, binding: &Binding, source: Option<&str>) -> Code
         Ok(path) => (Some(path), None),
         Err(error) => (None, Some(format!("{error:#}"))),
     };
+    let here = checkpoint.filter(|_| binding.repo.is_none());
     CodeTarget {
         repo: binding.repo.clone(),
         path: binding.path.clone(),
         symbol: binding.symbol.clone(),
-        commit: source.filter(|_| binding.repo.is_none()).map(str::to_owned),
+        commit: here.and_then(|c| c.source.clone()),
+        correction: here.and_then(|c| c.corrections.last().cloned()),
         local_path,
         unavailable,
     }

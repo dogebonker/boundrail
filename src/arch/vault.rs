@@ -35,9 +35,9 @@ pub use pictures::PictureEntry;
 pub(crate) use pictures::output_problems;
 pub(super) use proposals::{
     BASE, PROPOSAL, base_writes, in_proposal, is_proposal, is_proposal_path, prefix, proposal_file,
-    proposal_write, read_proposal,
+    proposal_write, read_proposal, split_proposal,
 };
-use proposals::{PROPOSALS, base_prefix, check_proposal, is_base, split_proposal, unprefixed};
+use proposals::{PROPOSALS, base_prefix, check_proposal, is_base, unprefixed};
 pub use proposals::{Scope, load_base, load_proposal, load_state, proposals};
 pub use views::ViewEntry;
 pub(crate) use views::{Named, position};
@@ -938,6 +938,12 @@ fn is_written(path: &str) -> bool {
         Some((id, rest)) => ids::is_local(id) && is_proposal_file(rest),
         None => path == MANIFEST || is_id_file(path, &FOLDERS),
     }
+}
+
+/// Whether the vault-relative `path` names a file of a proposal folder named by a well-formed
+/// local ID (see [`is_proposal_file`]).
+pub(super) fn is_proposal_vault_file(path: &str) -> bool {
+    split_proposal(path).is_some_and(|(id, rest)| ids::is_local(id) && is_proposal_file(rest))
 }
 
 /// Whether a proposal-relative path names a file a journaled write may write in a proposal

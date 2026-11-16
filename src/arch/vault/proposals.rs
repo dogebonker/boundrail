@@ -81,7 +81,7 @@ pub(crate) fn proposal_file(id: &str) -> String {
 }
 
 /// The proposal ID and proposal-relative rest of a path inside a proposal folder.
-pub(super) fn split_proposal(path: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_proposal(path: &str) -> Option<(&str, &str)> {
     path.strip_prefix(PROPOSALS)?
         .strip_prefix('/')?
         .split_once('/')
