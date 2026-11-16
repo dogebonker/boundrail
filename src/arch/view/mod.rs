@@ -212,29 +212,45 @@ fn same(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// A one-time code the browser opener gets in place of the token, so the token never appears in
-/// a process's arguments. The first request naming it redeems it; after that it is spent.
-pub struct Launch(Mutex<Option<String>>);
+/// a process's arguments. The first request naming it redeems it; after that it is spent. The
+/// code is still visible to other local users while the opener runs, so a spent code presented
+/// again means someone else may have redeemed it first.
+pub struct Launch(Mutex<(String, bool)>);
+
+/// What presenting a launch code found.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Redeem {
+    /// The unspent code, now spent.
+    Fresh,
+    /// The code, already spent by an earlier request.
+    Spent,
+    /// Not the code.
+    Unknown,
+}
 
 impl Launch {
     /// A new code from the operating system's random source.
     pub fn new() -> anyhow::Result<Self> {
-        Ok(Self(Mutex::new(Some(crate::token()?))))
+        Ok(Self(Mutex::new((crate::token()?, false))))
     }
 
     /// The code while it is unspent.
     pub fn code(&self) -> Option<String> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        let state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        (!state.1).then(|| state.0.clone())
     }
 
-    /// Whether `given` is the unspent code, which this spends.
-    pub fn redeem(&self, given: Option<&str>) -> bool {
-        let mut code = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        let matches =
-            (code.as_deref().zip(given)).is_some_and(|(c, g)| same(c.as_bytes(), g.as_bytes()));
-        if matches {
-            *code = None;
+    /// Spends `given` when it is the unspent code.
+    pub fn redeem(&self, given: Option<&str>) -> Redeem {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if !given.is_some_and(|given| same(state.0.as_bytes(), given.as_bytes())) {
+            Redeem::Unknown
+        } else if state.1 {
+            Redeem::Spent
+        } else {
+            state.1 = true;
+            Redeem::Fresh
         }
-        matches
     }
 }
 
@@ -396,13 +412,15 @@ mod tests {
         let code = launch.code().unwrap();
         assert_eq!(code.len(), 64);
         assert_ne!(code, token);
-        assert!(!launch.redeem(None));
-        assert!(!launch.redeem(Some(&code[1..])));
-        assert!(launch.redeem(Some(&code)));
-        assert!(
-            !launch.redeem(Some(&code)),
-            "a spent code does not redeem again"
+        assert_eq!(launch.redeem(None), Redeem::Unknown);
+        assert_eq!(launch.redeem(Some(&code[1..])), Redeem::Unknown);
+        assert_eq!(launch.redeem(Some(&code)), Redeem::Fresh);
+        assert_eq!(
+            launch.redeem(Some(&code)),
+            Redeem::Spent,
+            "a spent code does not redeem again and is told apart from a wrong one"
         );
+        assert_eq!(launch.redeem(Some("wrong")), Redeem::Unknown);
         assert_eq!(launch.code(), None);
     }
 

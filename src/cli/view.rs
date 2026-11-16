@@ -370,16 +370,29 @@ impl Server {
             "/" => asset("text/html; charset=utf-8", page::INDEX_HTML),
             "/app.js" => asset("text/javascript; charset=utf-8", page::APP_JS),
             "/style.css" => asset("text/css; charset=utf-8", page::STYLE_CSS),
-            "/launch" if self.launch.redeem(request.param("c")) => {
-                let location = format!("/?t={}", self.token);
-                page::response(
-                    303,
-                    "text/plain; charset=utf-8",
-                    b"",
-                    &[("Location", &location)],
-                )
-            }
-            "/launch" => text(403, "Unknown or used launch code"),
+            "/launch" => match self.launch.redeem(request.param("c")) {
+                page::Redeem::Fresh => {
+                    let location = format!("/?t={}", self.token);
+                    page::response(
+                        303,
+                        "text/plain; charset=utf-8",
+                        b"",
+                        &[("Location", &location)],
+                    )
+                }
+                page::Redeem::Spent => {
+                    eprintln!(
+                        "warning: the launch link was opened twice; another local process may \
+                         have opened this view first. Stop it and run `model view --no-open`"
+                    );
+                    text(
+                        403,
+                        "This launch link was already used, possibly by another local process. \
+                         Stop the view and open the URL it printed with --no-open.",
+                    )
+                }
+                page::Redeem::Unknown => text(403, "Unknown launch code"),
+            },
             "/api/render" => match self.render(request) {
                 Ok(svg) => {
                     let csp = [("Content-Security-Policy", page::RENDER_CSP)];
@@ -564,10 +577,12 @@ mod tests {
         );
         let location = format!("\r\nLocation: /?t={}\r\n", server.token);
         assert!(redirect.contains(&location), "{redirect}");
+        let reused = launch(&code);
         assert!(
-            launch(&code).starts_with("HTTP/1.1 403 "),
+            reused.starts_with("HTTP/1.1 403 "),
             "a used code is refused"
         );
+        assert!(reused.contains("already used"), "{reused}");
     }
 
     #[test]
