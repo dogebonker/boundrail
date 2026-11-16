@@ -58,7 +58,7 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 | T24 | Schema: relationship traffic, step anchors, authored flow participant order, flow summary required on write (`FLOW_SUMMARY_REQUIRED`) | done |
 | T25 | History on every write: each edit, including in proposals, retains a checkpoint with its doing line; publication destination with per-checkpoint status; source-commit availability on checkpoint reads | done |
 | T26 | Proposal metadata: summary, linked documents, rename and edit through `set`, select by unique name; walkthroughs authored inside proposals | done |
-| T27 | Proposal families: child proposals of a draft, family reconcile, standing, settle conflicts by mine, theirs or edited; `INHERITANCE_DROPPED` and `PART_RECREATED` confirmations | open |
+| T27 | Proposal families: child proposals of a draft, family reconcile, standing, settle conflicts by mine, theirs or edited; `INHERITANCE_DROPPED` and `PART_RECREATED` confirmations | done |
 | T28 | Readings: group regions and group filter; beat selection apart from focus, relationship filters, groups, visibility; saved views that need no output file | done |
 | T29 | Cross-model references: modules reference another model, state or subject, `read --references`, pinned foreign checkpoints; `read --code` resolves and opens the code target | done |
 | T30 | History repair and restore: correct a recorded state with source commits and an audit trail; restore a bundle into an empty vault with identities and history | open |
@@ -1643,3 +1643,86 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 - T26: the plan skill records slices in the proposal's description or summary (editable with
   `edit-proposal`) or as a walkthrough in the proposal, so slicing no longer edits the current
   state and no longer makes adoption refuse `PREDECESSOR_MOVED`.
+- T27: a child is `model propose --parent <draft>` (ID or unique name; not with `--from`): a copy
+  of the draft's modules and collections, no walkthroughs, whose base is the draft as it is and
+  whose `dropped` list is the draft's. `proposal.json` gains `parent`, the parent's local ID,
+  left out when absent, so proposals written before T27 load and digest as they did, and
+  `propose` without it keeps its fingerprint. A child's `predecessor` is `{state: <parent ID>,
+  revision: <content digest>}`, the content digest hashing the draft's `modules/` and
+  `collections/` files at their proposal-relative paths (`Model::content_digest`), base and
+  walkthroughs aside, so editing the parent's walkthroughs or metadata does not move it. An
+  adopted or shelved parent refuses `PROPOSAL_CLOSED`. A copy of a child (`--from`) inherits its
+  parent; an imported proposal bundle keeps its parent, which another clone may lack.
+- T27: standing, of drafts only: the predecessor is the current state for a draft without a
+  parent, the parent while the parent is a draft, or the parent adopted while it still is the
+  current state (its `adopted_as` is the current state and their modules and collections are
+  equal, the rule `--from` already used). `up-to-date` when the recorded revision equals that
+  predecessor's (the current state's predecessor digest, or its pre-T14 form, or the parent's
+  content digest), `behind` otherwise, and `orphaned` when the parent is shelved, adopted and
+  since replaced, or gone. `model proposals` adds `parent`, `children` (local IDs in ID order)
+  and `standing` to each entry, leaving `standing` out for closed proposals and when the current
+  state or a parent does not load; Markdown nests children under their parent and appends the
+  standing. `model read --proposal` adds `standing` (JSON) and a `Standing:` line (Markdown);
+  checkpoint readings have none.
+- T27: adoption of a child whose parent is a draft refuses `PARENT_NOT_ADOPTED` with
+  `details.parent`, after `STALE_REVISION`; once the parent is adopted and still the current
+  state, the child adopts when its recorded revision is the parent's content digest, and
+  otherwise refuses `PREDECESSOR_MOVED`, as does an orphaned child. Adopting a parent changes no
+  child. "Adopt the family in order" is adopting each in turn; there is no family adopt.
+- T27: reconcile merges against the parent while it is a draft (keeping `parent`, recording its
+  content digest), and otherwise against the current state, clearing `parent`, so an orphaned
+  child leaves the family. A child of a shelved or missing parent therefore loses what the parent
+  changed and it did not, and keeps what both changed as conflicts: it refuses
+  `PARENT_CHANGES_DROPPED` with `details.subjects`, the subjects the child holds as its base (the
+  parent) does and whose version the merge takes from the current state, until `--confirm
+  PARENT_CHANGES_DROPPED` (or `=<subject>` for each). A child of a parent adopted and since
+  replaced needs no confirmation: the parent's changes are in the current state's history. The
+  base becomes the predecessor as it is. The current state's revision is still required and its retired IDs still apply.
+  `MODEL_INVALID` with `cause: "merge"` now says "its predecessor".
+- T27: settling. `--settle <subject>=mine|theirs|edited:<file>` (repeatable; qualified or local
+  ID) decides a conflicting subject inside the merge: `mine` takes the draft's version (or its
+  removal), `theirs` the predecessor's, `edited` the file's JSON, parsed as what the base, draft
+  or predecessor holds under that ID: a module (its own fields; `outgoing` must be empty, since
+  each relationship merges and settles as its own subject), a relationship (kept in the owner the
+  draft or predecessor gives it) or a collection; one that does not parse, holds another ID, or
+  names nothing refuses `REQUEST_INVALID`, and one that does not load refuses `MODEL_INVALID`
+  (`cause: "merge"`). A relationship whose owner the merge removed settles too: `mine` and
+  `theirs` keep it, with its owner as that side holds them, only when that side holds it, and
+  drop it otherwise, leaving the owner removed; `edited` writes the replacement into its owner as
+  the draft, else the predecessor, holds it. A settlement naming a subject not
+  in conflict, or a subject twice, refuses `REQUEST_INVALID` (`details.subjects`) before
+  `RECONCILE_CONFLICT`, which lists only what no settlement decided, with the same `details` as
+  before. A `retired` conflict never settles: retired IDs stay reserved (D3). Settlements and
+  confirmations join the request, and so the fingerprint, only when given, so a retry with other
+  choices is another operation and old fingerprints hold.
+- T27: confirmations, judged after the conflicts on the merged draft against the base and the
+  predecessor now. `INHERITANCE_DROPPED`: a merged module's `parent` names a module the base held
+  and the predecessor no longer does, and the merge does not keep it (a draft's new part in a
+  container the predecessor removed, before T27 `MODEL_INVALID`; or a part settled `mine`).
+  `details.modules` lists `{module, parent, lifted_to}`, `lifted_to` being the nearest container
+  above the removed one, by the base's containment, that the merge keeps, else null for the
+  root; confirmed, the part moves there. `PART_RECREATED`: the merge keeps a module, by ID, that
+  the base held and the predecessor removed, which only a settlement as `mine` or `edited`
+  makes; `details.modules` lists them, and confirmed they stay. Against the current state such
+  an ID is retired and refuses `RECONCILE_CONFLICT` (`retired`) first, so `PART_RECREATED` comes
+  from children of drafts. `--confirm <CODE>` covers every module, `<CODE>=<module>` one; a
+  confirmation nothing needed is ignored. Refusals in order: `PROPOSAL_CLOSED`,
+  `STALE_REVISION`, `RECONCILE_NO_BASE`, `REQUEST_INVALID` (settlements), `RECONCILE_CONFLICT`,
+  `PARENT_CHANGES_DROPPED`, `INHERITANCE_DROPPED`, `PART_RECREATED`, claims, `MODEL_INVALID`. Adoption takes no
+  `--confirm`: it needs an unmoved predecessor, so its base equals the current state and neither
+  case can arise; it merges nothing.
+- T27: `--family` reconciles the named draft, then every draft descending from it through drafts,
+  depth first, parents before children and siblings in ID order, each against its parent as just
+  written. Each is its own journaled write retaining its own checkpoint (T25), since a journal
+  record's scope covers one proposal: the descendants take operation ID `<operation-id>.<local
+  ID>`, the current revision the caller named, their own revision as their write reads it (their
+  request names none), the confirmations naming one subject (a confirmation of every subject
+  covers the named draft only) and no settlements. When the draft has descendants, an operation
+  ID too long to leave room for `.<local ID>` within the operation ID limit refuses
+  `REQUEST_INVALID` before any write. A descendant already `up-to-date` is skipped
+  (`reconciled: false`); a retry with the same operation ID replays each receipt written and
+  goes on from there. A refusal stops the walk with `details.family` listing the
+  drafts finished before it (`{proposal, reconciled}`), whose writes stay; settle the refused
+  draft alone, then run `--family` from it. JSON is the named draft's receipt with `family`, each
+  descendant `{proposal, operation_id, reconciled, receipt?}`; Markdown prints a receipt per
+  reconciled draft and `<id> is up to date` for the others.

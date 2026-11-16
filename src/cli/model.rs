@@ -1,6 +1,6 @@
 use super::*;
 use clap::ValueEnum;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read as _;
 use std::iter;
 
@@ -20,7 +20,9 @@ use boundrail::arch::inspect::{self, InspectReport};
 use boundrail::arch::locality::{self, History, LocalityReport};
 use boundrail::arch::lsp::{self, Facts};
 use boundrail::arch::picture;
-use boundrail::arch::proposal::{self, CURRENT, Writing};
+use boundrail::arch::proposal::{
+    self, CURRENT, Confirm, Member, Origin, Reconciling, Settle, Take, Writing,
+};
 use boundrail::arch::render::{self, View};
 use boundrail::arch::request::INPUT_MAX;
 use boundrail::arch::semantic::{self, States};
@@ -372,13 +374,18 @@ enum ModelCmd {
         #[arg(long)]
         proposal: Option<String>,
     },
-    /// Draw a proposal: a draft of a future architecture, against the current state
+    /// Draw a proposal: a draft of a future architecture, against the current state or, as a
+    /// child, against a parent draft
     Propose {
         #[arg(long)]
         name: String,
         /// Start from the current state, or copy this proposal: its ID or unique name
         #[arg(long, default_value = CURRENT)]
         from: String,
+        /// Draw a child of this draft (its ID or unique name): a copy whose predecessor is the
+        /// draft, adopted only after it
+        #[arg(long, conflicts_with = "from")]
+        parent: Option<String>,
         #[arg(long)]
         description: Option<String>,
         /// One line saying what the proposal changes
@@ -425,9 +432,10 @@ enum ModelCmd {
         #[arg(long)]
         claim: Option<String>,
     },
-    /// Merge into a draft what the current state changed since the draft was drawn or last
-    /// reconciled, and make the current state its predecessor; both sides changing one module,
-    /// relationship or collection refuses with the conflicts
+    /// Merge into a draft what its predecessor (the current state, or a child's parent draft)
+    /// changed since the draft was drawn or last reconciled, and make the predecessor its new
+    /// base; both sides changing one module, relationship or collection refuses with the
+    /// conflicts until each is settled
     Reconcile {
         /// The proposal's ID or unique name
         proposal: String,
@@ -442,6 +450,20 @@ enum ModelCmd {
         /// Your claim covering what the merge changes in the proposal
         #[arg(long)]
         claim: Option<String>,
+        /// Settle a conflicting subject: `<subject>=mine` keeps the proposal's side, `=theirs`
+        /// takes the predecessor's, `=edited:<file>` takes the module (without `outgoing`),
+        /// relationship or collection JSON in the file. Repeat for several
+        #[arg(long, value_name = "SUBJECT=CHOICE", value_parser = parse_settle)]
+        settle: Vec<Settle>,
+        /// Confirm `INHERITANCE_DROPPED`, `PART_RECREATED` or `PARENT_CHANGES_DROPPED`, for every
+        /// subject or, as `<CODE>=<subject>`, for one; with `--family`, only those naming one
+        /// subject reach the descendants. Repeat for several
+        #[arg(long, value_name = "CODE[=SUBJECT]", value_parser = parse_confirm)]
+        confirm: Vec<Confirm>,
+        /// Reconcile the drafts descending from this one too, parents first, each against its
+        /// parent as just reconciled
+        #[arg(long)]
+        family: bool,
     },
     /// Write the current state, a proposal with its base, or a checkpoint as one JSON bundle
     /// (schema `model-bundle`)
@@ -868,6 +890,7 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
         ModelCmd::Propose {
             name,
             from,
+            parent,
             description,
             summary,
             document,
@@ -878,11 +901,15 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
             let documents: Vec<types::Document> = (document.chunks(2))
                 .map(|pair| linked_document(&pair[0], &pair[1]))
                 .collect();
+            let origin = match &parent {
+                Some(parent) => Origin::Parent(parent),
+                None => Origin::From(Some(&from)),
+            };
             let (receipt, finished) = proposal::propose(
                 &dir,
                 &writing,
                 &name,
-                Some(&from),
+                origin,
                 description.as_deref(),
                 summary.as_deref(),
                 &documents,
@@ -917,12 +944,23 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
             expected_proposal_revision,
             writing,
             claim,
+            settle,
+            confirm,
+            family,
         } => {
             let dir = vault::locate(root)?;
             let writing = writing.writing(claim.as_deref());
-            let compared = &expected_proposal_revision;
-            let (receipt, finished) =
-                proposal::reconcile(&dir, &writing, &proposal, &expected_revision, compared)?;
+            let asked = Reconciling {
+                expected: &expected_revision,
+                compared: &expected_proposal_revision,
+                settle: &settle,
+                confirm: &confirm,
+            };
+            if family {
+                let members = proposal::reconcile_family(&dir, &writing, &proposal, &asked)?;
+                return print_family(markdown, &dir, members);
+            }
+            let (receipt, finished) = proposal::reconcile(&dir, &writing, &proposal, &asked)?;
             if let Some(scope) = &finished {
                 warn_unloadable(&dir, &[(scope, &receipt)]);
             }
@@ -1230,6 +1268,9 @@ fn whole_output(loaded: Loaded) -> Result<Value> {
         "revision": model.revision,
     });
     extend(&mut output, json!({ "proposal": model.proposal }))?;
+    if let Some(standing) = checkpoint.is_none().then(|| standing(&model)).flatten() {
+        output["standing"] = json!(standing);
+    }
     if let Some(active) = state.as_deref().and_then(active_claims) {
         output["claims"] = json!(active);
     }
@@ -1240,6 +1281,16 @@ fn whole_output(loaded: Loaded) -> Result<Value> {
         output["checkpoint"] = json!(checkpoint);
     }
     Ok(output)
+}
+
+/// Where the draft `model` holds, read from its vault, stands; `None` for the current state, a
+/// closed proposal, or a vault whose current state does not load.
+fn standing(model: &Model) -> Option<proposal::Standing> {
+    let drawn = model.proposal.as_ref()?;
+    let current = vault::load_dir(model.dir.clone()).ok()?;
+    proposal::standing(&model.dir, &current, drawn)
+        .ok()
+        .flatten()
 }
 
 /// Prints the whole loaded model, as JSON or Markdown.
@@ -1257,6 +1308,10 @@ fn print_whole(loaded: Loaded, markdown: bool) -> Result<()> {
         print_checkpoint(checkpoint);
     }
     print_proposal(&model);
+    if let Some(standing) = checkpoint.is_none().then(|| standing(&model)).flatten() {
+        let standing = serde_json::to_value(standing)?;
+        println!("Standing: {}", standing.as_str().unwrap_or_default());
+    }
     print_reading(&model, &model.read());
     print_collections(&model.collection_views());
     print_walkthroughs(&model.walkthrough_entries());
@@ -3344,6 +3399,83 @@ fn print_written(
     write(None, &output)
 }
 
+/// The output of a family reconcile: the named draft's receipt as `model reconcile` prints it,
+/// and each descendant in `family`.
+fn print_family(markdown: bool, dir: &Path, mut members: Vec<Member>) -> Result<()> {
+    let finished: Vec<(&Scope, &Receipt)> = (members.iter())
+        .filter_map(|m| m.finished.as_ref().zip(m.receipt.as_ref()))
+        .collect();
+    warn_unloadable(dir, &finished);
+    let first = members.remove(0);
+    let receipt = first
+        .receipt
+        .context("the named draft is always reconciled")?;
+    if markdown {
+        print_receipt(&label("reconcile"), &receipt);
+        for member in &members {
+            match &member.receipt {
+                Some(receipt) => print_receipt(&format!("Reconcile {}", member.proposal), receipt),
+                None => println!("{} is up to date", member.proposal),
+            }
+        }
+        return Ok(());
+    }
+    let mut output = json!({
+        "schema": MODEL_SCHEMA,
+        "kind": "reconcile",
+        "success": true,
+        "vault": dir,
+    });
+    extend(&mut output, receipt)?;
+    output["family"] = json!(members);
+    write(None, &output)
+}
+
+/// One `--settle`: `<subject>=mine`, `=theirs` or `=edited:<file>`, the file read as JSON.
+fn parse_settle(value: &str) -> Result<Settle, String> {
+    let (subject, choice) = (value.split_once('='))
+        .ok_or("expected <subject>=mine, <subject>=theirs or <subject>=edited:<file>")?;
+    let take = match choice {
+        "mine" => Take::Mine,
+        "theirs" => Take::Theirs,
+        _ => {
+            let file = (choice.strip_prefix("edited:"))
+                .ok_or("expected mine, theirs or edited:<file> after `=`")?;
+            let bytes = read_request(Some(Path::new(file))).map_err(|e| format!("{e:#}"))?;
+            if bytes.len() as u64 > INPUT_MAX {
+                return Err(format!("{file} is larger than {INPUT_MAX} bytes"));
+            }
+            let value = serde_json::from_slice(&bytes)
+                .map_err(|e| format!("{file} does not parse as JSON: {e}"))?;
+            Take::Edited(value)
+        }
+    };
+    Ok(Settle {
+        subject: subject.to_owned(),
+        take,
+    })
+}
+
+/// One `--confirm`: `INHERITANCE_DROPPED`, `PART_RECREATED` or `PARENT_CHANGES_DROPPED`,
+/// optionally `=<subject>`.
+fn parse_confirm(value: &str) -> Result<Confirm, String> {
+    let (code, subject) = match value.split_once('=') {
+        Some((code, subject)) => (code, Some(subject.to_owned())),
+        None => (value, None),
+    };
+    let code = match code {
+        "INHERITANCE_DROPPED" => Code::InheritanceDropped,
+        "PART_RECREATED" => Code::PartRecreated,
+        "PARENT_CHANGES_DROPPED" => Code::ParentChangesDropped,
+        _ => {
+            return Err(
+                "expected INHERITANCE_DROPPED, PART_RECREATED or PARENT_CHANGES_DROPPED".to_owned(),
+            );
+        }
+    };
+    Ok(Confirm { code, subject })
+}
+
 /// Adds the fields of `fields`, which serializes to an object, to the output envelope `output`,
 /// leaving out null ones.
 fn extend(output: &mut Value, fields: impl serde::Serialize) -> Result<()> {
@@ -3390,8 +3522,9 @@ fn print_receipt(label: &str, receipt: &Receipt) {
     }
 }
 
-/// `model proposals`: every proposal folder with its ID, name, status and predecessor, or why
-/// its `proposal.json` does not read. `model read --proposal` shows a proposal's revision.
+/// `model proposals`: every proposal folder with its ID, name, status, predecessor, parent,
+/// children and standing, or why its `proposal.json` does not read; Markdown nests each child
+/// under its parent. `model read --proposal` shows a proposal's revision.
 fn list_proposals(root: &Path, markdown: bool) -> Result<()> {
     if !markdown {
         return write(None, &proposals_output(root)?);
@@ -3400,24 +3533,65 @@ fn list_proposals(root: &Path, markdown: bool) -> Result<()> {
     if entries.is_empty() {
         println!("No proposals");
     }
-    for entry in &entries {
-        let id = entry["id"].as_str().unwrap_or_default();
-        match entry["error"].as_str() {
-            Some(error) => println!("- {id}: {error}"),
-            None => {
-                println!(
-                    "- {} {id}, {}, drawn from {}",
-                    entry["name"].as_str().unwrap_or_default(),
-                    entry["status"].as_str().unwrap_or_default(),
-                    entry["predecessor"]["state"]
-                        .as_str()
-                        .unwrap_or("no current state"),
-                );
-                if let Some(summary) = entry["summary"].as_str() {
-                    println!("  {summary}");
-                }
+    let by_id: BTreeMap<&str, &Value> = (entries.iter())
+        .filter_map(|e| Some((e["id"].as_str()?, e)))
+        .collect();
+    let parent = |id: &str| {
+        let up = by_id.get(id)?["parent"].as_str()?;
+        by_id.contains_key(up).then_some(up)
+    };
+    let roots = (entries.iter()).filter(|e| e["id"].as_str().is_none_or(|id| parent(id).is_none()));
+    let mut stack: Vec<(&Value, usize, bool)> = roots.rev().map(|e| (e, 0, false)).collect();
+    let mut shown = BTreeSet::new();
+    loop {
+        while let Some((entry, depth, cycle)) = stack.pop() {
+            let indent = "  ".repeat(depth);
+            let id = entry["id"].as_str().unwrap_or_default();
+            if !shown.insert(id) {
+                continue;
             }
+            if let Some(error) = entry["error"].as_str() {
+                println!("{indent}- {id}: {error}");
+                continue;
+            }
+            let standing = entry["standing"].as_str().map(|s| format!(", {s}"));
+            println!(
+                "{indent}- {} {id}, {}, drawn from {}{}{}",
+                entry["name"].as_str().unwrap_or_default(),
+                entry["status"].as_str().unwrap_or_default(),
+                entry["predecessor"]["state"]
+                    .as_str()
+                    .unwrap_or("no current state"),
+                standing.unwrap_or_default(),
+                if cycle {
+                    " (its parents form a cycle)"
+                } else {
+                    ""
+                },
+            );
+            if let Some(summary) = entry["summary"].as_str() {
+                println!("{indent}  {summary}");
+            }
+            let children = entry["children"].as_array().into_iter().flatten();
+            let children: Vec<&Value> = children
+                .filter_map(|child| by_id.get(child.as_str()?).copied())
+                .collect();
+            stack.extend(children.into_iter().rev().map(|e| (e, depth + 1, false)));
         }
+        let Some(mut at) = by_id.keys().copied().find(|id| !shown.contains(id)) else {
+            break;
+        };
+        let mut seen = BTreeSet::new();
+        let cycle = loop {
+            if !seen.insert(at) {
+                break true;
+            }
+            match parent(at).filter(|up| !shown.contains(up)) {
+                Some(up) => at = up,
+                None => break false,
+            }
+        };
+        stack.push((by_id[at], 0, cycle));
     }
     Ok(())
 }
@@ -3437,11 +3611,28 @@ pub(super) fn proposals_output(root: &Path) -> Result<Value> {
 
 fn proposal_entries(dir: &Path) -> Result<Vec<Value>> {
     let list = proposal::list(dir)?;
+    let current = vault::load_dir(dir.to_path_buf()).ok();
+    let mut children: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for listed in &list {
+        if let Ok(Some(parent)) = listed.proposal.as_ref().map(|p| p.parent.as_deref()) {
+            children.entry(parent).or_default().push(&listed.id);
+        }
+    }
     Ok(list
         .iter()
         .map(|listed| match &listed.proposal {
             Ok(p) => {
                 let mut entry = json!({"id": listed.id, "name": p.name, "status": p.status, "predecessor": p.predecessor});
+                if let Some(parent) = &p.parent {
+                    entry["parent"] = json!(parent);
+                }
+                if let Some(children) = children.get(listed.id.as_str()) {
+                    entry["children"] = json!(children);
+                }
+                let standing = current.as_ref().map(|c| proposal::standing(dir, c, p));
+                if let Some(Ok(Some(standing))) = standing {
+                    entry["standing"] = json!(standing);
+                }
                 if let Some(summary) = &p.summary {
                     entry["summary"] = json!(summary);
                 }

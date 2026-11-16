@@ -4,6 +4,16 @@
 
 ### Added
 
+- Proposal families: `model propose --parent <draft>` draws a child whose predecessor is the
+  draft, and adoption refuses `PARENT_NOT_ADOPTED` until the parent is adopted. Drafts report
+  their `standing` (`up-to-date`, `behind`, `orphaned`) in `model proposals`, which also lists
+  `parent` and `children` and nests them in Markdown, and in `model read --proposal`. `model
+  reconcile` merges a child with its parent, `--family` reconciles descendants after their
+  parents, `--settle <subject>=mine|theirs|edited:<file>` settles conflicts, and `--confirm`
+  accepts `INHERITANCE_DROPPED` (a part whose container the predecessor removed moves to the
+  nearest container left), `PART_RECREATED` (a module the predecessor removed stays) and
+  `PARENT_CHANGES_DROPPED` (a child of a shelved or missing parent merges onto the current state,
+  replacing what the parent changed).
 - The authored architecture model, `boundrail model`: modules bound to code, relationships,
   collections, flows and walkthroughs in `.boundrail/model/`, committed with the code. Batch
   edits name the revision they read and an operation ID; claims coordinate writers; proposals

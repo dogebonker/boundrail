@@ -25,8 +25,11 @@ use super::types::{
 use super::vault::{self, Model, Scope};
 use super::{Code, Refusal, checkpoint, claims, ids, revision};
 
+mod family;
 mod reconcile;
-pub use reconcile::reconcile;
+pub use family::{Standing, standing};
+use family::{Upstream, upstream};
+pub use reconcile::{Confirm, Member, Reconciling, Settle, Take, reconcile, reconcile_family};
 
 /// The name `--from` and `--against` give the current state.
 pub const CURRENT: &str = "current";
@@ -43,27 +46,43 @@ pub struct Writing<'a> {
     pub claim: Option<&'a str>,
 }
 
-/// Draws a draft named `name` from the current state, or from the proposal `from` names, in the
-/// vault folder `vault`. Drawn from the current state, its predecessor is the current state and
-/// revision; in a planning model the predecessor state is `None` and the draft starts empty. A
-/// copy of a proposal inherits that proposal's predecessor and dropped IDs, since it holds what
-/// that proposal drew; a copy of an adopted proposal needs it to still be the current state,
-/// unchanged. It takes no revision: the draft records the predecessor it copied, which adoption
-/// checks again. `summary` is one line saying what it changes and `documents` the documents it
-/// links to.
+/// Where a new draft starts.
+#[derive(Debug, Clone, Copy)]
+pub enum Origin<'a> {
+    /// The current state, or a copy of the proposal this names (`--from`).
+    From(Option<&'a str>),
+    /// A child of the draft this names (`--parent`), which is its predecessor.
+    Parent(&'a str),
+}
+
+/// Draws a draft named `name` from where `origin` says, in the vault folder `vault`. Drawn from
+/// the current state, its predecessor is the current state and revision; in a planning model the
+/// predecessor state is `None` and the draft starts empty. A copy of a proposal inherits that
+/// proposal's predecessor, parent and dropped IDs, since it holds what that proposal drew; a copy
+/// of an adopted proposal needs it to still be the current state, unchanged. A child copies its
+/// parent draft, which becomes its predecessor and base, and inherits its dropped IDs; an adopted
+/// or shelved parent refuses `PROPOSAL_CLOSED`. It takes no revision: the draft records the
+/// predecessor it copied, which adoption checks again. `summary` is one line saying what it
+/// changes and `documents` the documents it links to.
 pub fn propose(
     vault: &Path,
     writing: &Writing<'_>,
     name: &str,
-    from: Option<&str>,
+    origin: Origin<'_>,
     description: Option<&str>,
     summary: Option<&str>,
     documents: &[Document],
 ) -> Result<(Receipt, Option<Scope>)> {
     let name = vault::valid_name(name)?.to_owned();
     let (writer, operation) = start(vault, writing)?;
-    let from = from.filter(|from| *from != CURRENT);
+    let (from, parent) = match origin {
+        Origin::From(from) => (from.filter(|from| *from != CURRENT), None),
+        Origin::Parent(parent) => (None, Some(parent)),
+    };
     let mut request = json!({"kind": "propose", "writer": writer, "name": name, "from": from, "description": description});
+    if let Some(parent) = parent {
+        request["parent"] = json!(parent);
+    }
     if let Some(summary) = summary {
         request["summary"] = json!(summary);
     }
@@ -72,15 +91,23 @@ pub fn propose(
     }
     edit::journaled(vault, &operation, request, |_, _, fingerprint| {
         let current = vault::load_dir(vault.to_path_buf())?;
-        let source = from
+        let source = (from.or(parent))
             .map(|from| vault::load_proposal(vault.to_path_buf(), from))
             .transpose()?;
-        let (predecessor, dropped) = inherited(&current, source.as_ref())?;
-        // A copy of a draft reconciles against its source's base; any other draft against the
-        // current state it was drawn from.
+        let child = parent.is_some();
+        let (predecessor, parent, dropped) = match &source {
+            Some(source) if child => {
+                let drawn = proposal_of(source)?;
+                refuse_closed(&drawn)?;
+                let predecessor = family::predecessor_of_draft(source)?;
+                (predecessor, Some(drawn.id), drawn.dropped)
+            }
+            _ => inherited(&current, source.as_ref())?,
+        };
         let copied = (source.as_ref().and_then(|s| s.proposal.as_ref()))
             .is_some_and(|p| p.status != ProposalStatus::Adopted);
         let base = match &source {
+            Some(source) if child => Some((source.modules.clone(), source.collections.clone())),
             Some(source) if copied => vault::load_base(source)?,
             _ => Some((current.modules.clone(), current.collections.clone())),
         };
@@ -94,6 +121,7 @@ pub fn propose(
             documents: documents.to_vec(),
             status: ProposalStatus::Draft,
             predecessor,
+            parent,
             created: claims::now(),
             adopted_as: None,
             dropped,
@@ -110,23 +138,21 @@ pub fn propose(
     })
 }
 
-/// The predecessor of a draft copied from `source`, or drawn from `current` without one, and the
-/// IDs the draft has dropped from it.
-fn inherited(current: &Model, source: Option<&Model>) -> Result<(Predecessor, Vec<String>)> {
+/// The predecessor and parent of a draft copied from `source`, or drawn from `current` without
+/// one, and the IDs the draft has dropped from it.
+fn inherited(current: &Model, source: Option<&Model>) -> Result<Inherited> {
     let of_current = predecessor_of(current)?;
     let state = of_current.state.clone();
     let Some((source, drawn)) = source.and_then(|s| Some((s, s.proposal.as_ref()?))) else {
-        return Ok((of_current, Vec::new()));
+        return Ok((of_current, None, Vec::new()));
     };
     if drawn.status != ProposalStatus::Adopted {
-        return Ok((drawn.predecessor.clone(), drawn.dropped.clone()));
+        let (predecessor, parent) = (drawn.predecessor.clone(), drawn.parent.clone());
+        return Ok((predecessor, parent, drawn.dropped.clone()));
     }
     // An adopted proposal stands for the current state only while nothing has changed it since.
-    if drawn.adopted_as == state
-        && source.modules == current.modules
-        && source.collections == current.collections
-    {
-        return Ok((of_current, Vec::new()));
+    if family::still_current(current, source, drawn) {
+        return Ok((of_current, None, Vec::new()));
     }
     Err(Refusal::new(
         Code::PredecessorMoved,
@@ -138,6 +164,9 @@ fn inherited(current: &Model, source: Option<&Model>) -> Result<(Predecessor, Ve
     .with_details(json!({ "proposal": drawn.id, "adopted_as": drawn.adopted_as, "current": state }))
     .into())
 }
+
+/// A new draft's predecessor, parent and dropped IDs.
+type Inherited = (Predecessor, Option<String>, Vec<String>);
 
 /// The IDs a new proposal or state must not take, in ASCII lowercase: those `models` hold or
 /// reserve and every proposal folder's. IDs are random, so this guards the names that matter
@@ -221,7 +250,7 @@ pub fn adopt(
     edit::journaled(vault, &operation, request, |_, dir, fingerprint| {
         let current = vault::load_dir(vault.to_path_buf())?;
         let (drawn, proposal) = open(vault, subject)?;
-        refuse_moved(&current, &proposal, expected)?;
+        refuse_moved(vault, &current, &proposal, expected)?;
         refuse_compared(&drawn, compared)?;
         let taken = taken(vault, &[&current, &drawn])?;
         let state = ids::allocate(|candidate| taken.contains(candidate))?;
@@ -475,16 +504,19 @@ fn open(vault: &Path, subject: &str) -> Result<(Model, Proposal)> {
     Ok((drawn, proposal))
 }
 
-/// Refuses an adoption the caller planned against another current revision, or of a proposal
-/// drawn against a current state that has moved since.
-fn refuse_moved(current: &Model, proposal: &Proposal, expected: &str) -> Result<()> {
+/// Refuses an adoption the caller planned against another current revision, of a child whose
+/// parent is still a draft (`PARENT_NOT_ADOPTED`), or of a proposal whose predecessor has moved
+/// since it was drawn or reconciled: the current state, or the parent adopted as the current
+/// state. Walkthroughs, pictures and views change on their own beside a proposal, so its
+/// predecessor digest leaves them out, and the retired IDs their removal grows.
+fn refuse_moved(vault: &Path, current: &Model, proposal: &Proposal, expected: &str) -> Result<()> {
     refuse_stale(current, expected)?;
-    // Walkthroughs, pictures and views change on their own beside a proposal, so its predecessor
-    // leaves them out, and the retired IDs their removal grows. Drafts drawn before retired IDs
-    // were left out record model.json as it was on disk.
-    let drawn_from = current.predecessor_digest()?;
-    let recorded = &proposal.predecessor.revision;
-    if *recorded != drawn_from && *recorded != current.earlier_predecessor_digest() {
+    let upstream = upstream(vault, current, proposal)?;
+    if let (Upstream::Draft(_), Some(parent)) = (&upstream, &proposal.parent) {
+        return Err(family::parent_not_adopted(proposal, parent));
+    }
+    if !family::fresh(current, proposal, &upstream)? {
+        let drawn_from = current.predecessor_digest()?;
         return Err(Refusal::new(
             Code::PredecessorMoved,
             format!(

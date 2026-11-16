@@ -73,6 +73,17 @@ its name when no other proposal has it: an exact ID wins, and a name two proposa
 `model render --proposal <id> --walkthrough <w> --beat <n>` draws a beat, and adoption adds it to
 the current state's walkthroughs.
 
+`model propose --parent <draft>` draws a child: a copy of the draft, which is its predecessor, so
+it adopts only after its parent. `model proposals` and `model read --proposal` give each draft's
+`standing`: `up-to-date`, `behind` (its predecessor moved since it was drawn or reconciled) or
+`orphaned` (its parent was shelved, or adopted and the current state moved on). `model reconcile
+<draft>` merges what its predecessor changed; `--family` goes on through its descendants, parents
+first. A conflict settles with `--settle <subject>=mine|theirs|edited:<file>`; a merge that keeps a
+part whose container the predecessor removed refuses `INHERITANCE_DROPPED`, one that keeps a
+module the predecessor removed refuses `PART_RECREATED`, and one of a child whose parent was
+shelved or is gone, which replaces what the parent changed, refuses `PARENT_CHANGES_DROPPED`,
+until `--confirm <CODE>[=<subject>]`.
+
 A relationship may describe its `traffic` (`protocol`, `sync` or `async`, `rate`, `payload`),
 which reads, compares and draws after its label. A message step may name the code that sends it
 in an `anchor` (`path` and `symbol`), which `model check` verifies like a relationship's. A flow

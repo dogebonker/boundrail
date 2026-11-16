@@ -11364,6 +11364,570 @@ fn reconcile_refuses_a_draft_without_a_base_and_a_closed_proposal() {
     reconcile_refused(&checkout, &shelved, "PROPOSAL_CLOSED");
 }
 
+/// `model propose --parent` named `name` by tester: the new child's local ID.
+fn propose_child(checkout: &Checkout, name: &str, parent: &str) -> String {
+    let out = checkout.ok(&[
+        "propose",
+        "--name",
+        name,
+        "--parent",
+        parent,
+        "--doing",
+        "draw a child",
+        "--writer",
+        "tester",
+        "--operation-id",
+        &operation(),
+    ]);
+    local(out["allocated"][0]["id"].as_str().unwrap()).to_owned()
+}
+
+/// `model reconcile` of `id` at the present revisions with `extra` flags and the operation ID
+/// `operation_id`, by tester.
+fn reconcile_with(
+    checkout: &Checkout,
+    id: &str,
+    operation_id: &str,
+    extra: &[&str],
+) -> (i32, Value) {
+    let (expected, compared) = (checkout.digest(), proposal_digest(checkout, id));
+    let mut args = vec![
+        "reconcile",
+        id,
+        "--expected-revision",
+        expected.as_str().unwrap(),
+        "--expected-proposal-revision",
+        &compared,
+        "--doing",
+        "catch up with the predecessor",
+        "--writer",
+        "tester",
+        "--operation-id",
+        operation_id,
+    ];
+    args.extend(extra);
+    checkout.run(&args)
+}
+
+/// The `model proposals` entry of `id`.
+fn listed(checkout: &Checkout, id: &str) -> Value {
+    let out = checkout.ok(&["proposals"]);
+    let entries = out["proposals"].as_array().unwrap();
+    entries.iter().find(|e| e["id"] == id).unwrap().clone()
+}
+
+fn shelve(checkout: &Checkout, id: &str) {
+    checkout.ok(&[
+        "shelve",
+        id,
+        "--expected-revision",
+        &proposal_digest(checkout, id),
+        "--doing",
+        "set aside",
+        "--writer",
+        "tester",
+        "--operation-id",
+        &operation(),
+    ]);
+}
+
+fn proposal_file(checkout: &Checkout, id: &str) -> Value {
+    let path = checkout
+        .vault()
+        .join(format!("proposals/{id}/proposal.json"));
+    serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+}
+
+#[test]
+fn a_child_stands_against_its_parent_draft_and_adopts_after_it() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let parent = propose(&checkout, "Parent", "current");
+    let child = propose_child(&checkout, "Child", &parent);
+    let file = proposal_file(&checkout, &child);
+    assert_eq!(file["parent"], parent.as_str());
+    assert_eq!(file["predecessor"]["state"], parent.as_str());
+    assert_eq!(file["base"], true);
+    assert!(proposal_file(&checkout, &parent).get("parent").is_none());
+    assert_eq!(listed(&checkout, &parent)["children"], json!([child]));
+    assert_eq!(listed(&checkout, &child)["parent"], parent.as_str());
+    for id in [&parent, &child] {
+        assert_eq!(listed(&checkout, id)["standing"], "up-to-date");
+    }
+    let (code, text) = checkout.run_raw(&["--format", "markdown", "proposals"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.contains(&format!(
+            "\n  - Child {child}, draft, drawn from {parent}, up-to-date"
+        )),
+        "{text}"
+    );
+
+    edited_proposal(
+        &checkout,
+        &parent,
+        json!([{"type": "edit-module", "subject": "Billing", "set": {"name": "Payments"}}]),
+    );
+    assert_eq!(listed(&checkout, &child)["standing"], "behind");
+    assert_eq!(
+        checkout.ok(&["read", "--proposal", &child])["standing"],
+        "behind"
+    );
+    let (code, out) = adopt(&checkout, &child, &checkout.digest());
+    assert_eq!(code, 2, "{out:#}");
+    assert_eq!(out["error"]["code"], "PARENT_NOT_ADOPTED", "{out:#}");
+    assert_eq!(out["error"]["details"]["parent"], parent.as_str());
+
+    let (code, out) = reconcile(&checkout, &child);
+    assert_eq!(code, 0, "{out:#}");
+    let read = checkout.ok(&["read", "--proposal", &child]);
+    assert_eq!(read["standing"], "up-to-date");
+    assert_eq!(names(&read), ["Bank", "Payments", "Platform", "Web"]);
+    assert_eq!(proposal_file(&checkout, &child)["parent"], parent.as_str());
+
+    let (code, out) = adopt(&checkout, &parent, &checkout.digest());
+    assert_eq!(code, 0, "{out:#}");
+    assert_eq!(listed(&checkout, &child)["standing"], "up-to-date");
+    assert!(listed(&checkout, &parent).get("standing").is_none());
+    let (code, out) = adopt(&checkout, &child, &checkout.digest());
+    assert_eq!(code, 0, "{out:#}");
+    assert_eq!(
+        names(&checkout.ok(&["read"])),
+        ["Bank", "Payments", "Platform", "Web"]
+    );
+}
+
+#[test]
+fn a_child_of_a_shelved_or_replaced_parent_is_orphaned_and_reconciles_onto_the_current_state() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let parent = propose(&checkout, "Parent", "current");
+    let child = propose_child(&checkout, "Child", &parent);
+    shelve(&checkout, &parent);
+    assert_eq!(listed(&checkout, &child)["standing"], "orphaned");
+    let (code, out) = adopt(&checkout, &child, &checkout.digest());
+    assert_eq!(out["error"]["code"], "PREDECESSOR_MOVED", "{code} {out:#}");
+    let (code, out) = reconcile(&checkout, &child);
+    assert_eq!(code, 0, "{out:#}");
+    let file = proposal_file(&checkout, &child);
+    assert!(file.get("parent").is_none(), "{file:#}");
+    assert_eq!(listed(&checkout, &child)["standing"], "up-to-date");
+
+    let parent = propose(&checkout, "Second", "current");
+    let child = propose_child(&checkout, "Second child", &parent);
+    let (code, out) = adopt(&checkout, &parent, &checkout.digest());
+    assert_eq!(code, 0, "{out:#}");
+    assert_eq!(listed(&checkout, &child)["standing"], "up-to-date");
+    checkout.edited(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 3}}]));
+    assert_eq!(listed(&checkout, &child)["standing"], "orphaned");
+    assert_eq!(listed(&checkout, &parent).get("standing"), None);
+}
+
+#[test]
+fn a_family_reconciles_parents_before_children() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let parent = propose(&checkout, "Parent", "current");
+    let child = propose_child(&checkout, "Child", &parent);
+    let grandchild = propose_child(&checkout, "Grandchild", &child);
+    let sibling = propose_child(&checkout, "Sibling", &parent);
+    let out = checkout.edited(json!([
+        {"type": "add-module", "module": {"name": "Ledger", "kind": "datastore", "order": 2}},
+    ]));
+    assert!(out["allocated"][0]["id"].is_string());
+    assert_eq!(listed(&checkout, &parent)["standing"], "behind");
+    assert_eq!(listed(&checkout, &child)["standing"], "up-to-date");
+
+    let long = "f".repeat(56);
+    let (code, out) = reconcile_with(&checkout, &parent, &long, &["--family"]);
+    assert_eq!(out["error"]["code"], "REQUEST_INVALID", "{code} {out:#}");
+    assert_eq!(listed(&checkout, &parent)["standing"], "behind");
+
+    let (code, out) = reconcile_with(&checkout, &parent, "family-1", &["--family"]);
+    assert_eq!(code, 0, "{out:#}");
+    assert_eq!(out["kind"], "reconcile");
+    assert_eq!(out["operation_id"], "family-1");
+    let mut order = vec![child.clone(), grandchild.clone(), sibling.clone()];
+    if sibling < child {
+        order = vec![sibling.clone(), child.clone(), grandchild.clone()];
+    }
+    let family = out["family"].as_array().unwrap();
+    let done: Vec<&str> = family
+        .iter()
+        .map(|m| m["proposal"].as_str().unwrap())
+        .collect();
+    assert_eq!(done, order);
+    for member in family {
+        assert_eq!(member["reconciled"], true, "{member:#}");
+        let id = member["proposal"].as_str().unwrap();
+        assert_eq!(member["operation_id"], format!("family-1.{id}"));
+        assert!(member["receipt"]["checkpoint"]["id"].is_string());
+    }
+    for id in [&parent, &child, &grandchild, &sibling] {
+        let read = checkout.ok(&["read", "--proposal", id]);
+        assert_eq!(read["standing"], "up-to-date", "{id}");
+        assert!(names(&read).contains(&"Ledger".to_owned()), "{id}");
+    }
+
+    let (code, out) = reconcile_with(&checkout, &parent, "family-2", &["--family"]);
+    assert_eq!(code, 0, "{out:#}");
+    let family = out["family"].as_array().unwrap();
+    assert!(
+        family
+            .iter()
+            .all(|m| m["reconciled"] == false && m.get("receipt").is_none())
+    );
+}
+
+#[test]
+fn a_family_reconcile_stops_at_a_conflict_naming_the_drafts_it_finished() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let parent = propose(&checkout, "Parent", "current");
+    let child = propose_child(&checkout, "Child", &parent);
+    let set = |text: &str| json!([{"type": "edit-module", "subject": "Billing", "set": {"responsibility": text}}]);
+    edited_proposal(&checkout, &child, set("Takes payments"));
+    checkout.edited(set("Bills customers"));
+    let (code, out) = reconcile_with(&checkout, &parent, &operation(), &["--family"]);
+    assert_eq!(code, 2, "{out:#}");
+    let error = &out["error"];
+    assert_eq!(error["code"], "RECONCILE_CONFLICT", "{out:#}");
+    assert_eq!(error["details"]["proposal"], child.as_str());
+    assert_eq!(
+        error["details"]["conflicts"],
+        json!([{"subject": format!("{model}#Billing1"), "kind": "both-changed"}])
+    );
+    assert_eq!(
+        error["details"]["family"],
+        json!([{"proposal": parent, "reconciled": true}])
+    );
+    assert_eq!(listed(&checkout, &parent)["standing"], "up-to-date");
+    assert_eq!(listed(&checkout, &child)["standing"], "behind");
+}
+
+#[test]
+fn a_family_reconcile_passes_only_confirmations_naming_a_subject_to_descendants() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let q = |id: &str| format!("{model}#{id}");
+    let parent = propose(&checkout, "Parent", "current");
+    let child = propose_child(&checkout, "Child", &parent);
+    let out = edited_proposal(
+        &checkout,
+        &child,
+        json!([{"type": "add-module", "module": {"name": "Cart", "kind": "service", "order": 3, "parent": "Platform"}}]),
+    );
+    let cart = local(out["allocated"][0]["id"].as_str().unwrap()).to_owned();
+    edited_proposal(
+        &checkout,
+        &parent,
+        json!([
+            {"type": "edit-module", "subject": "Web", "clear": ["parent"]},
+            {"type": "edit-module", "subject": "Billing", "clear": ["parent"]},
+            {"type": "remove-module", "subject": "Platform"},
+        ]),
+    );
+    let every = ["--family", "--confirm", "INHERITANCE_DROPPED"];
+    let (code, out) = reconcile_with(&checkout, &parent, &operation(), &every);
+    assert_eq!(
+        out["error"]["code"], "INHERITANCE_DROPPED",
+        "{code} {out:#}"
+    );
+    assert_eq!(out["error"]["details"]["proposal"], child.as_str());
+    assert_eq!(
+        out["error"]["details"]["family"],
+        json!([{"proposal": parent, "reconciled": true}])
+    );
+    let one = format!("INHERITANCE_DROPPED={}", q(&cart));
+    let (code, out) = reconcile_with(
+        &checkout,
+        &parent,
+        &operation(),
+        &["--family", "--confirm", &one],
+    );
+    assert_eq!(code, 0, "{out:#}");
+    let read = checkout.ok(&["read", "--proposal", &child, "Cart"]);
+    assert!(read["module"]["parent"].is_null(), "{read:#}");
+}
+
+#[test]
+fn reconciling_a_child_of_a_shelved_parent_refuses_dropping_its_changes_until_confirmed() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let parent = propose(&checkout, "Parent", "current");
+    edited_proposal(
+        &checkout,
+        &parent,
+        json!([{"type": "edit-module", "subject": "Billing", "set": {"name": "Payments"}}]),
+    );
+    let child = propose_child(&checkout, "Child", &parent);
+    shelve(&checkout, &parent);
+    let before = (checkout.digest(), proposal_digest(&checkout, &child));
+    let (code, out) = reconcile(&checkout, &child);
+    assert_eq!(code, 2, "{out:#}");
+    assert_eq!(out["error"]["code"], "PARENT_CHANGES_DROPPED", "{out:#}");
+    assert_eq!(
+        out["error"]["details"]["subjects"],
+        json!([format!("{model}#Billing1")])
+    );
+    assert_eq!(
+        (checkout.digest(), proposal_digest(&checkout, &child)),
+        before
+    );
+    let (code, out) = reconcile_with(
+        &checkout,
+        &child,
+        &operation(),
+        &["--confirm", "PARENT_CHANGES_DROPPED"],
+    );
+    assert_eq!(code, 0, "{out:#}");
+    let read = checkout.ok(&["read", "--proposal", &child]);
+    assert_eq!(names(&read), ["Bank", "Billing", "Platform", "Web"]);
+    assert!(proposal_file(&checkout, &child).get("parent").is_none());
+}
+
+#[test]
+fn proposals_markdown_lists_drafts_whose_parents_form_a_cycle() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let first = propose(&checkout, "First", "current");
+    let second = propose(&checkout, "Second", "current");
+    for (id, parent) in [(&first, &second), (&second, &first)] {
+        let path = checkout
+            .vault()
+            .join(format!("proposals/{id}/proposal.json"));
+        let mut file = proposal_file(&checkout, id);
+        file["parent"] = json!(parent);
+        fs::write(path, serde_json::to_string_pretty(&file).unwrap()).unwrap();
+    }
+    let (code, text) = checkout.run_raw(&["--format", "markdown", "proposals"]);
+    assert_eq!(code, 0, "{text}");
+    let (top, nested) = if first < second {
+        (&first, &second)
+    } else {
+        (&second, &first)
+    };
+    let top_line = text.lines().find(|l| l.contains(top.as_str())).unwrap();
+    assert!(top_line.starts_with("- "), "{text}");
+    assert!(top_line.ends_with("(its parents form a cycle)"), "{text}");
+    let nested_line = text.lines().find(|l| l.contains(nested.as_str())).unwrap();
+    assert!(nested_line.starts_with("  - "), "{text}");
+}
+
+/// The responsibility of Billing in the proposal `id`.
+fn billing_responsibility(checkout: &Checkout, id: &str) -> Value {
+    checkout.ok(&["read", "--proposal", id, "Billing"])["module"]["responsibility"].clone()
+}
+
+#[test]
+fn reconcile_settles_conflicts_by_mine_theirs_or_an_edited_replacement() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let q = |id: &str| format!("{model}#{id}");
+    let set = |text: &str| json!([{"type": "edit-module", "subject": "Billing", "set": {"responsibility": text}}]);
+    let mine = propose(&checkout, "Mine", "current");
+    let theirs = propose(&checkout, "Theirs", "current");
+    let edited = propose(&checkout, "Edited", "current");
+    for id in [&mine, &theirs, &edited] {
+        edited_proposal(&checkout, id, set("Takes payments"));
+    }
+    checkout.edited(set("Bills customers"));
+
+    let settle = format!("{}=mine", q("Billing1"));
+    let (code, out) = reconcile_with(&checkout, &mine, &operation(), &["--settle", &settle]);
+    assert_eq!(code, 0, "{out:#}");
+    assert_eq!(billing_responsibility(&checkout, &mine), "Takes payments");
+    assert_eq!(listed(&checkout, &mine)["standing"], "up-to-date");
+
+    let (code, out) = reconcile_with(
+        &checkout,
+        &theirs,
+        &operation(),
+        &["--settle", "Billing1=theirs"],
+    );
+    assert_eq!(code, 0, "{out:#}");
+    assert_eq!(
+        billing_responsibility(&checkout, &theirs),
+        "Bills customers"
+    );
+
+    let mut replacement = checkout.read_module("Billing1");
+    replacement["responsibility"] = json!("Charges and refunds");
+    let file = checkout.path().join("billing.json");
+    let path = file.to_str().unwrap();
+    fs::write(&file, replacement.to_string()).unwrap();
+    let settle = format!("{}=edited:{path}", q("Billing1"));
+    let (code, out) = reconcile_with(&checkout, &edited, &operation(), &["--settle", &settle]);
+    assert_eq!(out["error"]["code"], "REQUEST_INVALID", "{code} {out:#}");
+    replacement["outgoing"] = json!([]);
+    replacement["id"] = json!("Other001");
+    fs::write(&file, replacement.to_string()).unwrap();
+    let (code, out) = reconcile_with(&checkout, &edited, &operation(), &["--settle", &settle]);
+    assert_eq!(out["error"]["code"], "REQUEST_INVALID", "{code} {out:#}");
+    replacement["id"] = json!("Billing1");
+    replacement["kind"] = json!("no-such-kind");
+    fs::write(&file, replacement.to_string()).unwrap();
+    let (code, out) = reconcile_with(&checkout, &edited, &operation(), &["--settle", &settle]);
+    assert_eq!(out["error"]["code"], "MODEL_INVALID", "{code} {out:#}");
+    assert_eq!(out["error"]["details"]["cause"], "merge");
+    replacement["kind"] = json!("service");
+    fs::write(&file, replacement.to_string()).unwrap();
+    let (code, out) = reconcile_with(&checkout, &edited, &operation(), &["--settle", &settle]);
+    assert_eq!(code, 0, "{out:#}");
+    assert_eq!(
+        billing_responsibility(&checkout, &edited),
+        "Charges and refunds"
+    );
+    let billing = checkout.ok(&["read", "--proposal", &edited, "Billing"]);
+    assert_eq!(billing["outgoing"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn reconcile_refuses_settling_a_subject_not_in_conflict_and_lists_conflicts_left() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let q = |id: &str| format!("{model}#{id}");
+    let id = propose(&checkout, "Next", "current");
+    let set = |subject: &str, text: &str| json!({"type": "edit-module", "subject": subject, "set": {"responsibility": text}});
+    edited_proposal(
+        &checkout,
+        &id,
+        json!([set("Billing", "Takes payments"), set("Bank", "Moves money")]),
+    );
+    checkout.edited(json!([
+        set("Billing", "Bills customers"),
+        set("Bank", "Holds money")
+    ]));
+    let before = (checkout.digest(), proposal_digest(&checkout, &id));
+    let (code, out) = reconcile_with(&checkout, &id, &operation(), &["--settle", "WebApp01=mine"]);
+    assert_eq!(out["error"]["code"], "REQUEST_INVALID", "{code} {out:#}");
+    assert_eq!(out["error"]["details"]["subjects"], json!([q("WebApp01")]));
+    let (code, out) = reconcile_with(&checkout, &id, &operation(), &["--settle", "Billing1=mine"]);
+    assert_eq!(out["error"]["code"], "RECONCILE_CONFLICT", "{code} {out:#}");
+    assert_eq!(
+        out["error"]["details"]["conflicts"],
+        json!([{"subject": q("BankApi1"), "kind": "both-changed"}])
+    );
+    assert_eq!((checkout.digest(), proposal_digest(&checkout, &id)), before);
+    for flag in [
+        ["--settle", "Billing1"],
+        ["--confirm", "RECONCILE_CONFLICT"],
+    ] {
+        let (code, out) = checkout.run_raw(&[
+            "reconcile",
+            &id,
+            flag[0],
+            flag[1],
+            "--expected-revision",
+            "x",
+            "--expected-proposal-revision",
+            "x",
+            "--doing",
+            "x",
+            "--operation-id",
+            "x",
+        ]);
+        assert_eq!((code, out.as_str()), (2, ""));
+    }
+}
+
+#[test]
+fn reconcile_refuses_dropping_a_parts_container_until_confirmed() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let q = |id: &str| format!("{model}#{id}");
+    let id = propose(&checkout, "Next", "current");
+    let out = edited_proposal(
+        &checkout,
+        &id,
+        json!([{"type": "add-module", "module": {"name": "Cart", "kind": "service", "order": 3, "parent": "Platform"}}]),
+    );
+    let cart = local(out["allocated"][0]["id"].as_str().unwrap()).to_owned();
+    checkout.edited(json!([
+        {"type": "edit-module", "subject": "Web", "clear": ["parent"]},
+        {"type": "edit-module", "subject": "Billing", "clear": ["parent"]},
+        {"type": "remove-module", "subject": "Platform"},
+    ]));
+    let before = (checkout.digest(), proposal_digest(&checkout, &id));
+    let (code, out) = reconcile(&checkout, &id);
+    assert_eq!(code, 2, "{out:#}");
+    assert_eq!(out["error"]["code"], "INHERITANCE_DROPPED", "{out:#}");
+    assert_eq!(
+        out["error"]["details"]["modules"],
+        json!([{"module": q(&cart), "parent": q("Platfrm1"), "lifted_to": null}])
+    );
+    assert_eq!((checkout.digest(), proposal_digest(&checkout, &id)), before);
+    let other = format!("INHERITANCE_DROPPED={}", q("WebApp01"));
+    let (_, out) = reconcile_with(&checkout, &id, &operation(), &["--confirm", &other]);
+    assert_eq!(out["error"]["code"], "INHERITANCE_DROPPED", "{out:#}");
+    let (code, out) = reconcile_with(
+        &checkout,
+        &id,
+        &operation(),
+        &["--confirm", "INHERITANCE_DROPPED"],
+    );
+    assert_eq!(code, 0, "{out:#}");
+    let read = checkout.ok(&["read", "--proposal", &id, "Cart"]);
+    assert!(read["module"]["parent"].is_null(), "{read:#}");
+    assert_eq!(read["module"]["name"], "Cart");
+    assert_eq!(listed(&checkout, &id)["standing"], "up-to-date");
+}
+
+#[test]
+fn reconcile_refuses_keeping_a_part_the_parent_removed_until_confirmed() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let q = |id: &str| format!("{model}#{id}");
+    let parent = propose(&checkout, "Parent", "current");
+    let child = propose_child(&checkout, "Child", &parent);
+    let sibling = propose_child(&checkout, "Sibling", &parent);
+    for id in [&child, &sibling] {
+        edited_proposal(
+            &checkout,
+            id,
+            json!([{"type": "edit-module", "subject": "Web", "set": {"order": 5}}]),
+        );
+    }
+    edited_proposal(
+        &checkout,
+        &parent,
+        json!([{"type": "remove-module", "subject": "Web"}]),
+    );
+    let (code, out) = reconcile(&checkout, &child);
+    assert_eq!(out["error"]["code"], "RECONCILE_CONFLICT", "{code} {out:#}");
+    assert_eq!(
+        out["error"]["details"]["conflicts"],
+        json!([{"subject": q("WebApp01"), "kind": "changed-removed"}])
+    );
+    let (code, out) = reconcile_with(
+        &checkout,
+        &child,
+        &operation(),
+        &["--settle", "WebApp01=mine"],
+    );
+    assert_eq!(code, 2, "{out:#}");
+    assert_eq!(out["error"]["code"], "PART_RECREATED", "{out:#}");
+    assert_eq!(out["error"]["details"]["modules"], json!([q("WebApp01")]));
+    let confirm = format!("PART_RECREATED={}", q("WebApp01"));
+    let (code, out) = reconcile_with(
+        &checkout,
+        &child,
+        &operation(),
+        &["--settle", "WebApp01=mine", "--confirm", &confirm],
+    );
+    assert_eq!(code, 0, "{out:#}");
+    let web = checkout.ok(&["read", "--proposal", &child, "Web"]);
+    assert_eq!(web["module"]["order"], 5);
+    let (code, out) = reconcile_with(
+        &checkout,
+        &sibling,
+        &operation(),
+        &["--settle", "WebApp01=theirs"],
+    );
+    assert_eq!(code, 0, "{out:#}");
+    assert!(!names(&checkout.ok(&["read", "--proposal", &sibling])).contains(&"Web".to_owned()));
+}
+
 /// The bundle `model export` prints with `args`.
 fn export(checkout: &Checkout, args: &[&str]) -> Value {
     let mut all = vec!["export"];

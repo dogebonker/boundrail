@@ -96,6 +96,11 @@ pub struct Proposal {
     pub documents: Vec<Document>,
     pub status: ProposalStatus,
     pub predecessor: Predecessor,
+    /// The local ID of the draft this proposal is a child of: that draft, not the current
+    /// state, is its predecessor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(pattern(LOCAL_ID))]
+    pub parent: Option<String>,
     /// When it was drawn, in Unix seconds.
     pub created: u64,
     /// The local ID of the current state its adoption made.
@@ -152,14 +157,16 @@ where
     Option::deserialize(deserializer)
 }
 
-/// The current state a proposal was drawn against.
+/// The state a proposal was drawn against: the current state, or the parent draft of a child.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Predecessor {
-    /// The current state's local ID; `null` when drawn in a planning model.
+    /// The current state's local ID, or the parent draft's for a child; `null` when drawn in a
+    /// planning model.
     #[schemars(pattern(LOCAL_ID))]
     pub state: Option<String>,
-    /// The current state's revision digest when the proposal was drawn.
+    /// The current state's predecessor digest, or the parent draft's content digest, when the
+    /// proposal was drawn or last reconciled.
     pub revision: String,
 }
 

@@ -16,7 +16,9 @@ claims and refusals.
 ## Steps
 
 1. **Draw.** One spec gets one proposal. `boundrail model propose --name "<plan>" --doing "<why>" --operation-id <operation-id>`. Add
-   `--from <proposal>` to copy another draft instead of the current state, `--summary` for one
+   `--from <proposal>` to copy another draft instead of the current state, `--parent <draft>` to
+   draw a child that builds on a draft (its predecessor is the draft, and it adopts only after
+   it), `--summary` for one
    line saying what it changes, `--description` for the intent, and `--document "<title>"
    <path-or-https-url>` (repeatable) to link the spec. The receipt's `allocated[0].id` is the
    proposal's qualified ID; its local ID is the part after `#`. Every command that takes a
@@ -92,6 +94,36 @@ Set a plan aside with
 `boundrail model shelve <proposal> --expected-revision <proposal revision.digest> --doing "<why>" --operation-id <operation-id>`.
 It stays, reading only. List drafts and their status with `boundrail model proposals`.
 
+## Families
+
+`boundrail model proposals` lists each draft's `parent`, `children` and `standing`:
+`up-to-date`, `behind` (its predecessor moved: reconcile it) or `orphaned` (its parent was shelved,
+or adopted and the current state moved on: reconcile it onto the current state, which takes it out
+of the family). After changing a parent, reconcile it and its descendants in one command:
+
+```sh
+boundrail model reconcile <parent> --family \
+    --expected-revision <current revision.digest> \
+    --expected-proposal-revision <parent revision.digest> \
+    --doing "<why>" --operation-id <operation-id>
+```
+
+Each descendant is its own write with operation ID `<operation-id>.<its local ID>`, so the
+operation ID needs room for a dot and an 8-character local ID within the operation ID limit;
+`REQUEST_INVALID` says how long it may be. Only `--confirm <CODE>=<subject>` reaches the
+descendants; `--confirm <CODE>` covers the named draft alone. A refusal stops the walk and `details.family` lists the drafts done
+before it; settle that draft on its own, then run `--family` from it. Adopt a parent before its
+children.
+
+## Settle conflicts
+
+`RECONCILE_CONFLICT` lists `details.conflicts`. Read both sides (`model read --proposal`, and
+the parent or the current state), ask the person which side each subject keeps, then reconcile
+again with one `--settle` per listed subject: `<subject>=mine` keeps the draft's side,
+`<subject>=theirs` takes the predecessor's, and `<subject>=edited:<file>` takes the module file
+(with `outgoing` empty: relationships settle on their own), relationship or collection JSON in
+the file. A `retired` conflict never settles: edit the draft to drop that ID.
+
 ## Move a plan between clones
 
 `boundrail model export --proposal <proposal> --output plan.bundle.json` writes the draft as one
@@ -105,7 +137,11 @@ Other codes react as boundrail-model says.
 
 | Code | Reaction |
 |---|---|
-| `PREDECESSOR_MOVED` | The current state changed since the proposal was drawn. Run `boundrail model reconcile <proposal> --expected-revision <current revision.digest> --expected-proposal-revision <proposal revision.digest> --doing "<why>" --operation-id <operation-id>`, then compare and adopt again. On `RECONCILE_CONFLICT`, edit the draft to match one side of each listed subject and reconcile again. |
+| `PREDECESSOR_MOVED` | The proposal's predecessor changed since it was drawn. Run `boundrail model reconcile <proposal> --expected-revision <current revision.digest> --expected-proposal-revision <proposal revision.digest> --doing "<why>" --operation-id <operation-id>`, then compare and adopt again. On `RECONCILE_CONFLICT`, settle each listed subject (Settle conflicts) or edit the draft to match one side, and reconcile again. |
+| `PARENT_NOT_ADOPTED` | The proposal is a child of a draft. Adopt `details.parent` first, then this one. |
+| `INHERITANCE_DROPPED` | The merge keeps parts (`details.modules`) whose container the predecessor removed. With the person's yes, reconcile again with `--confirm INHERITANCE_DROPPED` (or `=<module>` for one): each moves to `lifted_to`, the nearest container left, or the root. Otherwise edit the draft. |
+| `PARENT_CHANGES_DROPPED` | The draft's parent was shelved or is gone, and merging it onto the current state replaces the parent's version of `details.subjects`. With the person's yes, reconcile again with `--confirm PARENT_CHANGES_DROPPED` (or `=<subject>` for one); otherwise edit the draft to keep what it needs. |
+| `PART_RECREATED` | The merge keeps modules (`details.modules`) the predecessor removed, from a settlement as `mine` or `edited`. With the person's yes, reconcile again with `--confirm PART_RECREATED` (or `=<module>`); otherwise settle them as `theirs`. |
 | `PROPOSAL_CLOSED` | The proposal is adopted or shelved. Draw a new one. |
 | `STALE_REVISION` on adopt | Either revision moved. Read both again and compare again before adopting. |
 | `MODEL_INVALID` on adopt | A beat or picture reads a module or flow the plan drops. Edit it first. |

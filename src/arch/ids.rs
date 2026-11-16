@@ -6,7 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Result, bail};
 use sha2::{Digest, Sha256};
 
-const LEN: usize = 8;
+/// The length of a local ID.
+pub const LEN: usize = 8;
 const ALPHABET: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 const BASE: u64 = ALPHABET.len() as u64;
 const ATTEMPTS: usize = 64;

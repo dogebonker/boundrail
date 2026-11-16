@@ -251,6 +251,7 @@ pub fn import(
             documents: drawn.map(|d| d.documents.clone()).unwrap_or_default(),
             status: ProposalStatus::Draft,
             predecessor,
+            parent: drawn.and_then(|d| d.parent.clone()),
             created: claims::now(),
             adopted_as: None,
             dropped: drawn.map(|d| d.dropped.clone()).unwrap_or_default(),

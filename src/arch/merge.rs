@@ -1,5 +1,6 @@
 //! The three-way merge `model reconcile` runs: what a proposal changed since its base, against
-//! what the current state changed since the same base, by ID.
+//! what its predecessor (the current state, or a child's parent draft) changed since the same
+//! base, by ID.
 //!
 //! Granularity: a module's own fields (everything but `outgoing`) merge as one subject, each
 //! relationship as a subject of its own with its owning module as a field, so one side adding a
@@ -7,7 +8,8 @@
 //! whole file, flows and steps included, since a flow or step move would need its own subject.
 //! A subject one side changed and the other did not takes the changed side; a subject both sides
 //! changed the same way takes it; a subject both changed differently is `both-changed`, and one
-//! changed by one side and removed by the other is `changed-removed`.
+//! changed by one side and removed by the other is `changed-removed`. A settlement decides a
+//! conflicting subject instead: the proposal's side, the predecessor's, or a replacement.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -35,52 +37,128 @@ pub(super) enum Kind {
     Retired,
 }
 
-/// Merges `ours` (the proposal) and `theirs` (the current state), both changed from `base`, in
-/// the model `model`. The current state's `retired` IDs may not stay in the result. Returns the
-/// merged modules and collections sorted by ID, or every conflict sorted by subject.
-pub(super) fn merge(
+/// How a conflicting subject settles.
+#[derive(Debug)]
+pub(super) enum Choice {
+    /// The proposal's side.
+    Mine,
+    /// The predecessor's side.
+    Theirs,
+    /// A replacement of the subject's own kind.
+    Edited(Box<Item>),
+}
+
+/// A replacement module (its own fields), relationship or collection.
+#[derive(Debug)]
+pub(super) enum Item {
+    Module(Module),
+    Relationship(Relationship),
+    Collection(Collection),
+}
+
+/// Choices by qualified subject.
+pub(super) type Settlement = BTreeMap<String, Choice>;
+
+/// What a merge gives: the merged modules and collections sorted by ID, the conflicts left,
+/// sorted by subject, the subjects a settlement decided, and the subjects it took from the
+/// predecessor over the base's version, which the proposal kept. The merge holds when no
+/// conflict is left.
+#[derive(Debug, Default)]
+pub(super) struct Merge {
+    pub(super) modules: Vec<Module>,
+    pub(super) collections: Vec<Collection>,
+    pub(super) conflicts: Vec<Conflict>,
+    pub(super) settled: BTreeSet<String>,
+    pub(super) taken: BTreeSet<String>,
+}
+
+/// Merges `ours` (the proposal) and `theirs` (its predecessor), both changed from `base`, in the
+/// model `model`, settling conflicts by `settlement`. The current state's `retired` IDs may not
+/// stay in the result, settled or not.
+pub(super) fn merge<'a>(
     model: &str,
-    base: Side<'_>,
-    ours: Side<'_>,
-    theirs: Side<'_>,
+    base: Side<'a>,
+    ours: Side<'a>,
+    theirs: Side<'a>,
     retired: &[String],
-) -> Result<(Vec<Module>, Vec<Collection>), Vec<Conflict>> {
-    let mut conflicts = Vec::new();
+    settlement: &'a Settlement,
+) -> Merge {
+    let mut out = Merge::default();
     let (b, o, t) = (modules(base.0), modules(ours.0), modules(theirs.0));
-    let fields = three(model, &b, &o, &t, same_fields, &mut conflicts);
+    let settle = |subject: &str, o: Option<&&'a Module>, t: Option<&&'a Module>| {
+        picked(settlement.get(subject)?, o, t, |item| match item {
+            Item::Module(m) => Some(m),
+            _ => None,
+        })
+    };
+    let fields = three(model, [&b, &o, &t], same_fields, settle, &mut out);
     let (b, o, t) = (owned(base.0), owned(ours.0), owned(theirs.0));
-    let owned = three(model, &b, &o, &t, PartialEq::eq, &mut conflicts);
+    let settle = |subject: &str, o: Option<&Owned<'a>>, t: Option<&Owned<'a>>| {
+        let owner = o.or(t).map(|(owner, _)| *owner);
+        picked(settlement.get(subject)?, o, t, |item| match item {
+            Item::Relationship(r) => Some((owner?, r)),
+            _ => None,
+        })
+    };
+    let owned = three(model, [&b, &o, &t], PartialEq::eq, settle, &mut out);
     let (b, o, t) = (
         collections(base.1),
         collections(ours.1),
         collections(theirs.1),
     );
-    let collections: Vec<Collection> = three(model, &b, &o, &t, PartialEq::eq, &mut conflicts)
+    let settle = |subject: &str, o: Option<&&'a Collection>, t: Option<&&'a Collection>| {
+        picked(settlement.get(subject)?, o, t, |item| match item {
+            Item::Collection(c) => Some(c),
+            _ => None,
+        })
+    };
+    out.collections = three(model, [&b, &o, &t], PartialEq::eq, settle, &mut out)
         .into_values()
         .cloned()
         .collect();
-    let modules = rebuild(model, fields, owned, [ours.0, theirs.0], &mut conflicts);
-    conflicts.extend(still_retired(model, &modules, &collections, retired));
-    if conflicts.is_empty() {
-        return Ok((modules, collections));
+    let rebuilt = Rebuild {
+        model,
+        sides: [ours.0, theirs.0],
+        settlement,
+    };
+    out.modules = rebuilt.modules(fields, owned, &mut out);
+    let left = still_retired(model, &out.modules, &out.collections, retired);
+    out.conflicts.extend(left);
+    out.conflicts.sort();
+    out.conflicts.dedup();
+    out
+}
+
+/// The version `choice` takes: ours, theirs, or the one `edited` makes of its replacement, `None`
+/// when the replacement is of another kind.
+fn picked<'a, V: Clone>(
+    choice: &'a Choice,
+    ours: Option<&V>,
+    theirs: Option<&V>,
+    edited: impl FnOnce(&'a Item) -> Option<V>,
+) -> Option<Option<V>> {
+    match choice {
+        Choice::Mine => Some(ours.cloned()),
+        Choice::Theirs => Some(theirs.cloned()),
+        Choice::Edited(item) => edited(item).map(Some),
     }
-    conflicts.sort();
-    conflicts.dedup();
-    Err(conflicts)
 }
 
 /// Items, borrowed, by local ID.
 type Keyed<'a, V> = BTreeMap<&'a str, V>;
 
-/// The merge of one kind of subject, `same` saying when two versions of it are equal. Only the
-/// version picked is copied.
+/// A relationship with the local ID of the module owning it.
+type Owned<'a> = (&'a str, &'a Relationship);
+
+/// The merge of one kind of subject, base, ours and theirs, `same` saying when two versions of
+/// it are equal and `settle` what a conflicting subject's settlement takes. Only the version
+/// picked is copied.
 fn three<'a, V: Clone>(
     model: &str,
-    base: &Keyed<'a, V>,
-    ours: &Keyed<'a, V>,
-    theirs: &Keyed<'a, V>,
+    [base, ours, theirs]: [&Keyed<'a, V>; 3],
     same: fn(&V, &V) -> bool,
-    conflicts: &mut Vec<Conflict>,
+    settle: impl Fn(&str, Option<&V>, Option<&V>) -> Option<Option<V>>,
+    out: &mut Merge,
 ) -> Keyed<'a, V> {
     let eq = |a: Option<&V>, b: Option<&V>| match (a, b) {
         (Some(a), Some(b)) => same(a, b),
@@ -94,21 +172,26 @@ fn three<'a, V: Clone>(
     for key in keys {
         let (b, o, t) = (base.get(key), ours.get(key), theirs.get(key));
         let pick = if eq(o, t) || eq(t, b) {
-            o
+            o.cloned()
         } else if eq(o, b) {
-            t
+            out.taken.insert(ids::qualify(model, key));
+            t.cloned()
         } else {
-            let kind = if o.is_some() && t.is_some() {
-                Kind::BothChanged
-            } else {
-                Kind::ChangedRemoved
-            };
             let subject = ids::qualify(model, key);
-            conflicts.push(Conflict { subject, kind });
-            continue;
+            let Some(pick) = settle(&subject, o, t) else {
+                let kind = if o.is_some() && t.is_some() {
+                    Kind::BothChanged
+                } else {
+                    Kind::ChangedRemoved
+                };
+                out.conflicts.push(Conflict { subject, kind });
+                continue;
+            };
+            out.settled.insert(subject);
+            pick
         };
         if let Some(value) = pick {
-            merged.insert(*key, value.clone());
+            merged.insert(*key, value);
         }
     }
     merged
@@ -123,7 +206,7 @@ fn collections(collections: &[Collection]) -> Keyed<'_, &Collection> {
 }
 
 /// Relationships with the local ID of the module owning them.
-fn owned(modules: &[Module]) -> Keyed<'_, (&str, &Relationship)> {
+fn owned(modules: &[Module]) -> Keyed<'_, Owned<'_>> {
     let mut owned = Keyed::new();
     for module in modules {
         for r in &module.outgoing {
@@ -175,56 +258,108 @@ fn in_order(relationships: &mut [&Relationship]) {
     relationships.sort_by(|a, b| (a.order, &a.id).cmp(&(b.order, &b.id)));
 }
 
-/// The merged modules with their merged relationships. A relationship whose owner the merge
-/// removed is `changed-removed`, unless that owner is in conflict itself. A module equal to one
-/// side's, relationship order aside, is that side's as it stands, so an unchanged file is not
-/// rewritten.
-fn rebuild(
-    model: &str,
-    fields: Keyed<'_, &Module>,
-    owned: Keyed<'_, (&str, &Relationship)>,
-    sides: [&[Module]; 2],
-    conflicts: &mut Vec<Conflict>,
-) -> Vec<Module> {
-    let mut outgoing: BTreeMap<&str, Vec<&Relationship>> = BTreeMap::new();
-    for (id, (owner, relationship)) in owned {
-        if fields.contains_key(owner) {
-            outgoing.entry(owner).or_default().push(relationship);
-            continue;
-        }
-        // A module in conflict already names the relationships it holds.
-        let owner = ids::qualify(model, owner);
-        if !conflicts.iter().any(|c| c.subject == owner) {
-            let subject = ids::qualify(model, id);
-            conflicts.push(Conflict {
-                subject,
-                kind: Kind::ChangedRemoved,
-            });
-        }
-    }
-    let sides = sides.map(modules);
-    let held = |module: &Module, relationships: &[&Relationship]| {
-        let mut own: Vec<&Relationship> = module.outgoing.iter().collect();
-        in_order(&mut own);
-        own == relationships
-    };
-    (fields.into_iter())
-        .map(|(id, module)| {
-            let mut relationships = outgoing.remove(id).unwrap_or_default();
-            in_order(&mut relationships);
-            let kept = (sides.iter()).find_map(|side| {
-                side.get(id)
-                    .filter(|m| same_fields(m, &module) && held(m, &relationships))
-            });
-            match kept {
-                Some(kept) => (*kept).clone(),
-                None => Module {
-                    outgoing: relationships.into_iter().cloned().collect(),
-                    ..module.clone()
-                },
+/// What puts merged modules and relationships back together: the model, the proposal's and
+/// the predecessor's modules, and the settlement.
+struct Rebuild<'a, 's> {
+    model: &'s str,
+    sides: [&'a [Module]; 2],
+    settlement: &'a Settlement,
+}
+
+impl<'a> Rebuild<'a, '_> {
+    /// The merged modules with their merged relationships. A relationship whose owner the merge
+    /// removed is `changed-removed`, unless that owner is in conflict itself. Settled as mine or
+    /// theirs, it stays with its owner as that side holds them when that side holds it, and goes
+    /// otherwise; settled as a replacement, the replacement stays with its owner as the proposal,
+    /// else the predecessor, holds it. A module equal to one side's, relationship order aside, is
+    /// that side's as it stands, so an unchanged file is not rewritten.
+    fn modules(
+        &self,
+        mut fields: Keyed<'a, &'a Module>,
+        mut owned: Keyed<'a, Owned<'a>>,
+        out: &mut Merge,
+    ) -> Vec<Module> {
+        let sides = self.sides.map(modules);
+        let qualify = |id: &str| ids::qualify(self.model, id);
+        let conflicted = |out: &Merge, id: &str| {
+            let subject = qualify(id);
+            out.conflicts.iter().any(|c| c.subject == subject)
+        };
+        let (mut kept, mut dropped, mut replaced) = (Vec::new(), BTreeSet::new(), Vec::new());
+        for (&id, &(owner, _)) in &owned {
+            if fields.contains_key(owner) || conflicted(out, owner) {
+                continue;
             }
-        })
-        .collect()
+            let subject = qualify(id);
+            let side = match self.settlement.get(&subject) {
+                Some(Choice::Mine) => Some(&sides[0]),
+                Some(Choice::Theirs) => Some(&sides[1]),
+                Some(Choice::Edited(item)) => match &**item {
+                    Item::Relationship(r) => {
+                        replaced.push((id, (owner, r)));
+                        None
+                    }
+                    _ => continue,
+                },
+                None => continue,
+            };
+            let holder = match side {
+                Some(side) => (side.get(owner)).filter(|m| m.outgoing.iter().any(|r| r.id == id)),
+                None => sides.iter().find_map(|side| side.get(owner)),
+            };
+            match holder {
+                Some(module) => kept.push((owner, *module)),
+                None if side.is_some() => {
+                    dropped.insert(id);
+                }
+                None => continue,
+            }
+            out.settled.insert(subject);
+        }
+        fields.extend(kept);
+        owned.extend(replaced);
+        let mut outgoing: BTreeMap<&str, Vec<&Relationship>> = BTreeMap::new();
+        for (id, (owner, relationship)) in owned {
+            if dropped.contains(id) {
+                continue;
+            }
+            if fields.contains_key(owner) {
+                outgoing.entry(owner).or_default().push(relationship);
+                continue;
+            }
+            let subject = qualify(id);
+            if let Some(Choice::Theirs) = self.settlement.get(&subject) {
+                out.settled.insert(subject);
+            } else if !conflicted(out, owner) {
+                out.conflicts.push(Conflict {
+                    subject,
+                    kind: Kind::ChangedRemoved,
+                });
+            }
+        }
+        let held = |module: &Module, relationships: &[&Relationship]| {
+            let mut own: Vec<&Relationship> = module.outgoing.iter().collect();
+            in_order(&mut own);
+            own == relationships
+        };
+        (fields.into_iter())
+            .map(|(id, module)| {
+                let mut relationships = outgoing.remove(id).unwrap_or_default();
+                in_order(&mut relationships);
+                let kept = (sides.iter()).find_map(|side| {
+                    side.get(id)
+                        .filter(|m| same_fields(m, &module) && held(m, &relationships))
+                });
+                match kept {
+                    Some(kept) => (*kept).clone(),
+                    None => Module {
+                        outgoing: relationships.into_iter().cloned().collect(),
+                        ..module.clone()
+                    },
+                }
+            })
+            .collect()
+    }
 }
 
 /// A `retired` conflict for every ID the merged state holds that the current state retired.
@@ -276,12 +411,28 @@ mod tests {
         .unwrap()
     }
 
+    /// The merged modules and collections, or the conflicts left.
+    fn held(merge: Merge) -> Result<(Vec<Module>, Vec<Collection>), Vec<Conflict>> {
+        if merge.conflicts.is_empty() {
+            return Ok((merge.modules, merge.collections));
+        }
+        Err(merge.conflicts)
+    }
+
     fn run(
         base: &[Module],
         ours: &[Module],
         theirs: &[Module],
     ) -> Result<(Vec<Module>, Vec<Collection>), Vec<Conflict>> {
-        merge(M, (base, &[]), (ours, &[]), (theirs, &[]), &[])
+        let settlement = Settlement::new();
+        held(merge(
+            M,
+            (base, &[]),
+            (ours, &[]),
+            (theirs, &[]),
+            &[],
+            &settlement,
+        ))
     }
 
     fn names(modules: &[Module]) -> Vec<(&str, &str)> {
@@ -417,19 +568,161 @@ mod tests {
             collection("Coll0002", "Refunds"),
         ];
         let theirs = [collection("Coll0001", "Purchases")];
-        let (_, merged) = merge(M, (&[], &base), (&[], &ours), (&[], &theirs), &[]).unwrap();
+        let none = Settlement::new();
+        let (_, merged) = held(merge(
+            M,
+            (&[], &base),
+            (&[], &ours),
+            (&[], &theirs),
+            &[],
+            &none,
+        ))
+        .unwrap();
         let names: Vec<&str> = merged.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, ["Purchases", "Refunds"]);
         let other = [collection("Coll0001", "Sales")];
-        let conflicts = merge(M, (&[], &base), (&[], &other), (&[], &theirs), &[]).unwrap_err();
+        let conflicts = held(merge(
+            M,
+            (&[], &base),
+            (&[], &other),
+            (&[], &theirs),
+            &[],
+            &none,
+        ))
+        .unwrap_err();
         assert_eq!(conflicts, [conflict("Coll0001", Kind::BothChanged)]);
     }
 
     #[test]
+    fn a_settlement_takes_mine_theirs_or_a_replacement() {
+        let base = [module("ModB0001", "B", json!([]))];
+        let ours = [module("ModB0001", "Bee", json!([]))];
+        let theirs = [module("ModB0001", "Bea", json!([]))];
+        let edited = module("ModB0001", "Bey", json!([]));
+        for (choice, name) in [
+            (Choice::Mine, "Bee"),
+            (Choice::Theirs, "Bea"),
+            (Choice::Edited(Box::new(Item::Module(edited))), "Bey"),
+        ] {
+            let settlement = Settlement::from([(q("ModB0001"), choice)]);
+            let merged = merge(
+                M,
+                (&base, &[]),
+                (&ours, &[]),
+                (&theirs, &[]),
+                &[],
+                &settlement,
+            );
+            assert_eq!(merged.settled, BTreeSet::from([q("ModB0001")]));
+            assert_eq!(names(&held(merged).unwrap().0), [("ModB0001", name)]);
+        }
+    }
+
+    #[test]
+    fn a_relationship_settled_as_mine_keeps_the_owner_the_other_side_removed() {
+        let base = [
+            module("ModA0001", "A", json!([])),
+            module("ModB0001", "B", json!([])),
+        ];
+        let ours = [
+            module("ModA0001", "A", json!([])),
+            module("ModB0001", "B", json!([call("RelB0001", "ModA0001", 0)])),
+        ];
+        let theirs = [module("ModA0001", "A", json!([]))];
+        let settle = |choice| Settlement::from([(q("RelB0001"), choice)]);
+        let mine = settle(Choice::Mine);
+        let merged = merge(M, (&base, &[]), (&ours, &[]), (&theirs, &[]), &[], &mine);
+        let (modules, _) = held(merged).unwrap();
+        assert_eq!(modules[1], ours[1]);
+        let gone = settle(Choice::Theirs);
+        let merged = merge(M, (&base, &[]), (&ours, &[]), (&theirs, &[]), &[], &gone);
+        assert_eq!(names(&held(merged).unwrap().0), [("ModA0001", "A")]);
+    }
+
+    #[test]
+    fn a_replacement_for_a_relationship_whose_owner_the_other_side_removed_is_written() {
+        let base = [
+            module("ModA0001", "A", json!([])),
+            module("ModB0001", "B", json!([])),
+        ];
+        let ours = [
+            module("ModA0001", "A", json!([])),
+            module("ModB0001", "B", json!([call("RelB0001", "ModA0001", 0)])),
+        ];
+        let theirs = [module("ModA0001", "A", json!([]))];
+        let replacement = serde_json::from_value(call("RelB0001", "ModA0001", 7)).unwrap();
+        let edited = Choice::Edited(Box::new(Item::Relationship(replacement)));
+        let settlement = Settlement::from([(q("RelB0001"), edited)]);
+        let merged = merge(
+            M,
+            (&base, &[]),
+            (&ours, &[]),
+            (&theirs, &[]),
+            &[],
+            &settlement,
+        );
+        assert_eq!(merged.settled, BTreeSet::from([q("RelB0001")]));
+        let (modules, _) = held(merged).unwrap();
+        assert_eq!(names(&modules), [("ModA0001", "A"), ("ModB0001", "B")]);
+        assert_eq!(modules[1].outgoing.len(), 1);
+        assert_eq!(modules[1].outgoing[0].order, 7);
+    }
+
+    #[test]
+    fn a_relationship_settled_to_the_side_without_it_goes_with_its_owner_left_removed() {
+        let base = [
+            module("ModA0001", "A", json!([])),
+            module("ModB0001", "B", json!([])),
+        ];
+        let ours = [module("ModA0001", "A", json!([]))];
+        let theirs = [
+            module("ModA0001", "A", json!([])),
+            module("ModB0001", "B", json!([call("RelB0002", "ModA0001", 0)])),
+        ];
+        let settle = |choice| Settlement::from([(q("RelB0002"), choice)]);
+        let mine = settle(Choice::Mine);
+        let merged = merge(M, (&base, &[]), (&ours, &[]), (&theirs, &[]), &[], &mine);
+        assert_eq!(merged.settled, BTreeSet::from([q("RelB0002")]));
+        assert_eq!(names(&held(merged).unwrap().0), [("ModA0001", "A")]);
+        let kept = settle(Choice::Theirs);
+        let merged = merge(M, (&base, &[]), (&ours, &[]), (&theirs, &[]), &[], &kept);
+        let (modules, _) = held(merged).unwrap();
+        assert_eq!(modules[1], theirs[1]);
+    }
+
+    #[test]
+    fn the_merge_names_what_it_took_from_the_predecessor_over_the_base() {
+        let base = [
+            module("ModA0001", "A", json!([])),
+            module("ModB0001", "B", json!([])),
+        ];
+        let ours = [
+            module("ModA0001", "Ay", json!([])),
+            module("ModB0001", "B", json!([])),
+        ];
+        let theirs = [
+            module("ModA0001", "A", json!([])),
+            module("ModB0001", "Bee", json!([])),
+        ];
+        let none = Settlement::new();
+        let merged = merge(M, (&base, &[]), (&ours, &[]), (&theirs, &[]), &[], &none);
+        assert_eq!(merged.taken, BTreeSet::from([q("ModB0001")]));
+    }
+
+    #[test]
     fn an_id_the_current_state_retired_conflicts() {
-        let held = [module("ModB0001", "B", json!([]))];
+        let kept = [module("ModB0001", "B", json!([]))];
         let retired = ["ModB0001".to_owned()];
-        let conflicts = merge(M, (&[], &[]), (&held, &[]), (&[], &[]), &retired).unwrap_err();
+        let none = Settlement::new();
+        let conflicts = held(merge(
+            M,
+            (&[], &[]),
+            (&kept, &[]),
+            (&[], &[]),
+            &retired,
+            &none,
+        ))
+        .unwrap_err();
         assert_eq!(conflicts, [conflict("ModB0001", Kind::Retired)]);
     }
 }

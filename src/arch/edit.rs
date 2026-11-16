@@ -1918,6 +1918,7 @@ mod tests {
                     state: Some("State001".to_owned()),
                     revision: String::new(),
                 },
+                parent: None,
                 created: 0,
                 adopted_as: None,
                 dropped: vec!["Billing1".to_owned()],

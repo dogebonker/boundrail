@@ -20,7 +20,7 @@ use crate::arch::types::{
     Collection, DESCRIPTION_MAX, Document, Module, Proposal, ProposalStatus, SUMMARY_MAX, URL_MAX,
     is_https,
 };
-use crate::arch::{Code, Refusal, ids, one_line, state};
+use crate::arch::{Code, Refusal, ids, one_line, revision, state};
 use crate::files::refuse_symlink;
 
 /// The folder of proposals, one folder per proposal ID, and the file each one holds.
@@ -301,6 +301,23 @@ fn changed<'a, T: PartialEq>(
     (fresh, gone)
 }
 
+impl Model {
+    /// The digest of the module and collection files this state or proposal holds, base aside: the
+    /// predecessor revision a child records of its parent draft.
+    pub fn content_digest(&self) -> String {
+        let held = |path: &str| {
+            let folder = path.split_once('/').map(|(folder, _)| folder);
+            folder.is_some_and(|f| BASE_FOLDERS.iter().any(|(held, _)| *held == f))
+        };
+        let files = (self.revision.files.iter())
+            .map(|f| (unprefixed(&f.path), &f.sha256))
+            .filter(|(path, _)| held(path))
+            .map(|(path, sha256)| (path.to_owned(), sha256.clone()))
+            .collect();
+        revision::of_digests(files).digest
+    }
+}
+
 fn module_id(module: &Module) -> &str {
     &module.id
 }
@@ -353,6 +370,15 @@ pub(super) fn check_proposal(file: &str, proposal: &Proposal, problems: &mut Pro
         if !ids::is_local(named) {
             problems.push(file, named, "state ID is not 8 base62 characters");
         }
+    }
+    if let Some(parent) = &proposal.parent
+        && (!ids::is_local(parent) || *parent == proposal.id)
+    {
+        problems.push(
+            file,
+            parent,
+            "parent is not another proposal's 8 base62 character ID",
+        );
     }
     for dropped in &proposal.dropped {
         if !ids::is_local(dropped) {

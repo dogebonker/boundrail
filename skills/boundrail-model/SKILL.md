@@ -167,7 +167,8 @@ module hides much behind few entry points; a **shallow** one lets callers reach 
   relationship the code shows and the model lacks (draw it) or one concern split across modules
   (merge them, or move the code). A low `local_share` means most changes to the module touch
   others too.
-- Draw each candidate design as its own proposal (boundrail-plan; `--from` copies another draft),
+- Draw each candidate design as its own proposal (boundrail-plan; `--from` copies another draft,
+  `--parent` draws a child that builds on one),
   then `boundrail model compare <a> --beside <b> --format markdown`. It sets each alternative's
   counts and per-module measures side by side and ranks nothing: pick by the counts the design
   question names, and show the person the table and each proposal's picture.
