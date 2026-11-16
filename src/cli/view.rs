@@ -420,10 +420,14 @@ impl Server {
                 }
                 model_cli::read_output(root, param("checkpoint"), param("proposal"))?
             }
-            "/api/check" => {
-                model_cli::run_check(root, None, param("proposal"), false, &Default::default())?
-                    .output()?
-            }
+            "/api/check" => model_cli::run_check(
+                root,
+                None,
+                param("proposal"),
+                boundrail::arch::lsp::Enable::Off,
+                &Default::default(),
+            )?
+            .output()?,
             "/api/proposals" => model_cli::proposals_output(root)?,
             "/api/checkpoints" => model_cli::checkpoints_output(root, None)?,
             "/api/compare" => {

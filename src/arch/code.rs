@@ -49,10 +49,13 @@ pub enum SkipReason {
     ScanFailed,
     /// No module binds the infrastructure unit.
     InfraUnbound,
-    /// Language servers are configured but were not enabled with `--language-servers`.
+    /// Language servers are configured but were not enabled, by `--language-servers` or the
+    /// user's config.
     LanguageServersNotEnabled,
     /// The language server failed; the check went without it.
     LanguageServerFailed,
+    /// The language server was not started: the project lacks a file it needs.
+    LanguageServerUnready,
     /// The picture could not be drawn or its file read, so its freshness is unknown.
     Unrenderable,
     /// The beat or picture reads a checkpoint, and the history ref is not in this repository.
@@ -76,6 +79,7 @@ impl SkipReason {
             Self::InfraUnbound => "infra-unbound",
             Self::LanguageServersNotEnabled => "language-servers-not-enabled",
             Self::LanguageServerFailed => "language-server-failed",
+            Self::LanguageServerUnready => "language-server-unready",
             Self::Unrenderable => "unrenderable",
             Self::HistoryNotLocal => "history-not-local",
         }

@@ -82,6 +82,10 @@ fn the_step_runs_real_commands_and_flags_and_never_language_servers() {
     let invocations = invocations(&code);
     let commands: Vec<&str> = invocations.iter().map(|w| w[0].as_str()).collect();
     assert_eq!(commands, ["check", "footprint", "footprint"]);
+    assert!(
+        invocations[0].iter().any(|w| w == "--no-language-servers"),
+        "a user's config must not turn language servers on in the action"
+    );
     let outside = TempDir::new("action-format").unwrap();
     for words in &invocations {
         let help = Command::new(env!("CARGO_BIN_EXE_boundrail"))

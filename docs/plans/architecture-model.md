@@ -63,7 +63,7 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 | T29 | Cross-model references: modules reference another model, state or subject, `read --references`, pinned foreign checkpoints; `read --code` resolves and opens the code target | open |
 | T30 | History repair and restore: correct a recorded state with source commits and an audit trail; restore a bundle into an empty vault with identities and history | open |
 | T31 | Vaults outside Git: a private history for a vault outside a checkout, used for temporary pull request models | open |
-| T32 | Language servers: `model language-server` add, remove and list; defaults for C-family, C# and Swift; on by default through user config outside the checkout; `unready` diagnostic and step timings | open |
+| T32 | Language servers: `model language-server` add, remove and list; defaults for C-family, C# and Swift; on by default through user config outside the checkout; `unready` diagnostic and step timings | done |
 | T33 | Browser: multi-select, relationship-kind filter, URL state for proposal, focus and flow with Back and Forward; an agent shows a reading in the user's open pane | open |
 | T34 | `model explain`: ask the local agent about a selection, relationship, flow or proposal | open |
 | T35 | Walkthrough recording: render a walkthrough to MP4 with local voice and replay it | open |
@@ -1200,3 +1200,67 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   read `saved-locally` until pushed. New trailers are optional, so older histories read and
   publish as before; a `Proposal` that is not a local ID or an `Uncommitted` other than `true`
   after a `Source` is not a checkpoint, which fetch and push refuse as for other forged trailers.
+- T32: commands. `model language-server list` prints both files (`repository` and `user`, each
+  `{file, content, problem?}`), and `effective`: each server a run with servers on would start,
+  once per language of the files it covers (`language`, `server`, `command`, `args`,
+  `extensions`, `defined_by: allowlist | user`), or a top-level `problem` when the list names an
+  unknown server. A language is a key of the allowlist: `c` (C, C++, Objective-C), `csharp`, `go`,
+  `java`, `python`, `rust`, `swift`, `typescript`, each with its allowlisted servers, the first
+  its default (`pyright-langserver` for Python, as setup writes). `add <language>` writes the
+  repository's list: the default's name, or `--command` when it is another allowlisted server of
+  that language; any other command, or an `--arg`, refuses `REQUEST_INVALID` pointing to
+  `--user`. `add <language> --user` defines the default's name in the user's config with
+  `--command` and its `--arg`s, else with the allowlisted program and arguments, so a list naming
+  that server runs the user's program; a `--command` naming an allowlisted server of the
+  language, without `--arg`, keeps that server's arguments (TypeScript's `--stdio`). The command
+  is checked as in T13. The user's config is written as a bare array of servers unless it trusts
+  a folder, so binaries older than trusted folders still read it. Both replace the
+  entries naming an allowlisted server of the language; `remove <language> [--user]` drops them
+  and deletes the repository's list when it is left empty. Entries naming a server only the user
+  defines are edited by hand. A file that does not read refuses, unchanged files are not
+  rewritten, and writes go through `files::write_atomic` (the repository's path through
+  `files::safe_path`). The output adds `edited: {file, change: written | deleted | unchanged}`.
+- T32: defaults. The allowlist adds `clangd` (`c h cc cpp cxx hh hpp hxx m mm`, languages `c`,
+  `cpp`, `objective-c`, `objective-cpp`), `csharp-ls` (`cs`; picked over OmniSharp, since `dotnet tool install --global
+  csharp-ls` puts a program of that name on `PATH` that speaks LSP with no arguments) and `sourcekit-lsp` (`swift`), each run
+  as its own name with no arguments under the T13 rules. clangd reads a committed `.clangd` and
+  `compile_commands.json` and passes their flags to its clang frontend, and its background index
+  writes `.cache/clangd` in the checkout; sourcekit-lsp 6 and later background-indexes, building
+  the package into `.build/` and running its macros and build-tool plugins; csharp-ls runs MSBuild
+  design-time targets and NuGet restore, which reaches the network, runs the `.targets` of
+  packages and writes `obj/`. All of it is code from the checkout. Each allowlisted server holds
+  its `project_files`, and `required` when it starts only with one of them (below); `model setup
+  --language-servers` names the default server of each language one of whose project files sits
+  at the root (`lsp::detected_servers`), so setup names no server that would be unready there.
+- T32: on by default in trusted folders. The user's config may be `{"trusted": [<absolute
+  folder>...], "servers": [...]}`, unknown keys refused; a bare array still reads as the servers,
+  trusting nothing. A global switch would have turned servers on for every checkout, freshly
+  cloned untrusted ones included, so trust is per folder. `--language-servers` turns servers on,
+  `--no-language-servers` off, and without either they run when the checkout root lies at or
+  below a trusted folder, both once links resolve (`lsp::Enable`: `On`, `Off`, `ByUserConfig`). A trusted folder that is not absolute makes the config not read. The user's
+  config is read only when the repository's list exists, its server commands are checked only
+  once servers are on, and a user's config at or below the checkout root (after links resolve)
+  does not read, as the repository could commit it. A user's config that does not read refuses
+  `REQUEST_INVALID` with `--language-servers`; without it, it prints `warning: language servers
+  stay off: <reason>` and the run keeps the `language-servers-not-enabled` skip, as when servers
+  are off. The committed list is never read without servers on, so it cannot turn them on. `model
+  view` passes `Off`. The GitHub Action passes `--no-language-servers`; any other machine that
+  checks untrusted pull requests must not list their folder as trusted.
+- T32: unready and timings. Before an allowlisted server starts (by name, so a user's definition
+  of the name too), one of its project files must sit in the folder of a file it would open or a
+  folder above it, up to the checkout root: `compile_commands.json`, `build/compile_commands.json`
+  or `compile_flags.txt` for clangd; `Cargo.toml` or `rust-project.json`; `go.mod` or `go.work`;
+  `pom.xml`, `build.gradle` or `build.gradle.kts`; a `*.sln`, `*.slnx` or `*.csproj`;
+  `Package.swift` for sourcekit-lsp. The TypeScript and Pyright servers need none (their project
+  files, `package.json` or `tsconfig.json` and `pyproject.toml`, `setup.py`, `setup.cfg` or
+  `requirements.txt`, only drive setup). Each folder holding a file a server would open, and each
+  folder above it, is looked in once per project file name for the whole run. Otherwise it is not started: `warning: language server <name> is not ready: no <files>
+  beside or above <first file> in the checkout` on stderr and the skip `{subject: <name>, site:
+  "language-server", reason: "language-server-unready"}`. `language_server_runs`, beside the skips
+  in `model check` JSON and beside `language_servers` in `model inspect` JSON (kept as the skip
+  list, so a new key rather than a changed one), lists each server that had something to answer:
+  `{server, outcome: answered | failed | unready, reason?, timings_ms?: {start, initialize,
+  queries, shutdown}}`, with the milliseconds of the steps it reached; it is left out when empty.
+  An answered server also prints `boundrail: language server <name> answered: start N ms,
+  initialize N ms, queries N ms, shutdown N ms` to stderr in every format, as the starting line
+  is.

@@ -36,6 +36,8 @@ use boundrail::arch::{Code, Refusal};
 use boundrail::cochange::MAX_FILES;
 use serde_json::{Value, json};
 
+#[path = "language_server.rs"]
+mod language_server;
 #[path = "pictures.rs"]
 mod pictures;
 #[path = "setup.rs"]
@@ -78,14 +80,24 @@ enum Command {
         /// any of them has a warning or does not load
         #[arg(long, conflicts_with = "proposal")]
         every_draft: bool,
-        /// Run the language servers .boundrail/language-servers.json names, for call references and symbols.
-        /// They run code from the checkout (a workspace tsserver.js under node_modules,
-        /// rust-analyzer build scripts and proc macros, jdtls Gradle and Maven imports): use it on
-        /// trusted checkouts only, never on untrusted pull request heads in CI. The servers may
-        /// leave build output and project metadata in the checkout (rust-analyzer target/, jdtls
-        /// .project, .classpath and .settings), while Boundrail itself writes nothing there
-        #[arg(long)]
+        /// Run the language servers .boundrail/language-servers.json names, for call references and symbols;
+        /// on without the flag in a checkout at or below a folder the user's config lists in
+        /// "trusted". They run code from the checkout (a workspace tsserver.js under
+        /// node_modules, rust-analyzer build scripts and proc macros, jdtls Gradle and Maven
+        /// imports, clangd flags from a committed .clangd and compile_commands.json passed to its
+        /// clang frontend, sourcekit-lsp 6+ background indexing that builds the package and runs
+        /// its macros and build-tool plugins, csharp-ls MSBuild design-time targets and NuGet
+        /// restore, which reaches the network and runs package .targets): use them on trusted
+        /// checkouts only, never on untrusted pull request heads in CI. The servers may leave
+        /// build output and project metadata in the checkout (rust-analyzer target/, jdtls
+        /// .project, .classpath and .settings, clangd .cache/, sourcekit-lsp .build/, csharp-ls
+        /// obj/), while Boundrail itself writes nothing there
+        #[arg(long, conflicts_with = "no_language_servers")]
         language_servers: bool,
+        /// Run no language server, even in a checkout the user's config trusts; pass it on
+        /// untrusted checkouts
+        #[arg(long)]
+        no_language_servers: bool,
     },
     /// Report the modules a branch changes, the relationships its changed imports cross, and
     /// what it changes in the model; with --fail-outside, exits 1 when it changes a module the
@@ -295,6 +307,11 @@ enum ModelCmd {
     },
     /// List the vault file and request schemas, or print one as JSON Schema
     Schema { name: Option<String> },
+    /// List, add or remove language servers: the repository's .boundrail/language-servers.json
+    /// names allowlisted servers, and the user's config outside the checkout defines programs
+    /// and arguments
+    #[command(subcommand)]
+    LanguageServer(language_server::LanguageServerCmd),
     /// Apply a batch of module, relationship, collection, flow, step, walkthrough, beat and picture changes (schema `model-edit`)
     Edit {
         /// Request file; `-` or absent reads standard input
@@ -494,14 +511,24 @@ enum ModelCmd {
         /// relationships between them, relationships crossing its boundary, and neighbours
         #[arg(long, conflicts_with = "language_servers")]
         group: Option<String>,
-        /// Run the language servers .boundrail/language-servers.json names, for references to each interface symbol.
-        /// They run code from the checkout (a workspace tsserver.js under node_modules,
-        /// rust-analyzer build scripts and proc macros, jdtls Gradle and Maven imports): use it on
-        /// trusted checkouts only, never on untrusted pull request heads in CI. The servers may
-        /// leave build output and project metadata in the checkout (rust-analyzer target/, jdtls
-        /// .project, .classpath and .settings), while Boundrail itself writes nothing there
-        #[arg(long)]
+        /// Run the language servers .boundrail/language-servers.json names, for references to each interface symbol;
+        /// on without the flag in a checkout at or below a folder the user's config lists in
+        /// "trusted". They run code from the checkout (a workspace tsserver.js under
+        /// node_modules, rust-analyzer build scripts and proc macros, jdtls Gradle and Maven
+        /// imports, clangd flags from a committed .clangd and compile_commands.json passed to its
+        /// clang frontend, sourcekit-lsp 6+ background indexing that builds the package and runs
+        /// its macros and build-tool plugins, csharp-ls MSBuild design-time targets and NuGet
+        /// restore, which reaches the network and runs package .targets): use them on trusted
+        /// checkouts only, never on untrusted pull request heads in CI. The servers may leave
+        /// build output and project metadata in the checkout (rust-analyzer target/, jdtls
+        /// .project, .classpath and .settings, clangd .cache/, sourcekit-lsp .build/, csharp-ls
+        /// obj/), while Boundrail itself writes nothing there
+        #[arg(long, conflicts_with = "no_language_servers")]
         language_servers: bool,
+        /// Run no language server, even in a checkout the user's config trusts; pass it on
+        /// untrusted checkouts
+        #[arg(long)]
+        no_language_servers: bool,
     },
     /// Report from Git history how often commits stay inside each module, which modules change
     /// together, and the pairs that do so with no relationship drawn
@@ -578,19 +605,24 @@ pub(super) fn run(args: ModelArgs) -> Result<ExitCode> {
             only,
             every_draft: true,
             language_servers,
+            no_language_servers,
             ..
-        } => check_every_draft(&args.root, args.format, only, language_servers),
+        } => {
+            let enable = enable(language_servers, no_language_servers);
+            check_every_draft(&args.root, args.format, only, enable)
+        }
         Command::Check {
             only,
             proposal,
             language_servers,
+            no_language_servers,
             ..
         } => check(
             &args.root,
             args.format,
             only,
             proposal.as_deref(),
-            language_servers,
+            enable(language_servers, no_language_servers),
         ),
         Command::Render(render) => {
             render_model(&args.root, args.format, &render).map(|()| ExitCode::SUCCESS)
@@ -1095,16 +1127,18 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
             checkpoint,
             group,
             language_servers,
+            no_language_servers,
         } => {
             let asked = Inspect {
                 subject: subject.as_deref(),
                 proposal: proposal.as_deref(),
                 checkpoint: checkpoint.as_deref(),
                 group: group.as_deref(),
-                language_servers,
+                language_servers: enable(language_servers, no_language_servers),
             };
             inspect_model(root, markdown, &asked)
         }
+        ModelCmd::LanguageServer(command) => language_server::run(root, markdown, command),
         ModelCmd::Locality { since, limit } => {
             model_locality(root, markdown, since.as_deref(), limit)
         }
@@ -1821,6 +1855,16 @@ fn check_output(root: &Path, output: &Path, flag: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether a run uses language servers: `--language-servers` turns them on and
+/// `--no-language-servers` off; without either the user's trusted folders decide.
+fn enable(on: bool, off: bool) -> lsp::Enable {
+    match (on, off) {
+        (true, _) => lsp::Enable::On,
+        (_, true) => lsp::Enable::Off,
+        _ => lsp::Enable::ByUserConfig,
+    }
+}
+
 /// `model check`: exit 0 without warnings, 1 with any. Like `model read`, it names a pending edit.
 /// The skips are reported only when the code check ran, a picture could not be checked, or a
 /// reading was skipped.
@@ -1829,7 +1873,7 @@ fn check(
     format: Option<ModelFormat>,
     only: Option<CheckOnly>,
     proposal: Option<&str>,
-    language_servers: bool,
+    language_servers: lsp::Enable,
 ) -> Result<ExitCode> {
     let checked = run_check(root, only, proposal, language_servers, &SharedScan::new())?;
     let code = ExitCode::from(u8::from(checked.warning > 0));
@@ -1872,7 +1916,7 @@ fn check_every_draft(
     root: &Path,
     format: Option<ModelFormat>,
     only: Option<CheckOnly>,
-    language_servers: bool,
+    language_servers: lsp::Enable,
 ) -> Result<ExitCode> {
     let refuse = |message: &str| Err(Refusal::new(Code::RequestInvalid, message).into());
     if format == Some(ModelFormat::Annotations) {
@@ -1959,15 +2003,17 @@ pub(super) struct Checked {
     pending: Option<Value>,
     warning: usize,
     information: usize,
+    /// The language servers the code check asked, with their step timings.
+    language_server_runs: Vec<lsp::Run>,
 }
 
 /// Runs the checks `only` names, or both, on the current state or `proposal`, the code check
-/// with the configured language servers when `language_servers` is set.
+/// with the configured language servers when `language_servers` enables them.
 pub(super) fn run_check(
     root: &Path,
     only: Option<CheckOnly>,
     proposal: Option<&str>,
-    language_servers: bool,
+    language_servers: lsp::Enable,
     scan: &SharedScan,
 ) -> Result<Checked> {
     if proposal.is_some() && only == Some(CheckOnly::Embeds) {
@@ -1978,7 +2024,7 @@ pub(super) fn run_check(
     let runs = |part: CheckOnly| only.is_none_or(|o| o == part);
     // Each proposal or checkpoint a beat or picture reads loads once for the whole check.
     let mut states = States::new(&model);
-    let (mut skips, mut units) = (None, None);
+    let (mut skips, mut units, mut language_server_runs) = (None, None, Vec::new());
     let mut diagnostics = if runs(CheckOnly::Semantic) {
         let mut found = semantic::check(&model.manifest.id, &model.modules, &model.collections);
         let (judged, skipped) = semantic::walkthroughs(&mut states);
@@ -1991,7 +2037,8 @@ pub(super) fn run_check(
         Vec::new()
     };
     if runs(CheckOnly::Code) {
-        let report = code_check(&model, language_servers, scan)?;
+        let (report, servers) = code_check(&model, language_servers, scan)?;
+        language_server_runs = servers;
         diagnostics.extend(report.diagnostics);
         skips.get_or_insert_with(Vec::new).extend(report.skips);
         units = Some(report.units);
@@ -2018,6 +2065,7 @@ pub(super) fn run_check(
         pending,
         warning,
         information,
+        language_server_runs,
     })
 }
 
@@ -2039,6 +2087,9 @@ impl Checked {
         }
         if let Some(units) = self.units {
             output["units"] = json!(units);
+        }
+        if !self.language_server_runs.is_empty() {
+            output["language_server_runs"] = json!(self.language_server_runs);
         }
         extend(&mut output, json!({ "proposal": self.model.proposal }))?;
         if let Some(pending) = self.pending {
@@ -2087,9 +2138,13 @@ fn read_infra(checkout: &Path) -> Infra {
 }
 
 /// The code check against the model's checkout and its infrastructure, with `scan`, made when
-/// a binding or anchor names code there. A failed scan or infrastructure read becomes a
-/// `SCAN_FAILED` warning.
-fn code_check(model: &Model, language_servers: bool, scan: &SharedScan) -> Result<CodeReport> {
+/// a binding or anchor names code there, and the language servers it asked. A failed scan or
+/// infrastructure read becomes a `SCAN_FAILED` warning.
+fn code_check(
+    model: &Model,
+    language_servers: lsp::Enable,
+    scan: &SharedScan,
+) -> Result<(CodeReport, Vec<lsp::Run>)> {
     let checkout = checkpoint::checkout(&model.dir)?;
     let checkout = checkout.as_path();
     let doc = if code::needs_scan(&model.modules, &model.collections, checkout) {
@@ -2100,7 +2155,7 @@ fn code_check(model: &Model, language_servers: bool, scan: &SharedScan) -> Resul
     let infra = read_infra(checkout);
     let scanned = doc.as_ref().ok().copied();
     let lsp = language_server_facts(model, checkout, scanned, &infra, language_servers)?;
-    Ok(code::check(
+    let report = code::check(
         &model.manifest.id,
         (&model.modules, &model.collections),
         &model.config,
@@ -2108,20 +2163,21 @@ fn code_check(model: &Model, language_servers: bool, scan: &SharedScan) -> Resul
         doc,
         &infra,
         &lsp,
-    ))
+    );
+    Ok((report, lsp.runs))
 }
 
-/// What the configured language servers find when `enabled` and the scan ran; otherwise
-/// nothing, with a `language-servers-not-enabled` skip when servers are configured. An invalid
-/// config refuses only when `enabled`.
+/// What the configured language servers find when `enable` turns them on and the scan ran;
+/// otherwise nothing, with a `language-servers-not-enabled` skip when servers are configured. An
+/// invalid config refuses only when it is read.
 fn language_server_facts(
     model: &Model,
     checkout: &Path,
     doc: Option<&Document>,
     infra: &Infra,
-    enabled: bool,
+    enable: lsp::Enable,
 ) -> Result<Facts> {
-    let (servers, skips) = lsp::configured(checkout, enabled)?;
+    let (servers, skips) = lsp::configured(checkout, enable)?;
     let mut facts = match doc {
         Some(doc) => {
             let (id, modules) = (&model.manifest.id, &model.modules);
@@ -2141,7 +2197,7 @@ pub(super) struct Inspect<'a> {
     pub(super) proposal: Option<&'a str>,
     pub(super) checkpoint: Option<&'a str>,
     pub(super) group: Option<&'a str>,
-    pub(super) language_servers: bool,
+    pub(super) language_servers: lsp::Enable,
 }
 
 /// Why a checkpoint's inspection has no code section.
@@ -2278,7 +2334,8 @@ fn inspected(root: &Path, asked: &Inspect<'_>) -> Result<Inspected> {
     let scanned = doc.as_ref().ok();
     let lsp = language_server_facts(&model, &checkout, scanned, &infra, asked.language_servers)?;
     let modules = &model.modules;
-    let report = inspect::inspect(id, modules, &checkout, scan, &infra, subject, &lsp);
+    let mut report = inspect::inspect(id, modules, &checkout, scan, &infra, subject, &lsp);
+    report.language_server_runs = lsp.runs;
     let scan_error = (scan_error(&doc).map(str::to_owned))
         .or_else(|| report.scan_error.clone())
         .or_else(|| infra.error.clone());

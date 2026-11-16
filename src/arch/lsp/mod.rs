@@ -12,9 +12,10 @@ mod wire;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
+use serde::Serialize;
 use serde_json::{Value, json};
 
 use super::code::{self, Ownership, Skip, SkipReason, SkipSite};
@@ -24,7 +25,10 @@ use super::segments;
 use super::types::{EXTERNAL_KIND, Module};
 use crate::model::Document;
 use client::Session;
-pub use config::{CONFIG, Server, configured};
+pub use config::{
+    CONFIG, Change, DefinedBy, Edited, Effective, Enable, Entry, Listed, Listing, Server,
+    UserConfig, add, configured, detected_servers, listing, remove,
+};
 use wire::{Range, Roots, Text, file_uri};
 
 /// The most interface symbols asked about per module.
@@ -46,8 +50,55 @@ pub struct Facts {
     pub(super) queried: HashSet<String>,
     /// The modules with at least one interface symbol a server found.
     pub(super) located: HashSet<String>,
-    /// Servers that failed, or the config when language servers are not enabled.
+    /// Servers that failed or were not ready, or the config when language servers are not
+    /// enabled.
     pub skips: Vec<Skip>,
+    /// Each server that had something to answer: how it went and how long each step took.
+    pub runs: Vec<Run>,
+}
+
+/// How one server's session went.
+#[derive(Debug, Clone, Serialize)]
+pub struct Run {
+    pub server: String,
+    pub outcome: Outcome,
+    /// Why it failed or was not ready.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The steps it reached; `None` when it was not started.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timings_ms: Option<Timings>,
+}
+
+/// How a server's session ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Outcome {
+    Answered,
+    Failed,
+    /// Not started: the project lacks a file the server needs.
+    Unready,
+}
+
+/// Milliseconds each step of a session took, for the steps it reached.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct Timings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initialize: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queries: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shutdown: Option<u64>,
+}
+
+/// Runs `step`, recording its milliseconds in `slot`.
+fn timed<T>(slot: &mut Option<u64>, step: impl FnOnce() -> T) -> T {
+    let started = Instant::now();
+    let value = step();
+    *slot = Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+    value
 }
 
 impl Facts {
@@ -118,13 +169,46 @@ pub fn gather(
         canonical: &canonical,
         given: root,
     };
+    let mut project_files = config::ProjectFiles::new();
     for server in servers {
         let (served, asks) = plan(server, &interfaces, &lookups);
         if asks.names.is_empty() {
             continue;
         }
-        match ask(roots, server, &asks) {
-            Ok(found) => merge(&mut facts, &served, found),
+        let run = |outcome, reason, timings_ms| Run {
+            server: server.name.clone(),
+            outcome,
+            reason,
+            timings_ms,
+        };
+        if let Some(reason) = config::unready(server, &canonical, &asks.files, &mut project_files) {
+            eprintln!(
+                "warning: language server {} is not ready: {reason}",
+                server.name
+            );
+            facts.skips.push(Skip {
+                subject: server.name.clone(),
+                site: SkipSite::LanguageServer,
+                reason: SkipReason::LanguageServerUnready,
+            });
+            facts.runs.push(run(Outcome::Unready, Some(reason), None));
+            continue;
+        }
+        let mut timings = Timings::default();
+        match ask(roots, server, &asks, &mut timings) {
+            Ok(found) => {
+                merge(&mut facts, &served, found);
+                let step = |name: &str, ms: Option<u64>| format!("{name} {} ms", ms.unwrap_or(0));
+                eprintln!(
+                    "boundrail: language server {} answered: {}, {}, {}, {}",
+                    server.name,
+                    step("start", timings.start),
+                    step("initialize", timings.initialize),
+                    step("queries", timings.queries),
+                    step("shutdown", timings.shutdown)
+                );
+                facts.runs.push(run(Outcome::Answered, None, Some(timings)));
+            }
             Err(error) => {
                 eprintln!("warning: language server {} failed: {error:#}", server.name);
                 facts.skips.push(Skip {
@@ -132,6 +216,8 @@ pub fn gather(
                     site: SkipSite::LanguageServer,
                     reason: SkipReason::LanguageServerFailed,
                 });
+                let reason = Some(format!("{error:#}"));
+                facts.runs.push(run(Outcome::Failed, reason, Some(timings)));
             }
         }
     }
@@ -268,8 +354,14 @@ struct Found<'a> {
 }
 
 /// Runs one session of `server` in the checkout, within the tool timeout (else
-/// [`SESSION_BUDGET_DEFAULT`]), printing the command line first.
-fn ask<'a>(roots: Roots<'_>, server: &Server, asks: &Asks<'a>) -> Result<Found<'a>> {
+/// [`SESSION_BUDGET_DEFAULT`]), printing the command line first and recording each step's time
+/// in `timings`.
+fn ask<'a>(
+    roots: Roots<'_>,
+    server: &Server,
+    asks: &Asks<'a>,
+    timings: &mut Timings,
+) -> Result<Found<'a>> {
     let program = if server.command.contains(['/', '\\']) {
         PathBuf::from(&server.command)
     } else {
@@ -284,12 +376,21 @@ fn ask<'a>(roots: Roots<'_>, server: &Server, asks: &Asks<'a>) -> Result<Found<'
         server.name
     );
     let budget = crate::collect::tool_timeout().unwrap_or(SESSION_BUDGET_DEFAULT);
-    let mut session = Session::spawn(&program, &server.args, roots.canonical, budget)?;
-    let found = (session.initialize(roots.canonical, server.initialization_options.as_ref()))
-        .and_then(|capabilities| questions(&mut session, roots, server, asks, &capabilities));
+    let mut session = timed(&mut timings.start, || {
+        Session::spawn(&program, &server.args, roots.canonical, budget)
+    })?;
+    let options = server.initialization_options.as_ref();
+    let found = timed(&mut timings.initialize, || {
+        session.initialize(roots.canonical, options)
+    })
+    .and_then(|capabilities| {
+        timed(&mut timings.queries, || {
+            questions(&mut session, roots, server, asks, &capabilities)
+        })
+    });
     match found {
         Ok(found) => {
-            session.shutdown();
+            timed(&mut timings.shutdown, || session.shutdown());
             Ok(found)
         }
         Err(error) => match session.stderr_tail() {

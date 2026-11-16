@@ -450,6 +450,17 @@ fn setup_creates_the_vault_and_skills_once_and_keeps_edited_files() {
     assert_eq!(out["language_servers"], Value::Null);
     assert_eq!(out["next_steps"][0], "boundrail model setup --agent claude");
     assert_eq!(bare.ok(&["read"])["manifest"]["name"], "Shop");
+
+    // C-family, C# and Swift project files name their allowlisted servers.
+    let native = Checkout::new();
+    for file in ["compile_commands.json", "App.csproj", "Package.swift"] {
+        fs::write(native.path().join(file), "").unwrap();
+    }
+    let out = native.ok(&["setup", "--language-servers"]);
+    assert_eq!(
+        out["language_servers"],
+        json!(["clangd", "csharp-ls", "sourcekit-lsp"])
+    );
 }
 
 #[test]
@@ -8624,8 +8635,8 @@ fn the_repository_names_servers_but_never_their_commands() {
     let config = user.join("boundrail/language-servers.json");
     let unknown = format!(
         "the language server \"evil\" is not one of typescript-language-server, \
-         basedpyright-langserver, pyright-langserver, rust-analyzer, gopls, jdtls, nor defined by \
-         the user; define it in {}",
+         pyright-langserver, basedpyright-langserver, rust-analyzer, gopls, jdtls, clangd, \
+         csharp-ls, sourcekit-lsp, nor defined by the user; define it in {}",
         config.display()
     );
     refused(json!([{"server": "evil"}]), &unknown);
@@ -8687,6 +8698,306 @@ fn a_failed_language_server_is_skipped_and_the_check_falls_back_to_imports() {
         ),
         "{stderr}"
     );
+}
+
+#[test]
+fn language_servers_are_added_listed_and_removed_in_both_files() {
+    let checkout = Checkout::new();
+    let user = TempDir::new("arch-model-user").unwrap();
+    let run = |args: &[&str]| {
+        let args = [&["language-server"], args].concat();
+        checkout.run_served_after(&[], user.path(), &args)
+    };
+    let ok = |args: &[&str]| {
+        let (code, out, _) = run(args);
+        assert_eq!(code, 0, "{out:#}");
+        assert_eq!(out["kind"], "language-servers");
+        out
+    };
+    let refused = |args: &[&str], expected: &str| {
+        let (code, out, _) = run(args);
+        assert_eq!(
+            (code, &out["error"]["code"]),
+            (2, &json!("REQUEST_INVALID")),
+            "{out:#}"
+        );
+        let message = out["error"]["message"].as_str().unwrap();
+        assert!(message.contains(expected), "{message}");
+    };
+    let repository = checkout.path().join(".boundrail/language-servers.json");
+    let user_config = user.path().join("boundrail/language-servers.json");
+    let read = |path: &Path| -> Value {
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    };
+
+    let out = ok(&["list"]);
+    assert_eq!(out["repository"]["content"], json!([]));
+    assert_eq!(
+        out["user"],
+        json!({"file": user_config, "content": {"trusted": [], "servers": []}})
+    );
+    assert_eq!(out["effective"], json!([]));
+
+    // The repository's list names allowlisted servers only: the language's default, or one of
+    // its others by name, never a program or arguments.
+    assert_eq!(ok(&["add", "c"])["edited"]["change"], "written");
+    ok(&["add", "python", "--command", "basedpyright-langserver"]);
+    let named = json!([{"server": "clangd"}, {"server": "basedpyright-langserver"}]);
+    assert_eq!(read(&repository), named);
+    assert_eq!(ok(&["remove", "go"])["edited"]["change"], "unchanged");
+    let to_user = "a command or arguments go in the user's config: pass --user";
+    refused(&["add", "rust", "--command", "/opt/rust-analyzer"], to_user);
+    refused(
+        &[
+            "add",
+            "python",
+            "--command",
+            "pyright-langserver",
+            "--arg",
+            "--stdio",
+        ],
+        to_user,
+    );
+    refused(
+        &["add", "cobol"],
+        "\"cobol\" is not a language with an allowlisted server; name one of c, csharp, go, \
+         java, python, rust, swift, typescript",
+    );
+    assert_eq!(read(&repository), named);
+    assert!(!user_config.exists());
+
+    // Programs and arguments go in the user's config, outside the checkout.
+    let swift = [
+        "add",
+        "swift",
+        "--user",
+        "--command",
+        "/opt/swift/bin/sourcekit-lsp",
+        "--arg",
+        "--log-level=error",
+    ];
+    ok(&swift);
+    ok(&["add", "csharp", "--user"]);
+    refused(
+        &["add", "go", "--user", "--command", "./gopls"],
+        "name a program on PATH or an absolute path",
+    );
+    let swift = json!({"name": "sourcekit-lsp", "command": "/opt/swift/bin/sourcekit-lsp",
+        "args": ["--log-level=error"], "languages": ["swift"], "extensions": ["swift"]});
+    let csharp = json!({"name": "csharp-ls", "command": "csharp-ls", "args": [],
+        "languages": ["csharp"], "extensions": ["cs"]});
+    assert_eq!(read(&user_config), json!([swift, csharp]));
+    ok(&[
+        "add",
+        "typescript",
+        "--user",
+        "--command",
+        "typescript-language-server",
+    ]);
+    assert_eq!(read(&user_config)[2]["args"], json!(["--stdio"]));
+    ok(&["remove", "typescript", "--user"]);
+
+    // The effective servers per language: the user's definition wins over the allowlist's.
+    ok(&["add", "swift"]);
+    let out = ok(&["list"]);
+    let effective: Vec<[&str; 4]> = (out["effective"].as_array().unwrap().iter())
+        .map(|e| ["language", "server", "command", "defined_by"].map(|k| e[k].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        effective,
+        [
+            ["c", "clangd", "clangd", "allowlist"],
+            [
+                "python",
+                "basedpyright-langserver",
+                "basedpyright-langserver",
+                "allowlist"
+            ],
+            [
+                "swift",
+                "sourcekit-lsp",
+                "/opt/swift/bin/sourcekit-lsp",
+                "user"
+            ],
+        ]
+    );
+
+    ok(&["remove", "python"]);
+    let trusted = json!({"trusted": ["/nowhere"], "servers": [swift, csharp]});
+    fs::write(&user_config, trusted.to_string()).unwrap();
+    ok(&["remove", "swift", "--user"]);
+    assert_eq!(
+        read(&user_config),
+        json!({"trusted": ["/nowhere"], "servers": [csharp]})
+    );
+    ok(&["remove", "c"]);
+    assert_eq!(ok(&["remove", "swift"])["edited"]["change"], "deleted");
+    assert!(!repository.exists());
+
+    // A user's config inside the checkout could be committed with it, so it is refused.
+    let inside = checkout.path().join("config");
+    let add = ["language-server", "add", "go", "--user"];
+    let (code, out, _) = checkout.run_served_after(&[], &inside, &add);
+    assert_eq!(code, 2, "{out:#}");
+    let message = out["error"]["message"].as_str().unwrap();
+    assert!(message.contains("inside the checkout"), "{message}");
+    assert!(!inside.exists());
+}
+
+#[test]
+fn language_servers_run_without_the_flag_in_a_checkout_the_user_config_trusts() {
+    let checkout = Checkout::new();
+    let (model, user) = served_shop(&checkout);
+    draw_web_to_bank(&checkout, &model);
+    let user = user.path();
+    let config = user.join("boundrail/language-servers.json");
+    let servers: Value = serde_json::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+    let trust = |folder: &Path| {
+        let trusted = json!({"trusted": [folder], "servers": servers});
+        fs::write(&config, trusted.to_string()).unwrap();
+    };
+    let check = ["check", "--only", "code"];
+    let not_enabled = json!([{"subject": ".boundrail/language-servers.json",
+        "site": "language-server", "reason": "language-servers-not-enabled"}]);
+    let stays_off = |out: &Value, stderr: &str| {
+        assert_eq!(out["skips"], not_enabled, "{out:#}");
+        assert!(!stderr.contains("starting language server"), "{stderr}");
+    };
+
+    // The committed list never turns them on: without the flag it is not even read.
+    name_servers(&checkout, &json!([{"server": "fake", "trusted": ["/"]}]));
+    let (code, out, stderr) = checkout.run_served(user, &check);
+    assert_eq!(code, 1, "{out:#}");
+    stays_off(&out, &stderr);
+    name_servers(&checkout, &json!([{"server": "fake"}]));
+
+    // A folder the checkout is not below leaves them off.
+    let elsewhere = TempDir::new("arch-model-elsewhere").unwrap();
+    trust(elsewhere.path());
+    let (code, out, stderr) = checkout.run_served(user, &check);
+    assert_eq!(code, 1, "{out:#}");
+    stays_off(&out, &stderr);
+
+    // The checkout root itself, or a folder above it, turns them on, and each step is timed.
+    let parent = checkout.path().parent().unwrap();
+    for folder in [checkout.path(), parent] {
+        trust(folder);
+        let (code, out, stderr) = checkout.run_served(user, &check);
+        assert_eq!(code, 0, "{out:#} {stderr}");
+        assert!(
+            stderr.contains("boundrail: starting language server fake: "),
+            "{stderr}"
+        );
+        let answered = "boundrail: language server fake answered: start ";
+        assert!(stderr.contains(answered), "{stderr}");
+        let run = &out["language_server_runs"][0];
+        assert_eq!(
+            (&run["server"], &run["outcome"]),
+            (&json!("fake"), &json!("answered"))
+        );
+        let timings = run["timings_ms"].as_object().unwrap();
+        let steps: Vec<&str> = timings.keys().map(String::as_str).collect();
+        assert_eq!(steps, ["start", "initialize", "queries", "shutdown"]);
+        assert!(timings.values().all(Value::is_u64), "{run}");
+    }
+    let (code, out, _) = checkout.run_served(user, &["inspect"]);
+    assert_eq!(code, 0, "{out:#}");
+    assert_eq!(out["modules"][0]["symbols"]["source"], "language-server");
+    assert_eq!(out["language_server_runs"][0]["outcome"], "answered");
+
+    // --no-language-servers turns them off for one run.
+    let off = ["check", "--only", "code", "--no-language-servers"];
+    let (code, out, stderr) = checkout.run_served(user, &off);
+    assert_eq!(code, 1, "{out:#}");
+    stays_off(&out, &stderr);
+    assert_eq!(out.get("language_server_runs"), None);
+
+    // A trusted folder reached through a link counts once the link resolves.
+    #[cfg(unix)]
+    {
+        let link = elsewhere.path().join("link");
+        std::os::unix::fs::symlink(checkout.path(), &link).unwrap();
+        trust(&link);
+        let (code, out, stderr) = checkout.run_served(user, &check);
+        assert_eq!(code, 0, "{out:#} {stderr}");
+        assert_eq!(out["language_server_runs"][0]["outcome"], "answered");
+    }
+
+    // A config that does not read leaves them off with a warning, and refuses only the flag.
+    for (written, reason) in [
+        (
+            json!({"enabled": true, "servers": servers}),
+            "unknown field",
+        ),
+        (json!({"trusted": ["relative"]}), "is not an absolute path"),
+    ] {
+        fs::write(&config, written.to_string()).unwrap();
+        let (code, out, stderr) = checkout.run_served(user, &check);
+        assert_eq!(code, 1, "{out:#}");
+        stays_off(&out, &stderr);
+        assert!(
+            stderr.contains("warning: language servers stay off: ") && stderr.contains(reason),
+            "{stderr}"
+        );
+        let (code, out, _) = checkout.run_served(user, &CHECK_SERVED);
+        assert_eq!(code, 2, "{out:#}");
+        let message = out["error"]["message"].as_str().unwrap();
+        assert!(message.contains(reason), "{message}");
+    }
+
+    // A user's config inside the checkout could be committed with it: a warning without the
+    // flag, a refusal with it.
+    let inside = checkout.path().join("settings");
+    fs::create_dir_all(inside.join("boundrail")).unwrap();
+    let trusted = json!({"trusted": [checkout.path()], "servers": servers});
+    fs::write(
+        inside.join("boundrail/language-servers.json"),
+        trusted.to_string(),
+    )
+    .unwrap();
+    let (code, out, stderr) = checkout.run_served(&inside, &check);
+    assert_eq!(code, 1, "{out:#}");
+    stays_off(&out, &stderr);
+    assert!(stderr.contains("inside the checkout"), "{stderr}");
+    let (code, out, stderr) = checkout.run_served(&inside, &CHECK_SERVED);
+    assert_eq!(code, 2, "{out:#}");
+    let message = out["error"]["message"].as_str().unwrap();
+    assert!(message.contains("inside the checkout"), "{message}");
+    assert!(!stderr.contains("starting language server"), "{stderr}");
+}
+
+#[test]
+fn a_language_server_missing_its_project_file_is_skipped_as_unready() {
+    let checkout = Checkout::new();
+    let (model, user) = served_shop(&checkout);
+    draw_web_to_bank(&checkout, &model);
+    // The user's config defines rust-analyzer as the fake server, which needs a Rust project.
+    let config = user.path().join("boundrail/language-servers.json");
+    let mut defined: Value = serde_json::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+    defined[0]["name"] = json!("rust-analyzer");
+    fs::write(&config, defined.to_string()).unwrap();
+    name_servers(&checkout, &json!([{"server": "rust-analyzer"}]));
+
+    let (code, out, stderr) = checkout.run_served(user.path(), &CHECK_SERVED);
+    assert_eq!(code, 1, "{out:#}");
+    assert_eq!(found(&out), ["RELATIONSHIP_UNSUPPORTED WebBnk01"]);
+    let unready = json!({"subject": "rust-analyzer", "site": "language-server",
+        "reason": "language-server-unready"});
+    assert_eq!(out["skips"], json!([unready]));
+    let reason =
+        "no Cargo.toml or rust-project.json beside or above src/bank/index.ts in the checkout";
+    assert_eq!(
+        out["language_server_runs"],
+        json!([{"server": "rust-analyzer", "outcome": "unready", "reason": reason}])
+    );
+    let warning = format!("warning: language server rust-analyzer is not ready: {reason}");
+    assert!(stderr.contains(&warning), "{stderr}");
+    assert!(!stderr.contains("starting language server"), "{stderr}");
+
+    fs::write(checkout.path().join("rust-project.json"), "{}").unwrap();
+    let (code, out, stderr) = checkout.run_served(user.path(), &CHECK_SERVED);
+    assert_eq!(code, 0, "{out:#} {stderr}");
+    assert_eq!(out["language_server_runs"][0]["outcome"], "answered");
 }
 
 #[cfg(unix)]

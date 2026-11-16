@@ -11,7 +11,7 @@ use serde::Serialize;
 use super::code::{self, NoScan, Ownership, SkipReason};
 use super::index::{Index, Line};
 use super::infra::{self, Infra};
-use super::lsp::Facts;
+use super::lsp::{Facts, Run};
 use super::types::{Evidence, Module};
 use crate::model::Document;
 use crate::surface::{SymbolExport, Symbols as SymbolData};
@@ -22,8 +22,12 @@ pub struct InspectReport {
     pub modules: Vec<Interface>,
     /// The modules whose code was not judged, with the code check's reason.
     pub skips: Vec<Skip>,
-    /// Language servers that failed, or the config when language servers are not enabled.
+    /// Language servers that failed or were not ready, or the config when language servers are
+    /// not enabled.
     pub language_servers: Vec<code::Skip>,
+    /// Each language server that had something to answer, with its step timings.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub language_server_runs: Vec<Run>,
     /// The errors of the languages whose collector failed, when a reported module's code is
     /// skipped or judged in part for it, as the code check's `SCAN_FAILED` names it.
     #[serde(skip)]

@@ -6,17 +6,25 @@
 //! footprint`. Writing `.git/config` already allows
 //! running code, so neither widens what a repository can do. The third exception is outside Git:
 //! language servers, which run only when `model check` or `model inspect` gets
-//! `--language-servers`. The committed `.boundrail/language-servers.json` only names them: an
+//! `--language-servers`, or when the checkout root, once links resolve, lies at or below a folder
+//! the user's config outside the checkout lists in `trusted` and the run does not pass
+//! `--no-language-servers`; the committed list can never turn them on, and a user's config inside
+//! the checkout is refused. The committed `.boundrail/language-servers.json` only names them: an
 //! allowlisted server runs its own name, found in an absolute `PATH` folder outside the checkout,
 //! with fixed arguments, and any other program, argument or initialization option comes from the
-//! user's config outside the checkout. Each command line is printed to stderr before it starts, and
-//! the server sees only the absolute folders of `PATH`. A server still runs code from the
-//! checkout it opens: the TypeScript server runs the workspace's `tsserver.js` under
-//! `node_modules` and its `tsconfig.json` plugins, rust-analyzer runs build scripts and proc
-//! macros and reads a committed `rust-analyzer.toml`, and jdtls runs Gradle and Maven imports.
-//! So `--language-servers` is a per-run opt-in for trusted checkouts only, never for untrusted
-//! pull request heads in CI. The rasterizers `model pictures --write` runs for PNG pictures are no
-//! exception: Boundrail picks them from a fixed list (`resvg`, `rsvg-convert`, `magick`), finds
+//! user's config. Each command line is printed to stderr before it starts, and the server sees
+//! only the absolute folders of `PATH`. A server still runs code from the checkout it opens: the
+//! TypeScript server runs the workspace's `tsserver.js` under `node_modules` and its
+//! `tsconfig.json` plugins, rust-analyzer runs build scripts and proc macros and reads a committed
+//! `rust-analyzer.toml`, jdtls runs Gradle and Maven imports, clangd reads a committed `.clangd`
+//! and `compile_commands.json` and passes their flags to its clang frontend, sourcekit-lsp 6 and
+//! later background-indexes, building the package and running its macros and build-tool plugins,
+//! and csharp-ls runs MSBuild design-time targets and NuGet restore, which reaches the network
+//! and runs the `.targets` of packages. So language servers are for trusted checkouts only, never
+//! for untrusted pull request heads in CI: a machine that checks those must not list their folder
+//! as trusted, and the GitHub Action passes `--no-language-servers`. The rasterizers `model
+//! pictures --write` runs for PNG pictures are no exception: Boundrail picks them from a fixed
+//! list (`resvg`, `rsvg-convert`, `magick`), finds
 //! them in absolute `PATH` folders outside the checkout, and runs them in a private temporary
 //! folder holding only the SVG it drew; the repository names none of them. `model history push`
 //! and `model history fetch` reach a remote the user configured and names by its `git remote`

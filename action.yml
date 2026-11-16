@@ -11,8 +11,9 @@ inputs:
   path:
     description: >-
       Repository root holding .boundrail/model, relative to the workspace. The step runs boundrail model check and
-      annotates its warnings and information. It never passes --language-servers: language servers run code from the
-      checkout, and a pull request head is untrusted
+      annotates its warnings and information. It never passes --language-servers, and passes --no-language-servers so a
+      user's config that turns them on cannot either: language servers run code from the checkout, and a pull request
+      head is untrusted
     default: "."
   fail-on:
     description: "warnings (the default; any warning fails), information (any finding fails) or never"

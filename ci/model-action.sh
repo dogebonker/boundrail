@@ -8,7 +8,8 @@
 # Runs `model check --format annotations` and replays its annotations. With a base ref, writes
 # `model footprint --format pr-comment` to the job summary and, on a pull_request event with a
 # token, posts it as one comment, replacing the comment the same account posted before. It never
-# passes --language-servers. Exit 1 when the check finds what fail-on names, 2 on errors.
+# passes --language-servers, and passes --no-language-servers so a user's config cannot turn them
+# on. Exit 1 when the check finds what fail-on names, 2 on errors.
 set -euo pipefail
 # A failed setup step is a failure to run, not a gate result.
 trap 'exit 2' ERR
@@ -72,7 +73,7 @@ fi
 "$boundrail" --version
 
 check=0
-"$boundrail" model check --root "$path" --format annotations >"$work/check.txt" || check=$?
+"$boundrail" model check --root "$path" --no-language-servers --format annotations >"$work/check.txt" || check=$?
 if ((check > 1)); then
   cat "$work/check.txt"
   die "model check failed with exit $check"

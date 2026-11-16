@@ -17,26 +17,6 @@ const SKILLS: [(&str, &str); 3] = [
     ),
 ];
 
-/// Project files at the checkout root that show a language, and the allowlisted server for it.
-const SERVERS: [(&[&str], &str); 5] = [
-    (
-        &["package.json", "tsconfig.json"],
-        "typescript-language-server",
-    ),
-    (
-        &[
-            "pyproject.toml",
-            "setup.py",
-            "setup.cfg",
-            "requirements.txt",
-        ],
-        "pyright-langserver",
-    ),
-    (&["Cargo.toml"], "rust-analyzer"),
-    (&["go.mod"], "gopls"),
-    (&["pom.xml", "build.gradle", "build.gradle.kts"], "jdtls"),
-];
-
 const NEXT_STEPS: [&str; 5] = [
     "boundrail model read",
     "boundrail model schema model-edit",
@@ -104,15 +84,6 @@ impl Placed {
     }
 }
 
-/// The allowlisted servers of the languages whose project files sit at the checkout root.
-fn detected_servers(checkout: &Path) -> Vec<&'static str> {
-    SERVERS
-        .iter()
-        .filter(|(files, _)| files.iter().any(|f| checkout.join(f).is_file()))
-        .map(|(_, server)| *server)
-        .collect()
-}
-
 /// What `model setup` did.
 #[derive(serde::Serialize)]
 struct Report {
@@ -136,9 +107,8 @@ pub(super) fn run(
     force: bool,
 ) -> Result<()> {
     let (vault, created) = create_vault(root, name)?;
-    // The vault is `<checkout>/.boundrail/model`.
-    let checkout = (vault.ancestors().nth(2)).context("the vault lies below its checkout")?;
-    let (placed, servers) = place_files(checkout, agents, language_servers, force)?;
+    let checkout = checkpoint::checkout(&vault)?;
+    let (placed, servers) = place_files(&checkout, agents, language_servers, force)?;
     let mut notes = Vec::new();
     if name.is_some() && !created {
         notes.push("The vault exists, so --name was not used.".to_owned());
@@ -188,7 +158,7 @@ fn place_files(
             placed.place(checkout, &relative, text, force)?;
         }
     }
-    let servers = language_servers.then(|| detected_servers(checkout));
+    let servers = language_servers.then(|| lsp::detected_servers(checkout));
     if let Some(servers) = servers.as_ref().filter(|s| !s.is_empty()) {
         let entries: Vec<Value> = servers.iter().map(|s| json!({"server": s})).collect();
         let text = format!("{}\n", serde_json::to_string_pretty(&entries)?);
@@ -201,7 +171,8 @@ fn place_files(
 /// folder and whether setup created it.
 fn create_vault(root: &Path, name: Option<&str>) -> Result<(PathBuf, bool)> {
     let vault = vault::path(root)?;
-    let folder = (vault.ancestors().nth(2))
+    let checkout = checkpoint::checkout(&vault).ok();
+    let folder = (checkout.as_deref())
         .and_then(Path::file_name)
         .and_then(|n| n.to_str())
         .unwrap_or("Model");

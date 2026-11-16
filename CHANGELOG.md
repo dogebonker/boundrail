@@ -73,6 +73,30 @@
 - Checkpoints record `Uncommitted: true` when the checkout had changes outside `.boundrail`, and
   readings report `source_status`: `available`, `uncommitted`, or `unavailable` when no source
   commit was recorded or this repository lacks it.
+- `model language-server list` prints the repository's `.boundrail/language-servers.json`, the
+  user's config and the servers a run would start per language; `add <language>` and
+  `remove <language>` edit the repository's list, which names only allowlisted servers, or with
+  `--user` the user's config, the only place a `--command` and `--arg` can go. Writes are atomic.
+- Allowlisted language servers for C, C++ and Objective-C (`clangd`), C# (`csharp-ls`) and Swift
+  (`sourcekit-lsp`), run as their own name with no arguments; `model setup --language-servers`
+  names them from `compile_commands.json`, `build/compile_commands.json` or `compile_flags.txt`,
+  a `.sln`, `.slnx` or `.csproj`, and `Package.swift`, the same project files a server needs to
+  start.
+- The user's language-server config may be `{"trusted": ["/abs/folder"], "servers": [...]}`:
+  `model check` and `model inspect` then run the servers without `--language-servers` in a
+  checkout at or below a trusted folder, once links resolve, and `--no-language-servers` turns
+  them off for one run. The committed list cannot turn them on, and the GitHub Action passes
+  `--no-language-servers`. Without the flag, a user's config that does not read or lies inside
+  the checkout is a warning that leaves the servers off; with it, it refuses `REQUEST_INVALID`.
+  `model language-server add --user` and `remove --user` write a bare array of servers unless
+  the config trusts a folder; a binary older than this change cannot read the object form.
+- A server whose project file is missing beside or above every file it would open (clangd without
+  `compile_commands.json`, rust-analyzer without `Cargo.toml`, gopls without `go.mod`, jdtls
+  without a build file, csharp-ls without a solution or project, sourcekit-lsp without
+  `Package.swift`) is not started: a `language-server-unready` skip and a warning give the reason.
+  `language_server_runs` in the JSON of `model check` and `model inspect` lists each server's
+  outcome and the milliseconds of its start, initialize, queries and shutdown, which stderr also
+  prints.
 
 ### Changed
 

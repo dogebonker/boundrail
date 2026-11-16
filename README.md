@@ -192,8 +192,9 @@ branch's footprint:
 
 The action needs a `boundrail` that includes `boundrail model`: set `version` to a release that
 does, or `binary` to an executable you built. `fail-on` is `warnings` (the default),
-`information` or `never`. The action never passes `--language-servers`, since language servers
-run code from the checkout. Commenting is best effort: a token that cannot write leaves a notice
+`information` or `never`. The action never passes `--language-servers`, and passes
+`--no-language-servers` so a user's config cannot turn them on, since language servers run code
+from the checkout. Commenting is best effort: a token that cannot write leaves a notice
 instead.
 
 Checkpoint readings resolve only against a fetched history. To judge them, run `boundrail model
@@ -206,8 +207,21 @@ history has one authoritative remote: push to and fetch from only that one.
 TypeScript and JavaScript, Python, Go, Rust, Java and Elixir. Go collection runs the Go
 toolchain's `go list` for read-only package metadata. With `--language-servers`, `model check`
 and `model inspect` add call-level references from allowlisted language servers named in
-`.boundrail/language-servers.json` (`model setup --language-servers` writes a starter list). Use
-it on trusted checkouts only: the servers run code from the repository.
+`.boundrail/language-servers.json` (`model setup --language-servers` writes a starter list).
+The allowlist covers TypeScript, Python, Rust, Go, Java, C, C++ and Objective-C (`clangd`), C#
+(`csharp-ls`) and Swift (`sourcekit-lsp`). `model language-server list`, `add <language>` and
+`remove <language>` edit the repository's list, which only names allowlisted servers, and with
+`--user` your own config (`~/.config/boundrail/language-servers.json`), the only place a program
+or arguments can come from. Listing absolute folders in that config, as `{"trusted":
+["/home/me/work"], "servers": [...]}`, turns the servers on without the flag for checkouts at or
+below them, once links resolve; `--no-language-servers` turns them off for one run. Use them on
+trusted checkouts only: the servers run code from the repository (clangd passes the flags of a
+committed `.clangd` and `compile_commands.json` to its compiler, sourcekit-lsp builds the package
+and runs its macros and plugins, csharp-ls runs MSBuild targets and NuGet restore), so never
+list a folder you clone untrusted code into. A server whose project file is
+missing (clangd without `compile_commands.json`, rust-analyzer without `Cargo.toml`) is skipped
+as `language-server-unready`, and `language_server_runs` in the JSON output times each server's
+start, initialize, queries and shutdown.
 
 ## Limits
 

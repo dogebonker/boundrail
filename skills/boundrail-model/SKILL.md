@@ -69,7 +69,18 @@ command prints JSON; add `--format markdown` for a readable summary. A refusal p
 - Draw what the code does. When the code and the model disagree, decide which one is wrong and
   say so; never draw a relationship only to silence a warning.
 - `model check --language-servers` runs language servers from the checkout. Use it only on a
-  checkout you trust.
+  checkout you trust; pass `--no-language-servers` on any other, since the user's config turns
+  them on for every checkout below a folder it lists in `trusted`. Never add a folder to
+  `trusted` yourself.
+- `model language-server list` shows the repository's list, the user's config and the server
+  each language would run. `model language-server add <language>` names the language's
+  allowlisted server in `.boundrail/language-servers.json` (`c`, `csharp`, `go`, `java`,
+  `python`, `rust`, `swift`, `typescript`); a program or arguments go only in the user's config,
+  with `--user`. Tell the user when you add one: the servers run code from the checkout.
+- `language-server-unready` means the project lacks a file the server needs, named in the
+  reason: `compile_commands.json` for clangd (CMake writes it with
+  `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`), `Cargo.toml`, `go.mod`, a Maven or Gradle build file, a
+  `.sln` or `.csproj`, or `Package.swift`.
 
 | Warning | What to do |
 |---|---|
