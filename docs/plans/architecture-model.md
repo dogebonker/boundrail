@@ -50,6 +50,24 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 | T16 | Agent integration: `model setup`, skills for authoring/planning/PRs, CI action with PR annotations and footprint comment | done |
 | T17 | Reconcile drafts after current changes, export/import bundles, history publication | done |
 | T18 | Remove scan-era code that the model does not use | done |
+| T19 | Footprint against a proposal: modules the proposal names and the branch changes, changes outside it, named but unchanged, held subjects, large changes, `--fail-outside` exit 1, exit 2 on an unreadable ref | open |
+| T20 | Check correctness: infrastructure-unit bindings exempt from `CONTAINER_PARTS_OUTSIDE`; the code check scans every language in the checkout, not one; `check --every-draft` | open |
+| T21 | Render quality and options: edges route around boxes and labels never collide; `--focus`, `--hide-kind`, legend, `--theme auto`; JSON receipt with dimensions, placed IDs and digest; direct PNG with `--scale` and `--region` | open |
+| T22 | Model-side inspect: entry points, hidden parts, callers, outgoing, pass-through, container relationships and measures read from the model, `--checkpoint`, and `inspect --group` | open |
+| T23 | Compare: interface changes and interface measures between states, `--beside` alternatives, `--against` a checkpoint | open |
+| T24 | Schema: relationship traffic, step anchors, authored flow participant order, flow summary required on write (`FLOW_SUMMARY_REQUIRED`) | open |
+| T25 | History on every write: each edit, including in proposals, retains a checkpoint with its doing line; publication destination with per-checkpoint status; source-commit availability on checkpoint reads | open |
+| T26 | Proposal metadata: summary, linked documents, rename and edit through `set`, select by unique name; walkthroughs authored inside proposals | open |
+| T27 | Proposal families: child proposals of a draft, family reconcile, standing, settle conflicts by mine, theirs or edited; `INHERITANCE_DROPPED` and `PART_RECREATED` confirmations | open |
+| T28 | Readings: group regions and group filter; beat selection apart from focus, relationship filters, groups, visibility; saved views that need no output file | open |
+| T29 | Cross-model references: modules reference another model, state or subject, `read --references`, pinned foreign checkpoints; `read --code` resolves and opens the code target | open |
+| T30 | History repair and restore: correct a recorded state with source commits and an audit trail; restore a bundle into an empty vault with identities and history | open |
+| T31 | Vaults outside Git: a private history for a vault outside a checkout, used for temporary pull request models | open |
+| T32 | Language servers: `model language-server` add, remove and list; defaults for C-family, C# and Swift; on by default through user config outside the checkout; `unready` diagnostic and step timings | open |
+| T33 | Browser: multi-select, relationship-kind filter, URL state for proposal, focus and flow with Back and Forward; an agent shows a reading in the user's open pane | open |
+| T34 | `model explain`: ask the local agent about a selection, relationship, flow or proposal | open |
+| T35 | Walkthrough recording: render a walkthrough to MP4 with local voice and replay it | open |
+| T36 | Agent workflow: plan skill slices per ticket with the footprint gate; pull request skill body, state marker, temporary model and split guidance; action reads the proposal and skips held subjects; design guidance for inspect and locality | open |
 
 ## Notes
 
