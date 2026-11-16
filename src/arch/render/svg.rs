@@ -16,7 +16,7 @@ pub(super) const BACKGROUND: &str = "#ffffff";
 /// the font when that shows.
 const CHAR_W: f64 = 7.0;
 /// How far a glyph reaches below its baseline.
-const DESCENT: f64 = 4.0;
+pub(super) const DESCENT: f64 = 4.0;
 /// The arrowhead's length and half its width.
 const HEAD_LENGTH: f64 = 9.0;
 const HEAD_HALF: f64 = 4.5;
@@ -254,15 +254,25 @@ impl Svg {
         self.bounds.map_or(0.0, |(_, high)| high.1)
     }
 
-    /// The finished document: the body on a light background, sized with its viewBox to what was
-    /// drawn plus a margin, and never starting right or below the origin.
-    pub(super) fn finish(self) -> String {
+    /// The viewBox of the finished document: left, top, width and height.
+    pub(super) fn frame(&self) -> (f64, f64, f64, f64) {
         let ((x0, y0), (x1, y1)) = self.bounds.unwrap_or(((0.0, 0.0), (0.0, 0.0)));
         let (left, top) = (
             (x0 - MARGIN).min(0.0).floor(),
             (y0 - MARGIN).min(0.0).floor(),
         );
-        let (w, h) = ((x1 + MARGIN - left).ceil(), (y1 + MARGIN - top).ceil());
+        (
+            left,
+            top,
+            (x1 + MARGIN - left).ceil(),
+            (y1 + MARGIN - top).ceil(),
+        )
+    }
+
+    /// The finished document: the body on a light background, sized with its viewBox to what was
+    /// drawn plus a margin, and never starting right or below the origin.
+    pub(super) fn finish(self) -> String {
+        let (left, top, w, h) = self.frame();
         let mut out = String::with_capacity(self.body.len() + 256);
         let _ = writeln!(
             out,

@@ -4,8 +4,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::layout::{self, Boxed, Rect};
-use super::svg::{Anchor, BACKGROUND, Font, Point, Style, Svg};
+use super::layout::{self, Boxed, Rect, Scene};
+use super::svg::{Anchor, BACKGROUND, DESCENT, FONT_SIZE, Font, Point, Style, Svg};
 use super::{
     Context, MARGIN, Mark, SOFT_INK, TITLE_H, class, label, line_style, outline, text_width,
 };
@@ -22,10 +22,11 @@ const STRIPE_W: f64 = 5.0;
 const LABEL_PAD: f64 = 4.0;
 const LABEL_H: f64 = 16.0;
 const LABEL_RADIUS: f64 = 3.0;
-const LABEL_OPACITY: f64 = 0.9;
 /// Baselines of a box's name and kind lines below its top.
 const NAME_LINE: f64 = 20.0;
 const KIND_LINE: f64 = 37.0;
+/// Room kept around a container's title by the routes passing it.
+const TITLE_GAP: f64 = 2.0;
 
 /// The boxes drawn, in containment pre-order, down to the depth asked.
 #[derive(Default)]
@@ -47,6 +48,8 @@ struct Arrow<'a> {
     to: usize,
     /// The first relationship's qualified ID.
     id: String,
+    /// Every relationship it stands for, by qualified ID.
+    ids: Vec<String>,
     kind: &'a str,
     label: Option<&'a str>,
     count: usize,
@@ -55,12 +58,15 @@ struct Arrow<'a> {
     mark: Option<Mark>,
 }
 
+/// The drawing, with the IDs of the modules drawn as boxes and of the relationships the arrows
+/// stand for. With `legend`, the node and relationship kinds drawn are named below it.
 pub(super) fn render(
     ctx: &Context<'_>,
     modules: &[Module],
     scope: Option<&str>,
     depth: usize,
-) -> String {
+    legend: bool,
+) -> (Svg, Vec<String>, Vec<String>) {
     let index = Index::new(ctx.model, modules);
     let roots = match scope {
         Some(scope) if index.is_container(scope) => index.parts_of(scope).to_vec(),
@@ -80,7 +86,20 @@ pub(super) fn render(
             ..r
         })
         .collect();
-    let routes = layout::routes(&rects, &pairs);
+    let scene = Scene {
+        parents: visible.boxes.iter().map(|b| b.parent).collect(),
+        titles: (0..rects.len())
+            .map(|i| visible.containers[i].then(|| title_area(&rects[i], &visible, i)))
+            .collect(),
+        fixed: vec![ctx.title_area()],
+        rects: &rects,
+    };
+    let routes = layout::routes(&scene, &pairs);
+    let texts: Vec<String> = arrows.iter().map(|a| arrow_text(ctx, a)).collect();
+    let sizes: Vec<(f64, f64)> = (texts.iter())
+        .map(|t| (text_width(t) + 2.0 * LABEL_PAD, LABEL_H))
+        .collect();
+    let centers = layout::labels(&scene, &routes, &sizes);
     let mut svg = Svg::default();
     ctx.title(&mut svg);
     let lit = lit_boxes(ctx, &visible);
@@ -95,18 +114,42 @@ pub(super) fn render(
             svg.close_group();
         }
     }
-    for (arrow, route) in arrows.iter().zip(&routes) {
-        let dim = dims(arrow.from) && dims(arrow.to);
-        if dim {
-            svg.dimmed();
-        }
-        draw_arrow(&mut svg, ctx, arrow, route);
-        if dim {
-            svg.close_group();
+    // Every route first and every label after, so no route is drawn across a label.
+    for labels in [false, true] {
+        for (k, arrow) in arrows.iter().enumerate() {
+            let dim = dims(arrow.from) && dims(arrow.to);
+            if dim {
+                svg.dimmed();
+            }
+            if labels {
+                draw_label(&mut svg, arrow, &texts[k], centers[k]);
+            } else {
+                draw_route(&mut svg, ctx, arrow, &routes[k]);
+            }
+            if dim {
+                svg.close_group();
+            }
         }
     }
     ctx.legend(&mut svg);
-    svg.finish()
+    if legend {
+        let nodes: BTreeSet<&str> = visible.modules.iter().map(|m| m.kind.as_str()).collect();
+        let lines: BTreeSet<&str> = arrows.iter().map(|a| a.kind).collect();
+        ctx.kinds(&mut svg, &nodes, &lines);
+    }
+    let relationships = (arrows.into_iter()).flat_map(|a| a.ids).collect();
+    (svg, visible.ids, relationships)
+}
+
+/// Where the name and kind lines of container `i` sit, which routes pass around.
+fn title_area(rect: &Rect, visible: &Visible<'_>, i: usize) -> Rect {
+    let width = text_width(&visible.modules[i].name).max(text_width(&visible.kinds[i]));
+    Rect {
+        x: rect.x + TEXT_PAD - TITLE_GAP,
+        y: rect.y + NAME_LINE - FONT_SIZE - TITLE_GAP,
+        w: width + 2.0 * TITLE_GAP,
+        h: KIND_LINE - NAME_LINE + FONT_SIZE + DESCENT + 2.0 * TITLE_GAP,
+    }
 }
 
 /// The boxes a focus lights: those of the focused modules and of the modules inside them, drawn
@@ -206,6 +249,7 @@ fn arrows<'a>(ctx: &Context<'_>, modules: &'a [Module], visible: &Visible<'_>) -
             (merged.entry((from, to, r.kind.as_str())))
                 .and_modify(|arrow| {
                     arrow.count += 1;
+                    arrow.ids.push(id.clone());
                     arrow.hero |= hero;
                     arrow.muted &= muted;
                     arrow.mark = Mark::merge(arrow.mark, mark);
@@ -213,6 +257,7 @@ fn arrows<'a>(ctx: &Context<'_>, modules: &'a [Module], visible: &Visible<'_>) -
                 .or_insert(Arrow {
                     from,
                     to,
+                    ids: vec![id.clone()],
                     id,
                     kind: &r.kind,
                     label: r.label.as_deref(),
@@ -267,7 +312,18 @@ fn draw_box(svg: &mut Svg, ctx: &Context<'_>, rect: &Rect, visible: &Visible<'_>
     svg.close_group();
 }
 
-fn draw_arrow(svg: &mut Svg, ctx: &Context<'_>, arrow: &Arrow<'_>, route: &[Point]) {
+/// The text on an arrow: its relationship's label or kind, or the kind and how many it stands for.
+fn arrow_text(ctx: &Context<'_>, arrow: &Arrow<'_>) -> String {
+    let kind = ctx.relationship_name(arrow.kind);
+    match (arrow.count, arrow.label) {
+        (1, Some(label)) => label.to_owned(),
+        (1, None) => kind.to_owned(),
+        (n, _) => format!("{kind} x{n}"),
+    }
+}
+
+/// An arrow's line along `route`, with its head.
+fn draw_route(svg: &mut Svg, ctx: &Context<'_>, arrow: &Arrow<'_>, route: &[Point]) {
     svg.group(&class("relationship", arrow.mark), Some(&arrow.id));
     let emphasis = match (arrow.hero, arrow.muted) {
         (true, _) => Some(Emphasis::Hero),
@@ -279,17 +335,15 @@ fn draw_arrow(svg: &mut Svg, ctx: &Context<'_>, arrow: &Arrow<'_>, route: &[Poin
     if let [.., from, to] = route {
         svg.arrowhead(*from, *to, style.stroke.unwrap_or(SOFT_INK));
     }
-    let kind = ctx.relationship_name(arrow.kind);
-    let text = match (arrow.count, arrow.label) {
-        (1, Some(label)) => label.to_owned(),
-        (1, None) => kind.to_owned(),
-        (n, _) => format!("{kind} x{n}"),
-    };
-    let (mx, my) = layout::midpoint(route);
-    let w = text_width(&text) + 2.0 * LABEL_PAD;
+    svg.close_group();
+}
+
+/// An arrow's text on an opaque plate centered where layout placed it.
+fn draw_label(svg: &mut Svg, arrow: &Arrow<'_>, text: &str, (mx, my): Point) {
+    svg.group(&class("relationship label", arrow.mark), Some(&arrow.id));
+    let w = text_width(text) + 2.0 * LABEL_PAD;
     let background = Style {
         fill: Some(BACKGROUND),
-        fill_opacity: Some(LABEL_OPACITY),
         ..Style::default()
     };
     let corner = (mx - w / 2.0, my - LABEL_H / 2.0);
@@ -299,7 +353,7 @@ fn draw_arrow(svg: &mut Svg, ctx: &Context<'_>, arrow: &Arrow<'_>, route: &[Poin
         fill: Some(SOFT_INK),
         ..label(arrow.mark)
     };
-    svg.text((mx, my + super::BASELINE), &text, &font);
+    svg.text((mx, my + super::BASELINE), text, &font);
     svg.close_group();
 }
 

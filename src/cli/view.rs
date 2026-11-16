@@ -465,8 +465,9 @@ impl Server {
             scope: owned("scope"),
             depth,
             against: owned("against"),
+            ..RenderSpec::default()
         };
-        model_cli::render_svg(&self.root, &spec, None).map(|(svg, _)| svg)
+        model_cli::render_svg(&self.root, &spec, None).map(|(rendered, _)| rendered.svg)
     }
 
     /// Streams `changed` events with the current state's revision (null when it does not load)

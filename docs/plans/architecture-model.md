@@ -52,7 +52,7 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 | T18 | Remove scan-era code that the model does not use | done |
 | T19 | Footprint against a proposal: modules the proposal names and the branch changes, changes outside it, named but unchanged, held subjects, large changes, `--fail-outside` exit 1, exit 2 on an unreadable ref | done |
 | T20 | Check correctness: infrastructure-unit bindings exempt from `CONTAINER_PARTS_OUTSIDE`; the code check scans every language in the checkout, not one; `check --every-draft` | done |
-| T21 | Render quality and options: edges route around boxes and labels never collide; `--focus`, `--hide-kind`, legend, `--theme auto`; JSON receipt with dimensions, placed IDs and digest; direct PNG with `--scale` and `--region` | open |
+| T21 | Render quality and options: edges route around boxes and labels never collide; `--focus`, `--hide-kind`, legend, `--theme auto`; JSON receipt with dimensions, placed IDs and digest; direct PNG with `--scale` and `--region` | done |
 | T22 | Model-side inspect: entry points, hidden parts, callers, outgoing, pass-through, container relationships and measures read from the model, `--checkpoint`, and `inspect --group` | open |
 | T23 | Compare: interface changes and interface measures between states, `--beside` alternatives, `--against` a checkpoint | open |
 | T24 | Schema: relationship traffic, step anchors, authored flow participant order, flow summary required on write (`FLOW_SUMMARY_REQUIRED`) | open |
@@ -975,3 +975,49 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   state has a warning or refuses. `--format annotations` and `--only embeds` refuse
   `REQUEST_INVALID`. The states share one scan of the checkout, made the first time a state needs
   it; a draft's error other than a refusal stops the command with `checking draft <id>`.
+- T21: routing replaces the T9 lanes and its ponytail about edges crossing boxes. Ports stay
+  where T9 put them (facing sides, spread by the other end). Each route leaves its port straight
+  for 10 units, then runs A* over a grid of lines: every box's outline kept 10 away, each container
+  title, the picture title, the route ends, two rings around everything, and filler lines at most
+  12 apart. A route may not enter any box except the containers around its ends, nor their titles
+  or the picture title; it pays 40 per bend, 30 per crossing and 4 times the length again for
+  each route already on a segment, and shorter edges route first. Without a path it retries
+  ignoring titles, then falls back to the T9 bend. The searches share one scratch grid, refilled
+  per edge, and skip heap entries a cheaper path has overtaken. Container headers grew from 44 to
+  56 so a route can pass between a title and the parts below it. Labels go on the route, middle
+  segment first, in steps of 8: first where they meet no other label, box, container title band
+  or border, fixed area or other route; then ignoring routes; then just beside a segment; then on
+  rings around the route; with nothing free, at the middle of the middle segment. A label may sit
+  inside a container below its header but never across its border. Every route and arrowhead is
+  drawn first and every label after, each label in its own `relationship label` group with the
+  arrow's `data-id` and an opaque plate, so a label that had to sit on another route covers it
+  rather than being crossed. Same model, same bytes. `assert_clean_layout` in
+  `tests/arch_model.rs` parses a render and asserts no segment enters a box but its ends and their
+  containers, every label group comes after every route, no two labels meet, and no label meets a
+  box, a box's text or a container border; it fails on the T9 layout of the eleven-module fixture.
+  The new layout changes every architecture picture's bytes, so pictures drawn before T21 report
+  stale until `model pictures --write`. ponytail: one grid per edge search, fine for tens of
+  boxes; use a sparse visibility graph if large pictures get slow.
+- T21: `model render` flags. `--focus <subject>` (repeatable) lights the subject, its parts and the
+  other end of every relationship from or to them, through the beat focus, and dims the rest.
+  `--hide-kind <key>` (repeatable) leaves out modules of a configured node kind; their parts move
+  to the nearest drawn ancestor; an unknown kind, or a `--scope` of a hidden kind, refuses
+  `REQUEST_INVALID`. `--legend` draws a row of node kinds (fill, dashed when external) and a row
+  of relationship kinds (dash) under the picture, in configured names, only those drawn.
+  `--hide-kind` and `--legend` with a flow view refuse `REQUEST_INVALID`. `--theme light` (the
+  default) writes nothing new; `dark` adds a `<style>` that recolors by attribute selectors on the
+  light colors, built from the same constants the drawing writes, and drops box fills to 0.3
+  opacity so configured colors stay readable; `auto` wraps it in `@media (prefers-color-scheme:
+  dark)`. In a PNG the dark and auto themes depend on the rasterizer's CSS support. All four
+  refuse with `--walkthrough` and `--picture`, whose readings say what to draw.
+- T21: `--format json` adds `revision` (the drawn state's digest), `width` and `height` (the
+  viewBox), `modules` (boxes drawn, or a flow's participants), `relationships` (every relationship
+  an arrow stands for, empty for flows) and `digest` (SHA-256 of the SVG, computed only for the
+  receipt). `--png <file>` checks its folder as `--output` does, refuses the same file as
+  `--output`, rasterizes with the T15 discovery, writes the PNG with its source chunk after the
+  output file (before printing, when there is none), and prints nothing unless `--output` or
+  `--format json` asks (the receipt adds `png`). `--scale` (default 1, at most 8) and `--region
+  x,y,w,h` (exactly four finite numbers, picture units from the top-left corner, inside the
+  picture) rewrite the root's size and viewBox before rasterizing, so every rasterizer honors
+  them. A missing or failing rasterizer refuses `REQUEST_INVALID` with `details.reason`
+  `no-rasterizer` or `rasterizer-failed`.

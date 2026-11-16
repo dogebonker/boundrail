@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Result, bail, ensure};
 use sha2::{Digest, Sha256};
 
-pub(crate) fn hash(bytes: &[u8]) -> String {
+pub fn hash(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
         .map(|b| format!("{b:02x}"))

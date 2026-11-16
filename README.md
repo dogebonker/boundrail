@@ -56,6 +56,30 @@ inspect` reports each module's interface from the code; `model locality` reads G
 modules that change together; `model render` draws the model as SVG. `boundrail model --help`
 lists every command. [Design notes](docs/plans/architecture-model.md).
 
+### Rendering
+
+`model render` draws the architecture, or a flow as a sequence diagram or flowchart. Arrows route
+around the boxes they do not connect, no two labels, and no label and box, overlap, and labels
+are drawn over the arrows. The same model always draws the same bytes.
+
+```sh
+# Billing and what it talks to, the rest dimmed, with a legend of the kinds drawn.
+boundrail model render --focus Billing --legend --output billing.svg
+
+# Leave out jobs; follow the viewer's light or dark color scheme.
+boundrail model render --hide-kind job --theme auto --output model.svg
+
+# A PNG at twice the size, cut to one region (x,y,w,h in picture units).
+boundrail model render --png model.png --scale 2 --region 0,0,600,400
+
+# A receipt: revision, width, height, the module and relationship IDs drawn, the SVG's digest.
+boundrail model render --format json
+```
+
+`--png` needs `resvg`, `rsvg-convert` or `magick` on PATH outside the checkout, and refuses
+without one. A dark or auto theme in a PNG is only as dark as the rasterizer's CSS support makes
+it.
+
 ## Footprint
 
 `boundrail model footprint` lists the modules a branch changes, the relationships its changed

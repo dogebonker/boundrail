@@ -27,6 +27,18 @@
   that code.
 - A module bound to a compose service, Kubernetes workload or Terraform resource is exempt from
   `CONTAINER_PARTS_OUTSIDE`, and its parts are judged against the closest ancestor bound to code.
+- `model render` routes arrows around the boxes they do not connect, gives each edge its own
+  port on a shared side, places labels where no two labels, and no label and box, meet, and
+  draws every label over the arrows. New flags: `--focus` (a module and its direct neighbours,
+  the rest dimmed), `--hide-kind`, `--legend`, `--theme light|dark|auto`, and `--png` with
+  `--scale` and `--region`. `--format json` adds the revision, width, height, module and
+  relationship IDs drawn and the SVG's SHA-256. A dark or auto theme in a PNG depends on the
+  rasterizer's CSS support.
+
+### Changed
+
+- The new layout changes the bytes of every architecture picture, so existing pictures report
+  stale until `model pictures --write` draws them again.
 
 ### Removed
 

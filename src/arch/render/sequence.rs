@@ -40,7 +40,7 @@ const NOTE_CHARS: usize = 32;
 const NOTE_LINE: f64 = 15.0;
 const NOTE_PAD: f64 = 8.0;
 const NOTE_RADIUS: f64 = 3.0;
-const NOTE_FILL: &str = "#fff9db";
+pub(super) const NOTE_FILL: &str = "#fff9db";
 const NOTE_EDGE: &str = "#e0c873";
 
 /// A message step's fields.
@@ -90,7 +90,7 @@ struct Lanes<'a> {
     y: f64,
 }
 
-pub(super) fn render(ctx: &Context<'_>, steps: &[Step]) -> String {
+pub(super) fn render(ctx: &Context<'_>, steps: &[Step]) -> Svg {
     let names = participants(steps);
     let col = (names.iter())
         .map(|id| text_width(ctx.name(id)) + COL_GAP)
@@ -116,7 +116,7 @@ pub(super) fn render(ctx: &Context<'_>, steps: &[Step]) -> String {
     lanes.heads(&mut svg, lanes.y + FRAME_GAP);
     svg.append(lanes.body);
     ctx.legend(&mut svg);
-    svg.finish()
+    svg
 }
 
 /// `text` broken into lines of at most `NOTE_CHARS` characters at spaces, longer words split.

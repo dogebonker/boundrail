@@ -154,7 +154,7 @@ fn judge<'m>(
 ) -> Entry<'m> {
     // A reading of a proposal or checkpoint that no longer loads draws nothing.
     let drawing = match draw_reading(root, entry.reading, None, states) {
-        Ok((svg, _)) => Drawing::new(svg),
+        Ok((rendered, _)) => Drawing::new(rendered.svg),
         Err(error) => return entry.unrenderable(RENDER_FAILED, format!("{error:#}")),
     };
     let status = match picture::compare(checkout, entry.output, &drawing) {

@@ -4524,13 +4524,18 @@ fn render_marks_what_a_proposal_changes() {
         ]),
     );
     let svg = checkout.render(&["--proposal", &id, "--against", "current"]);
+    assert_clean_layout(&svg);
     let fraud = group_holding(&svg, "module added", ">Fraud<").unwrap();
     assert!(fraud.contains("stroke=\"#2f9e44\""), "{fraud}");
     assert!(
         group_holding(&svg, "module changed", ">Payments<").is_some(),
         "{svg}"
     );
-    assert!(group_holding(&svg, "relationship added", ">score<").is_some());
+    // The route and its label are drawn apart, each marked, with the same ID.
+    let score = group_holding(&svg, "relationship label added", ">score<").unwrap();
+    let drawn = attr(score, "data-id").unwrap();
+    let route = format!("<g class=\"relationship added\" data-id=\"{drawn}\">\n<polyline");
+    assert!(svg.contains(&route), "{svg}");
     let legend = group_holding(&svg, "legend", ">added<").unwrap();
     assert!(
         legend.contains(">removed<") && legend.contains(">changed<"),
@@ -4561,11 +4566,15 @@ fn render_marks_what_a_proposal_changes() {
     // faded and struck.
     let copy = propose(&checkout, "Plain", "current");
     let back = checkout.render(&["--proposal", &copy, "--against", &id]);
+    assert_clean_layout(&back);
     assert!(back.contains(">Shop, proposal Plain, compared with proposal Fraud</text>"));
     let gone = group_holding(&back, "module removed", ">Fraud<").unwrap();
     assert!(gone.contains("text-decoration=\"line-through\""), "{gone}");
     assert!(gone.contains("stroke=\"#e03131\"") && gone.contains("opacity=\"0.4\""));
-    assert!(group_holding(&back, "relationship removed", ">score<").is_some());
+    let score = group_holding(&back, "relationship label removed", ">score<").unwrap();
+    let drawn = attr(score, "data-id").unwrap();
+    let route = format!("<g class=\"relationship removed\" data-id=\"{drawn}\">\n<polyline");
+    assert!(back.contains(&route), "{back}");
 
     // In a flow, the removed step is drawn where it stood.
     let sequence = checkout.render(&[
@@ -4669,6 +4678,492 @@ fn render_refuses_flags_that_do_not_go_together() {
     assert_eq!(code, 2);
     assert!(stdout.starts_with("REQUEST_INVALID: "), "{stdout}");
     checkout.refused(&["render", "--flow", "Nowhere"], "SUBJECT_NOT_FOUND");
+}
+
+/// A rectangle read from a render.
+#[derive(Clone, Copy, Debug)]
+struct Area {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
+impl Area {
+    fn right(&self) -> f64 {
+        self.x + self.w
+    }
+    fn bottom(&self) -> f64 {
+        self.y + self.h
+    }
+    /// Whether the insides of the two meet; touching edges do not.
+    fn overlaps(&self, other: &Area) -> bool {
+        self.x < other.right()
+            && other.x < self.right()
+            && self.y < other.bottom()
+            && other.y < self.bottom()
+    }
+    fn holds(&self, other: &Area) -> bool {
+        self.x <= other.x
+            && self.y <= other.y
+            && other.right() <= self.right()
+            && other.bottom() <= self.bottom()
+    }
+    /// Whether `p` lies on the outline.
+    fn on_edge(&self, p: (f64, f64)) -> bool {
+        let near = |a: f64, b: f64| (a - b).abs() < 0.11;
+        let across = p.0 >= self.x - 0.11 && p.0 <= self.right() + 0.11;
+        let down = p.1 >= self.y - 0.11 && p.1 <= self.bottom() + 0.11;
+        (across && (near(p.1, self.y) || near(p.1, self.bottom())))
+            || (down && (near(p.0, self.x) || near(p.0, self.right())))
+    }
+}
+
+/// The value of attribute `key` in `tag`.
+fn attr<'a>(tag: &'a str, key: &str) -> Option<&'a str> {
+    let start = tag.find(&format!(" {key}=\""))? + key.len() + 3;
+    Some(&tag[start..start + tag[start..].find('"')?])
+}
+
+fn number(tag: &str, key: &str) -> f64 {
+    attr(tag, key).unwrap().parse().unwrap()
+}
+
+/// The tags named `name` in `body`, each up to its `>`.
+fn tags<'a>(body: &'a str, name: &str) -> Vec<&'a str> {
+    let opening = format!("<{name} ");
+    (body.match_indices(&opening))
+        .map(|(at, _)| &body[at..at + body[at..].find('>').unwrap()])
+        .collect()
+}
+
+/// Where each text of `body` sits, at the estimated width the renderer uses.
+fn text_areas(body: &str) -> Vec<Area> {
+    (body.match_indices("<text "))
+        .map(|(at, _)| {
+            let tag = &body[at..at + body[at..].find('>').unwrap()];
+            let content = &body[at + tag.len() + 1..at + body[at..].find("</text>").unwrap()];
+            let chars = ["&amp;", "&lt;", "&gt;", "&quot;", "&apos;"]
+                .iter()
+                .fold(content.to_owned(), |text, entity| text.replace(entity, "&"))
+                .chars()
+                .count();
+            let size = attr(tag, "font-size").map_or(12.0, |s| s.parse().unwrap());
+            let w = chars as f64 * 7.0 * size / 12.0;
+            let x = number(tag, "x");
+            let left = if tag.contains("text-anchor=\"middle\"") {
+                x - w / 2.0
+            } else {
+                x
+            };
+            let y = number(tag, "y");
+            Area {
+                x: left,
+                y: y - size,
+                w,
+                h: size + 4.0,
+            }
+        })
+        .collect()
+}
+
+/// The bodies of the groups of `svg` whose class starts with `class`, each up to its `</g>`,
+/// with where each starts; a relationship's label group is not one of its `relationship` groups.
+fn placed_groups<'a>(svg: &'a str, class: &str) -> Vec<(usize, &'a str)> {
+    let opening = format!("<g class=\"{class}");
+    (svg.match_indices(&opening))
+        .map(|(at, _)| (at, &svg[at..at + svg[at..].find("</g>").unwrap()]))
+        .filter(|(_, body)| {
+            class != "relationship" || !body.starts_with("<g class=\"relationship label")
+        })
+        .collect()
+}
+
+fn groups<'a>(svg: &'a str, class: &str) -> Vec<&'a str> {
+    placed_groups(svg, class)
+        .into_iter()
+        .map(|(_, body)| body)
+        .collect()
+}
+
+/// Asserts the architecture drawing `svg` is laid out cleanly: every relationship runs in
+/// horizontal and vertical segments that pass through no box but its ends and the containers
+/// around them; every label is drawn after every route, so no route crosses a label plate; no
+/// two labels meet; and no label meets a box, a box's text, or a container's border, though it
+/// may sit inside a container below its title.
+fn assert_clean_layout(svg: &str) {
+    let modules: Vec<(Area, Vec<Area>)> = (groups(svg, "module").into_iter())
+        .map(|body| {
+            let rect = tags(body, "rect")[0];
+            let area = Area {
+                x: number(rect, "x"),
+                y: number(rect, "y"),
+                w: number(rect, "width"),
+                h: number(rect, "height"),
+            };
+            (area, text_areas(body))
+        })
+        .collect();
+    let boxes: Vec<Area> = modules.iter().map(|(area, _)| *area).collect();
+    let holds_another =
+        |i: usize| (boxes.iter().enumerate()).any(|(k, b)| k != i && boxes[i].holds(b));
+    let mut routes = Vec::new();
+    for (at, body) in placed_groups(svg, "relationship") {
+        let points: Vec<(f64, f64)> = (attr(tags(body, "polyline")[0], "points").unwrap())
+            .split(' ')
+            .map(|p| {
+                let (x, y) = p.split_once(',').unwrap();
+                (x.parse().unwrap(), y.parse().unwrap())
+            })
+            .collect();
+        // An end's box is the smallest box whose outline holds the end.
+        let end = |p: (f64, f64)| {
+            (boxes.iter().enumerate())
+                .filter(|(_, b)| b.on_edge(p))
+                .min_by(|a, b| (a.1.w * a.1.h).total_cmp(&(b.1.w * b.1.h)))
+                .map(|(i, _)| i)
+                .unwrap_or_else(|| panic!("{p:?} is on no box: {body}"))
+        };
+        let ends = [end(points[0]), end(*points.last().unwrap())];
+        let allowed = |i: usize| ends.iter().any(|&e| e == i || boxes[i].holds(&boxes[e]));
+        for pair in points.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            assert!(a.0 == b.0 || a.1 == b.1, "a slanted segment: {body}");
+            let line = Area {
+                x: a.0.min(b.0),
+                y: a.1.min(b.1),
+                w: (a.0 - b.0).abs(),
+                h: (a.1 - b.1).abs(),
+            };
+            for (i, area) in boxes.iter().enumerate() {
+                assert!(
+                    allowed(i) || !line.overlaps(area),
+                    "{a:?}-{b:?} crosses the box at {area:?}: {body}"
+                );
+            }
+        }
+        routes.push(at);
+    }
+    let last_route = routes.iter().copied().max().unwrap_or(0);
+    let mut labels = Vec::new();
+    for (at, body) in placed_groups(svg, "relationship label") {
+        // Drawn after every route, an opaque plate is crossed by none.
+        assert!(at > last_route, "a label is drawn before a route: {body}");
+        let rect = tags(body, "rect")[0];
+        assert!(
+            attr(rect, "fill-opacity").is_none(),
+            "a see-through plate: {body}"
+        );
+        labels.push(Area {
+            x: number(rect, "x"),
+            y: number(rect, "y"),
+            w: number(rect, "width"),
+            h: number(rect, "height"),
+        });
+    }
+    assert_eq!(labels.len(), routes.len(), "a label per route: {svg}");
+    for (k, label) in labels.iter().enumerate() {
+        for other in &labels[k + 1..] {
+            assert!(!label.overlaps(other), "labels meet: {label:?} {other:?}");
+        }
+        for (i, (area, texts)) in modules.iter().enumerate() {
+            let inside = holds_another(i) && area.holds(label);
+            assert!(
+                !label.overlaps(area) || inside,
+                "the label at {label:?} meets the box at {area:?}"
+            );
+            for text in texts {
+                assert!(
+                    !label.overlaps(text),
+                    "the label at {label:?} meets a title"
+                );
+            }
+        }
+    }
+}
+
+/// A model of eleven modules: a platform of five parts, two clients above it, and a datastore,
+/// a cache and an external service below, with thirteen labelled relationships.
+fn platform(checkout: &Checkout) {
+    checkout.init();
+    let mut changes = Vec::new();
+    for (name, kind, parent, order) in [
+        ("Platform", "system", None, 0),
+        ("Gateway", "service", Some("Platform"), 0),
+        ("Orders", "service", Some("Platform"), 1),
+        ("Billing", "service", Some("Platform"), 2),
+        ("Catalog", "service", Some("Platform"), 3),
+        ("Worker", "job", Some("Platform"), 4),
+        ("Web UI", "ui", None, 1),
+        ("Mobile App", "app", None, 2),
+        ("Postgres", "datastore", None, 3),
+        ("Redis", "cache", None, 4),
+        ("Stripe", "external", None, 5),
+    ] {
+        let mut module = json!({"name": name, "kind": kind, "order": order});
+        if let Some(parent) = parent {
+            module["parent"] = parent.into();
+        }
+        changes.push(json!({"type": "add-module", "module": module}));
+    }
+    for (order, (from, to, kind, label)) in [
+        ("Web UI", "Gateway", "http", "REST calls"),
+        ("Mobile App", "Gateway", "http", "REST calls"),
+        ("Web UI", "Catalog", "http", "browse products"),
+        ("Mobile App", "Billing", "http", "wallet"),
+        ("Gateway", "Orders", "rpc", "place order"),
+        ("Gateway", "Catalog", "rpc", "list items"),
+        ("Orders", "Billing", "rpc", "charge"),
+        ("Orders", "Worker", "queue", "enqueue"),
+        ("Orders", "Postgres", "data", "read/write"),
+        ("Catalog", "Postgres", "data", "read"),
+        ("Catalog", "Redis", "data", "cache"),
+        ("Billing", "Stripe", "http", "payments"),
+        ("Worker", "Postgres", "data", "write"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        changes.push(json!({"type": "add-relationship", "source": from,
+            "relationship": {"to": to, "kind": kind, "order": order, "label": label}}));
+    }
+    checkout.edited(Value::Array(changes));
+}
+
+#[test]
+fn render_routes_around_boxes_and_keeps_labels_apart() {
+    let checkout = Checkout::new();
+    platform(&checkout);
+    let svg = checkout.render(&[]);
+    assert_eq!(svg.matches("<g class=\"module\"").count(), 11, "{svg}");
+    assert_eq!(svg.matches("<g class=\"relationship\"").count(), 13);
+    assert_clean_layout(&svg);
+    assert_eq!(checkout.render(&[]), svg);
+    for args in [
+        &["--depth", "1"][..],
+        &["--scope", "Platform"],
+        &["--focus", "Orders"],
+        &["--hide-kind", "job", "--legend"],
+    ] {
+        assert_clean_layout(&checkout.render(args));
+    }
+    let small = Checkout::new();
+    shop(&small);
+    assert_clean_layout(&small.render(&[]));
+    assert_clean_layout(&small.render(&["--depth", "1"]));
+}
+
+#[test]
+fn render_focus_hides_kinds_and_draws_a_legend_and_theme() {
+    let checkout = Checkout::new();
+    platform(&checkout);
+    // Orders and its direct neighbours stay lit; the rest dims.
+    let focused = checkout.render(&["--focus", "Orders"]);
+    let dimmed = |svg: &str, name: &str| {
+        svg.split("<g class=\"dimmed\"").skip(1).any(|part| {
+            let body = &part[..part.find("</g>").unwrap()];
+            body.contains(&format!(">{name}</text>"))
+        })
+    };
+    for name in ["Web UI", "Mobile App", "Catalog", "Redis", "Stripe"] {
+        assert!(dimmed(&focused, name), "{name}: {focused}");
+    }
+    for name in [
+        "Orders", "Gateway", "Billing", "Worker", "Postgres", "Platform",
+    ] {
+        assert!(!dimmed(&focused, name), "{name}: {focused}");
+    }
+    checkout.refused(&["render", "--focus", "Nowhere"], "SUBJECT_NOT_FOUND");
+
+    // A hidden kind leaves its modules out with their relationships; a hidden container's
+    // parts stay.
+    let hidden = checkout.render(&["--hide-kind", "job", "--hide-kind", "system"]);
+    assert!(!hidden.contains(">Worker</text>") && !hidden.contains(">Platform</text>"));
+    assert!(hidden.contains(">Orders</text>") && !hidden.contains(">enqueue</text>"));
+    let error = checkout.refused(&["render", "--hide-kind", "gizmo"], "REQUEST_INVALID");
+    assert!(
+        error["message"].as_str().unwrap().contains("datastore"),
+        "{error}"
+    );
+    checkout.refused(
+        &["render", "--scope", "Platform", "--hide-kind", "system"],
+        "REQUEST_INVALID",
+    );
+
+    // The legend names the kinds drawn by their configured names, with their dashes.
+    let legend = checkout.render(&["--legend"]);
+    let kinds = group_holding(&legend, "legend kinds", ">Datastore<").unwrap();
+    for name in [">Service<", ">External<", ">HTTP<", ">Data<", ">Queue<"] {
+        assert!(kinds.contains(name), "{name}: {kinds}");
+    }
+    assert!(!kinds.contains(">Function<") && kinds.contains("stroke-dasharray=\"2 3\""));
+    assert!(!checkout.render(&[]).contains("legend kinds"));
+
+    // Light adds nothing; dark recolors always; auto when the viewer prefers dark.
+    let plain = checkout.render(&[]);
+    assert_eq!(checkout.render(&["--theme", "light"]), plain);
+    let dark = checkout.render(&["--theme", "dark"]);
+    assert!(
+        dark.contains("<style>svg{color:") && !dark.contains("@media"),
+        "{dark}"
+    );
+    let auto = checkout.render(&["--theme", "auto"]);
+    assert!(auto.contains("<style>@media (prefers-color-scheme: dark){svg{color:"));
+    let start = auto.find("<style>").unwrap();
+    let end = auto.find("</style>\n").unwrap() + "</style>\n".len();
+    assert_eq!(format!("{}{}", &auto[..start], &auto[end..]), plain);
+
+    // Hidden kinds and the legend draw the architecture only.
+    let checkout = Checkout::new();
+    shop(&checkout);
+    add_checkout(&checkout);
+    for args in [
+        vec!["render", "--flow", "Checkout", "--hide-kind", "job"],
+        vec!["render", "--flow", "Checkout", "--legend"],
+    ] {
+        checkout.refused(&args, "REQUEST_INVALID");
+    }
+}
+
+#[test]
+fn render_json_is_a_receipt_of_what_it_drew() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let svg = checkout.render(&[]);
+    let out = checkout.ok(&["render", "--format", "json"]);
+    assert_eq!(out["svg"], svg);
+    assert_eq!(out["digest"], sha256(svg.as_bytes()));
+    assert_eq!(
+        out["revision"],
+        checkout.ok(&["read"])["revision"]["digest"]
+    );
+    let root = &svg[..svg.find('>').unwrap()];
+    assert_eq!(out["width"].as_f64(), Some(number(root, "width")));
+    assert_eq!(out["height"].as_f64(), Some(number(root, "height")));
+    let sorted = |list: &Value| {
+        let mut ids: Vec<String> = (list.as_array().unwrap().iter())
+            .map(|id| id.as_str().unwrap().to_owned())
+            .collect();
+        ids.sort();
+        ids
+    };
+    let q = |id: &str| format!("{model}#{id}");
+    let mut modules = vec![q("Platfrm1"), q("WebApp01"), q("Billing1"), q("BankApi1")];
+    modules.sort();
+    assert_eq!(sorted(&out["modules"]), modules);
+    assert_eq!(
+        sorted(&out["relationships"]),
+        [q("RelBil01"), q("RelWeb01")]
+    );
+    // Collapsed, Platform stands for its parts and only the relationship leaving it is drawn.
+    let collapsed = checkout.ok(&["render", "--format", "json", "--depth", "1"]);
+    assert_eq!(
+        sorted(&collapsed["modules"]),
+        [q("BankApi1"), q("Platfrm1")]
+    );
+    assert_eq!(sorted(&collapsed["relationships"]), [q("RelBil01")]);
+}
+
+/// `model render` with `path` as PATH: exit code and stdout.
+fn render_on_path(checkout: &Checkout, path: &std::ffi::OsStr, args: &[&str]) -> (i32, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_boundrail"))
+        .args(["model", "render"])
+        .args(args)
+        .current_dir(checkout.path())
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    (out.status.code().unwrap(), stdout)
+}
+
+#[cfg(unix)]
+#[test]
+fn render_writes_a_png_scaled_and_cut_to_a_region() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    fs::create_dir(checkout.path().join("out")).unwrap();
+    let svg = checkout.render(&[]);
+    let (_bin, path) = fake_rasterizer();
+    let args = [
+        "--png",
+        "out/a.png",
+        "--scale",
+        "2",
+        "--region",
+        "10,20,100,50",
+    ];
+    let (code, stdout) = render_on_path(&checkout, &path, &args);
+    assert_eq!((code, stdout.as_str()), (0, ""));
+    let png = fs::read(checkout.path().join("out/a.png")).unwrap();
+    assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+    // The PNG names the SVG it was drawn from: the picture, scaled and cut.
+    let region = Some([10.0, 20.0, 100.0, 50.0]);
+    let framed = boundrail::arch::picture::reframe(&svg, 2.0, region).unwrap();
+    let size = r#" width="200" height="100" viewBox="10 20 100 50""#;
+    assert!(framed.contains(size), "{framed}");
+    assert_eq!(
+        boundrail::arch::picture::source(&png),
+        Some(sha256(framed.as_bytes()))
+    );
+    // The receipt names the PNG; --output still writes the SVG.
+    let mut json = vec!["--png", "out/b.png", "--format", "json"];
+    let (code, stdout) = render_on_path(&checkout, &path, &json);
+    let out: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(
+        (&out["png"], &out["svg"]),
+        (&json!("out/b.png"), &json!(svg))
+    );
+    json.extend(["--output", "out/b.json"]);
+    let (code, _) = render_on_path(&checkout, &path, &json);
+    assert_eq!(code, 0);
+    assert!(checkout.path().join("out/b.json").is_file());
+
+    for (args, says) in [
+        (
+            vec!["--png", "out/c.png", "--region", "0,0,99999,10"],
+            "not inside",
+        ),
+        (vec!["--png", "out/c.png", "--region", "0,0,10"], "x,y,w,h"),
+        (vec!["--png", "out/c.png", "--region", "1,x,2,3"], "x,y,w,h"),
+        (
+            vec!["--png", "out/c.png", "--region", "1,2,3,4,5"],
+            "x,y,w,h",
+        ),
+        (
+            vec!["--png", "out/c.png", "--output", "out/../out/c.png"],
+            "both name",
+        ),
+        (vec!["--png", "out/c.png", "--scale", "0"], "--scale"),
+        (vec!["--png", "missing/c.png"], "--png missing/c.png"),
+    ] {
+        let (code, stdout) = render_on_path(&checkout, &path, &args);
+        let out: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(code, 2, "{out}");
+        assert_eq!(out["error"]["code"], "REQUEST_INVALID", "{out}");
+        assert!(
+            out["error"]["message"].as_str().unwrap().contains(says),
+            "{out}"
+        );
+    }
+    assert!(!checkout.path().join("out/c.png").exists());
+
+    // Without a rasterizer the render refuses and writes nothing.
+    let system = std::env::var_os("PATH").unwrap_or_default();
+    let found = (std::env::split_paths(&system))
+        .map(|dir| dir.join("git"))
+        .find(|candidate| candidate.is_file())
+        .unwrap();
+    let bin = TempDir::new("git-only").unwrap();
+    std::os::unix::fs::symlink(found, bin.path().join("git")).unwrap();
+    let only = bin.path().as_os_str();
+    let (code, stdout) = render_on_path(&checkout, only, &["--png", "out/d.png"]);
+    let out: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(code, 2, "{out}");
+    assert_eq!(out["error"]["code"], "REQUEST_INVALID", "{out}");
+    assert_eq!(out["error"]["details"]["reason"], "no-rasterizer");
+    assert!(!checkout.path().join("out/d.png").exists());
 }
 
 /// Writes `files` into the checkout.

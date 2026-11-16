@@ -19,6 +19,7 @@ use boundrail::arch::infra::{self, Infra};
 use boundrail::arch::inspect::{self, InspectReport};
 use boundrail::arch::locality::{self, History, LocalityReport};
 use boundrail::arch::lsp::{self, Facts};
+use boundrail::arch::picture;
 use boundrail::arch::proposal::{self, CURRENT, Writing};
 use boundrail::arch::render::{self, View};
 use boundrail::arch::request::INPUT_MAX;
@@ -141,6 +142,17 @@ struct RenderArgs {
     /// Write to this file instead of standard output; its folder must exist
     #[arg(long)]
     output: Option<PathBuf>,
+    /// Rasterize the picture to this PNG file, with the first of resvg, rsvg-convert and magick
+    /// on PATH outside the checkout; its folder must exist. Prints the SVG only with --output
+    /// or --format json
+    #[arg(long)]
+    png: Option<PathBuf>,
+    /// PNG pixels per picture unit, more than 0 and at most 8 [default: 1]
+    #[arg(long, requires = "png")]
+    scale: Option<f64>,
+    /// Rasterize only this part of the picture: x,y,w,h in picture units from its top-left corner
+    #[arg(long, requires = "png")]
+    region: Option<String>,
 }
 
 /// What `model render` draws, as the command line and the live view ask for it.
@@ -181,6 +193,20 @@ pub(super) struct RenderSpec {
     /// current, then proposal) is drawn with what it adds, removes and changes marked
     #[arg(long)]
     pub(super) against: Option<String>,
+    /// Draw this module and its direct neighbours as usual and dim the rest: its ID or unique
+    /// name; repeat for several
+    #[arg(long)]
+    pub(super) focus: Vec<String>,
+    /// Leave out the modules of this node kind, its key in config.yaml; their parts stay in the
+    /// nearest container drawn. Repeat for several; architecture view only
+    #[arg(long = "hide-kind")]
+    pub(super) hide_kind: Vec<String>,
+    /// Name the node and relationship kinds drawn below the picture; architecture view only
+    #[arg(long)]
+    pub(super) legend: bool,
+    /// Colors: light, dark, or auto, which follows the viewer's color scheme [default: light]
+    #[arg(long, value_enum)]
+    pub(super) theme: Option<RenderTheme>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -188,6 +214,23 @@ pub(super) enum RenderView {
     Architecture,
     Sequence,
     Flowchart,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub(super) enum RenderTheme {
+    Light,
+    Dark,
+    Auto,
+}
+
+impl From<RenderTheme> for render::Theme {
+    fn from(theme: RenderTheme) -> Self {
+        match theme {
+            RenderTheme::Light => Self::Light,
+            RenderTheme::Dark => Self::Dark,
+            RenderTheme::Auto => Self::Auto,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -1182,42 +1225,120 @@ pub(super) fn walkthrough_output(root: &Path, subject: &str) -> Result<Value> {
     output.context("a JSON reading returns its output")
 }
 
-/// `model render`: the SVG on stdout or in `--output`; with `--format json`, inside the output
-/// envelope.
+/// `model render`: the SVG on stdout or in `--output`; with `--format json`, a receipt with the
+/// drawn state's revision, the picture's size, the modules and relationships drawn and the SVG's
+/// digest, around the SVG. `--png` rasterizes it too.
 fn render_model(root: &Path, format: Option<ModelFormat>, args: &RenderArgs) -> Result<()> {
+    let invalid =
+        |message: String| anyhow::Error::from(Refusal::new(Code::RequestInvalid, message));
     if matches!(format, Some(ModelFormat::Markdown)) {
         let message = "model render prints SVG, or JSON with --format json";
-        return Err(Refusal::new(Code::RequestInvalid, message).into());
+        return Err(invalid(message.to_owned()));
     }
+    let scale = args.scale.unwrap_or(1.0);
+    if !(scale > 0.0 && scale <= MAX_SCALE) {
+        return Err(invalid(format!(
+            "--scale must be more than 0 and at most {MAX_SCALE}"
+        )));
+    }
+    let region = (args.region.as_deref())
+        .map(|text| {
+            let numbers: Result<Vec<f64>, _> =
+                text.split(',').map(|n| n.trim().parse::<f64>()).collect();
+            match numbers.as_deref() {
+                Ok(&[x, y, w, h]) if [x, y, w, h].iter().all(|n| n.is_finite()) => Ok([x, y, w, h]),
+                _ => Err(invalid(format!("--region takes x,y,w,h, not `{text}`"))),
+            }
+        })
+        .transpose()?;
     let output = args.output.as_deref();
-    let (svg, view) = render_svg(root, &args.spec, output)?;
+    let png = args.png.as_deref();
+    if let Some(png) = png {
+        check_output(root, png, "--png")?;
+        if output.is_some_and(|output| same_file(png, output)) {
+            return Err(invalid(format!(
+                "--png and --output both name {}; give each its own file",
+                png.display()
+            )));
+        }
+    }
+    let (rendered, view) = render_svg(root, &args.spec, output)?;
+    let png = match png {
+        Some(path) => {
+            let framed = picture::reframe(&rendered.svg, scale, region).map_err(invalid)?;
+            let checkout = checkpoint::checkout(&vault::path(root)?)?;
+            let drawing = picture::Drawing::new(framed);
+            let bytes = picture::rasterize(&drawing, &checkout).map_err(|failed| {
+                let details = json!({"reason": failed.reason});
+                Refusal::new(Code::RequestInvalid, failed.message).with_details(details)
+            })?;
+            Some((path, bytes))
+        }
+        None => None,
+    };
+    // The PNG is written last, so a failed write of the output leaves no PNG behind; printing
+    // to standard output waits for it too.
+    let save_png = || match &png {
+        Some((path, bytes)) => write_file(path, bytes),
+        None => Ok(()),
+    };
+    if output.is_none() {
+        save_png()?;
+    }
     if matches!(format, Some(ModelFormat::Json)) {
-        let envelope = json!({
+        let mut envelope = json!({
             "schema": MODEL_SCHEMA,
             "kind": "render",
             "success": true,
             "view": view,
-            "svg": svg,
+            "revision": rendered.revision,
+            "width": rendered.width,
+            "height": rendered.height,
+            "modules": rendered.modules,
+            "relationships": rendered.relationships,
+            "digest": boundrail::files::hash(rendered.svg.as_bytes()),
+            "svg": rendered.svg,
         });
-        return write(output, &envelope);
-    }
-    match output {
-        Some(path) => write_file(path, svg.as_bytes()),
-        None => {
-            print!("{svg}");
-            Ok(())
+        if let Some((path, _)) = &png {
+            envelope["png"] = json!(path);
+        }
+        write(output, &envelope)?;
+    } else {
+        match output {
+            Some(path) => write_file(path, rendered.svg.as_bytes())?,
+            None if png.is_some() => {}
+            None => print!("{}", rendered.svg),
         }
     }
+    if output.is_some() {
+        save_png()?;
+    }
+    Ok(())
 }
 
-/// The SVG of what `spec` asks for, with the name of the view drawn, refusing an `output` it
+/// Whether `a` and `b` name the same file: equal, or the same name in the same folder once
+/// links in the folders are resolved.
+fn same_file(a: &Path, b: &Path) -> bool {
+    let resolved = |path: &Path| {
+        let parent = (path.parent())
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        Some(fs::canonicalize(parent).ok()?.join(path.file_name()?))
+    };
+    a == b || resolved(a).is_some_and(|r| Some(r) == resolved(b))
+}
+
+/// The largest `--scale`, so a PNG stays a few tens of megapixels.
+const MAX_SCALE: f64 = 8.0;
+
+/// The drawing of what `spec` asks for, with the name of the view drawn, refusing an `output` it
 /// could not write to. A walkthrough beat or a picture is drawn as its reading says, with its
 /// focus.
 pub(super) fn render_svg(
     root: &Path,
     spec: &RenderSpec,
     output: Option<&Path>,
-) -> Result<(String, &'static str)> {
+) -> Result<(render::Rendered, &'static str)> {
     if spec.walkthrough.is_none() && spec.beat.is_none() && spec.picture.is_none() {
         return draw(root, spec, output);
     }
@@ -1237,24 +1358,42 @@ pub(super) fn render_svg(
     draw_reading(root, reading, output, &mut States::new(&current))
 }
 
-/// The SVG of what the flags of `spec` ask for, and the name of the view drawn.
-fn draw(root: &Path, spec: &RenderSpec, output: Option<&Path>) -> Result<(String, &'static str)> {
+/// The drawing of what the flags of `spec` ask for, and the name of the view drawn.
+fn draw(
+    root: &Path,
+    spec: &RenderSpec,
+    output: Option<&Path>,
+) -> Result<(render::Rendered, &'static str)> {
     let view = spec.view()?;
     let (drawn, base) = spec.states()?;
     let (model, name) = load_state(root, drawn)?;
     let base = base.map(|b| load_state(root, b)).transpose()?;
     let base = (base.as_ref()).map(|(model, name)| (model, name.as_deref()));
-    paint(root, &view, &[], (&model, name.as_deref()), base, output)
+    let focus = render::neighbourhood(&model, &spec.focus)?;
+    let options = render::Options {
+        focus: &focus,
+        hide: &spec.hide_kind,
+        legend: spec.legend,
+        theme: spec.theme.map_or(render::Theme::Light, Into::into),
+    };
+    paint(
+        root,
+        &view,
+        &options,
+        (&model, name.as_deref()),
+        base,
+        output,
+    )
 }
 
-/// The SVG of what `reading` draws with its focus, and the name of the view drawn. Each state it
-/// reads loads once into `states`.
+/// The drawing of what `reading` draws with its focus, and the name of the view drawn. Each
+/// state it reads loads once into `states`.
 fn draw_reading(
     root: &Path,
     reading: &BeatReading,
     output: Option<&Path>,
     states: &mut States<'_>,
-) -> Result<(String, &'static str)> {
+) -> Result<(render::Rendered, &'static str)> {
     let spec = reading_spec(reading);
     let view = spec.view()?;
     let (drawn, base) = spec.states()?;
@@ -1268,7 +1407,11 @@ fn draw_reading(
         .map(|b| states.get(b))
         .transpose()
         .map_err(again)?;
-    paint(root, &view, &reading.focus, drawn, base, output)
+    let options = render::Options {
+        focus: &reading.focus,
+        ..render::Options::default()
+    };
+    paint(root, &view, &options, drawn, base, output)
 }
 
 /// A load error kept in a cache, as a new error: a refusal stays one.
@@ -1285,16 +1428,16 @@ fn again(error: &anyhow::Error) -> anyhow::Error {
     }
 }
 
-/// Draws `view` of the state `drawn` (its model and title name) with `focus`, compared with
+/// Draws `view` of the state `drawn` (its model and title name) with `options`, compared with
 /// `base` when given, refusing an `output` it could not write to.
 fn paint<'m>(
     root: &Path,
     view: &View<'_>,
-    focus: &[String],
+    options: &render::Options<'_>,
     drawn: (&'m Model, Option<&str>),
     base: Option<(&'m Model, Option<&str>)>,
     output: Option<&Path>,
-) -> Result<(String, &'static str)> {
+) -> Result<(render::Rendered, &'static str)> {
     // A proposal's local and qualified IDs name the same state.
     let id = |model: &Model| model.proposal.as_ref().map(|p| p.id.clone());
     if let Some((base, _)) = base
@@ -1305,15 +1448,15 @@ fn paint<'m>(
         return Err(Refusal::new(Code::RequestInvalid, message).into());
     }
     if let Some(output) = output {
-        check_output(root, output)?;
+        check_output(root, output, "--output")?;
     }
     let side = |(model, name): (&'m Model, Option<&str>)| render::Side {
         model,
         name: name.map(str::to_owned),
     };
     let base = base.map(side);
-    let svg = render::render(&side(drawn), base.as_ref(), view, focus)?;
-    Ok((svg, view.name()))
+    let rendered = render::render(&side(drawn), base.as_ref(), view, options)?;
+    Ok((rendered, view.name()))
 }
 
 /// What a beat's reading draws, as the flags would ask for it.
@@ -1417,7 +1560,14 @@ impl RenderSpec {
             &self.scope,
             &self.against,
         ];
-        if drawing.iter().any(|flag| flag.is_some()) || self.view.is_some() || self.depth.is_some()
+        let styled = !self.focus.is_empty()
+            || !self.hide_kind.is_empty()
+            || self.legend
+            || self.theme.is_some();
+        if drawing.iter().any(|flag| flag.is_some())
+            || self.view.is_some()
+            || self.depth.is_some()
+            || styled
         {
             let message = format!("{why}; leave out the other flags");
             return Err(Refusal::new(Code::RequestInvalid, message).into());
@@ -1496,7 +1646,7 @@ fn export_bundle(
         return Err(Refusal::new(Code::RequestInvalid, message).into());
     }
     if let Some(output) = output {
-        check_output(root, output)?;
+        check_output(root, output, "--output")?;
     }
     let bundle = bundle::export(root, what)?;
     let text = bundle::to_text(&bundle)?;
@@ -1565,9 +1715,10 @@ fn print_published(markdown: bool, pushing: bool, published: &Published) -> Resu
     Ok(())
 }
 
-/// Refuses an `--output` whose folder is missing or lies inside the model vault or the Git
-/// folder. The folder is resolved first, so a linked folder on the way cannot reach either.
-fn check_output(root: &Path, output: &Path) -> Result<()> {
+/// Refuses an `output`, given by `flag`, whose folder is missing or lies inside the model vault
+/// or the Git folder. The folder is resolved first, so a linked folder on the way cannot reach
+/// either.
+fn check_output(root: &Path, output: &Path, flag: &str) -> Result<()> {
     let parent = match output.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
@@ -1576,7 +1727,7 @@ fn check_output(root: &Path, output: &Path) -> Result<()> {
         Refusal::new(
             Code::RequestInvalid,
             format!(
-                "--output {}: its folder cannot be read: {error}",
+                "{flag} {}: its folder cannot be read: {error}",
                 output.display()
             ),
         )
@@ -1594,7 +1745,7 @@ fn check_output(root: &Path, output: &Path) -> Result<()> {
             return Err(Refusal::new(
                 Code::RequestInvalid,
                 format!(
-                    "--output {} is inside {place}; write it elsewhere",
+                    "{flag} {} is inside {place}; write it elsewhere",
                     output.display()
                 ),
             )

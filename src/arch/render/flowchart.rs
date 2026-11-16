@@ -37,7 +37,7 @@ struct Chart<'c, 's> {
     texts: BTreeMap<&'s str, String>,
 }
 
-pub(super) fn render(ctx: &Context<'_>, steps: &[Step]) -> String {
+pub(super) fn render(ctx: &Context<'_>, steps: &[Step]) -> Svg {
     let mut chart = Chart {
         ctx,
         svg: Svg::default(),
@@ -53,7 +53,7 @@ pub(super) fn render(ctx: &Context<'_>, steps: &[Step]) -> String {
     }
     svg.append(chart.svg);
     ctx.legend(&mut svg);
-    svg.finish()
+    svg
 }
 
 fn loop_text(label: &str) -> String {

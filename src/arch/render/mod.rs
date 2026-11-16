@@ -19,7 +19,7 @@ use super::types::{Dash, EXTERNAL_KIND, Emphasis, Flow, Module, Step, VaultConfi
 use super::vault::{self, Model};
 use super::{Code, Refusal, ids};
 pub(crate) use svg::GENERATOR;
-use svg::{Font, Style, Svg, text_width};
+use svg::{Font, Point, Style, Svg, text_width};
 
 /// What to draw.
 #[derive(Debug)]
@@ -49,6 +49,42 @@ impl View<'_> {
 pub struct Side<'a> {
     pub model: &'a Model,
     pub name: Option<String>,
+}
+
+/// How to draw, beyond what: the modules lit, the node kinds left out, whether a legend names the
+/// kinds drawn, and the colors.
+#[derive(Default)]
+pub struct Options<'a> {
+    /// Qualified module IDs drawn as usual, the rest dimmed; none dims nothing.
+    pub focus: &'a [String],
+    /// Node kind keys whose modules the architecture view leaves out.
+    pub hide: &'a [String],
+    /// Name the node and relationship kinds the architecture view draws, below it.
+    pub legend: bool,
+    pub theme: Theme,
+}
+
+/// The colors of a drawing: light, dark, or light unless the viewer prefers dark.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Theme {
+    #[default]
+    Light,
+    Dark,
+    Auto,
+}
+
+/// A finished drawing and what it shows.
+#[derive(Debug)]
+pub struct Rendered {
+    pub svg: String,
+    /// The revision digest of the state drawn.
+    pub revision: String,
+    pub width: f64,
+    pub height: f64,
+    /// Qualified IDs of the modules drawn: boxes, or a flow's lifelines and participants.
+    pub modules: Vec<String>,
+    /// Qualified IDs of the relationships the arrows stand for.
+    pub relationships: Vec<String>,
 }
 
 /// How a title names the current state.
@@ -101,6 +137,9 @@ const RULE: Style<'static> = Style {
 const LEGEND_SWATCH: f64 = 14.0;
 const LEGEND_STEP: f64 = 96.0;
 const LEGEND_GAP: f64 = 6.0;
+/// The length of a relationship kind's sample line, and the space after each name.
+const LEGEND_LINE: f64 = 28.0;
+const LEGEND_SPACE: f64 = 18.0;
 const SWATCH_RADIUS: f64 = 2.0;
 
 /// How a comparison marks an element.
@@ -242,6 +281,48 @@ impl Context<'_> {
         svg.text((MARGIN, MARGIN + TITLE_SIZE), &self.title, &font);
     }
 
+    /// Where the title line sits, which routes and labels keep clear of.
+    fn title_area(&self) -> layout::Rect {
+        layout::Rect {
+            x: MARGIN,
+            y: MARGIN,
+            w: text_width(&self.title) * TITLE_SIZE / svg::FONT_SIZE,
+            h: TITLE_SIZE + svg::DESCENT,
+        }
+    }
+
+    /// Below everything drawn so far, one row naming the node kinds `nodes` with their fills and
+    /// one naming the relationship kinds `lines` with their dashes, in configured names.
+    fn kinds(&self, svg: &mut Svg, nodes: &BTreeSet<&str>, lines: &BTreeSet<&str>) {
+        let mut y = svg.bottom() + MARGIN;
+        svg.group("legend kinds", None);
+        let mut x = MARGIN;
+        for &kind in nodes {
+            let mut style = outline(None, self.fill(kind));
+            if kind == EXTERNAL_KIND {
+                style.dash = Some(DASHED);
+            }
+            svg.rect(
+                (x, y),
+                (LEGEND_SWATCH, LEGEND_SWATCH),
+                SWATCH_RADIUS,
+                &style,
+            );
+            x = legend_name(svg, (x + LEGEND_SWATCH, y), self.kind_name(kind));
+        }
+        if !nodes.is_empty() {
+            y += LEGEND_SWATCH + LEGEND_GAP;
+        }
+        x = MARGIN;
+        for &kind in lines {
+            let mid = y + LEGEND_SWATCH / 2.0;
+            let style = line_style(None, None, self.dash(kind));
+            svg.polyline(&[(x, mid), (x + LEGEND_LINE, mid)], &style);
+            x = legend_name(svg, (x + LEGEND_LINE, y), self.relationship_name(kind));
+        }
+        svg.close_group();
+    }
+
     /// Below everything drawn so far, the legend when marks are on.
     fn legend(&self, svg: &mut Svg) {
         if self.marks.is_none() {
@@ -262,6 +343,50 @@ impl Context<'_> {
         }
         svg.close_group();
     }
+}
+
+/// `name` after a legend sample ending at `at`; returns where the next sample starts.
+fn legend_name(svg: &mut Svg, at: Point, name: &str) -> f64 {
+    let x = at.0 + LEGEND_GAP;
+    svg.text((x, at.1 + LEGEND_SWATCH - BASELINE), name, &label(None));
+    x + text_width(name) + LEGEND_SPACE
+}
+
+/// The finished `svg` in `theme`: the light drawing as it is, or with a style sheet that recolors
+/// it dark, always or when the viewer prefers dark. The sheet matches the light colors the
+/// drawing writes as attributes, which a style rule overrides, and lets fills show through so
+/// configured node colors stay readable under light text.
+fn themed(svg: String, theme: Theme) -> String {
+    let sheet = match theme {
+        Theme::Light => return svg,
+        Theme::Dark => dark(),
+        Theme::Auto => format!("@media (prefers-color-scheme: dark){{{}}}", dark()),
+    };
+    let at = svg.find('\n').map_or(svg.len(), |end| end + 1);
+    format!("{}<style>{sheet}</style>\n{}", &svg[..at], &svg[at..])
+}
+
+/// The dark sheet: each light color the drawing writes, by attribute, and the color replacing
+/// it. Built from the light constants, so changing one keeps the sheet matching it.
+fn dark() -> String {
+    let swaps = [
+        ("fill", svg::BACKGROUND, "#16191d"),
+        ("fill", INK, "#e4e7eb"),
+        ("fill", SOFT_INK, "#9aa5b1"),
+        ("stroke", SOFT_INK, "#9aa5b1"),
+        ("fill", LINE, "#c3cbd3"),
+        ("stroke", LINE, "#c3cbd3"),
+        ("fill", MUTED_LINE, "#616e7c"),
+        ("stroke", MUTED_LINE, "#616e7c"),
+        ("fill", HEAD_FILL, "#2a3038"),
+        ("fill", sequence::NOTE_FILL, "#3d3720"),
+    ];
+    let mut sheet = String::from("svg{color:#e4e7eb}");
+    for (key, light, dark) in swaps {
+        let _ = write!(sheet, "[{key}=\"{light}\"]{{{key}:{dark}}}");
+    }
+    sheet.push_str(".module rect,.step rect,.step polygon,.legend rect{fill-opacity:0.3}");
+    sheet
 }
 
 /// Whether `text` is a color as `#rgb` or `#rrggbb`.
@@ -345,16 +470,30 @@ fn class(base: &str, mark: Option<Mark>) -> Cow<'_, str> {
 
 /// Draws `view` of the state `drawn`. With `base`, marks what `drawn` adds, removes and changes
 /// against it; removed modules, relationships and steps are drawn too, faded and struck. With a
-/// `focus` of qualified module IDs, those modules and what touches them are drawn as usual and
-/// the rest dimmed.
+/// focus of qualified module IDs, those modules and what touches them are drawn as usual and
+/// the rest dimmed. Hidden node kinds and the kinds legend apply to the architecture view only;
+/// hidden kinds must be configured.
 pub fn render(
     drawn: &Side<'_>,
     base: Option<&Side<'_>>,
     view: &View<'_>,
-    focus: &[String],
-) -> Result<String, Refusal> {
+    options: &Options<'_>,
+) -> Result<Rendered, Refusal> {
     let model = drawn.model;
     let id = model.manifest.id.as_str();
+    let architecture = matches!(view, View::Architecture { .. });
+    if !architecture && (!options.hide.is_empty() || options.legend) {
+        let message = "--hide-kind and --legend apply to the architecture view only";
+        return Err(Refusal::new(Code::RequestInvalid, message));
+    }
+    if let Some(kind) = (options.hide.iter()).find(|k| !model.config.node_kinds.contains_key(*k)) {
+        let known: Vec<&str> = model.config.node_kinds.keys().map(String::as_str).collect();
+        let message = format!(
+            "--hide-kind `{kind}` is not a node kind in config.yaml; known: {}",
+            known.join(", ")
+        );
+        return Err(Refusal::new(Code::RequestInvalid, message));
+    }
     let comparison = base.map(|b| {
         compare::compare(
             id,
@@ -367,6 +506,7 @@ pub fn render(
         Some((before, c)) => with_removed(id, &model.modules, &before.modules, c),
         None => Cow::Borrowed(model.modules.as_slice()),
     };
+    let modules = without_kinds(id, modules, options.hide);
     let mut context = Context {
         model: id,
         config: &model.config,
@@ -374,12 +514,12 @@ pub fn render(
             .map(|m| (ids::qualify(id, &m.id), m.name.as_str()))
             .collect(),
         marks: comparison.as_ref().map(marks),
-        focus: Focus::new(id, &modules, focus),
+        focus: Focus::new(id, &modules, options.focus),
         title: title(drawn, base),
     };
-    match *view {
+    let (svg, drawn_modules, relationships) = match *view {
         View::Architecture { scope, depth } => {
-            draw_architecture(&mut context, model, &modules, scope, depth)
+            draw_architecture(&mut context, model, &modules, (scope, depth), options)?
         }
         View::Sequence(subject) | View::Flowchart(subject) => {
             let (_, flow) = model.flow(subject)?;
@@ -388,12 +528,90 @@ pub fn render(
                 Some((before, c)) => with_removed_steps(id, flow, before, &c.steps),
                 None => Cow::Borrowed(flow.steps.as_slice()),
             };
-            Ok(match view {
+            let svg = match view {
                 View::Sequence(_) => sequence::render(&context, &steps),
                 _ => flowchart::render(&context, &steps),
-            })
+            };
+            let shown = participants(&steps).into_iter().map(str::to_owned);
+            (svg, shown.collect(), Vec::new())
+        }
+    };
+    let (_, _, width, height) = svg.frame();
+    let svg = themed(svg.finish(), options.theme);
+    Ok(Rendered {
+        svg,
+        revision: model.revision.digest.clone(),
+        width,
+        height,
+        modules: drawn_modules,
+        relationships,
+    })
+}
+
+/// `modules` without those of the node kinds `hide`; the parts of a module left out move to
+/// its nearest ancestor drawn, so they stay in their containers.
+fn without_kinds<'a>(
+    model: &str,
+    modules: Cow<'a, [Module]>,
+    hide: &[String],
+) -> Cow<'a, [Module]> {
+    if !modules.iter().any(|m| hide.contains(&m.kind)) {
+        return modules;
+    }
+    let parents: BTreeMap<String, (Option<String>, bool)> = (modules.iter())
+        .map(|m| {
+            (
+                ids::qualify(model, &m.id),
+                (m.parent.clone(), hide.contains(&m.kind)),
+            )
+        })
+        .collect();
+    let shown_parent = |mut parent: Option<String>| {
+        while let Some((above, true)) = parent.as_ref().and_then(|p| parents.get(p)) {
+            parent.clone_from(above);
+        }
+        parent
+    };
+    let kept = (modules.iter())
+        .filter(|m| !hide.contains(&m.kind))
+        .map(|m| Module {
+            parent: shown_parent(m.parent.clone()),
+            ..m.clone()
+        });
+    Cow::Owned(kept.collect())
+}
+
+/// The modules `subjects` name in `model` and their direct neighbours: the other end of every
+/// relationship from or to a subject or a part inside it, by qualified ID. A focus on these
+/// lights each subject with what it talks to.
+pub fn neighbourhood(model: &Model, subjects: &[String]) -> Result<Vec<String>, Refusal> {
+    let id = model.manifest.id.as_str();
+    let index = Index::new(id, &model.modules);
+    let mut lit = BTreeSet::new();
+    let mut inside = BTreeSet::new();
+    for subject in subjects {
+        let found = ids::qualify(id, &vault::find(id, &model.modules, subject)?.id);
+        inside.extend(
+            index
+                .descendants(&found)
+                .into_iter()
+                .map(|(d, _)| d.to_owned()),
+        );
+        inside.insert(found.clone());
+        lit.insert(found);
+    }
+    for module in &model.modules {
+        let from = ids::qualify(id, &module.id);
+        for r in &module.outgoing {
+            if inside.contains(&from) {
+                lit.insert(r.to.clone());
+            }
+            if inside.contains(&r.to) {
+                lit.insert(from.clone());
+            }
         }
     }
+    Ok(lit.into_iter().collect())
 }
 
 /// The architecture view of `modules`, the parts of `scope` when given, `depth` levels deep.
@@ -401,9 +619,9 @@ fn draw_architecture(
     context: &mut Context<'_>,
     model: &Model,
     modules: &[Module],
-    scope: Option<&str>,
-    depth: usize,
-) -> Result<String, Refusal> {
+    (scope, depth): (Option<&str>, usize),
+    options: &Options<'_>,
+) -> Result<(Svg, Vec<String>, Vec<String>), Refusal> {
     if depth == 0 {
         return Err(Refusal::new(
             Code::RequestInvalid,
@@ -412,6 +630,10 @@ fn draw_architecture(
     }
     let scope = (scope.map(|s| vault::find(&model.manifest.id, &model.modules, s))).transpose()?;
     if let Some(scope) = scope {
+        if options.hide.contains(&scope.kind) {
+            let message = format!("--scope {} is of a kind --hide-kind leaves out", scope.name);
+            return Err(Refusal::new(Code::RequestInvalid, message));
+        }
         let _ = write!(context.title, ", parts of {}", scope.name);
     }
     let scope = scope.map(|m| context.qualify(&m.id));
@@ -420,6 +642,7 @@ fn draw_architecture(
         modules,
         scope.as_deref(),
         depth,
+        options.legend,
     ))
 }
 
@@ -646,7 +869,7 @@ mod tests {
     /// `view` of the current state `model`, compared with nothing.
     pub(super) fn draw(model: &Model, view: &View<'_>) -> Result<String, Refusal> {
         let drawn = Side { model, name: None };
-        render(&drawn, None, view, &[])
+        render(&drawn, None, view, &Options::default()).map(|r| r.svg)
     }
 
     const WHOLE: View<'static> = View::Architecture {
@@ -791,20 +1014,27 @@ mod tests {
             name: None,
         };
         let focus = [q("Billing1")];
+        let focused = |view: &View<'_>, focus: &[String]| {
+            let options = Options {
+                focus,
+                ..Options::default()
+            };
+            render(&drawn, None, view, &options).unwrap().svg
+        };
         let dimmed = |out: &str, class: &str, id: &str| {
             out.contains(&format!(
                 "<g class=\"dimmed\" opacity=\"0.3\">\n<g class=\"{class}\" data-id=\"{id}\">"
             ))
         };
         // Web and Bank dim; the arrows into and out of Billing stay, as Platform around it does.
-        let out = render(&drawn, None, &WHOLE, &focus).unwrap();
+        let out = focused(&WHOLE, &focus);
         assert_eq!(out.matches("class=\"dimmed\"").count(), 2, "{out}");
         assert!(dimmed(&out, "module", &q("WebApp01")) && dimmed(&out, "module", &q("BankApi1")));
-        let sequence = render(&drawn, None, &View::Sequence("Checkout"), &focus).unwrap();
+        let sequence = focused(&View::Sequence("Checkout"), &focus);
         assert!(dimmed(&sequence, "lifeline", &q("BankApi1")), "{sequence}");
         assert!(dimmed(&sequence, "message", &q("Step0002")));
         assert!(!dimmed(&sequence, "message", &q("Step0001")));
-        let flowchart = render(&drawn, None, &View::Flowchart("Checkout"), &focus).unwrap();
+        let flowchart = focused(&View::Flowchart("Checkout"), &focus);
         assert!(
             dimmed(&flowchart, "step message", &q("Step0002")),
             "{flowchart}"
@@ -817,7 +1047,7 @@ mod tests {
             depth: DEFAULT_DEPTH,
         };
         let bank = [q("BankApi1")];
-        let inside = render(&drawn, None, &platform, &bank).unwrap();
+        let inside = focused(&platform, &bank);
         assert!(!inside.contains("dimmed"), "{inside}");
     }
 

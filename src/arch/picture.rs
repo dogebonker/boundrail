@@ -225,6 +225,37 @@ fn locate(checkout: &Path, output: &str, create: bool) -> Result<Option<PathBuf>
     }
 }
 
+/// `svg`, a Boundrail render, scaled by `scale` and cut to `region` (x, y, width and height in
+/// picture units from its top-left corner) by rewriting the size and viewBox of its root element,
+/// which every rasterizer honors; why not when the region is empty or leaves the picture.
+pub fn reframe(svg: &str, scale: f64, region: Option<[f64; 4]>) -> Result<String, String> {
+    let malformed = || "the drawing has no viewBox".to_owned();
+    let root = &svg[..svg.find('>').ok_or_else(malformed)?];
+    let start = root.find(" width=\"").ok_or_else(malformed)?;
+    let view = root.find("viewBox=\"").ok_or_else(malformed)? + "viewBox=\"".len();
+    let end = view + root[view..].find('"').ok_or_else(malformed)?;
+    let numbers: Vec<f64> = (root[view..end].split(' '))
+        .filter_map(|n| n.parse().ok())
+        .collect();
+    let [left, top, width, height] = numbers[..] else {
+        return Err(malformed());
+    };
+    let [x, y, w, h] = region.unwrap_or([0.0, 0.0, width, height]);
+    if !(w > 0.0 && h > 0.0 && x >= 0.0 && y >= 0.0 && x + w <= width && y + h <= height) {
+        return Err(format!(
+            "--region {x},{y},{w},{h} is not inside the picture, 0,0,{width},{height}"
+        ));
+    }
+    let size = format!(
+        " width=\"{:.0}\" height=\"{:.0}\" viewBox=\"{} {} {w} {h}\"",
+        (w * scale).ceil().max(1.0),
+        (h * scale).ceil().max(1.0),
+        left + x,
+        top + y,
+    );
+    Ok(format!("{}{size}{}", &svg[..start], &svg[end + 1..]))
+}
+
 /// The PNG of `drawing` from the first rasterizer on `PATH` outside `checkout`, carrying the
 /// SVG's digest.
 pub fn rasterize(drawing: &Drawing, checkout: &Path) -> Result<Vec<u8>, Unrendered> {
