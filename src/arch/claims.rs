@@ -384,17 +384,16 @@ fn drafts(vault: &Path, skip: Option<&str>) -> Result<Vec<Model>> {
 
 /// The container of each module, relationship and flow, by qualified ID: a module's parent, a
 /// relationship's owning module, a flow's collection. In a proposal, the proposal contains its
-/// root modules and its collections.
+/// root modules, its collections and its walkthroughs.
 fn containers(model: &Model) -> BTreeMap<String, String> {
     let root = model.proposal.as_ref().map(|_| model.root());
     let parents = model.modules.iter().filter_map(|m| {
         let parent = m.parent.clone().or_else(|| root.clone())?;
         Some((model.qualify(&m.id), parent))
     });
-    let held = model
-        .collections
-        .iter()
-        .filter_map(|c| Some((model.qualify(&c.id), root.clone()?)));
+    let held = (model.collections.iter().map(|c| &c.id))
+        .chain(model.walkthroughs.iter().map(|w| &w.id))
+        .filter_map(|id| Some((model.qualify(id), root.clone()?)));
     let owners = vault::relationships(&model.modules)
         .into_iter()
         .map(|(id, (owner, _))| (model.qualify(id), model.qualify(owner)));

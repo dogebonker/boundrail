@@ -1,6 +1,6 @@
 //! Walkthroughs in the vault: their validation and their read views. A walkthrough belongs to the
-//! current state; its beats may read a proposal or a checkpoint, which change on their own, so
-//! only references into the current state must exist.
+//! current state or to a proposal, its own state; its beats may read another proposal or a
+//! checkpoint, which change on their own, so only references into its own state must exist.
 
 use std::collections::BTreeSet;
 
@@ -33,23 +33,29 @@ pub(crate) fn reading_ids<'a>(
     (modules, flows)
 }
 
-/// The qualified module and flow IDs of the current state, which current-state readings name.
+/// The qualified module and flow IDs of the loaded state, which readings of their own state name.
 pub(super) struct Known {
     model: String,
+    own: ReadingState,
     modules: BTreeSet<String>,
     flows: BTreeSet<String>,
 }
 
 impl Known {
-    /// What the readings of `contents` may name; `None` without the model ID, when references
-    /// are not judged.
-    pub(super) fn new(model: Option<&str>, contents: Contents<'_>) -> Option<Self> {
+    /// What the readings of `contents`, the files of `own`, may name; `None` without the model
+    /// ID, when references are not judged.
+    pub(super) fn new(
+        model: Option<&str>,
+        own: ReadingState,
+        contents: Contents<'_>,
+    ) -> Option<Self> {
         model.map(|model| {
             let modules = contents.modules.iter().map(|(_, m)| *m);
             let collections = contents.collections.iter().map(|(_, c)| *c);
             let (modules, flows) = reading_ids(model, modules, collections);
             Known {
                 model: model.to_owned(),
+                own,
                 modules,
                 flows,
             }
@@ -57,15 +63,21 @@ impl Known {
     }
 }
 
-/// Every walkthrough's own fields and beats. References are judged only with the model ID, and
-/// configured keys only with the config.
+/// Every walkthrough's own fields and beats, in the current state or the proposal with local ID
+/// `proposal`. References are judged only with the model ID, and configured keys only with the
+/// config.
 pub(super) fn check(
     model: Option<&str>,
+    proposal: Option<&str>,
     config: Option<&VaultConfig>,
     contents: Contents<'_>,
     problems: &mut Problems,
 ) {
-    let known = Known::new(model, contents);
+    let own = match (model, proposal) {
+        (Some(model), Some(id)) => ReadingState::Proposal(ids::qualify(model, id)),
+        _ => ReadingState::Current,
+    };
+    let known = Known::new(model, own, contents);
     for (file, walkthrough) in contents.walkthroughs {
         let id = walkthrough.id.as_str();
         let (version, name) = (walkthrough.schema_version, &walkthrough.name);
@@ -118,8 +130,8 @@ fn check_beat(
 }
 
 /// Why a reading does not hold: fields that do not go together, as `model render` refuses them,
-/// a module, kind or group listed twice, keys `config` lacks, and references. Into the current
-/// state they must exist; into a proposal or checkpoint they must be well formed.
+/// a module, kind or group listed twice, keys `config` lacks, and references. Into the state
+/// loaded they must exist; into another state they must be well formed.
 pub(super) fn reading_problems(
     reading: &BeatReading,
     known: Option<&Known>,
@@ -263,7 +275,7 @@ fn reference_problems(reading: &BeatReading, known: &Known) -> Vec<String> {
             _ => {}
         }
     }
-    let current = reading.state.is_current();
+    let current = reading.state == known.own;
     let modules = reading.scope.iter().map(|s| ("scope", s));
     let focus = reading.focus.iter().map(|f| ("focus", f));
     let selection = reading.selection.iter().map(|s| ("selection", s));

@@ -662,7 +662,7 @@ function renderChanges() {
   const c = app.comparison;
   if (!c) return box.append(note('Comparing'));
   if (c.error) return box.append(note(c.error));
-  for (const section of ['modules', 'relationships', 'collections', 'flows', 'steps']) {
+  for (const section of ['modules', 'relationships', 'collections', 'flows', 'steps', 'walkthroughs']) {
     for (const verb of ['added', 'removed', 'changed']) {
       for (const entry of c[section]?.[verb] ?? []) {
         const label = `${verb} ${section.replace(/s$/, '')} ${entry.name ?? entry.id}`;
@@ -684,11 +684,16 @@ function markEmpty(box, empty) {
   line.textContent = names.length ? `No ${names.length > 1 ? `${names.slice(0, -1).join(', ')} or ${names.at(-1)}` : names[0]} yet.` : '';
 }
 
+function aboutProposal(p) {
+  const lines = [p.summary, ...(p.documents ?? []).map((d) => `${d.title}: ${d.path ?? d.url}`)];
+  return lines.filter(Boolean).join('\n') || null;
+}
+
 function renderLists() {
   markEmpty($('#proposals'), !app.proposals.length);
   markEmpty($('#history'), !app.checkpoints.length);
   $('#proposals').replaceChildren(...(app.proposals.length
-    ? app.proposals.map((p) => item({ onclick: () => setState({ kind: 'proposal', id: p.id }) }, p.name, p.status))
+    ? app.proposals.map((p) => item({ title: aboutProposal(p), onclick: () => setState({ kind: 'proposal', id: p.id }) }, p.name, p.status))
     : [note('No proposals yet.')]));
   $('#history').replaceChildren(...(app.checkpoints.length
     ? app.checkpoints.map((c) => {

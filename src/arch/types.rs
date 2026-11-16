@@ -33,6 +33,18 @@ const PICTURE_OUTPUT: &str = r"^[^/\\:]+(?:/[^\\]*)?\.(?:svg|png)$";
 /// A path relative to the repository root, as `vault::is_repo_path` checks it: no leading `/`, no
 /// `..` segment, no backslash, and no `:` in the first segment.
 const REPO_PATH: &str = concat!("^", repo_path!(), "$");
+const HTTPS_URL: &str = r"^https://[^\s]+$";
+/// The longest URL a document links to, in characters.
+pub const URL_MAX: usize = 2000;
+
+/// Whether `url` is an `https` URL of at most [`URL_MAX`] characters, without spaces or control
+/// characters.
+pub fn is_https(url: &str) -> bool {
+    url.strip_prefix("https://")
+        .is_some_and(|rest| !rest.is_empty())
+        && url.chars().count() <= URL_MAX
+        && !url.chars().any(|c| c.is_whitespace() || c.is_control())
+}
 
 /// `model.json`: the model's identity and its current state.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -75,6 +87,13 @@ pub struct Proposal {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = DESCRIPTION_MAX))]
     pub description: Option<String>,
+    /// One line saying what the proposal changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = SUMMARY_MAX))]
+    pub summary: Option<String>,
+    /// Documents the proposal links to, shown as text and never fetched.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub documents: Vec<Document>,
     pub status: ProposalStatus,
     pub predecessor: Predecessor,
     /// When it was drawn, in Unix seconds.
@@ -93,6 +112,19 @@ pub struct Proposal {
     /// before bases existed have none.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub base: bool,
+}
+
+/// A document a proposal links to: a repository path or an `https` URL, never both.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Document {
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(pattern(REPO_PATH))]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(pattern(HTTPS_URL), length(max = URL_MAX))]
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

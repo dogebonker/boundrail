@@ -68,10 +68,15 @@ const FOLDERS: [(&str, &str); 5] = [
     (PICTURES, PICTURE_SUFFIX),
     (VIEWS, VIEW_SUFFIX),
 ];
-/// The folders only the current state holds.
+/// The folders a proposal's predecessor digest leaves out: they change beside a proposal.
 const CURRENT_ONLY: [&str; 3] = [WALKTHROUGHS, PICTURES, VIEWS];
-/// A proposal's folders: walkthroughs, pictures and views belong to the current state.
-const PROPOSAL_FOLDERS: [(&str, &str); 2] =
+/// A proposal's folders: pictures and views belong to the current state.
+const PROPOSAL_FOLDERS: [(&str, &str); 3] = [
+    (MODULES, MODULE_SUFFIX),
+    (COLLECTIONS, COLLECTION_SUFFIX),
+    (WALKTHROUGHS, WALKTHROUGH_SUFFIX),
+];
+const BASE_FOLDERS: [(&str, &str); 2] =
     [(MODULES, MODULE_SUFFIX), (COLLECTIONS, COLLECTION_SUFFIX)];
 /// The name of a new model's current state.
 const DEFAULT_STATE_NAME: &str = "Current";
@@ -87,7 +92,7 @@ pub struct Model {
     pub modules: Vec<Module>,
     /// Sorted by local ID.
     pub collections: Vec<Collection>,
-    /// Sorted by local ID; always empty in a proposal.
+    /// Sorted by local ID: the current state's, or the proposal's own.
     pub walkthroughs: Vec<Walkthrough>,
     /// Sorted by local ID; always empty in a proposal.
     pub pictures: Vec<Picture>,
@@ -250,10 +255,12 @@ pub fn load(start: &Path) -> Result<Model> {
 
 const LINKED: &str = "is a symbolic link";
 
-/// The per-ID folders of the state or proposal folder `prefix` names, with their suffixes.
+/// The per-ID folders of the state, proposal or base folder `prefix` names, with their suffixes.
 fn state_folders(prefix: &str) -> &'static [(&'static str, &'static str)] {
     if prefix.is_empty() {
         &FOLDERS
+    } else if prefix.ends_with(BASE) {
+        &BASE_FOLDERS
     } else {
         &PROPOSAL_FOLDERS
     }
@@ -261,7 +268,7 @@ fn state_folders(prefix: &str) -> &'static [(&'static str, &'static str)] {
 
 /// The folders a load reads through, by their vault-relative paths: the state, vault, modules,
 /// collections and walkthroughs folders, and for a proposal its folder, the folder holding it,
-/// its own modules and collections folders and its base's.
+/// its own modules, collections and walkthroughs folders and its base's.
 fn folders(dir: &Path, proposal: Option<&str>) -> Vec<(String, PathBuf)> {
     let mut folders = vec![
         ("..".to_owned(), dir.parent().unwrap_or(dir).to_path_buf()),
@@ -645,7 +652,8 @@ fn check(
     }
     let model = manifest.map(|m| m.id.as_str());
     flows::check(model, modules, collections, problems);
-    walkthroughs::check(model, config, contents, problems);
+    let own = proposal.map(|(_, p)| p.id.as_str());
+    walkthroughs::check(model, own, config, contents, problems);
     pictures::check(model, config, contents, problems);
     views::check(
         model,
@@ -923,8 +931,8 @@ fn file_subject(path: &str) -> &str {
 }
 
 /// Whether a journaled write may write or delete `path`: the manifest, a module, collection,
-/// walkthrough, picture or view file of the current state, a module or collection file of a
-/// proposal or its base, or a proposal's `proposal.json`.
+/// walkthrough, picture or view file of the current state, a module, collection or walkthrough
+/// file of a proposal, a module or collection file of its base, or a proposal's `proposal.json`.
 fn is_written(path: &str) -> bool {
     match split_proposal(path) {
         Some((id, rest)) => ids::is_local(id) && is_proposal_file(rest),
@@ -933,9 +941,13 @@ fn is_written(path: &str) -> bool {
 }
 
 /// Whether a proposal-relative path names a file a journaled write may write in a proposal
-/// folder: its `proposal.json`, or a module or collection file of its own or of its base.
+/// folder: its `proposal.json`, a module, collection or walkthrough file of its own, or a module
+/// or collection file of its base.
 pub(super) fn is_proposal_file(rest: &str) -> bool {
-    rest == PROPOSAL || is_id_file(rest.strip_prefix(BASE).unwrap_or(rest), &PROPOSAL_FOLDERS)
+    match rest.strip_prefix(BASE) {
+        Some(base) => is_id_file(base, &BASE_FOLDERS),
+        None => rest == PROPOSAL || is_id_file(rest, &PROPOSAL_FOLDERS),
+    }
 }
 
 /// Whether `path` names a file directly inside one of `folders` by a well-formed local ID.
@@ -1226,7 +1238,7 @@ pub(super) fn is_repo_path(path: &str) -> bool {
 }
 
 fn check_path(problems: &mut Problems, file: &str, subject: &str, field: &str, path: &str) {
-    if !is_repo_path(path) {
+    if !is_repo_path(path) || path.chars().any(char::is_control) {
         problems.push(
             file,
             subject,

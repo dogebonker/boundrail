@@ -3,7 +3,8 @@
 //! a module without its relationships, a collection without its flows, a flow without its
 //! steps, a step without the steps inside it. A relationship's `from` is its owning module, a
 //! flow's `collection` its collection, and a step's `flow` and `parent` the flow and the list
-//! (flow, branch or loop) holding it. Interfaces compare as `model inspect` draws them.
+//! (flow, branch or loop) holding it. A walkthrough compares as a whole, its beats a field.
+//! Interfaces compare as `model inspect` draws them.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -12,7 +13,7 @@ use serde_json::{Map, Value};
 
 use super::ids;
 use super::inspect::{Drawn, Measures, Reach};
-use super::types::{Collection, Module, Step};
+use super::types::{Collection, Module, Step, Walkthrough};
 
 #[derive(Debug, Default, Serialize)]
 pub struct Comparison {
@@ -21,6 +22,9 @@ pub struct Comparison {
     pub collections: Changes,
     pub flows: Changes,
     pub steps: Changes,
+    /// Left out when no walkthrough differs, so comparisons without one read as they did.
+    #[serde(skip_serializing_if = "Changes::is_empty")]
+    pub walkthroughs: Changes,
 }
 
 #[derive(Debug, Default, PartialEq, Eq, Serialize)]
@@ -28,6 +32,12 @@ pub struct Changes {
     pub added: Vec<Entry>,
     pub removed: Vec<Entry>,
     pub changed: Vec<Entry>,
+}
+
+impl Changes {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -106,20 +116,19 @@ pub struct MeasuresRow {
 
 impl Comparison {
     /// The sections by plural noun, in reading order.
-    pub fn sections(&self) -> [(&'static str, &Changes); 5] {
+    pub fn sections(&self) -> [(&'static str, &Changes); 6] {
         [
             ("modules", &self.modules),
             ("relationships", &self.relationships),
             ("collections", &self.collections),
             ("flows", &self.flows),
             ("steps", &self.steps),
+            ("walkthroughs", &self.walkthroughs),
         ]
     }
 
     pub fn is_empty(&self) -> bool {
-        self.sections()
-            .iter()
-            .all(|(_, c)| **c == Changes::default())
+        self.sections().iter().all(|(_, c)| c.is_empty())
     }
 
     pub fn counts(&self) -> Counts {
@@ -230,7 +239,15 @@ pub fn compare(
         }),
         flows: side(flows),
         steps: side(steps),
+        walkthroughs: Changes::default(),
     }
+}
+
+/// What `after` changes against `before`, both walkthroughs of the model `model`, each compared
+/// as its whole file.
+pub fn walkthroughs(model: &str, before: &[Walkthrough], after: &[Walkthrough]) -> Changes {
+    let whole = |list: &[Walkthrough]| by_id(list, |w| (&w.id, fields(w, &[])));
+    changes(model, whole(before), whole(after))
 }
 
 /// Each item's comparable fields by local ID.

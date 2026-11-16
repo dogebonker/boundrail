@@ -16,14 +16,20 @@ claims and refusals.
 ## Steps
 
 1. **Draw.** One spec gets one proposal. `boundrail model propose --name "<plan>" --doing "<why>" --operation-id <operation-id>`. Add
-   `--from <proposal>` to copy another draft instead of the current state, and `--description`
-   for the intent. The receipt's `allocated[0].id` is the proposal's qualified ID; its local ID is
-   the part after `#`.
+   `--from <proposal>` to copy another draft instead of the current state, `--summary` for one
+   line saying what it changes, `--description` for the intent, and `--document "<title>"
+   <path-or-https-url>` (repeatable) to link the spec. The receipt's `allocated[0].id` is the
+   proposal's qualified ID; its local ID is the part after `#`. Every command that takes a
+   proposal also takes its name when no other proposal has it; on `SUBJECT_AMBIGUOUS` use an ID
+   from `details.matches`.
 2. **Edit.** Read it with `boundrail model read --proposal <proposal>`. Write a `model-edit` request with
    `target.state` set to the proposal's local ID and `expected_revision` set to that read's
    `revision.digest`, then run
    `boundrail model edit --proposal <proposal> --doing "<why>" --input <request.json>`.
-   Walkthroughs and pictures belong to the current state; a proposal edit refuses them.
+   An `edit-proposal` change renames it or sets and clears its description, summary and
+   documents: `{"type": "edit-proposal", "set": {"summary": "<line>"}}`. Walkthroughs may live in
+   the proposal; pictures and saved views belong to the current state and a proposal edit
+   refuses them.
 3. **Check.** `boundrail model check --proposal <proposal> --format markdown`. Done when the plan adds no
    warning you cannot explain.
 4. **Compare.** `boundrail model compare <proposal> --format markdown` lists what the plan adds, removes
@@ -41,12 +47,12 @@ of the modules and relationships the proposal names; every subject `model compar
 to exactly one slice. Commit the proposal folder before the first ticket, so every ticket's
 branch holds it.
 
-1. **Record the slices.** Write each slice's ticket and subjects in `--description` when you
-   draw the proposal. A current-state walkthrough (`add-walkthrough`, one beat per slice, `state`
-   `{"proposal": "<proposal>"}`, `against` `"current"`, `focus` the slice's modules, title naming
-   the ticket) edits the current state: use it only when the description cannot hold the slices,
-   and tell the person that adopt will then refuse `PREDECESSOR_MOVED` until you reconcile. Done
-   when every subject `model compare` lists sits in one slice.
+1. **Record the slices.** Write each slice's ticket and subjects in the proposal's description
+   (`--description`, or later `edit-proposal`), or as a walkthrough inside the proposal:
+   `add-walkthrough` in a `model edit --proposal` request, one beat per slice, `against`
+   `"current"`, `focus` the slice's modules, title naming the ticket. A beat there reads the
+   proposal unless its `state` names another. Done when every subject `model compare` lists sits
+   in one slice.
 2. **Gate each ticket.** On the ticket's branch run
    `boundrail model footprint --proposal <proposal> --fail-outside --format markdown`. Exit 1 names the
    modules the branch changes outside the proposal. For each, decide:
@@ -75,8 +81,9 @@ boundrail model adopt <proposal> \
     --doing "<why>" --operation-id <operation-id>
 ```
 
-The proposal's files replace the current state's; the output's `revision` is the current state's
-new revision. The adopted proposal stays, reading only. On the default branch, retain and
+The proposal's files replace the current state's and its walkthroughs join the current state's;
+the output's `revision` is the current state's new revision. The adopted proposal stays, reading
+only. On the default branch, retain and
 publish the adopted model as boundrail-pr says under After the merge.
 
 ## Shelve

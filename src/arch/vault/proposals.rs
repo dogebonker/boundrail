@@ -12,12 +12,15 @@ use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
 
 use super::{
-    FileWrite, Model, PROPOSAL_FOLDERS, Problems, SCHEMA_VERSION, check_name, check_text,
-    collection_file, file_json, invalid, is_link, linked, listed, load_dir, load_scope,
+    BASE_FOLDERS, FileWrite, Model, NAME_MAX, Problems, SCHEMA_VERSION, check_name, check_path,
+    check_text, collection_file, file_json, invalid, is_link, linked, listed, load_dir, load_scope,
     module_file, parse_message, plan_writes,
 };
-use crate::arch::types::{Collection, DESCRIPTION_MAX, Module, Proposal, ProposalStatus};
-use crate::arch::{Code, Refusal, ids, state};
+use crate::arch::types::{
+    Collection, DESCRIPTION_MAX, Document, Module, Proposal, ProposalStatus, SUMMARY_MAX, URL_MAX,
+    is_https,
+};
+use crate::arch::{Code, Refusal, ids, one_line, state};
 use crate::files::refuse_symlink;
 
 /// The folder of proposals, one folder per proposal ID, and the file each one holds.
@@ -94,19 +97,36 @@ pub(super) fn unprefixed(path: &str) -> &str {
     split_proposal(path).map_or(path, |(_, rest)| rest)
 }
 
-/// Loads the proposal `subject` names, its local or qualified ID, from the vault folder `dir`:
-/// its modules and collections with the vault's manifest and config. Its revision covers the
-/// proposal's own files.
+/// Loads the proposal `subject` names from the vault folder `dir`: its local or qualified ID,
+/// else its unique name, compared with case. It holds its modules, collections and walkthroughs
+/// with the vault's manifest and config, and its revision covers the proposal's own files. A name
+/// that more than one proposal has refuses `SUBJECT_AMBIGUOUS`, listing their IDs.
 pub fn load_proposal(dir: PathBuf, subject: &str) -> Result<Model> {
     let id = subject.split_once('#').map_or(subject, |(_, local)| local);
-    if !is_proposal(&dir, id)? {
-        return Err(proposal_not_found(subject));
+    if is_proposal(&dir, id)? {
+        let model = load_scope(dir.clone(), Some(id))?;
+        if !subject.contains('#') || model.qualify(id) == subject {
+            return Ok(model);
+        }
     }
-    let model = load_scope(dir, Some(id))?;
-    if subject.contains('#') && model.qualify(id) != subject {
-        return Err(proposal_not_found(subject));
+    let id = named(&dir, subject)?;
+    load_scope(dir, Some(&id))
+}
+
+fn named(dir: &Path, subject: &str) -> Result<String> {
+    let mut found: Vec<String> = (proposals(dir)?.into_iter())
+        .filter(|id| read_proposal(dir, id).is_ok_and(|p| p.name == subject))
+        .collect();
+    match found.len() {
+        0 => Err(proposal_not_found(subject)),
+        1 => Ok(found.remove(0)),
+        n => Err(Refusal::new(
+            Code::SubjectAmbiguous,
+            format!("{n} proposals are named `{subject}`; name one by ID"),
+        )
+        .with_details(serde_json::json!({ "matches": found }))
+        .into()),
     }
-    Ok(model)
 }
 
 /// The proposal `state` names, when a proposal has that local ID, else the current state.
@@ -121,7 +141,7 @@ pub fn load_state(dir: PathBuf, state: &str) -> Result<Model> {
 fn proposal_not_found(subject: &str) -> anyhow::Error {
     Refusal::new(
         Code::SubjectNotFound,
-        format!("no proposal has the ID `{subject}`"),
+        format!("no proposal has the ID or name `{subject}`"),
     )
     .into()
 }
@@ -202,7 +222,7 @@ pub fn load_base(model: &Model) -> Result<Option<(Vec<Module>, Vec<Collection>)>
     };
     let base = base_prefix(&proposal.id);
     let mut problems = Problems::default();
-    let (dir, folders) = (&model.dir, PROPOSAL_FOLDERS);
+    let (dir, folders) = (&model.dir, BASE_FOLDERS);
     let mut modules = base_files(dir, &base, folders[0], module_id, &mut problems)?;
     let mut collections = base_files(dir, &base, folders[1], collection_id, &mut problems)?;
     if !problems.0.is_empty() {
@@ -315,6 +335,15 @@ pub(super) fn check_proposal(file: &str, proposal: &Proposal, problems: &mut Pro
         Some(DESCRIPTION_MAX),
         true,
     );
+    if let Some(summary) = &proposal.summary
+        && !one_line(summary, SUMMARY_MAX)
+    {
+        let message = format!("summary needs one line of 1 to {SUMMARY_MAX} characters");
+        problems.push(file, id, message);
+    }
+    for document in &proposal.documents {
+        check_document(problems, file, id, document);
+    }
     for named in proposal
         .predecessor
         .state
@@ -336,5 +365,30 @@ pub(super) fn check_proposal(file: &str, proposal: &Proposal, problems: &mut Pro
             id,
             "an adopted proposal names the state it became in adopted_as, and only an adopted one",
         );
+    }
+}
+
+fn check_document(problems: &mut Problems, file: &str, id: &str, document: &Document) {
+    let title = &document.title;
+    if !one_line(title, NAME_MAX) {
+        let message =
+            format!("document title needs 1 to {NAME_MAX} characters and no control characters");
+        problems.push(file, id, message);
+    }
+    match (&document.path, &document.url) {
+        (Some(path), None) => {
+            check_path(problems, file, id, &format!("document {title}: path"), path);
+        }
+        (None, Some(url)) if !is_https(url) => {
+            let message = format!(
+                "document {title}: url needs https:// and at most {URL_MAX} characters without spaces"
+            );
+            problems.push(file, id, message);
+        }
+        (None, Some(_)) => {}
+        _ => {
+            let message = format!("document {title} needs a path or a url, not both");
+            problems.push(file, id, message);
+        }
     }
 }

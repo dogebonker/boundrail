@@ -1347,6 +1347,42 @@ fn operation_ids_replay_their_receipt_or_refuse_another_request() {
 }
 
 #[test]
+fn a_reading_without_a_state_keeps_the_fingerprint_it_had_when_state_defaulted_to_current() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let request = checkout.request(json!([{"type": "add-walkthrough", "walkthrough": {
+        "name": "Tour", "order": 0,
+        "beats": [{"title": "All", "narration": "Everything.", "reading": {"view": "architecture"}}],
+    }}]));
+    let (code, first) = checkout.edit(&request);
+    assert_eq!(code, 0, "{first:#}");
+    // The request as it serialized when an absent state read `current`.
+    let old = format!(
+        concat!(
+            r#"{{"target":{{"model":{},"state":{}}},"expected_revision":{},"operation_id":{},"#,
+            r#""writer":"tester","changes":[{{"type":"add-walkthrough","walkthrough":{{"#,
+            r#""name":"Tour","order":0,"description":null,"beats":[{{"title":"All","#,
+            r#""narration":"Everything.","reading":{{"view":"architecture","state":"current","#,
+            r#""against":null,"scope":null,"depth":null,"flow":null,"focus":[],"selection":[],"#,
+            r#""filters":null,"groups":null,"visibility":null}}}}]}}}}]}}"#,
+        ),
+        request["target"]["model"],
+        request["target"]["state"],
+        request["expected_revision"],
+        request["operation_id"],
+    );
+    let record = checkout.path().join(format!(
+        ".git/boundrail/operations/{}.json",
+        request["operation_id"].as_str().unwrap()
+    ));
+    let record: Value = serde_json::from_str(&fs::read_to_string(record).unwrap()).unwrap();
+    assert_eq!(record["request_sha256"], sha256(old.as_bytes()));
+    let (code, again) = checkout.edit(&request);
+    assert_eq!(code, 0, "{again:#}");
+    assert_eq!(again, first);
+}
+
+#[test]
 fn a_held_edit_lock_refuses() {
     let checkout = Checkout::new();
     shop(&checkout);
@@ -4964,6 +5000,22 @@ fn a_claim_on_a_proposal_blocks_another_writers_edit_inside_it() {
     let (code, out) = checkout.pipe(&["claim", "--doing", "reserve web"], &request);
     assert_eq!(code, 2, "{out:#}");
     assert_eq!(out["error"]["code"], "CLAIM_CONFLICT");
+
+    // The claim holds the proposal's walkthroughs too.
+    let add = json!([{"type": "add-walkthrough", "walkthrough": {"name": "Plan", "order": 0}}]);
+    let mut request = proposal_request(&checkout, &id, "alice", add);
+    request["claim"] = claim["id"].clone();
+    let (code, out) = edit_proposal(&checkout, &id, &request);
+    assert_eq!(code, 0, "{out:#}");
+    let reorder = json!([{"type": "edit-walkthrough", "subject": "Plan", "set": {"order": 1}}]);
+    let request = proposal_request(&checkout, &id, "bob", reorder.clone());
+    let (code, out) = edit_proposal(&checkout, &id, &request);
+    assert_eq!(code, 2, "{out:#}");
+    assert_eq!(out["error"]["code"], "CLAIM_CONFLICT");
+    let mut request = proposal_request(&checkout, &id, "alice", reorder);
+    request["claim"] = claim["id"].clone();
+    let (code, out) = edit_proposal(&checkout, &id, &request);
+    assert_eq!(code, 0, "{out:#}");
 }
 
 #[cfg(unix)]
@@ -5233,6 +5285,316 @@ fn proposals_list_each_folder_even_when_one_does_not_read() {
         entry(&bad)["error"].as_str().unwrap().contains("parsing"),
         "{listed:#}"
     );
+}
+
+fn propose_with(checkout: &Checkout, name: &str, more: &[&str]) -> (i32, Value) {
+    let operation = operation();
+    let mut args = vec!["propose", "--name", name, "--doing", "draw a plan"];
+    args.extend(["--writer", "tester", "--operation-id", &operation]);
+    args.extend(more);
+    checkout.run(&args)
+}
+
+#[test]
+fn proposal_metadata_is_set_at_propose_and_changed_through_edit_proposal() {
+    let checkout = committed();
+    let model = shop(&checkout);
+    let (code, out) = propose_with(
+        &checkout,
+        "Next",
+        &[
+            "--summary",
+            "Split billing from payments",
+            "--document",
+            "Spec",
+            "docs/next.md",
+            "--document",
+            "Ticket",
+            "https://tickets.example/SHOP-1",
+        ],
+    );
+    assert_eq!(code, 0, "{out:#}");
+    let id = local(out["allocated"][0]["id"].as_str().unwrap()).to_owned();
+    let read = checkout.ok(&["read", "--proposal", &id]);
+    assert_eq!(read["proposal"]["summary"], "Split billing from payments");
+    assert_eq!(
+        read["proposal"]["documents"],
+        json!([
+            {"title": "Spec", "path": "docs/next.md"},
+            {"title": "Ticket", "url": "https://tickets.example/SHOP-1"},
+        ])
+    );
+    let listed = checkout.ok(&["proposals"]);
+    assert_eq!(
+        listed["proposals"][0]["summary"],
+        "Split billing from payments"
+    );
+    assert_eq!(listed["proposals"][0]["documents"][1]["title"], "Ticket");
+    let (code, text) = checkout.run_raw(&["read", "--proposal", &id, "--format", "markdown"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.contains("Summary: Split billing from payments\n"),
+        "{text}"
+    );
+    assert!(text.contains("Document: Spec docs/next.md\n"), "{text}");
+
+    // Renaming and the other fields go through the journaled edit, which retains a checkpoint.
+    let out = edited_proposal(
+        &checkout,
+        &id,
+        json!([{"type": "edit-proposal",
+            "set": {"name": " Payments split ", "description": "Why we split",
+                    "documents": [{"title": "Design", "path": "docs/design.md"}]},
+            "clear": ["summary"]}]),
+    );
+    assert_eq!(out["subjects"]["changed"], json!([format!("{model}#{id}")]));
+    let retained = out["checkpoint"].clone();
+    assert_eq!(retained["proposal"], id);
+    assert_eq!(retained["doing"], "plan ahead");
+    assert_eq!(retained["revision"], proposal_digest(&checkout, &id));
+    assert_eq!(checkpoints(&checkout)[0], retained);
+    let read = checkout.ok(&["read", "--proposal", &id]);
+    let drawn = &read["proposal"];
+    assert_eq!(drawn["name"], "Payments split");
+    assert_eq!(drawn["description"], "Why we split");
+    assert_eq!(drawn.get("summary"), None);
+    assert_eq!(
+        drawn["documents"],
+        json!([{"title": "Design", "path": "docs/design.md"}])
+    );
+    let file = fs::read_to_string(
+        checkout
+            .vault()
+            .join(format!("proposals/{id}/proposal.json")),
+    )
+    .unwrap();
+    assert!(!file.contains("summary"), "{file}");
+
+    let refused = |changes: Value, code: &str| {
+        let request = proposal_request(&checkout, &id, "tester", changes);
+        let (status, out) = edit_proposal(&checkout, &id, &request);
+        assert_eq!(status, 2, "{out:#}");
+        assert_eq!(out["error"]["code"], code, "{out:#}");
+        out["error"].clone()
+    };
+    refused(
+        json!([{"type": "edit-proposal", "set": {"summary": "x"}, "clear": ["summary"]}]),
+        "REQUEST_INVALID",
+    );
+    refused(
+        json!([{"type": "edit-proposal", "set": {"summary": "two\nlines"}}]),
+        "MODEL_INVALID",
+    );
+    refused(
+        json!([{"type": "edit-proposal", "set": {"name": "  "}}]),
+        "NAME_INVALID",
+    );
+    for document in [
+        json!({"title": "Plain", "url": "http://tickets.example/SHOP-1"}),
+        json!({"title": "Outside", "path": "../elsewhere.md"}),
+        json!({"title": "Bell", "path": "docs/a\u{7}.md"}),
+        json!({"title": "Both", "path": "docs/a.md", "url": "https://tickets.example/a"}),
+        json!({"title": "Neither"}),
+    ] {
+        let error = refused(
+            json!([{"type": "edit-proposal", "set": {"documents": [document]}}]),
+            "MODEL_INVALID",
+        );
+        assert_eq!(error["details"]["problems"][0]["change"], 0, "{error:#}");
+    }
+    let (code, out) = propose_with(&checkout, "Other", &["--document", "Spec", "/etc/passwd"]);
+    assert_eq!(code, 2, "{out:#}");
+    assert_eq!(out["error"]["code"], "MODEL_INVALID");
+    // The current state has no proposal fields.
+    let error = checkout.edit_refused(
+        &checkout.request(json!([{"type": "edit-proposal", "set": {"name": "Now"}}])),
+        "REQUEST_INVALID",
+    );
+    assert_eq!(error["details"]["change"], 0);
+
+    // A proposal drawn without them writes neither key, as proposals did before.
+    let plain = propose(&checkout, "Plain", "current");
+    let file = fs::read_to_string(
+        checkout
+            .vault()
+            .join(format!("proposals/{plain}/proposal.json")),
+    )
+    .unwrap();
+    assert!(
+        !file.contains("summary") && !file.contains("documents"),
+        "{file}"
+    );
+}
+
+#[test]
+fn a_proposal_is_named_by_its_id_or_its_unique_name() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let (next, _) = next(&checkout);
+    let later = propose(&checkout, "Later", "current");
+    let read = checkout.ok(&["read", "--proposal", "Next"]);
+    assert_eq!(read["proposal"]["id"], next);
+    let compared = checkout.ok(&["compare", "Next", "--against", "Later"]);
+    assert_eq!(compared["proposal"]["id"], format!("{model}#{next}"));
+    assert_eq!(compared["against"]["id"], format!("{model}#{later}"));
+    checkout.render(&["--proposal", "Next", "--against", "Later"]);
+    let inspected = checkout.ok(&["inspect", "--proposal", "Next"]);
+    assert_eq!(inspected["proposal"]["id"], next);
+    // The request's target names the proposal's ID; --proposal may name it.
+    let changes = json!([{"type": "edit-proposal", "set": {"summary": "Later on"}}]);
+    let request = proposal_request(&checkout, &later, "tester", changes);
+    let (code, out) = edit_proposal(&checkout, "Later", &request);
+    assert_eq!(code, 0, "{out:#}");
+    assert_eq!(
+        out["subjects"]["changed"],
+        json!([format!("{model}#{later}")])
+    );
+    let copy = propose(&checkout, "Copy", "Next");
+    assert_eq!(
+        checkout.ok(&["read", "--proposal", &copy])["proposal"]["predecessor"],
+        read["proposal"]["predecessor"]
+    );
+
+    // A second proposal named Next makes the name ambiguous; an exact ID still wins.
+    let twin = propose(&checkout, "Next", "current");
+    let error = checkout.refused(&["read", "--proposal", "Next"], "SUBJECT_AMBIGUOUS");
+    let mut matches = vec![next.clone(), twin.clone()];
+    matches.sort();
+    assert_eq!(error["details"]["matches"], json!(matches));
+    checkout.refused(&["compare", "Next"], "SUBJECT_AMBIGUOUS");
+    let named_like_an_id = propose(&checkout, &later, "current");
+    let read = checkout.ok(&["read", "--proposal", &later]);
+    assert_eq!(read["proposal"]["id"], later);
+    let read = checkout.ok(&["read", "--proposal", &format!("{model}#{later}")]);
+    assert_eq!(read["proposal"]["id"], later);
+    assert_ne!(named_like_an_id, later);
+    checkout.refused(&["read", "--proposal", "Nowhere"], "SUBJECT_NOT_FOUND");
+    checkout.refused(&["read", "--proposal", "next"], "SUBJECT_NOT_FOUND");
+
+    let out = checkout.ok(&[
+        "shelve",
+        "Later",
+        "--expected-revision",
+        &proposal_digest(&checkout, &later),
+        "--doing",
+        "set it aside",
+        "--writer",
+        "tester",
+        "--operation-id",
+        &operation(),
+    ]);
+    assert_eq!(
+        out["subjects"]["changed"],
+        json!([format!("{model}#{later}")])
+    );
+    let (code, out) = adopt(&checkout, "Copy", &checkout.digest());
+    assert_eq!(code, 0, "{out:#}");
+    assert_eq!(
+        checkout.ok(&["read"])["manifest"]["current"]["name"],
+        "Copy"
+    );
+}
+
+#[test]
+fn a_walkthrough_authored_in_a_proposal_reads_it_and_is_adopted_with_it() {
+    let checkout = Checkout::new();
+    let model = shop(&checkout);
+    let q = |id: &str| format!("{model}#{id}");
+    let (id, ledger) = next(&checkout);
+    let out = edited_proposal(
+        &checkout,
+        &id,
+        json!([{"type": "add-walkthrough", "walkthrough": {"name": "Slices", "order": 0,
+            "beats": [{"title": "SHOP-1 ledger", "narration": "The ledger lands first.",
+                       "reading": {"view": "architecture", "against": "current",
+                                   "focus": ["Ledger"]}}]}}]),
+    );
+    let slices = out["allocated"][0]["id"].as_str().unwrap().to_owned();
+    assert_eq!(out["subjects"]["added"], json!([slices]));
+    assert_eq!(out["checkpoint"]["proposal"], id);
+    let retained = out["checkpoint"]["id"].as_str().unwrap();
+    let read = checkout.ok(&["read", "--checkpoint", retained]);
+    assert_eq!(read["walkthroughs"][0]["id"], slices);
+    assert!(
+        checkout
+            .vault()
+            .join(format!(
+                "proposals/{id}/walkthroughs/{}.walkthrough.json",
+                local(&slices)
+            ))
+            .is_file()
+    );
+    // Its beat reads the proposal, against the current state, by default.
+    let read = checkout.ok(&["read", "--proposal", &id, "--walkthrough", "Slices"]);
+    let reading = &read["walkthrough"]["beats"][0]["reading"];
+    assert_eq!(reading["state"], json!({"proposal": q(&id)}));
+    assert_eq!(reading["against"], "current");
+    assert_eq!(reading["focus"], json!([q(&ledger)]));
+    assert_eq!(checkout.ok(&["read"])["walkthroughs"], json!([]));
+    let svg = checkout.render(&["--proposal", &id, "--walkthrough", "Slices", "--beat", "1"]);
+    assert!(svg.contains(&q(&ledger)), "{svg}");
+    checkout.refused(
+        &["render", "--walkthrough", "Slices", "--beat", "1"],
+        "SUBJECT_NOT_FOUND",
+    );
+    let (_, checked) = checkout.run(&["check", "--proposal", &id, "--only", "semantic"]);
+    assert_eq!(checked["kind"], "check", "{checked:#}");
+    let codes: Vec<&Value> = (checked["diagnostics"].as_array().unwrap().iter())
+        .map(|d| &d["code"])
+        .collect();
+    assert!(
+        !codes.contains(&&json!("WALKTHROUGH_TARGET_MISSING")),
+        "{checked:#}"
+    );
+
+    // Removing what one of its beats reads refuses, as in the current state.
+    let request = proposal_request(
+        &checkout,
+        &id,
+        "tester",
+        json!([{"type": "remove-module", "subject": "Ledger"}]),
+    );
+    let (code, out) = edit_proposal(&checkout, &id, &request);
+    assert_eq!(code, 2, "{out:#}");
+    assert_eq!(out["error"]["code"], "REFERENCED_BY_WALKTHROUGH");
+
+    // It compares as adoption would add it to the current state's walkthroughs.
+    let compared = checkout.ok(&["compare", &id]);
+    assert_eq!(compared["walkthroughs"]["added"][0]["id"], slices);
+    assert_eq!(compared["walkthroughs"]["removed"], json!([]));
+    let current = checkout.ok(&["compare", &propose(&checkout, "Empty", "current")]);
+    assert_eq!(current.get("walkthroughs"), None, "{current:#}");
+
+    // Reconciling keeps it, and adoption adds it to the current state, still reading the
+    // proposal it was told in.
+    checkout.edited(
+        json!([{"type": "add-module", "module": {"name": "Audit", "kind": "service", "order": 5}}]),
+    );
+    let (code, out) = adopt(&checkout, &id, &checkout.digest());
+    assert_eq!(out["error"]["code"], "PREDECESSOR_MOVED", "{code} {out:#}");
+    let (code, out) = reconcile(&checkout, &id);
+    assert_eq!(code, 0, "{out:#}");
+    let read = checkout.ok(&["read", "--proposal", &id]);
+    assert_eq!(read["walkthroughs"][0]["id"], slices);
+    // A walkthrough ID the current state holds too is not replaced: adoption refuses.
+    let file = format!("walkthroughs/{}.walkthrough.json", local(&slices));
+    let text = fs::read_to_string(checkout.vault().join(format!("proposals/{id}/{file}"))).unwrap();
+    checkout.write(&file, &text);
+    let (code, out) = adopt(&checkout, &id, &checkout.digest());
+    assert_eq!(out["error"]["code"], "MODEL_INVALID", "{code} {out:#}");
+    fs::remove_file(checkout.vault().join(&file)).unwrap();
+    let (code, out) = adopt(&checkout, &id, &checkout.digest());
+    assert_eq!(code, 0, "{out:#}");
+    assert!(
+        out["subjects"]["added"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(slices))
+    );
+    let read = checkout.ok(&["read", "--walkthrough", "Slices"]);
+    let reading = &read["walkthrough"]["beats"][0]["reading"];
+    assert_eq!(reading["state"], json!({"proposal": q(&id)}));
+    checkout.render(&["--walkthrough", "Slices", "--beat", "1"]);
 }
 
 #[test]
@@ -9569,17 +9931,17 @@ fn removing_a_module_a_beat_reads_refuses() {
         {"type": "remove-module", "subject": "Bank"},
     ]));
 
-    // Proposals hold no walkthroughs.
+    // Proposals hold no saved views or pictures.
     let id = propose(&checkout, "Next", "current");
-    let request = proposal_request(
-        &checkout,
-        &id,
-        "tester",
-        json!([{"type": "add-walkthrough", "walkthrough": {"name": "Plan", "order": 0}}]),
-    );
-    let (code, out) = edit_proposal(&checkout, &id, &request);
-    assert_eq!(code, 2, "{out:#}");
-    assert_eq!(out["error"]["code"], "REQUEST_INVALID");
+    for change in [
+        json!({"type": "add-view", "view": {"name": "Plan", "order": 0, "reading": {"view": "architecture"}}}),
+        json!({"type": "add-picture", "picture": {"name": "Plan", "order": 0, "output": "docs/plan.svg", "reading": {"view": "architecture"}}}),
+    ] {
+        let request = proposal_request(&checkout, &id, "tester", json!([change]));
+        let (code, out) = edit_proposal(&checkout, &id, &request);
+        assert_eq!(code, 2, "{out:#}");
+        assert_eq!(out["error"]["code"], "REQUEST_INVALID");
+    }
 }
 
 #[test]
@@ -11125,6 +11487,18 @@ fn an_exported_proposal_imports_into_another_clone_of_the_model() {
     let (first, second) = clones();
 
     let (id, _) = next(&first);
+    let documents = json!([{"title": "Plan", "path": "docs/plan.md"}]);
+    edited_proposal(
+        &first,
+        &id,
+        json!([
+            {"type": "edit-proposal", "set": {"summary": "Ledger first", "documents": documents}},
+            {"type": "add-walkthrough", "walkthrough": {"name": "Tour", "order": 0, "beats": [
+                {"title": "After", "narration": "The ledger lands.",
+                 "reading": {"view": "architecture", "against": "current"}},
+            ]}},
+        ]),
+    );
     let bundle = export(&first, &["--proposal", &id]);
     assert_eq!(bundle["source"]["kind"], "proposal");
     assert!(bundle["files"]["proposal.json"].is_string());
@@ -11133,10 +11507,19 @@ fn an_exported_proposal_imports_into_another_clone_of_the_model() {
     let copy = imported(&second, &bundle);
     let read = |checkout: &Checkout, id: &str| names(&checkout.ok(&["read", "--proposal", id]));
     assert_eq!(read(&second, &copy), read(&first, &id));
+    let drawn = second.ok(&["read", "--proposal", &copy]);
+    assert_eq!(drawn["proposal"]["name"], "Next");
+    assert_eq!(drawn["proposal"]["summary"], "Ledger first");
+    assert_eq!(drawn["proposal"]["documents"], documents);
+    // Its beat reads the imported draft rather than the bundled proposal.
+    let model = drawn["manifest"]["id"].as_str().unwrap();
+    let tour = second.ok(&["read", "--proposal", &copy, "--walkthrough", "Tour"]);
+    let reading = &tour["walkthrough"]["beats"][0]["reading"];
     assert_eq!(
-        second.ok(&["read", "--proposal", &copy])["proposal"]["name"],
-        "Next"
+        reading["state"],
+        json!({"proposal": format!("{model}#{copy}")})
     );
+    assert_eq!(reading["against"], "current");
     let (code, out) = adopt(&second, &copy, &second.digest());
     assert_eq!(code, 0, "{out:#}");
 }

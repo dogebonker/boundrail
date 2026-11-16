@@ -24,8 +24,8 @@ use super::request::{
 use super::revision::{self, Revision};
 use super::state::{self, Locked};
 use super::types::{
-    Anchor, Binding, Collection, Emphasis, Module, Picture, Reference, Relationship,
-    SCHEMA_VERSION, SavedView, Step, Traffic, Walkthrough, walk,
+    Anchor, Binding, Collection, Document, Emphasis, Module, Picture, Proposal, ReadingState,
+    Reference, Relationship, SCHEMA_VERSION, SavedView, Step, Traffic, Walkthrough, walk,
 };
 use super::vault::{self, FileWrite, Model, Scope, relationships};
 use super::{Code, Refusal, ids, proposal};
@@ -85,7 +85,7 @@ pub struct EditRequest {
 /// subject is a qualified or local ID or a unique name, likewise; a relationship, step, branch or
 /// beat subject is a qualified or local ID. A step's or beat's position is its index in its list,
 /// the end when absent. A picture or view subject is a qualified or local ID or a unique name.
-/// Walkthrough, picture and view changes apply to the current state only.
+/// Picture and view changes apply to the current state only, `edit-proposal` to a proposal only.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Change {
@@ -260,6 +260,33 @@ pub enum Change {
     RemoveView {
         subject: String,
     },
+    /// Sets or clears the edited proposal's name, description, summary and linked documents.
+    EditProposal {
+        #[serde(default)]
+        set: ProposalSet,
+        #[serde(default)]
+        clear: Vec<ProposalField>,
+    },
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProposalSet {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    /// One line saying what the proposal changes.
+    pub summary: Option<String>,
+    /// Replaces the whole list; each document has a repository path or an `https` URL.
+    pub documents: Option<Vec<Document>>,
+}
+
+/// A proposal field `clear` may empty; the name cannot be cleared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposalField {
+    Description,
+    Summary,
+    Documents,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -349,6 +376,16 @@ impl ModuleField {
             Self::Groups => set.groups.is_some(),
             Self::Binding => set.binding.is_some(),
             Self::References => set.references.is_some(),
+        }
+    }
+}
+
+impl ProposalField {
+    fn is_set(self, set: &ProposalSet) -> bool {
+        match self {
+            Self::Description => set.description.is_some(),
+            Self::Summary => set.summary.is_some(),
+            Self::Documents => set.documents.is_some(),
         }
     }
 }
@@ -459,8 +496,9 @@ pub fn run(
     proposal: Option<&str>,
 ) -> Result<(Receipt, Option<Scope>)> {
     check_doing(doing)?;
-    let request: EditRequest = parse(input, "edit")?;
+    let mut request: EditRequest = parse(input, "edit")?;
     check_request(&request)?;
+    request.name_edited_state(proposal.is_some());
     let operation = request.operation_id.clone();
     journaled(vault, &operation, request, |request, dir, fingerprint| {
         let model = vault::load_target(vault.to_path_buf(), proposal)?;
@@ -670,6 +708,32 @@ pub fn interrupted(state: &Path) -> Result<Option<Interrupted>> {
     }))
 }
 
+impl EditRequest {
+    fn name_edited_state(&mut self, in_proposal: bool) {
+        let own = if in_proposal {
+            ReadingState::Proposal(ids::qualify(&self.target.model, &self.target.state))
+        } else {
+            ReadingState::Current
+        };
+        for change in &mut self.changes {
+            let readings: Vec<&mut NewReading> = match change {
+                Change::AddWalkthrough { walkthrough } => walkthrough
+                    .beats
+                    .iter_mut()
+                    .map(|b| &mut b.reading)
+                    .collect(),
+                Change::AddBeat { beat, .. } => vec![&mut beat.reading],
+                Change::AddPicture { picture } => vec![&mut picture.reading],
+                Change::AddView { view } => vec![&mut view.reading],
+                _ => continue,
+            };
+            for reading in readings {
+                reading.state.get_or_insert_with(|| own.clone());
+            }
+        }
+    }
+}
+
 fn check_request(request: &EditRequest) -> Result<()> {
     check_operation(&request.operation_id)?;
     if request.changes.is_empty() || request.changes.len() > CHANGES_MAX {
@@ -715,7 +779,7 @@ fn plan(
         batch.apply(index, change)?;
     }
     batch.finish()?;
-    let diff = diff(
+    let mut diff = diff(
         model,
         &batch.modules,
         &batch.collections,
@@ -724,10 +788,15 @@ fn plan(
         &batch.views,
         &batch.fresh,
     );
+    if batch.proposal != model.proposal {
+        diff.subjects.changed.push(model.root());
+        diff.subjects.changed.sort();
+        diff.affected.insert(model.root());
+    }
 
     // A proposal keeps the IDs it held before the batch and removes, so it never allocates
     // them again; IDs the batch both allocates and removes were never written.
-    let drawn = model.proposal.clone().map(|mut drawn| {
+    let drawn = batch.proposal.clone().map(|mut drawn| {
         let removed = diff.retired.iter().filter(|id| !batch.fresh.contains(id));
         drawn.dropped.extend(removed.cloned());
         drawn.dropped.sort();
@@ -1161,8 +1230,9 @@ struct Batch<'a> {
     walkthroughs: Vec<Walkthrough>,
     pictures: Vec<Picture>,
     views: Vec<SavedView>,
-    /// Whether the batch edits a proposal, which holds no walkthroughs, pictures or views.
-    in_proposal: bool,
+    /// The proposal the batch edits, as `edit-proposal` leaves it; `None` for the current state.
+    /// A proposal holds no pictures or views.
+    proposal: Option<Proposal>,
     removed: BTreeSet<String>,
     /// Local IDs of relationships the batch removed or gave another source or target.
     moved: BTreeSet<String>,
@@ -1187,7 +1257,7 @@ impl<'a> Batch<'a> {
             walkthroughs: model.walkthroughs.clone(),
             pictures: model.pictures.clone(),
             views: model.views.clone(),
-            in_proposal: model.proposal.is_some(),
+            proposal: model.proposal.clone(),
             removed: BTreeSet::new(),
             moved: BTreeSet::new(),
             taken,
@@ -1261,39 +1331,29 @@ impl<'a> Batch<'a> {
                 branch,
             } => self.add_branch(index, &decision, position, branch),
             Change::RemoveBranch { subject } => self.remove_branch(index, &subject),
-            Change::AddWalkthrough { walkthrough } => {
-                self.apply_walkthrough(index, |b| b.add_walkthrough(index, walkthrough))
-            }
+            Change::AddWalkthrough { walkthrough } => self.add_walkthrough(index, walkthrough),
             Change::EditWalkthrough {
                 subject,
                 set,
                 clear,
-            } => {
-                self.apply_walkthrough(index, |b| b.edit_walkthrough(index, &subject, set, &clear))
-            }
-            Change::RemoveWalkthrough { subject } => {
-                self.apply_walkthrough(index, |b| b.remove_walkthrough(index, &subject))
-            }
+            } => self.edit_walkthrough(index, &subject, set, &clear),
+            Change::RemoveWalkthrough { subject } => self.remove_walkthrough(index, &subject),
             Change::AddBeat {
                 walkthrough,
                 position,
                 beat,
-            } => self.apply_walkthrough(index, |b| b.add_beat(index, &walkthrough, position, beat)),
+            } => self.add_beat(index, &walkthrough, position, beat),
             Change::EditBeat {
                 subject,
                 set,
                 clear,
-            } => self.apply_walkthrough(index, |b| b.edit_beat(index, &subject, set, &clear)),
-            Change::RemoveBeat { subject } => {
-                self.apply_walkthrough(index, |b| b.take_beat(index, &subject).map(drop))
-            }
+            } => self.edit_beat(index, &subject, set, &clear),
+            Change::RemoveBeat { subject } => self.take_beat(index, &subject).map(drop),
             Change::MoveBeat {
                 subject,
                 walkthrough,
                 position,
-            } => self.apply_walkthrough(index, |b| {
-                b.move_beat(index, &subject, &walkthrough, position)
-            }),
+            } => self.move_beat(index, &subject, &walkthrough, position),
             Change::AddPicture { picture } => {
                 self.apply_current(index, "pictures", |b| b.add_picture(index, picture))
             }
@@ -1321,7 +1381,46 @@ impl<'a> Batch<'a> {
             Change::RemoveView { subject } => self.apply_current(index, "views", |b| {
                 b.remove_named(index, &subject, |b| &mut b.views)
             }),
+            Change::EditProposal { set, clear } => self.edit_proposal(index, set, &clear),
         }
+    }
+
+    fn edit_proposal(
+        &mut self,
+        index: usize,
+        set: ProposalSet,
+        clear: &[ProposalField],
+    ) -> Result<()> {
+        if let Some(field) = clear.iter().find(|f| f.is_set(&set)) {
+            return Err(both(index, field));
+        }
+        let Some(proposal) = self.proposal.as_mut() else {
+            let message = "edit-proposal changes a proposal; edit one with --proposal".to_owned();
+            return Err(request_invalid(index, message));
+        };
+        let id = proposal.id.clone();
+        if let Some(name) = set.name {
+            proposal.name = vault::valid_name(&name)?.to_owned();
+        }
+        if set.description.is_some() {
+            proposal.description = set.description;
+        }
+        if set.summary.is_some() {
+            proposal.summary = set.summary;
+        }
+        if let Some(documents) = set.documents {
+            proposal.documents = documents;
+        }
+        for field in clear {
+            match field {
+                ProposalField::Description => proposal.description = None,
+                ProposalField::Summary => proposal.summary = None,
+                ProposalField::Documents => proposal.documents.clear(),
+            }
+        }
+        self.edit_once(index, &id)?;
+        self.touched.insert(id, index);
+        Ok(())
     }
 
     fn qualify(&self, at: usize) -> String {
@@ -1812,6 +1911,8 @@ mod tests {
                 id: "Propose1".to_owned(),
                 name: "Next".to_owned(),
                 description: None,
+                summary: None,
+                documents: Vec::new(),
                 status: ProposalStatus::Draft,
                 predecessor: Predecessor {
                     state: Some("State001".to_owned()),

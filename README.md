@@ -64,6 +64,15 @@ inspect` reports each module's interface from the code; `model locality` reads G
 modules that change together; `model render` draws the model as SVG. `boundrail model --help`
 lists every command. [Design notes](docs/plans/architecture-model.md).
 
+A proposal carries a one-line `--summary` and linked `--document <title> <path-or-https-url>`
+entries, shown as text and never fetched; an `edit-proposal` change renames it or sets and clears
+them, retaining a checkpoint like any proposal edit. Every command that takes a proposal also takes
+its name when no other proposal has it: an exact ID wins, and a name two proposals share refuses
+`SUBJECT_AMBIGUOUS` with their IDs. A walkthrough may be written inside a proposal with `model edit
+--proposal`; its beats read the proposal unless they name another state, `model compare` lists it,
+`model render --proposal <id> --walkthrough <w> --beat <n>` draws a beat, and adoption adds it to
+the current state's walkthroughs.
+
 A relationship may describe its `traffic` (`protocol`, `sync` or `async`, `rate`, `payload`),
 which reads, compares and draws after its label. A message step may name the code that sends it
 in an `anchor` (`path` and `symbol`), which `model check` verifies like a relationship's. A flow

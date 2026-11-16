@@ -1,5 +1,6 @@
 //! The walkthrough changes of a `model edit` batch: walkthroughs and their beats, and what the
-//! batch changed in them. Walkthroughs belong to the current state; a proposal edit refuses them.
+//! batch changed in them. Walkthroughs belong to the current state or to a proposal, the state the
+//! batch edits; a beat reads that state unless it names another.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -50,15 +51,15 @@ pub struct NewBeat {
     pub reading: NewReading,
 }
 
-/// A reading to store. In the current state, modules are referenced like module subjects and the
-/// flow by its ID or unique name; in a proposal or checkpoint, by qualified or local ID. A
-/// proposal is named by its qualified or local ID.
+/// A reading to store. In the state the batch edits, modules are referenced like module subjects
+/// and the flow by its ID or unique name; in another proposal or a checkpoint, by qualified or
+/// local ID. A proposal is named by its qualified or local ID.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NewReading {
     pub view: ReadingView,
-    #[serde(default)]
-    pub state: ReadingState,
+    /// The state drawn; absent, the state the batch edits: the current state, or the proposal.
+    pub state: Option<ReadingState>,
     pub against: Option<ReadingState>,
     pub scope: Option<String>,
     pub depth: Option<u32>,
@@ -104,7 +105,7 @@ pub struct ReadingSet {
     pub visibility: Option<u32>,
 }
 
-/// A reading field `clear` empties; clearing `state` reads the current state.
+/// A reading field `clear` empties; clearing `state` reads the state the batch edits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BeatField {
@@ -146,15 +147,6 @@ impl BeatField {
 }
 
 impl Batch<'_> {
-    /// Applies the walkthrough change `change`, refusing it in a proposal, which holds none.
-    pub(super) fn apply_walkthrough(
-        &mut self,
-        index: usize,
-        change: impl FnOnce(&mut Self) -> Result<()>,
-    ) -> Result<()> {
-        self.apply_current(index, "walkthroughs", change)
-    }
-
     /// Applies `change` to what only the current state holds, `what`, refusing it in a proposal.
     pub(super) fn apply_current(
         &mut self,
@@ -162,7 +154,7 @@ impl Batch<'_> {
         what: &str,
         change: impl FnOnce(&mut Self) -> Result<()>,
     ) -> Result<()> {
-        if self.in_proposal {
+        if self.proposal.is_some() {
             let message =
                 format!("{what} belong to the current state; edit them without --proposal");
             return Err(request_invalid(index, message));
@@ -194,6 +186,13 @@ impl Batch<'_> {
         ids::qualify(self.model, ids::local(self.model, subject))
     }
 
+    fn own_state(&self) -> ReadingState {
+        match &self.proposal {
+            Some(p) => ReadingState::Proposal(ids::qualify(self.model, &p.id)),
+            None => ReadingState::Current,
+        }
+    }
+
     fn reading_state(&self, state: ReadingState) -> ReadingState {
         match state {
             ReadingState::Proposal(p) => ReadingState::Proposal(self.qualified(&p)),
@@ -201,7 +200,7 @@ impl Batch<'_> {
         }
     }
 
-    /// A module reference: resolved in the batch for the current state, else qualified.
+    /// A module reference: resolved in the batch for the state it edits, else qualified.
     fn reading_module(&self, index: usize, current: bool, subject: &str) -> Result<String> {
         if current {
             self.module_id(index, subject)
@@ -210,7 +209,7 @@ impl Batch<'_> {
         }
     }
 
-    /// A flow reference: resolved in the batch for the current state, else qualified.
+    /// A flow reference: resolved in the batch for the state it edits, else qualified.
     fn reading_flow(&self, index: usize, current: bool, subject: &str) -> Result<String> {
         if !current {
             return Ok(self.qualified(subject));
@@ -234,8 +233,9 @@ impl Batch<'_> {
     }
 
     pub(super) fn build_reading(&self, index: usize, new: NewReading) -> Result<BeatReading> {
-        let state = self.reading_state(new.state);
-        let current = state.is_current();
+        let own = self.own_state();
+        let state = new.state.map_or(own.clone(), |s| self.reading_state(s));
+        let current = state == own;
         let module = |s: String| self.reading_module(index, current, &s);
         let flow = |s: String| self.reading_flow(index, current, &s);
         let reading = BeatReading {
@@ -255,10 +255,10 @@ impl Batch<'_> {
         Ok(reading)
     }
 
-    /// Refuses a current-state reading whose group filter names a group no module is in: it would
-    /// draw none of that group. Into another state the drawing refuses it instead.
+    /// Refuses a reading of the state the batch edits whose group filter names a group no module
+    /// is in: it would draw none of that group. Into another state the drawing refuses it instead.
     fn refuse_empty_groups(&self, index: usize, reading: &BeatReading) -> Result<()> {
-        if !reading.state.is_current() {
+        if reading.state != self.own_state() {
             return Ok(());
         }
         let mut groups = reading.filters.iter().flat_map(|f| &f.groups);
@@ -423,9 +423,9 @@ impl Batch<'_> {
             reading.state = self.reading_state(state.clone());
         }
         if clear.contains(&BeatField::State) {
-            reading.state = ReadingState::Current;
+            reading.state = self.own_state();
         }
-        let current = reading.state.is_current();
+        let current = reading.state == self.own_state();
         if let Some(view) = set.view {
             reading.view = view;
         }
@@ -476,8 +476,8 @@ impl Batch<'_> {
         Ok(())
     }
 
-    /// Refuses when a current-state beat the batch did not edit names a module or flow the batch
-    /// removed. Stored references held before the batch, so whatever no longer holds, it broke.
+    /// Refuses when a beat of the edited state the batch did not edit names a module or flow the
+    /// batch removed. Stored references held before the batch, so whatever no longer holds, it broke.
     /// A beat the batch edited is judged by validation instead.
     pub(super) fn refuse_walkthrough_references(&self) -> Result<()> {
         let beats = self.walkthroughs.iter().flat_map(|w| &w.beats);
@@ -490,8 +490,8 @@ impl Batch<'_> {
         self.refuse_reading_references(readings, &refused)
     }
 
-    /// Refuses `refused.code` when a current-state reading among `readings` (by the local ID of
-    /// what holds it) that the batch did not edit names a module or flow the batch removed,
+    /// Refuses `refused.code` when a reading of the edited state among `readings` (by the local
+    /// ID of what holds it) that the batch did not edit names a module or flow the batch removed,
     /// listing the holders in `details[refused.key]`.
     pub(super) fn refuse_reading_references<'r>(
         &self,
@@ -506,8 +506,9 @@ impl Batch<'_> {
         let (modules, flows) = vault::reading_ids(model, &self.modules, &self.collections);
         let mut causes: BTreeSet<usize> = BTreeSet::new();
         let mut holders = Vec::new();
+        let own = self.own_state();
         for (id, reading) in readings {
-            if !reading.state.is_current() || self.edited.contains(id) {
+            if reading.state != own || self.edited.contains(id) {
                 continue;
             }
             let named = (reading.scope.iter())

@@ -57,7 +57,7 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 | T23 | Compare: interface changes and interface measures between states, `--beside` alternatives, `--against` a checkpoint | done |
 | T24 | Schema: relationship traffic, step anchors, authored flow participant order, flow summary required on write (`FLOW_SUMMARY_REQUIRED`) | done |
 | T25 | History on every write: each edit, including in proposals, retains a checkpoint with its doing line; publication destination with per-checkpoint status; source-commit availability on checkpoint reads | done |
-| T26 | Proposal metadata: summary, linked documents, rename and edit through `set`, select by unique name; walkthroughs authored inside proposals | open |
+| T26 | Proposal metadata: summary, linked documents, rename and edit through `set`, select by unique name; walkthroughs authored inside proposals | done |
 | T27 | Proposal families: child proposals of a draft, family reconcile, standing, settle conflicts by mine, theirs or edited; `INHERITANCE_DROPPED` and `PART_RECREATED` confirmations | open |
 | T28 | Readings: group regions and group filter; beat selection apart from focus, relationship filters, groups, visibility; saved views that need no output file | done |
 | T29 | Cross-model references: modules reference another model, state or subject, `read --references`, pinned foreign checkpoints; `read --code` resolves and opens the code target | done |
@@ -1520,3 +1520,67 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   label with the reason and no link. Double-clicking a module without parts but with references
   selects it. ponytail: the pane shows the reading as text, not a drawing; render the other model
   when one is needed. The CSP is unchanged and the page makes no request off its own server.
+- T26: `proposal.json` gains `summary` (one line, 1 to 200 characters, `SUMMARY_MAX` as a flow's)
+  and `documents`, a list of `{title, path?, url?}`: a title of 1 to 120 characters on one line
+  and exactly one of a repository path (`is_repo_path`, no control character) or an `https://`
+  URL of at most 2000 characters with no space or control character (`MODEL_INVALID`
+  otherwise). Both are left out of the file when absent, so proposals written before T26 load
+  and digest as they did, and `propose` without them keeps its old fingerprint. Documents are
+  text: nothing reads, fetches or links them; the browser shows the summary and documents as
+  the proposal item's title text. `model propose --summary` and `--document <title>
+  <path-or-url>` (repeatable; a target naming `://` is a URL, else a path) set them, and
+  `model proposals` lists them when present. Importing a proposal bundle carries them; a
+  description is not imported.
+- T26: `edit-proposal` (`set` name, description, summary, documents; `clear` description,
+  summary, documents) is an edit change, so it rides the journaled edit of `model edit
+  --proposal` and retains a proposal checkpoint like every proposal write (T25). In a
+  current-state edit it refuses `REQUEST_INVALID`. The batch holds a copy of `proposal.json`
+  that the change edits, once per batch; validation is the load's (`MODEL_INVALID` with the
+  change index), the name is trimmed and checked as `propose` does (`NAME_INVALID`), and the
+  receipt lists the proposal as changed and
+  claims cover it (the proposal's root level).
+- T26: one resolver, `vault::load_proposal`, takes a proposal's local or qualified ID, else its
+  name compared with case among every `proposal.json` that reads. An exact ID wins, so a
+  proposal named like another's ID never hides it; a name two proposals share refuses
+  `SUBJECT_AMBIGUOUS` with the local IDs in `details.matches`; none refuses `SUBJECT_NOT_FOUND`.
+  Every command loads proposals through it (`--proposal` of read, check, inspect, render,
+  explain, footprint, edit and export, `compare` and its `--against` and `--beside`, `adopt`,
+  `shelve`, `reconcile`, `propose --from`). An edit request's `target.state` stays the ID.
+  Stored readings name proposals by qualified ID and reach the name only when that ID names no
+  proposal, which validation keeps to an ID-shaped name.
+- T26: walkthroughs inside proposals. A proposal holds `walkthroughs/` beside its modules and
+  collections: its revision, `file_digests`, the journal's write allow-list, checkpoints and
+  bundles cover them; the base never holds one. Pictures and saved views stay current-only and
+  a proposal edit with one still refuses `REQUEST_INVALID`. A beat reads the state the batch
+  edits when `state` is absent from the request (`NewReading.state` is optional), stored as
+  `{"proposal": <qualified ID>}` in a proposal, so the file never depends on where it lies and
+  adoption needs no rewrite; `"current"` given explicitly reads the current state, and clearing
+  `state` reads the edited state again. References into the loaded state (the current state, or
+  the proposal for its own walkthroughs) must exist and resolve by name in the batch, others are
+  qualified as given, and `REFERENCED_BY_WALKTHROUGH` judges the loaded state's readings.
+  Walkthrough and beat IDs come from the proposal's allocator; removing one puts its IDs on the
+  `dropped` list, and a claim on the proposal holds its walkthroughs. Before the request is
+  fingerprinted, an absent `state` is filled with the edited state (`"current"`, or the target
+  proposal), so a request written before T26 replays its receipt.
+- T26: adoption. The current state's walkthroughs become its own with the proposal's added,
+  and the adopted state is validated with them, so an ID both hold refuses `MODEL_INVALID`. A
+  beat reading the adopted proposal keeps reading it, read only. `propose --from` copies no
+  walkthrough, since its beats read the source. Import of a proposal bundle carries its
+  walkthroughs, a beat reading or compared with the bundled proposal then naming the new draft;
+  a current-state bundle's are not imported. Reconcile keeps the draft's walkthroughs as they are and validates
+  them over the merge (`MODEL_INVALID`, `cause: "merge"`).
+- T26: compare. `walkthroughs` joins the comparison, each walkthrough compared as its whole file
+  (`beats` a field), and is left out of the JSON when nothing differs, so earlier outputs hold.
+  Against the current state or a checkpoint the proposal's side is what adoption leaves (the
+  other side's walkthroughs with the proposal's added), so nothing reads as
+  removed; against another proposal each side is its own. Render marks and footprints compare
+  no walkthroughs. `model render --proposal <id> --walkthrough <w> --beat <n>` finds the
+  walkthrough in the proposal; `--proposal` then names where it lies, not what to draw.
+  `model check --proposal` judges its beats (`WALKTHROUGH_TARGET_MISSING`); a beat in a
+  proposal that reads the current state is judged only by the load's shape rules, since the
+  check loads no current state there. ponytail: the browser lists and plays the current state's
+  walkthroughs only, and `model record` records them only; add `proposal` to `/api/walkthrough`
+  and `record` when a proposal's slices need playing.
+- T26: the plan skill records slices in the proposal's description or summary (editable with
+  `edit-proposal`) or as a walkthrough in the proposal, so slicing no longer edits the current
+  state and no longer makes adoption refuse `PREDECESSOR_MOVED`.

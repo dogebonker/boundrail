@@ -114,7 +114,10 @@ Other codes explain themselves in their message. `skips` list what the check cou
   one-line `summary` saying what the flow does. Put the sending code in a message's `anchor`, and
   list a flow's `participants` to fix the order of its sequence diagram.
 - A walkthrough is ordered beats, each with a narration and a reading (what to draw). Preview a
-  beat with `boundrail model render --walkthrough <id> --beat <n> --output <file.svg>`.
+  beat with `boundrail model render --walkthrough <id> --beat <n> --output <file.svg>`. A
+  walkthrough may also live in a proposal (`model edit --proposal`); its beats read the proposal
+  unless `state` names another, preview with `--proposal <proposal>` beside `--walkthrough`, and
+  adoption adds it to the current state's walkthroughs.
 - Record a walkthrough with a local voice: `boundrail model record <id> --output <file.mp4>`. It
   needs a rasterizer, `say`, `espeak-ng` or `piper`, and `ffmpeg` on PATH; `details.reason` names
   a missing one. `--replay <file>.talk --output <file.mp4>` encodes it again without the model.

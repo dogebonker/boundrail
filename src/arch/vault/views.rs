@@ -6,7 +6,9 @@ use serde::Serialize;
 
 use super::walkthroughs::{Known, reading_problems};
 use super::{Contents, Model, Problems, check_file, check_text, pick};
-use crate::arch::types::{BeatReading, DESCRIPTION_MAX, Picture, SavedView, VaultConfig};
+use crate::arch::types::{
+    BeatReading, DESCRIPTION_MAX, Picture, ReadingState, SavedView, VaultConfig,
+};
 use crate::arch::{Refusal, ids};
 
 /// A named, ordered reading the current state holds: a saved view or a picture.
@@ -101,7 +103,7 @@ pub(super) fn check<'a, T: Named>(
     problems: &mut Problems,
     mut own: impl FnMut(&str, &'a T, &mut Problems),
 ) {
-    let known = Known::new(model, contents);
+    let known = Known::new(model, ReadingState::Current, contents);
     for &(file, item) in items {
         let id = item.id();
         check_file(problems, file, id, item.schema_version(), item.name());

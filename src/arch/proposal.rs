@@ -19,7 +19,8 @@ use super::merge::Side;
 use super::request::{check_doing, check_operation, check_writer};
 use super::revision::Revision;
 use super::types::{
-    Manifest, Module, Predecessor, Proposal, ProposalStatus, SCHEMA_VERSION, State,
+    Collection, Document, Manifest, Module, Predecessor, Proposal, ProposalStatus, SCHEMA_VERSION,
+    State, Walkthrough,
 };
 use super::vault::{self, Model, Scope};
 use super::{Code, Refusal, checkpoint, claims, ids, revision};
@@ -48,18 +49,27 @@ pub struct Writing<'a> {
 /// copy of a proposal inherits that proposal's predecessor and dropped IDs, since it holds what
 /// that proposal drew; a copy of an adopted proposal needs it to still be the current state,
 /// unchanged. It takes no revision: the draft records the predecessor it copied, which adoption
-/// checks again.
+/// checks again. `summary` is one line saying what it changes and `documents` the documents it
+/// links to.
 pub fn propose(
     vault: &Path,
     writing: &Writing<'_>,
     name: &str,
     from: Option<&str>,
     description: Option<&str>,
+    summary: Option<&str>,
+    documents: &[Document],
 ) -> Result<(Receipt, Option<Scope>)> {
     let name = vault::valid_name(name)?.to_owned();
     let (writer, operation) = start(vault, writing)?;
     let from = from.filter(|from| *from != CURRENT);
-    let request = json!({"kind": "propose", "writer": writer, "name": name, "from": from, "description": description});
+    let mut request = json!({"kind": "propose", "writer": writer, "name": name, "from": from, "description": description});
+    if let Some(summary) = summary {
+        request["summary"] = json!(summary);
+    }
+    if !documents.is_empty() {
+        request["documents"] = json!(documents);
+    }
     edit::journaled(vault, &operation, request, |_, _, fingerprint| {
         let current = vault::load_dir(vault.to_path_buf())?;
         let source = from
@@ -80,6 +90,8 @@ pub fn propose(
             id: ids::allocate(|candidate| taken.contains(candidate))?,
             name: name.clone(),
             description: description.map(str::to_owned),
+            summary: summary.map(str::to_owned),
+            documents: documents.to_vec(),
             status: ProposalStatus::Draft,
             predecessor,
             created: claims::now(),
@@ -88,7 +100,7 @@ pub fn propose(
             base: base.is_some(),
         };
         let source = source.as_ref().unwrap_or(&current);
-        let contents = (&source.modules[..], &source.collections[..]);
+        let contents = (&source.modules[..], &source.collections[..], &[][..]);
         let base = base.as_ref().map(|(m, c)| (&m[..], &c[..]));
         let named = (writer.clone(), operation.clone());
         let plan = drawing(
@@ -139,33 +151,34 @@ pub(super) fn taken(vault: &Path, models: &[&Model]) -> Result<BTreeSet<String>>
 }
 
 /// The plan of the write `kind` that stores `proposal` in the vault of `current`, holding
-/// `contents` and, when given, `base` as its base; `named` is the writer and operation ID.
-/// `contents` must load as a proposal of this vault (`MODEL_INVALID`).
+/// `contents`, its modules, collections and walkthroughs, and, when given, `base` as its base;
+/// `named` is the writer and operation ID. `contents` must load as a proposal of this vault
+/// (`MODEL_INVALID`).
 pub(super) fn drawing(
     kind: &'static str,
     current: &Model,
     proposal: Proposal,
-    contents: Side<'_>,
+    (modules, collections, walkthroughs): (&[Module], &[Collection], &[Walkthrough]),
     base: Option<Side<'_>>,
     (writer, operation_id): (String, String),
     writing: &Writing<'_>,
 ) -> Result<Plan> {
-    let (modules, collections) = contents;
     let problems = vault::problems(
         &current.manifest,
         &current.config,
         Some(&proposal),
         modules,
         collections,
-        (&[], &[], &[]),
+        (walkthroughs, &[], &[]),
     );
     if !problems.is_empty() {
         return Err(vault::invalid(&current.dir, problems));
     }
     let modules: Vec<&Module> = modules.iter().collect();
     let collections: Vec<_> = collections.iter().collect();
+    let walkthroughs: Vec<_> = walkthroughs.iter().collect();
     let mut writes = vec![vault::proposal_write(&proposal)?];
-    let copies = vault::plan_writes(None, &modules, &collections, &[], &[], &[], &[])?;
+    let copies = vault::plan_writes(None, &modules, &collections, &walkthroughs, &[], &[], &[])?;
     writes.extend(vault::in_proposal(&proposal.id, copies));
     if let Some(base) = base {
         writes.extend(vault::base_writes(&proposal.id, base, None)?);
@@ -212,12 +225,12 @@ pub fn adopt(
         refuse_compared(&drawn, compared)?;
         let taken = taken(vault, &[&current, &drawn])?;
         let state = ids::allocate(|candidate| taken.contains(candidate))?;
-        // Walkthroughs, pictures and views belong to the current state and stay as they are.
+        let walkthroughs = adopted_walkthroughs(&current.walkthroughs, &drawn.walkthroughs);
         let diff = edit::diff(
             &current,
             &drawn.modules,
             &drawn.collections,
-            &current.walkthroughs,
+            &walkthroughs,
             &current.pictures,
             &current.views,
             &[],
@@ -229,6 +242,7 @@ pub fn adopt(
         let adoption = Adoption {
             current: &current,
             drawn: &drawn,
+            walkthroughs: &walkthroughs,
             proposal,
             state,
         };
@@ -241,6 +255,7 @@ pub fn adopt(
 struct Adoption<'a> {
     current: &'a Model,
     drawn: &'a Model,
+    walkthroughs: &'a [Walkthrough],
     proposal: Proposal,
     state: String,
 }
@@ -258,7 +273,7 @@ impl Adoption<'_> {
         let (current, drawn) = (self.current, self.drawn);
         let manifest = adopted_manifest(
             current,
-            drawn,
+            (drawn, self.walkthroughs),
             &diff.retired,
             &self.proposal.name,
             &self.state,
@@ -299,14 +314,14 @@ impl Adoption<'_> {
 }
 
 /// The manifest after adopting `drawn` as the state `state` named `name`, refusing
-/// `MODEL_INVALID` when the adopted state would not load, the current state's walkthroughs,
-/// pictures and views included: a beat, picture or view reading a module or flow the adopted
-/// state drops must be edited first. The
+/// `MODEL_INVALID` when the adopted state would not load with `walkthroughs` and the current
+/// state's pictures and views: a beat, picture or view reading a module or flow the adopted
+/// state drops must be edited first, and a walkthrough ID both states hold refuses. The
 /// state it replaces leaves the model with the IDs it drops, `retired`, and all stay reserved, as
 /// do the IDs the proposal dropped.
 fn adopted_manifest(
     current: &Model,
-    drawn: &Model,
+    (drawn, walkthroughs): (&Model, &[Walkthrough]),
     retired: &[String],
     name: &str,
     state: &str,
@@ -336,12 +351,21 @@ fn adopted_manifest(
         None,
         &drawn.modules,
         &drawn.collections,
-        (&current.walkthroughs, &current.pictures, &current.views),
+        (walkthroughs, &current.pictures, &current.views),
     );
     if !problems.is_empty() {
         return Err(vault::invalid(&current.dir, problems));
     }
     Ok(manifest)
+}
+
+/// The current state's walkthroughs once the proposal holding `drawn` is adopted: `current` and
+/// `drawn` together, by ID. An ID both hold appears twice, which adoption refuses as
+/// `MODEL_INVALID`.
+pub fn adopted_walkthroughs(current: &[Walkthrough], drawn: &[Walkthrough]) -> Vec<Walkthrough> {
+    let mut walkthroughs = [current, drawn].concat();
+    walkthroughs.sort_by(|a, b| a.id.cmp(&b.id));
+    walkthroughs
 }
 
 /// Sets the draft `subject` names aside: it stays, reading only. `expected` is the proposal

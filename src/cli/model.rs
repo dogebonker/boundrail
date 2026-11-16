@@ -189,7 +189,7 @@ struct RenderArgs {
 #[derive(Args, Default)]
 pub(super) struct RenderSpec {
     /// Draw a beat of this walkthrough, as its reading says: its ID or unique name; needs --beat
-    /// and no other flag that says what to draw
+    /// and no other flag that says what to draw, but --proposal for a proposal's walkthrough
     #[arg(long)]
     pub(super) walkthrough: Option<String>,
     /// The beat of --walkthrough to draw: its number, from 1, or its ID
@@ -203,7 +203,8 @@ pub(super) struct RenderSpec {
     /// what to draw
     #[arg(long = "saved-view", conflicts_with_all = ["walkthrough", "picture"])]
     pub(super) saved_view: Option<String>,
-    /// Draw this proposal, marked against the current state unless --against names another
+    /// Draw this proposal, marked against the current state unless --against names another: its
+    /// ID or unique name
     #[arg(long)]
     pub(super) proposal: Option<String>,
     /// Draw the model a checkpoint holds, or with --against compare it: its ID or a unique
@@ -330,7 +331,7 @@ enum ModelCmd {
         /// Read the model a checkpoint holds: its ID or a unique commit prefix
         #[arg(long)]
         checkpoint: Option<String>,
-        /// Read a proposal instead of the current state: its ID
+        /// Read a proposal instead of the current state: its ID or unique name
         #[arg(long, conflicts_with = "checkpoint")]
         proposal: Option<String>,
         /// List the module's references, each followed: the other model's name, the subject's
@@ -365,8 +366,8 @@ enum ModelCmd {
         /// One line saying why the model changes, 1 to 140 characters
         #[arg(long)]
         doing: String,
-        /// Edit this proposal instead of the current state: its ID; the request's target state
-        /// and expected revision are the proposal's
+        /// Edit this proposal instead of the current state: its ID or unique name; the request's
+        /// target state is its ID and its expected revision the proposal's
         #[arg(long)]
         proposal: Option<String>,
     },
@@ -374,11 +375,18 @@ enum ModelCmd {
     Propose {
         #[arg(long)]
         name: String,
-        /// Start from the current state, or copy this proposal
+        /// Start from the current state, or copy this proposal: its ID or unique name
         #[arg(long, default_value = CURRENT)]
         from: String,
         #[arg(long)]
         description: Option<String>,
+        /// One line saying what the proposal changes
+        #[arg(long)]
+        summary: Option<String>,
+        /// Link a document: its title, then a repository path or an https URL; shown as text,
+        /// never fetched. Repeat for several
+        #[arg(long, num_args = 2, value_names = ["TITLE", "PATH_OR_URL"])]
+        document: Vec<String>,
         #[command(flatten)]
         writing: WritingArgs,
     },
@@ -387,7 +395,7 @@ enum ModelCmd {
     /// Report what a proposal adds, removes and changes against the current state, another
     /// proposal or a checkpoint, and how each module's drawn interface changes
     Compare {
-        /// The proposal's ID
+        /// The proposal's ID or unique name
         proposal: String,
         /// Compare against the current state, or this proposal
         #[arg(long, default_value = CURRENT)]
@@ -402,7 +410,7 @@ enum ModelCmd {
     },
     /// Make a proposal the current state
     Adopt {
-        /// The proposal's ID
+        /// The proposal's ID or unique name
         proposal: String,
         /// The current state's revision digest the adoption is for
         #[arg(long)]
@@ -420,7 +428,7 @@ enum ModelCmd {
     /// reconciled, and make the current state its predecessor; both sides changing one module,
     /// relationship or collection refuses with the conflicts
     Reconcile {
-        /// The proposal's ID
+        /// The proposal's ID or unique name
         proposal: String,
         /// The current state's revision digest the merge is for
         #[arg(long)]
@@ -469,7 +477,7 @@ enum ModelCmd {
     },
     /// Set a proposal aside; it stays, reading only
     Shelve {
-        /// The proposal's ID
+        /// The proposal's ID or unique name
         proposal: String,
         /// The proposal's revision digest, as `model read --proposal` shows it; another refuses
         #[arg(long)]
@@ -858,12 +866,24 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
             name,
             from,
             description,
+            summary,
+            document,
             writing,
         } => {
             let dir = vault::locate(root)?;
             let writing = writing.writing(None);
-            let (receipt, finished) =
-                proposal::propose(&dir, &writing, &name, Some(&from), description.as_deref())?;
+            let documents: Vec<types::Document> = (document.chunks(2))
+                .map(|pair| linked_document(&pair[0], &pair[1]))
+                .collect();
+            let (receipt, finished) = proposal::propose(
+                &dir,
+                &writing,
+                &name,
+                Some(&from),
+                description.as_deref(),
+                summary.as_deref(),
+                &documents,
+            )?;
             if let Some(scope) = &finished {
                 warn_unloadable(&dir, &[(scope, &receipt)]);
             }
@@ -1581,9 +1601,13 @@ pub(super) fn render_svg(
             let message = format!("{why}; leave out --walkthrough and --beat");
             return Err(Refusal::new(Code::RequestInvalid, message).into());
         }
-        spec.refuse_drawing_flags(why)
+        spec.refuse_drawing_flags(why, false)
     };
     let (current, _) = load_state(root, RenderState::Current)?;
+    let holder = match (&spec.walkthrough, &spec.proposal) {
+        (Some(_), Some(p)) => Some(load_state(root, RenderState::Proposal(p))?.0),
+        _ => None,
+    };
     let reading = match (&spec.picture, &spec.saved_view) {
         (Some(picture), _) => {
             alone("--picture draws what its recipe reads")?;
@@ -1593,7 +1617,7 @@ pub(super) fn render_svg(
             alone("--saved-view draws what the view reads")?;
             &current.saved_view(view)?.reading
         }
-        (None, None) => spec.beat(&current)?,
+        (None, None) => spec.beat(holder.as_ref().unwrap_or(&current))?,
     };
     draw_reading(root, reading, output, &mut States::new(&current))
 }
@@ -1773,8 +1797,9 @@ fn load_state(root: &Path, state: RenderState<'_>) -> Result<(Model, Option<Stri
 }
 
 impl RenderSpec {
-    /// What the beat `--beat` of `--walkthrough` reads in `model`, the current state. Refuses
-    /// `REQUEST_INVALID` without both flags or with any other flag that says what to draw.
+    /// What the beat `--beat` of `--walkthrough` reads in `model`, the current state or the
+    /// proposal `--proposal` names. Refuses `REQUEST_INVALID` without both flags or with any other
+    /// flag that says what to draw.
     fn beat<'m>(&self, model: &'m Model) -> Result<&'m BeatReading> {
         let invalid = |message: &str| Refusal::new(Code::RequestInvalid, message);
         let (walkthrough, beat) = match (&self.walkthrough, &self.beat) {
@@ -1782,7 +1807,7 @@ impl RenderSpec {
             (None, _) => return Err(invalid("--beat needs --walkthrough").into()),
             (_, None) => return Err(invalid("--walkthrough needs --beat").into()),
         };
-        self.refuse_drawing_flags("--walkthrough draws what its beat reads")?;
+        self.refuse_drawing_flags("--walkthrough draws what its beat reads", true)?;
         let walkthrough = model.walkthrough(walkthrough)?;
         let by_number = (beat.parse::<usize>().ok())
             .and_then(|n| n.checked_sub(1))
@@ -1799,21 +1824,17 @@ impl RenderSpec {
         Ok(&found.reading)
     }
 
-    /// Refuses `REQUEST_INVALID` with `why` when a flag says what to draw.
-    fn refuse_drawing_flags(&self, why: &str) -> Result<()> {
-        let drawing = [
-            &self.proposal,
-            &self.checkpoint,
-            &self.flow,
-            &self.scope,
-            &self.against,
-        ];
+    /// Refuses `REQUEST_INVALID` with `why` when a flag says what to draw; `--proposal` only
+    /// names where the walkthrough is when `holds` says so.
+    fn refuse_drawing_flags(&self, why: &str, holds: bool) -> Result<()> {
+        let drawing = [&self.checkpoint, &self.flow, &self.scope, &self.against];
         let styled = !self.focus.is_empty()
             || !self.hide_kind.is_empty()
             || !self.group.is_empty()
             || self.legend
             || self.theme.is_some();
-        if drawing.iter().any(|flag| flag.is_some())
+        if (self.proposal.is_some() && !holds)
+            || drawing.iter().any(|flag| flag.is_some())
             || self.view.is_some()
             || self.depth.is_some()
             || styled
@@ -3295,14 +3316,19 @@ fn list_proposals(root: &Path, markdown: bool) -> Result<()> {
         let id = entry["id"].as_str().unwrap_or_default();
         match entry["error"].as_str() {
             Some(error) => println!("- {id}: {error}"),
-            None => println!(
-                "- {} {id}, {}, drawn from {}",
-                entry["name"].as_str().unwrap_or_default(),
-                entry["status"].as_str().unwrap_or_default(),
-                entry["predecessor"]["state"]
-                    .as_str()
-                    .unwrap_or("no current state"),
-            ),
+            None => {
+                println!(
+                    "- {} {id}, {}, drawn from {}",
+                    entry["name"].as_str().unwrap_or_default(),
+                    entry["status"].as_str().unwrap_or_default(),
+                    entry["predecessor"]["state"]
+                        .as_str()
+                        .unwrap_or("no current state"),
+                );
+                if let Some(summary) = entry["summary"].as_str() {
+                    println!("  {summary}");
+                }
+            }
         }
     }
     Ok(())
@@ -3326,7 +3352,16 @@ fn proposal_entries(dir: &Path) -> Result<Vec<Value>> {
     Ok(list
         .iter()
         .map(|listed| match &listed.proposal {
-            Ok(p) => json!({"id": listed.id, "name": p.name, "status": p.status, "predecessor": p.predecessor}),
+            Ok(p) => {
+                let mut entry = json!({"id": listed.id, "name": p.name, "status": p.status, "predecessor": p.predecessor});
+                if let Some(summary) = &p.summary {
+                    entry["summary"] = json!(summary);
+                }
+                if !p.documents.is_empty() {
+                    entry["documents"] = json!(p.documents);
+                }
+                entry
+            }
             Err(error) => json!({"id": listed.id, "error": error}),
         })
         .collect())
@@ -3480,11 +3515,19 @@ fn compared_models(
     let drawn = inspect::drawn(&model_id, &before.modules, None);
     let alternatives = (models.into_iter())
         .map(|after| {
-            let comparison = compare::compare(
+            let mut comparison = compare::compare(
                 &model_id,
                 (&before.modules, &before.collections),
                 (&after.modules, &after.collections),
             );
+            let (old, new) = (&before.walkthroughs, &after.walkthroughs);
+            comparison.walkthroughs = match before.proposal {
+                Some(_) => compare::walkthroughs(&model_id, old, new),
+                None => {
+                    let adopted = proposal::adopted_walkthroughs(old, new);
+                    compare::walkthroughs(&model_id, old, &adopted)
+                }
+            };
             let now = inspect::drawn(&model_id, &after.modules, None);
             Alternative {
                 side: side(&after),
@@ -3624,6 +3667,15 @@ fn print_alternatives(c: &Compared) {
     }
 }
 
+fn linked_document(title: &str, target: &str) -> types::Document {
+    let url = target.contains("://");
+    types::Document {
+        title: title.to_owned(),
+        path: (!url).then(|| target.to_owned()),
+        url: url.then(|| target.to_owned()),
+    }
+}
+
 /// The proposal line of a markdown reading of a proposal.
 fn print_proposal(model: &Model) {
     if let Some(drawn) = &model.proposal {
@@ -3635,6 +3687,13 @@ fn print_proposal(model: &Model) {
             status.as_str().unwrap_or_default(),
             model.revision.digest
         );
+        if let Some(summary) = &drawn.summary {
+            println!("Summary: {summary}");
+        }
+        for document in &drawn.documents {
+            let target = document.path.as_ref().or(document.url.as_ref());
+            println!("Document: {} {}", document.title, target.map_or("", |t| t));
+        }
     }
 }
 

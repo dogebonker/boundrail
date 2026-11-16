@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::iter;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -16,7 +17,9 @@ use super::edit::{self, Receipt};
 use super::proposal::{self, Writing};
 use super::request::{INPUT_MAX, check_size};
 use super::revision::Revision;
-use super::types::{Collection, Module, Predecessor, Proposal, ProposalStatus, SCHEMA_VERSION};
+use super::types::{
+    Collection, Module, Proposal, ProposalStatus, ReadingState, SCHEMA_VERSION, Walkthrough,
+};
 use super::vault::{self, Model, Problem, Scope};
 use super::{Code, Refusal, checkpoint, claims, ids};
 use crate::collect::TempDir;
@@ -200,9 +203,10 @@ fn text(path: String, sha256: String, bytes: Vec<u8>) -> Result<Text> {
 
 /// Imports the bundle `input` as a new draft of the vault folder `vault`, named `name` or after
 /// what the bundle holds. A current-state or checkpoint bundle gives its modules and collections,
-/// with the current state as predecessor and base. A proposal bundle gives its proposal's, with
-/// that proposal's predecessor, base and dropped IDs, so adopting it after the current state
-/// moved refuses `PREDECESSOR_MOVED` until `model reconcile` merges the two. `expected` is the
+/// with the current state as predecessor and base. A proposal bundle gives its proposal's, its
+/// walkthroughs, summary and documents too, with that proposal's predecessor, base and dropped
+/// IDs, so adopting it after the current state moved refuses `PREDECESSOR_MOVED` until
+/// `model reconcile` merges the two. A beat that read the bundled proposal reads the draft. `expected` is the
 /// current revision the caller read. Refuses `MODEL_MISMATCH` for another model's bundle,
 /// `BUNDLE_INVALID` for a bundle that is not well formed or whose base does not hold, and
 /// `MODEL_INVALID` when its files do not load or the draft does not load in this vault.
@@ -222,29 +226,44 @@ pub fn import(
         let opened = open(input, &current)?;
         let taken = proposal::taken(vault, &[&current, &opened.model])?;
         let now = (&current.modules[..], &current.collections[..]);
-        let (predecessor, base) = match opened.drawn {
-            Some(predecessor) => (
-                predecessor,
+        let id = ids::allocate(|candidate| taken.contains(candidate))?;
+        let drawn = opened.drawn.as_ref();
+        let (predecessor, base) = match drawn {
+            Some(drawn) => (
+                drawn.predecessor.clone(),
                 opened.base.as_ref().map(|(m, c)| (&m[..], &c[..])),
             ),
             None => (proposal::predecessor_of(&current)?, Some(now)),
         };
+        let walkthroughs = match drawn {
+            Some(drawn) => {
+                let (from, to) = (current.qualify(&drawn.id), current.qualify(&id));
+                retold(&opened.model.walkthroughs, &from, &to)
+            }
+            None => Vec::new(),
+        };
         let draft = Proposal {
             schema_version: SCHEMA_VERSION,
-            id: ids::allocate(|candidate| taken.contains(candidate))?,
+            id,
             name: name.clone().unwrap_or(opened.name),
             description: None,
+            summary: drawn.and_then(|d| d.summary.clone()),
+            documents: drawn.map(|d| d.documents.clone()).unwrap_or_default(),
             status: ProposalStatus::Draft,
             predecessor,
             created: claims::now(),
             adopted_as: None,
-            dropped: opened.dropped,
+            dropped: drawn.map(|d| d.dropped.clone()).unwrap_or_default(),
             base: base.is_some(),
         };
         let root = BTreeSet::from([current.manifest.id.clone()]);
         claims::check_edit(dir, &current, &writer, writing.claim, &root, &[])?;
         let model = &opened.model;
-        let contents = (&model.modules[..], &model.collections[..]);
+        let contents = (
+            &model.modules[..],
+            &model.collections[..],
+            &walkthroughs[..],
+        );
         let named = (writer.clone(), operation.clone());
         let plan = proposal::drawing("import", &current, draft, contents, base, named, writing)?;
         Ok(plan.record(fingerprint))
@@ -252,13 +271,12 @@ pub fn import(
 }
 
 /// A bundle read and loaded: the state it holds, the draft's default name, and for a proposal
-/// its base, dropped IDs and predecessor (`drawn`).
+/// its base and the proposal itself (`drawn`).
 struct Opened {
     model: Model,
     name: String,
     base: Option<(Vec<Module>, Vec<Collection>)>,
-    dropped: Vec<String>,
-    drawn: Option<Predecessor>,
+    drawn: Option<Proposal>,
 }
 
 /// How refusals name a bundle's files instead of the temporary folder they load from.
@@ -288,9 +306,21 @@ fn open(input: &[u8], current: &Model) -> Result<Opened> {
         model,
         name,
         base: None,
-        dropped: Vec::new(),
         drawn: None,
     })
+}
+
+fn retold(walkthroughs: &[Walkthrough], from: &str, to: &str) -> Vec<Walkthrough> {
+    let mut walkthroughs = walkthroughs.to_vec();
+    let readings = walkthroughs.iter_mut().flat_map(|w| &mut w.beats);
+    for reading in readings.map(|b| &mut b.reading) {
+        for state in iter::once(&mut reading.state).chain(&mut reading.against) {
+            if *state == ReadingState::Proposal(from.to_owned()) {
+                *state = ReadingState::Proposal(to.to_owned());
+            }
+        }
+    }
+    walkthroughs
 }
 
 /// The bundle `input`, refused as every request is, but one that does not parse gets a fixed
@@ -349,10 +379,9 @@ fn open_proposal(
     }
     Ok(Opened {
         model,
-        name: drawn.name,
+        name: drawn.name.clone(),
         base,
-        dropped: drawn.dropped,
-        drawn: Some(drawn.predecessor),
+        drawn: Some(drawn),
     })
 }
 

@@ -139,6 +139,23 @@
   name, the subject's name and kind and the state read, or why it was skipped; `--reference N`
   reads what one points at. The other repository is only read, never written or fetched. The
   browser lists a module's references and shows a followed one read-only in a pane.
+- Proposal metadata: `model propose --summary` (one line) and `--document <title>
+  <path-or-https-url>` (repeatable; a repository path or an `https` URL, shown as text and never
+  fetched), and an `edit-proposal` edit change that renames a proposal or sets and clears its
+  description, summary and documents through the journaled write, retaining a checkpoint.
+  `model proposals` lists the summary and documents. A proposal without them writes neither key,
+  so older proposals load and digest as before.
+- Every command that takes a proposal (`--proposal`, `compare`, `--against`, `--beside`,
+  `adopt`, `shelve`, `reconcile`, `export`, `propose --from`) takes its unique name too: an exact
+  ID wins, a name two proposals share refuses `SUBJECT_AMBIGUOUS` listing their IDs in
+  `details.matches`, and an unknown one `SUBJECT_NOT_FOUND`.
+- Walkthroughs inside proposals: `proposals/<id>/walkthroughs/`, written with `model edit
+  --proposal`. A beat there reads the proposal unless its `state` names another; `model read
+  --proposal <id> --walkthrough`, `model render --proposal <id> --walkthrough --beat` and `model
+  check --proposal` read them, `model compare` lists them under `walkthroughs` (left out when
+  none differs), reconcile keeps them over the merge, import of a proposal bundle carries them,
+  and adoption adds them to the current state's walkthroughs, refusing `MODEL_INVALID` when both
+  hold one ID. Pictures and saved views stay with the current state.
 - `model read <module> --code` prints the binding's `code_target`: `repo`, `path`, `symbol`, the
   commit with `--checkpoint`, and `local_path` in this checkout or in the checkout
   `boundrail/checkouts.json` names for its repo. `--open` opens it with the platform opener (on
