@@ -789,6 +789,7 @@ impl Server {
                 None,
                 param("proposal"),
                 boundrail::arch::lsp::Enable::Off,
+                None,
                 &Default::default(),
             )?
             .output()?,

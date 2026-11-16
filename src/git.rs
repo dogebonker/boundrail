@@ -1,11 +1,15 @@
 //! Every Git subprocess boundrail runs, hardened so a repository's config never names a program
-//! Git would run on our behalf (fsmonitor, hooks), and so Git never discovers a bare repository
-//! implicitly (`safe.bareRepository=explicit`): a bare repository planted in a checkout, such as
-//! one a reference or binding leads into, cannot supply its config. The exceptions are the signing program, which
-//! signs the checkpoints `model retain` writes and those `model history fetch` replays when the
-//! user opts into `commit.gpgSign`, and the clean and process filter drivers repository config
-//! defines, which run when Git content-checks a working-tree entry, for example in `model
-//! footprint`. Writing `.git/config` already allows
+//! Git would run on our behalf (fsmonitor, hooks, transport), and so Git never discovers a bare
+//! repository implicitly (`safe.bareRepository=explicit`): a bare repository planted in a
+//! checkout, such as one a reference or binding leads into, cannot supply its config. Git never
+//! fetches a missing object lazily from a promisor remote (`GIT_NO_LAZY_FETCH`, Git 2.45 and
+//! later), and every command but the transport of `model history push` and `model history
+//! fetch` runs with `GIT_ALLOW_PROTOCOL` empty, which allows no protocol whatever the
+//! repository's `protocol.*` config says, so older Git cannot reach a remote either. The
+//! exceptions are the signing program, which signs the checkpoints `model retain` writes and
+//! those `model history fetch` replays when the user opts into `commit.gpgSign`, and the clean
+//! and process filter drivers repository config defines, which run when Git content-checks a
+//! working-tree entry, for example in `model footprint`. Writing `.git/config` already allows
 //! running code, so neither widens what a repository can do. The third exception is outside Git:
 //! language servers, which run only when `model check` or `model inspect` gets
 //! `--language-servers`, or when the checkout root, once links resolve, lies at or below a folder
@@ -49,11 +53,16 @@
 //! same accepted scope as the signing program, and only on that explicit command. Hooks stay off
 //! there too, `pre-push` and `reference-transaction` included.
 
+use std::collections::HashMap;
+use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use anyhow::{Context, Result, anyhow, bail};
+
+use crate::arch::vault::{STATE, VAULT};
 
 /// The references naming a repository's default branch, in the order they are tried.
 pub const DEFAULT_BRANCHES: [&str; 3] = ["origin/HEAD", "main", "master"];
@@ -69,7 +78,7 @@ pub fn run(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
 /// A disposable index permits Git's own stat cache without changing the user's staging index,
 /// so `git diff` refreshes it: an entry whose stat changed is content-checked, not listed.
 pub fn run_with_index(root: &Path, args: &[&str], index: Option<&Path>) -> Result<Vec<u8>> {
-    checked(root, args, index, &[], None)
+    checked(root, args, index, &[], None, false)
 }
 
 /// `run_with_index` with `input` on Git's standard input, such as the paths `--stdin-paths`
@@ -80,12 +89,18 @@ pub fn run_with_input(
     index: Option<&Path>,
     input: Vec<u8>,
 ) -> Result<Vec<u8>> {
-    checked(root, args, index, &[], Some(input))
+    checked(root, args, index, &[], Some(input), false)
 }
 
 /// `run` with `env` set for Git, such as the dates a copied commit keeps.
 pub fn run_with_env(root: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<Vec<u8>> {
-    checked(root, args, None, env, None)
+    checked(root, args, None, env, None, false)
+}
+
+/// `run` for `git push`, `git fetch` and `git ls-remote` in `model history push` and `model
+/// history fetch`, the only Git commands allowed a transport.
+pub fn run_transport(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    checked(root, args, None, &[], None, true)
 }
 
 fn checked(
@@ -94,8 +109,9 @@ fn checked(
     index: Option<&Path>,
     env: &[(&str, &str)],
     input: Option<Vec<u8>>,
+    transport: bool,
 ) -> Result<Vec<u8>> {
-    let out = output(root, args, index, env, input)?;
+    let out = output(root, args, index, env, input, transport)?;
     if !out.status.success() {
         bail!(
             "git {}: {}",
@@ -106,6 +122,108 @@ fn checked(
     Ok(out.stdout)
 }
 
+const PRIVATE_HISTORY: &str = "history.git";
+
+/// The private history around `path`, the one bare repository Boundrail names explicitly:
+/// `<folder>/.boundrail/history.git`, which `model init --private` creates without a template
+/// beside the vault `<folder>/.boundrail/model`, for the nearest folder at or above `path`
+/// holding one. It counts only when `.boundrail`, the history and the vault are folders, not
+/// symbolic links, that on Unix the effective user owns (the owner of a folder this process
+/// creates in the system temporary folder), and no folder at or above `path` holds `.git`; so
+/// one committed into a checkout or planted by another user is never used, and its config is
+/// trusted as a checkout's `.git/config` is. Every Git command Boundrail runs at or below that
+/// folder uses it by an explicit `--git-dir`. The answer is kept per canonical path for the
+/// process, until [`init_private_history`] creates a history.
+pub fn private_history(path: &Path) -> Option<PathBuf> {
+    let path = fs::canonicalize(path).ok()?;
+    let mut known = known_histories()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    known
+        .entry(path)
+        .or_insert_with_key(|p| find_history(p))
+        .clone()
+}
+
+fn known_histories() -> &'static Mutex<HashMap<PathBuf, Option<PathBuf>>> {
+    static KNOWN: OnceLock<Mutex<HashMap<PathBuf, Option<PathBuf>>>> = OnceLock::new();
+    KNOWN.get_or_init(Mutex::default)
+}
+
+fn find_history(path: &Path) -> Option<PathBuf> {
+    let mut found = None;
+    for folder in path.ancestors() {
+        if enclosed(folder) {
+            return None;
+        }
+        let state = folder.join(STATE);
+        let history = state.join(PRIVATE_HISTORY);
+        if found.is_none()
+            && [&state, &history, &state.join(VAULT)]
+                .into_iter()
+                .all(owned_dir)
+        {
+            found = Some(history);
+        }
+    }
+    found
+}
+
+fn owned_dir(path: &PathBuf) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|m| m.is_dir() && owned(&m))
+}
+
+#[cfg(unix)]
+fn owned(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    static EUID: OnceLock<Option<u32>> = OnceLock::new();
+    let euid = EUID.get_or_init(|| {
+        let probe = crate::collect::TempDir::new("owner").ok()?;
+        fs::metadata(probe.path()).ok().map(|m| m.uid())
+    });
+    *euid == Some(metadata.uid())
+}
+
+#[cfg(not(unix))]
+fn owned(_: &fs::Metadata) -> bool {
+    true
+}
+
+fn enclosed(folder: &Path) -> bool {
+    fs::symlink_metadata(folder.join(".git")).is_ok()
+}
+
+/// The folder at or above `path` holding `.git`, the top of the checkout around it.
+pub fn enclosing_checkout(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .find(|f| enclosed(f))
+        .map(Path::to_path_buf)
+}
+
+/// The private history at or above `path` that a `.git` at or above its folder absorbs into that
+/// checkout, so Boundrail ignores it, with that checkout's folder.
+pub fn absorbed_history(path: &Path) -> Option<(PathBuf, PathBuf)> {
+    let path = fs::canonicalize(path).ok()?;
+    let (folder, history) = path.ancestors().find_map(|folder| {
+        let history = folder.join(STATE).join(PRIVATE_HISTORY);
+        history.is_dir().then_some((folder, history))
+    })?;
+    enclosing_checkout(folder).map(|checkout| (history, checkout))
+}
+
+/// Creates the bare repository of the private history in `<folder>/.boundrail`, with no
+/// template, so it holds no hooks or other files Git would copy in.
+pub fn init_private_history(folder: &Path) -> Result<PathBuf> {
+    let history = folder.join(STATE).join(PRIVATE_HISTORY);
+    let path = history.to_str().context("the folder is not UTF-8")?;
+    run(folder, &["init", "--bare", "--quiet", "--template=", path])?;
+    known_histories()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
+    Ok(history)
+}
+
 /// The finished `git -C root args` process, whatever its exit status.
 fn output(
     root: &Path,
@@ -113,6 +231,7 @@ fn output(
     index: Option<&Path>,
     env: &[(&str, &str)],
     input: Option<Vec<u8>>,
+    transport: bool,
 ) -> Result<Output> {
     let mut command = Command::new("git");
     command.envs(env.iter().copied());
@@ -124,14 +243,22 @@ fn output(
             "core.untrackedCache=true",
         ]);
     }
+    if !transport {
+        command.env("GIT_ALLOW_PROTOCOL", "");
+    }
     command
+        .env("GIT_NO_LAZY_FETCH", "1")
         // Read-only queries must not rewrite the index.
         .env(
             "GIT_OPTIONAL_LOCKS",
             if index.is_some() { "1" } else { "0" },
         )
         .arg("-C")
-        .arg(root)
+        .arg(root);
+    if let Some(history) = private_history(root) {
+        command.arg("--git-dir").arg(history);
+    }
+    command
         .args([
             "-c",
             "core.fsmonitor=false",
@@ -181,7 +308,7 @@ pub fn have_merge_base(root: &Path, a: &str, b: &str) -> Result<bool> {
 /// Whether `git merge-base args` answers yes (exit 0) or no (exit 1).
 fn merge_base(root: &Path, args: &[&str]) -> Result<bool> {
     let args = [&["merge-base"][..], args].concat();
-    let out = output(root, &args, None, &[], None)?;
+    let out = output(root, &args, None, &[], None, false)?;
     match out.status.code() {
         Some(0) => Ok(true),
         Some(1) => Ok(false),

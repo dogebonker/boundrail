@@ -6,6 +6,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::iter;
 use std::path::{Path, PathBuf};
+use std::sync::Once;
 
 use anyhow::{Context, Result, ensure};
 use serde::de::DeserializeOwned;
@@ -46,8 +47,8 @@ pub(super) use walkthroughs::walkthrough_position;
 pub use walkthroughs::{BeatView, WalkthroughEntry, WalkthroughView};
 
 /// Boundrail's state folder at the checkout root, and the vault folder inside it.
-const STATE: &str = ".boundrail";
-const VAULT: &str = "model";
+pub(crate) const STATE: &str = ".boundrail";
+pub(crate) const VAULT: &str = "model";
 pub(super) const MANIFEST: &str = "model.json";
 pub(super) const CONFIG: &str = "config.yaml";
 const MODULES: &str = "modules";
@@ -129,8 +130,26 @@ impl Problems {
     }
 }
 
-/// The top-level directory of the Git work tree containing `start`.
+/// The top-level directory of the Git work tree containing `start`, or the folder of the private
+/// vault around it.
 fn checkout_root(start: &Path) -> Result<PathBuf> {
+    if let Some(folder) = private_folder(start) {
+        return Ok(folder);
+    }
+    if let Some((history, checkout)) = crate::git::absorbed_history(start) {
+        static WARNED: Once = Once::new();
+        WARNED.call_once(|| {
+            eprintln!(
+                "warning: the private vault history {} lies inside the Git checkout {}, so it is ignored and the checkout's vault is used; move the private folder out of the checkout",
+                history.display(),
+                checkout.display()
+            );
+        });
+    }
+    git_root(start)
+}
+
+fn git_root(start: &Path) -> Result<PathBuf> {
     crate::git::toplevel(start).map_err(|error| {
         Refusal::new(
             Code::CheckoutNotFound,
@@ -166,7 +185,7 @@ pub(super) fn valid_name(name: &str) -> Result<&str> {
 /// model has no current state until a proposal is adopted.
 pub fn init(start: &Path, name: &str, planning: bool) -> Result<Model> {
     let name = valid_name(name)?;
-    let state = checkout_root(start)?.join(STATE);
+    let state = git_root(start)?.join(STATE);
     let dir = state.join(VAULT);
     refuse_symlink(&state)?;
     fs::create_dir_all(&state).with_context(|| format!("creating {}", state.display()))?;
@@ -188,6 +207,103 @@ pub fn init(start: &Path, name: &str, planning: bool) -> Result<Model> {
         let _ = fs::remove_dir_all(&dir);
     }
     created
+}
+
+/// What a private vault starts from.
+#[derive(Clone, Copy)]
+pub enum Seed<'a> {
+    /// A new model with this name, without a current state when `planning`.
+    New { name: &'a str, planning: bool },
+    /// The files of a current-state or checkpoint bundle, keeping its model's identities.
+    Bundle(&'a [u8]),
+}
+
+fn private_folder(start: &Path) -> Option<PathBuf> {
+    let history = crate::git::private_history(start)?;
+    history.parent()?.parent().map(Path::to_path_buf)
+}
+
+/// Whether the vault folder `dir` is a private vault, outside every Git checkout.
+pub fn is_private(dir: &Path) -> bool {
+    private_folder(dir).is_some()
+}
+
+/// Creates a private vault in `folder`, which is created when missing: the vault in
+/// `.boundrail/model` and its private history, the bare repository `.boundrail/history.git`,
+/// whose path it returns with the vault. Refuses `REQUEST_INVALID` for a folder that is a
+/// symbolic link or lies at or below a folder holding `.git`, which would absorb the vault into
+/// that checkout, and `VAULT_EXISTS` when `.boundrail` exists there.
+pub fn init_private(folder: &Path, seed: Seed<'_>) -> Result<(Model, PathBuf)> {
+    let seed = match seed {
+        Seed::New { name, planning } => Seed::New {
+            name: valid_name(name)?,
+            planning,
+        },
+        bundle => bundle,
+    };
+    let refuse = |message: String| Err(Refusal::new(Code::RequestInvalid, message).into());
+    if fs::symlink_metadata(folder).is_ok_and(|m| m.file_type().is_symlink()) {
+        return refuse(format!(
+            "{} is a symbolic link; name the folder it leads to",
+            folder.display()
+        ));
+    }
+    let created = match fs::create_dir(folder) {
+        Ok(()) => true,
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => false,
+        Err(e) => return Err(e).with_context(|| format!("creating {}", folder.display())),
+    };
+    let canonical =
+        fs::canonicalize(folder).with_context(|| format!("reading {}", folder.display()));
+    let inside = canonical.as_ref().ok().and_then(|path| {
+        crate::git::toplevel(path)
+            .ok()
+            .or_else(|| crate::git::enclosing_checkout(path))
+    });
+    let made = match (canonical, inside) {
+        (Err(e), _) => Err(e),
+        (Ok(_), Some(checkout)) => refuse(format!(
+            "{} is inside the Git checkout {}, which would absorb a private vault there; its vault is the checkout's, made by `boundrail model init` there",
+            folder.display(),
+            checkout.display()
+        )),
+        (Ok(folder), None) => create_private(&folder, seed),
+    };
+    if made.is_err() && created {
+        let _ = fs::remove_dir(folder);
+    }
+    made
+}
+
+fn create_private(folder: &Path, seed: Seed<'_>) -> Result<(Model, PathBuf)> {
+    let state = folder.join(STATE);
+    match fs::create_dir(&state) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+            return Err(Refusal::new(
+                Code::VaultExists,
+                format!("{} already exists", state.display()),
+            )
+            .into());
+        }
+        Err(e) => return Err(e).with_context(|| format!("creating {}", state.display())),
+    }
+    let dir = state.join(VAULT);
+    let made = crate::git::init_private_history(folder).and_then(|history| {
+        fs::create_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let model = match seed {
+            Seed::New { name, planning } => {
+                populate(&dir, name, planning)?;
+                load_dir(dir)
+            }
+            Seed::Bundle(input) => super::bundle::seed(dir, input),
+        }?;
+        Ok((model, history))
+    });
+    if made.is_err() {
+        let _ = fs::remove_dir_all(&state);
+    }
+    made
 }
 
 fn populate(dir: &Path, name: &str, planning: bool) -> Result<()> {

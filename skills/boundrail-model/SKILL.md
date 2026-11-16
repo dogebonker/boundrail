@@ -154,6 +154,18 @@ To move the whole model to a checkout without a vault, run `boundrail model expo
 --with-history --output <file>` in the old checkout and `boundrail model import --restore <file>`
 in the new one.
 
+## Private vaults
+
+A model that must not land in the repository, such as a pull request's temporary model, lives in
+a **private vault**: `boundrail model init --private <folder> --name <name>`, or `--from
+<bundle>` to start from a `boundrail model export` of the repository's model with its IDs. The
+folder must lie outside every Git checkout. Its history is the bare repository
+`<folder>/.boundrail/history.git`, so every write still retains a checkpoint. Pass `--root
+<folder>` to every command. `model check` and `model inspect` skip the code there
+(`no-checkout`) unless `--code <checkout>` names the code to read; `footprint` and `locality`
+refuse `CHECKOUT_REQUIRED`, and so do `history push` and `fetch` until a remote is added with
+`git --git-dir <folder>/.boundrail/history.git remote add`. Delete the folder to discard it.
+
 ## Design
 
 To improve the architecture, find candidates in the measures before you draw a plan. A **deep**

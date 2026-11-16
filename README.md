@@ -259,6 +259,37 @@ boundrail model export --with-history --output shop.bundle.json
 boundrail model import --restore shop.bundle.json     # in a checkout with no vault and no history
 ```
 
+### Private vaults
+
+A vault can live outside every Git checkout, for a model the repository should not keep, such as
+a pull request's temporary model. `model init --private <folder>` creates the vault in
+`<folder>/.boundrail/model` and its history beside it in the bare repository
+`<folder>/.boundrail/history.git`, so every write still retains a checkpoint, signed as
+`commit.gpgSign` says. `--from <bundle>` starts it from a current-state or checkpoint bundle with
+that model's IDs, so its proposals compare and render against the repository's state:
+
+```sh
+evidence=$(mktemp -d)
+boundrail model export --output "$evidence/current.json"
+boundrail model init --private "$evidence/model" --from "$evidence/current.json"
+boundrail model --root "$evidence/model" propose --name "PR: queue" --doing "draw the PR" --operation-id pr-1
+boundrail model --root "$evidence/model" compare <proposal> --format markdown
+boundrail model --root "$evidence/model" render --proposal <proposal> --output "$evidence/after.svg"
+boundrail model --root "$evidence/model" check --code .   # the code check reads this checkout
+rm -rf "$evidence"
+```
+
+Every command that takes `--root` works there. `model check` and `model inspect` skip the code
+(`no-checkout`) unless `--code <checkout>` names the code to read; `footprint` and `locality`
+refuse `CHECKOUT_REQUIRED`, as do `history push` and `fetch` until a remote is added to the
+private history with `git --git-dir <folder>/.boundrail/history.git remote add`. `init --private`
+refuses a folder inside a checkout, where the checkout's vault applies, and a symbolic link; a
+plain `model init` below a private folder refuses `CHECKOUT_NOT_FOUND`. Boundrail uses a private
+history only where no folder above holds `.git`, so one committed into a repository is never
+read, and only when the current user owns `.boundrail`, the history and the vault. A `.git`
+created above the folder later absorbs the vault into that checkout: commands then warn and use
+the checkout's vault, so move the folder out.
+
 ## Explain
 
 `boundrail model explain` asks a local agent CLI about the model and prints its answer. Boundrail

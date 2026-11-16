@@ -22,7 +22,8 @@ backwards according to what the code shows.
 - D5. Writes are CLI file operations under a vault lock. No server is required to read or write.
   The live browser view, `boundrail model view`, runs its own local read-only HTTP server.
 - D6. Checkpoints are commits on a separate history branch in the source repository, never on
-  the working branch.
+  the working branch. A private vault outside every checkout (T31) keeps them in a bare
+  repository beside it instead.
 - D7. New code lives under `src/arch/`. Existing scan code is reused as an evidence source, and
   code that no longer serves the product is removed in its own task.
 
@@ -62,7 +63,7 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 | T28 | Readings: group regions and group filter; beat selection apart from focus, relationship filters, groups, visibility; saved views that need no output file | done |
 | T29 | Cross-model references: modules reference another model, state or subject, `read --references`, pinned foreign checkpoints; `read --code` resolves and opens the code target | done |
 | T30 | History repair and restore: correct a recorded state with source commits and an audit trail; restore a bundle into an empty vault with identities and history | done |
-| T31 | Vaults outside Git: a private history for a vault outside a checkout, used for temporary pull request models | open |
+| T31 | Vaults outside Git: a private history for a vault outside a checkout, used for temporary pull request models | done |
 | T32 | Language servers: `model language-server` add, remove and list; defaults for C-family, C# and Swift; on by default through user config outside the checkout; `unready` diagnostic and step timings | done |
 | T33 | Browser: multi-select, relationship-kind filter, URL state for proposal, focus and flow with Back and Forward; an agent shows a reading in the user's open pane | done |
 | T34 | `model explain`: ask the local agent about a selection, relationship, flow or proposal | done |
@@ -352,8 +353,9 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   `--description` (set only at `propose` until T26) or as beats of a current-state walkthrough
   reading the proposal against the current state with `focus` on the slice's modules, since a
   proposal edit refuses walkthroughs. A deviation is a proposal edit whose doing line names it.
-  The temporary model is a proposal committed on the branch and shelved after the merge, until
-  T31 gives temporary models their own vault.
+  The temporary model is a proposal committed on the branch and shelved after the merge; since
+  T31 it is drawn in a private vault outside the repository, and the committed proposal is the
+  alternative.
 - T11: `model view [--port N] [--no-open]` serves the page and a JSON API on 127.0.0.1 only, port 0
   (a free one) by default, and prints the URL with its token as the first line on stdout. Without
   `--no-open` it starts the platform opener (`open`, `xdg-open`, `cmd /c start ""`) with a one-time
@@ -1778,3 +1780,62 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   remote are not carried. A retry refuses `VAULT_EXISTS`. ponytail: the whole history travels in
   one bundle under the 4 MiB `INPUT_MAX`; page it into several files if real histories outgrow
   it.
+- T31: a private vault lives in a folder outside every Git checkout: `model init --private
+  <folder>` (made when missing, one level) writes `.boundrail/model` as in a checkout and creates
+  `.boundrail/history.git` beside it, a bare repository made with `git init --bare
+  --template=`, so it holds no hooks or other template files. Every command then takes `--root`
+  at or below the folder. The vault folder's checkout is the private folder, and every Git
+  command Boundrail runs at or below it (`src/git.rs`) adds `--git-dir <history>`, so retain,
+  every write's checkpoint (T25), claims and the journal (`<git dir>/boundrail`), checkpoint
+  readings, export of a checkpoint and the view's watchers use the private history unchanged,
+  with no working-tree Git operation. Signing follows `commit.gpgSign` from the user's config or
+  the private history's own, and the identity comes from the same; tests set both on the history.
+  The history's HEAD is unborn, so checkpoints carry no `Source` and read `source_status:
+  unavailable`.
+- T31: the history is found by the filesystem, not by Git: the nearest folder at or above the
+  path holding `.boundrail/history.git`, with `.boundrail`, the history and `.boundrail/model`
+  real directories (no symbolic link) that on Unix the effective user owns, and only when no
+  folder at or above the path holds `.git`. The effective user is the owner of a folder the
+  process creates in the system temporary folder, since std has no `geteuid`. The answer is
+  memoized per canonical path for the process and cleared when `init --private` creates a
+  history. So a bare repository committed into a checkout or planted by another user, or a
+  private folder later moved into one, is never used; inside a checkout the checkout's vault and
+  history apply as before, and a command whose path has a private history absorbed by a `.git`
+  above its folder warns once on stderr. A plain `model init` never adopts a private folder: below
+  one it refuses `CHECKOUT_NOT_FOUND`. `init --private` refuses `REQUEST_INVALID` for a folder
+  that is a symbolic link or lies inside a checkout (Git's toplevel or any `.git` above), saying
+  the checkout would absorb the vault, removing a folder it made, and `VAULT_EXISTS` when
+  `.boundrail` exists there; a failure after that removes `.boundrail` again. Its JSON adds
+  `history`. The history's config is trusted as a checkout's `.git/config` is: running Boundrail
+  in a folder trusts its Boundrail folder, as running Git trusts `.git`.
+- T31: `init --private <folder> --from <bundle>` starts the vault from a current-state or
+  checkpoint bundle (`model export`), validated as `import` validates one and loaded through the
+  loader, so it holds that model with its IDs, current state and revision; a proposal bundle
+  refuses `BUNDLE_INVALID` and another model's manifest `MODEL_MISMATCH`. Since the IDs match,
+  a proposal drawn there compares and renders against the repository's state with the existing
+  `compare` and `render --proposal`, and `export --proposal` from it imports into the repository.
+  `import` alone could not do this: it refuses another model's bundle, and a fresh private vault
+  is another model. Seeding is not a journaled write and retains no checkpoint; the first edit
+  does. A bundle exported `--with-history` (T30) seeds its current state only: its proposals and
+  history are left out, as `import` leaves them. `import --restore` needs a checkout: in a private
+  vault it refuses `VAULT_EXISTS` and outside every checkout `CHECKOUT_NOT_FOUND`, while a private
+  vault's `export --with-history` restores into a checkout like any other. `history correct`
+  works on a private history; its source must be a commit that history holds, so fetch the
+  code's commit into it first (`git --git-dir <history> fetch <repository> <commit>`).
+- T31: `model check` on a private vault skips the code check with one skip `{subject: <model>,
+  site: "code", reason: "no-checkout"}` and runs the semantic and embeds checks. `--code
+  <checkout>` names a Git checkout (its toplevel; `CHECKOUT_NOT_FOUND` otherwise) whose code the
+  code check scans instead of the vault's own, for any vault; it only reads it, though language
+  servers enabled for it run as they do there. `footprint` and `locality` refuse
+  `CHECKOUT_REQUIRED` on a private vault, since they read a checkout's commits. `history push`,
+  `fetch` and `configure` work against remotes added to the private history (`git --git-dir
+  <history> remote add`); a remote it lacks refuses `CHECKOUT_REQUIRED` naming that command.
+  `model inspect` skips the scan the same way (`code_skipped` starts `no-checkout`) and takes
+  `--code <checkout>` like check. ponytail: `setup`, `pictures --write`, `record` and `explain`
+  treat the private folder as the checkout. Moving the folder moves
+  the history with it; deleting the folder discards both.
+- T31: temporary pull request models. The PR skill exports the repository's current state,
+  starts a private vault from it in `mktemp -d`, draws a proposal there, compares and renders it,
+  checks it with `--code <repository>`, and deletes the folder, so nothing is committed. The
+  proposal committed on the branch (T36) stays the alternative when CI should gate the pull
+  request against it, since the action reads proposals from the checkout's vault.

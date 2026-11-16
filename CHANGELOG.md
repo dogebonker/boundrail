@@ -14,6 +14,13 @@
   nearest container left), `PART_RECREATED` (a module the predecessor removed stays) and
   `PARENT_CHANGES_DROPPED` (a child of a shelved or missing parent merges onto the current state,
   replacing what the parent changed).
+- Private vaults: `model init --private <folder>` creates a vault outside every Git checkout with
+  its history in the bare repository `<folder>/.boundrail/history.git`, so every write still
+  retains a checkpoint; `--from <bundle>` starts it from an exported model with its IDs. Commands
+  take `--root <folder>`; `model check` and `model inspect` skip the code there (`no-checkout`)
+  unless `--code <checkout>` names the code to read, and `footprint`, `locality` and publishing
+  without a remote on the private history refuse `CHECKOUT_REQUIRED`. The `boundrail-pr` skill
+  draws a pull request's temporary model in one and deletes it after, so nothing is committed.
 - The authored architecture model, `boundrail model`: modules bound to code, relationships,
   collections, flows and walkthroughs in `.boundrail/model/`, committed with the code. Batch
   edits name the revision they read and an operation ID; claims coordinate writers; proposals
@@ -197,6 +204,10 @@
 
 ### Changed
 
+- Git never fetches a missing object lazily from a promisor remote (`GIT_NO_LAZY_FETCH`), and only
+  the transport of `model history push` and `fetch` may reach a remote (`GIT_ALLOW_PROTOCOL` is
+  empty for every other Git command), so a repository's config cannot make a read run the
+  program its `core.sshCommand` or a remote helper names.
 - `model retain` refuses `NOTHING_TO_RETAIN` only when the latest checkpoint of the current state
   holds the same revision with the same `--doing`, so it retains an unchanged model with a new
   reason. A write whose checkpoint cannot be retained fails before anything is written: without

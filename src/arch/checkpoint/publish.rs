@@ -181,7 +181,7 @@ pub fn push(start: &Path, remote: Option<&str>) -> Result<Published> {
     ];
     let pushing = pushing_ref(remote);
     git::run(&root, &["update-ref", &pushing, &object])?;
-    if let Err(error) = git::run(&root, &args) {
+    if let Err(error) = git::run_transport(&root, &args) {
         // What the remote holds now says whether it took the push; while it cannot be asked,
         // what was sent stays pending.
         let now = remote_tip(&root, remote)?;
@@ -264,7 +264,7 @@ fn fetched<T>(root: &Path, remote: &str, then: impl FnOnce(&str, &str) -> Result
         remote,
         &refspec(&format!("+{HISTORY}"), &scratch),
     ];
-    let result = git::run(root, &args).and_then(|_| {
+    let result = git::run_transport(root, &args).and_then(|_| {
         let object = ref_target(root, &scratch)?.context("the fetched history ref is missing")?;
         let commit =
             peel(root, &object).ok_or_else(|| foreign(remote, &object, "is not a commit"))?;
@@ -554,17 +554,28 @@ fn check_remote(root: &Path, remote: &str) -> Result<()> {
     {
         return Ok(());
     }
+    let details = json!({ "remote": remote, "remotes": remotes });
+    if let Some(history) = git::private_history(root) {
+        let message = format!(
+            "--remote is not a remote of this private vault's history; add one with `git --git-dir {} remote add <name> <url>`",
+            history.display()
+        );
+        return Err(Refusal::new(Code::CheckoutRequired, message)
+            .with_details(details)
+            .into());
+    }
     Err(Refusal::new(
         Code::RequestInvalid,
         "--remote is not a configured remote; `git remote` lists them",
     )
-    .with_details(json!({ "remote": remote, "remotes": remotes }))
+    .with_details(details)
     .into())
 }
 
 /// The object `remote`'s history ref holds, `None` when it has none.
 fn remote_tip(root: &Path, remote: &str) -> Result<Option<String>> {
-    let listing = git::text(root, &["ls-remote", "--end-of-options", remote, HISTORY])?;
+    let listing = git::run_transport(root, &["ls-remote", "--end-of-options", remote, HISTORY])?;
+    let listing = String::from_utf8(listing).context("git ls-remote output is not UTF-8")?;
     Ok(listing.lines().find_map(|line| {
         let (object, name) = line.split_once('\t')?;
         (name == HISTORY).then(|| object.to_owned())

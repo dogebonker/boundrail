@@ -400,6 +400,29 @@ fn vault_exists(dir: &Path) -> anyhow::Error {
     .into()
 }
 
+/// Fills the new, empty vault folder `dir` from a current-state or checkpoint bundle and loads it;
+/// a proposal bundle refuses `BUNDLE_INVALID`. Only the state is seeded: the proposals and history
+/// a bundle exported `--with-history` carries are left out, as `import` leaves them.
+pub(super) fn seed(dir: PathBuf, input: &[u8]) -> Result<Model> {
+    let bundle = parse_bundle(input)?;
+    check(&bundle, &bundle.model.id)?;
+    if let Source::Proposal { .. } = bundle.source {
+        let message =
+            "a proposal bundle holds no current state; export the current state or a checkpoint";
+        return Err(invalid(message, json!({})));
+    }
+    let state = (bundle.files.into_iter())
+        .filter(|(path, _)| vault::is_vault_file(path))
+        .collect();
+    let files = bytes(state, "");
+    checkpoint::put(&dir, slices(&files))?;
+    let model = vault::load_dir(dir)?;
+    if model.manifest.id != bundle.model.id {
+        return Err(mismatch(&model.manifest.id, &bundle.model.id));
+    }
+    Ok(model)
+}
+
 /// A bundle read and loaded: the state it holds, the draft's default name, and for a proposal
 /// its base and the proposal itself (`drawn`).
 struct Opened {

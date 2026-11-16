@@ -108,6 +108,7 @@ pub enum Code {
     ModelMismatch,
     BundleInvalid,
     HistoryDiverged,
+    CheckoutRequired,
 }
 
 impl Code {
@@ -157,6 +158,7 @@ impl Code {
             Code::ModelMismatch => "MODEL_MISMATCH",
             Code::BundleInvalid => "BUNDLE_INVALID",
             Code::HistoryDiverged => "HISTORY_DIVERGED",
+            Code::CheckoutRequired => "CHECKOUT_REQUIRED",
         }
     }
 }

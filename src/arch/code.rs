@@ -60,6 +60,8 @@ pub enum SkipReason {
     Unrenderable,
     /// The beat or picture reads a checkpoint, and the history ref is not in this repository.
     HistoryNotLocal,
+    /// The vault is private, outside every Git checkout, and no `--code` checkout was named.
+    NoCheckout,
 }
 
 impl SkipReason {
@@ -82,13 +84,14 @@ impl SkipReason {
             Self::LanguageServerUnready => "language-server-unready",
             Self::Unrenderable => "unrenderable",
             Self::HistoryNotLocal => "history-not-local",
+            Self::NoCheckout => "no-checkout",
         }
     }
 }
 
 /// What a skip concerns: a module's binding, a relationship's or message step's anchor, the
 /// relationship, a language server (its name, or the config file), a walkthrough's beat, a
-/// picture, or a saved view.
+/// picture, a saved view, or the whole code check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SkipSite {
@@ -99,6 +102,7 @@ pub enum SkipSite {
     Walkthrough,
     Picture,
     View,
+    Code,
 }
 
 impl SkipSite {
@@ -111,6 +115,7 @@ impl SkipSite {
             Self::Walkthrough => "walkthrough",
             Self::Picture => "picture",
             Self::View => "view",
+            Self::Code => "code",
         }
     }
 }

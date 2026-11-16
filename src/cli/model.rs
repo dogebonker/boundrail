@@ -7,7 +7,7 @@ use std::iter;
 use boundrail::arch::bundle::{self, Exported};
 use boundrail::arch::checkpoint::{self, Checkpoint, Publication, Published, SourceStatus};
 use boundrail::arch::claims::{self, Claim};
-use boundrail::arch::code::{self, CodeReport, NoScan, Skip, SkipReason, UnitStatus};
+use boundrail::arch::code::{self, CodeReport, NoScan, Skip, SkipReason, SkipSite, UnitStatus};
 use boundrail::arch::compare::{self, Comparison};
 use boundrail::arch::diagnostic::{Diagnostic, Severity};
 use boundrail::arch::edit::{self, Receipt};
@@ -31,7 +31,7 @@ use boundrail::arch::types::{
     SCHEMAS, SavedView, Step, Walkthrough,
 };
 use boundrail::arch::vault::{
-    self, CollectionView, Found, Model, ModuleView, PictureEntry, RelationshipView, Scope,
+    self, CollectionView, Found, Model, ModuleView, PictureEntry, RelationshipView, Scope, Seed,
     ViewEntry, WalkthroughEntry, escape_controls,
 };
 use boundrail::arch::view::Shown;
@@ -60,7 +60,7 @@ pub(super) const MODEL_SCHEMA: &str = "boundrail/model/v1";
 
 #[derive(Args)]
 pub(super) struct ModelArgs {
-    /// Directory inside the Git checkout that holds the model
+    /// Directory inside the Git checkout that holds the model, or inside a private vault's folder
     #[arg(long, global = true, default_value = ".")]
     root: PathBuf,
     /// Output format; JSON when absent, except `model render`, which then prints the SVG, and
@@ -110,6 +110,11 @@ enum Command {
         /// untrusted checkouts
         #[arg(long)]
         no_language_servers: bool,
+        /// Compare the model with the code of this Git checkout instead of the vault's own; a
+        /// private vault has no code of its own, so without it its code check is skipped
+        /// (`no-checkout`). The checkout is only read
+        #[arg(long, value_name = "CHECKOUT")]
+        code: Option<PathBuf>,
     },
     /// Report the modules a branch changes, the relationships its changed imports cross, and
     /// what it changes in the model; with --fail-outside, exits 1 when it changes a module the
@@ -284,13 +289,25 @@ pub(super) enum CheckOnly {
 
 #[derive(Subcommand)]
 enum ModelCmd {
-    /// Create the model vault in .boundrail/model at the checkout root
+    /// Create the model vault in .boundrail/model at the checkout root, or with --private in a
+    /// folder outside every checkout
     Init {
-        #[arg(long)]
-        name: String,
+        #[arg(long, required_unless_present = "from")]
+        name: Option<String>,
         /// Start without a current state: plan in proposals until the first adoption
         #[arg(long)]
         planning: bool,
+        /// Create a private vault in this folder, made when missing, outside every Git checkout:
+        /// the vault in .boundrail/model and its history in the bare repository
+        /// .boundrail/history.git beside it, so every write retains a checkpoint there. Commands
+        /// then take --root <folder>; delete the folder to discard it
+        #[arg(long, value_name = "FOLDER")]
+        private: Option<PathBuf>,
+        /// Start the private vault from a current-state or checkpoint bundle `model export`
+        /// wrote, keeping that model's identities, so its proposals compare with that state;
+        /// `-` reads standard input
+        #[arg(long, value_name = "BUNDLE", requires = "private", conflicts_with_all = ["name", "planning"])]
+        from: Option<PathBuf>,
     },
     /// Set a repository up for the model: create the vault when absent, install the model
     /// skills for the agents named, and optionally write a starter language-server list.
@@ -622,6 +639,11 @@ enum ModelCmd {
         /// untrusted checkouts
         #[arg(long)]
         no_language_servers: bool,
+        /// Scan the code of this Git checkout instead of the vault's own; a private vault has no
+        /// code of its own, so without it the scan is skipped (`no-checkout`). The checkout is
+        /// only read
+        #[arg(long, value_name = "CHECKOUT", conflicts_with_all = ["checkpoint", "group"])]
+        code: Option<PathBuf>,
     },
     /// Report from Git history how often commits stay inside each module, which modules change
     /// together, and the pairs that do so with no relationship drawn
@@ -717,24 +739,33 @@ pub(super) fn run(args: ModelArgs) -> Result<ExitCode> {
             every_draft: true,
             language_servers,
             no_language_servers,
+            code,
             ..
         } => {
             let enable = enable(language_servers, no_language_servers);
-            check_every_draft(&args.root, args.format, only, enable)
+            let code = code.as_deref().map(code_checkout).transpose()?;
+            check_every_draft(&args.root, args.format, only, enable, code.as_deref())
         }
         Command::Check {
             only,
             proposal,
             language_servers,
             no_language_servers,
+            code,
             ..
-        } => check(
-            &args.root,
-            args.format,
-            only,
-            proposal.as_deref(),
-            enable(language_servers, no_language_servers),
-        ),
+        } => {
+            let enable = enable(language_servers, no_language_servers);
+            let code = code.as_deref().map(code_checkout).transpose()?;
+            let proposal = proposal.as_deref();
+            check(
+                &args.root,
+                args.format,
+                only,
+                proposal,
+                enable,
+                code.as_deref(),
+            )
+        }
         Command::Render(render) => {
             render_model(&args.root, args.format, &render).map(|()| ExitCode::SUCCESS)
         }
@@ -794,8 +825,28 @@ fn refuse_format(format: Option<ModelFormat>, command: &Command) -> Result<()> {
 
 fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
     match command {
-        ModelCmd::Init { name, planning } => {
-            let model = vault::init(root, &name, planning)?;
+        ModelCmd::Init {
+            name,
+            planning,
+            private,
+            from,
+        } => {
+            let name = name.as_deref().unwrap_or_default();
+            let input = from
+                .as_deref()
+                .map(|from| read_request(Some(from)))
+                .transpose()?;
+            let (model, history) = match private {
+                Some(folder) => {
+                    let seed = match &input {
+                        Some(input) => Seed::Bundle(input),
+                        None => Seed::New { name, planning },
+                    };
+                    let (model, history) = vault::init_private(&folder, seed)?;
+                    (model, Some(history))
+                }
+                None => (vault::init(root, name, planning)?, None),
+            };
             if markdown {
                 println!(
                     "Created model {} ({}) at {}",
@@ -804,19 +855,23 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
                     model.dir.display()
                 );
                 println!("revision {}", model.revision.digest);
+                if let Some(history) = &history {
+                    println!("private history {}", history.display());
+                }
                 return Ok(());
             }
-            write(
-                None,
-                &json!({
-                    "schema": MODEL_SCHEMA,
-                    "kind": "init",
-                    "success": true,
-                    "vault": model.dir,
-                    "manifest": model.manifest,
-                    "revision": model.revision,
-                }),
-            )
+            let mut output = json!({
+                "schema": MODEL_SCHEMA,
+                "kind": "init",
+                "success": true,
+                "vault": model.dir,
+                "manifest": model.manifest,
+                "revision": model.revision,
+            });
+            if let Some(history) = history {
+                output["history"] = json!(history);
+            }
+            write(None, &output)
         }
         ModelCmd::Read {
             subject: Some(subject),
@@ -1278,13 +1333,16 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
             group,
             language_servers,
             no_language_servers,
+            code,
         } => {
+            let code = code.as_deref().map(code_checkout).transpose()?;
             let asked = Inspect {
                 subject: subject.as_deref(),
                 proposal: proposal.as_deref(),
                 checkpoint: checkpoint.as_deref(),
                 group: group.as_deref(),
                 language_servers: enable(language_servers, no_language_servers),
+                code: code.as_deref(),
             };
             inspect_model(root, markdown, &asked)
         }
@@ -2291,8 +2349,10 @@ fn check(
     only: Option<CheckOnly>,
     proposal: Option<&str>,
     language_servers: lsp::Enable,
+    code: Option<&Path>,
 ) -> Result<ExitCode> {
-    let checked = run_check(root, only, proposal, language_servers, &SharedScan::new())?;
+    let scan = SharedScan::new();
+    let checked = run_check(root, only, proposal, language_servers, code, &scan)?;
     let code = ExitCode::from(u8::from(checked.warning > 0));
     if format == Some(ModelFormat::Annotations) {
         print!("{}", github::annotations(&checked.output()?));
@@ -2334,6 +2394,7 @@ fn check_every_draft(
     format: Option<ModelFormat>,
     only: Option<CheckOnly>,
     language_servers: lsp::Enable,
+    code: Option<&Path>,
 ) -> Result<ExitCode> {
     let refuse = |message: &str| Err(Refusal::new(Code::RequestInvalid, message).into());
     if format == Some(ModelFormat::Annotations) {
@@ -2350,11 +2411,11 @@ fn check_every_draft(
         .map(|listed| listed.id)
         .collect();
     let scan = SharedScan::new();
-    let current = run_check(root, only, None, language_servers, &scan)?;
+    let current = run_check(root, only, None, language_servers, code, &scan)?;
     let mut passed = current.warning == 0;
     let mut states = vec![Ok(current)];
     for id in drafts {
-        match run_check(root, only, Some(&id), language_servers, &scan) {
+        match run_check(root, only, Some(&id), language_servers, code, &scan) {
             Ok(checked) => {
                 passed &= checked.warning == 0;
                 states.push(Ok(checked));
@@ -2425,12 +2486,14 @@ pub(super) struct Checked {
 }
 
 /// Runs the checks `only` names, or both, on the current state or `proposal`, the code check
-/// with the configured language servers when `language_servers` enables them.
+/// with the configured language servers when `language_servers` enables them, against the code of
+/// `code` when given, else of the vault's checkout, which a private vault lacks (`no-checkout`).
 pub(super) fn run_check(
     root: &Path,
     only: Option<CheckOnly>,
     proposal: Option<&str>,
     language_servers: lsp::Enable,
+    code: Option<&Path>,
     scan: &SharedScan,
 ) -> Result<Checked> {
     if proposal.is_some() && only == Some(CheckOnly::Embeds) {
@@ -2456,8 +2519,14 @@ pub(super) fn run_check(
     } else {
         Vec::new()
     };
-    if runs(CheckOnly::Code) {
-        let (report, servers) = code_check(&model, language_servers, scan)?;
+    if runs(CheckOnly::Code) && code.is_none() && vault::is_private(&model.dir) {
+        skips.get_or_insert_with(Vec::new).push(Skip {
+            subject: model.manifest.id.clone(),
+            site: SkipSite::Code,
+            reason: SkipReason::NoCheckout,
+        });
+    } else if runs(CheckOnly::Code) {
+        let (report, servers) = code_check(&model, language_servers, code, scan)?;
         language_server_runs = servers;
         diagnostics.extend(report.diagnostics);
         skips.get_or_insert_with(Vec::new).extend(report.skips);
@@ -2520,8 +2589,11 @@ impl Checked {
 }
 
 /// The model's checkout and its scan, made only when a binding or anchor names code there.
-fn scan_checkout(model: &Model) -> Result<(PathBuf, Result<Document, NoScan>)> {
-    let checkout = checkpoint::checkout(&model.dir)?;
+fn scan_checkout(
+    model: &Model,
+    code: Option<&Path>,
+) -> Result<(PathBuf, Result<Document, NoScan>)> {
+    let checkout = checkout_of(model, code)?;
     let doc = if code::needs_scan(&model.modules, &model.collections, &checkout) {
         live_scan(&checkout)
     } else {
@@ -2557,15 +2629,31 @@ fn read_infra(checkout: &Path) -> Infra {
     })
 }
 
-/// The code check against the model's checkout and its infrastructure, with `scan`, made when
-/// a binding or anchor names code there, and the language servers it asked. A failed scan or
-/// infrastructure read becomes a `SCAN_FAILED` warning.
+fn checkout_of(model: &Model, code: Option<&Path>) -> Result<PathBuf> {
+    code.map_or_else(
+        || checkpoint::checkout(&model.dir),
+        |code| Ok(code.to_path_buf()),
+    )
+}
+
+/// The top of the Git checkout `--code` names, refusing `CHECKOUT_NOT_FOUND` for any other folder.
+fn code_checkout(path: &Path) -> Result<PathBuf> {
+    boundrail::git::toplevel(path).map_err(|error| {
+        let message = format!("--code {} is not a Git checkout: {error:#}", path.display());
+        Refusal::new(Code::CheckoutNotFound, message).into()
+    })
+}
+
+/// The code check against the model's checkout, or `code`, and its infrastructure, with `scan`,
+/// made when a binding or anchor names code there, and the language servers it asked. A failed
+/// scan or infrastructure read becomes a `SCAN_FAILED` warning.
 fn code_check(
     model: &Model,
     language_servers: lsp::Enable,
+    code: Option<&Path>,
     scan: &SharedScan,
 ) -> Result<(CodeReport, Vec<lsp::Run>)> {
-    let checkout = checkpoint::checkout(&model.dir)?;
+    let checkout = checkout_of(model, code)?;
     let checkout = checkout.as_path();
     let doc = if code::needs_scan(&model.modules, &model.collections, checkout) {
         (scan.get_or_init(|| live_scan(checkout)).as_ref()).map_err(Clone::clone)
@@ -2618,10 +2706,13 @@ pub(super) struct Inspect<'a> {
     pub(super) checkpoint: Option<&'a str>,
     pub(super) group: Option<&'a str>,
     pub(super) language_servers: lsp::Enable,
+    pub(super) code: Option<&'a Path>,
 }
 
 /// Why a checkpoint's inspection has no code section.
 const CHECKPOINT_CODE_SKIPPED: &str = "the checkout's code is not the checkpoint's code";
+const PRIVATE_CODE_SKIPPED: &str =
+    "no-checkout: the vault is private, outside every Git checkout, and --code names no checkout";
 
 /// `model inspect`: each module's interface, or one module's or group's.
 fn inspect_model(root: &Path, markdown: bool, asked: &Inspect<'_>) -> Result<()> {
@@ -2639,9 +2730,14 @@ fn inspect_model(root: &Path, markdown: bool, asked: &Inspect<'_>) -> Result<()>
     print_proposal(&model);
     match measured {
         Measured::Group(group) => print_group(&model, &group),
-        Measured::Modules { report, drawn, .. } => {
-            match checkpoint {
-                Some(_) => println!("Code not scanned: {CHECKPOINT_CODE_SKIPPED}"),
+        Measured::Modules {
+            report,
+            drawn,
+            code_skipped,
+            ..
+        } => {
+            match code_skipped {
+                Some(why) => println!("Code not scanned: {why}"),
                 None => print_inspect(&model, &report),
             }
             // Every module's drawn interface would bury the scan; JSON keeps them all.
@@ -2676,11 +2772,12 @@ pub(super) fn inspect_output(root: &Path, asked: &Inspect<'_>) -> Result<Value> 
             report,
             drawn,
             scan_error,
+            code_skipped,
         } => {
             extend(&mut output, &report)?;
             output["model_interfaces"] = json!(drawn);
-            if checkpoint.is_some() {
-                output["code_skipped"] = json!(CHECKPOINT_CODE_SKIPPED);
+            if let Some(why) = code_skipped {
+                output["code_skipped"] = json!(why);
             }
             scan_error
         }
@@ -2711,6 +2808,7 @@ enum Measured {
         drawn: Vec<inspect::Drawn>,
         /// The error of a failed scan.
         scan_error: Option<String>,
+        code_skipped: Option<&'static str>,
     },
 }
 
@@ -2736,11 +2834,19 @@ fn inspected(root: &Path, asked: &Inspect<'_>) -> Result<Inspected> {
         .transpose()?;
     let subject = subject.as_deref();
     let drawn = inspect::drawn(id, &model.modules, subject);
-    if checkpoint.is_some() {
+    let code_skipped = if checkpoint.is_some() {
+        Some(CHECKPOINT_CODE_SKIPPED)
+    } else if asked.code.is_none() && vault::is_private(&model.dir) {
+        Some(PRIVATE_CODE_SKIPPED)
+    } else {
+        None
+    };
+    if code_skipped.is_some() {
         let measured = Measured::Modules {
             report: InspectReport::default(),
             drawn,
             scan_error: None,
+            code_skipped,
         };
         return Ok(Inspected {
             model,
@@ -2748,7 +2854,7 @@ fn inspected(root: &Path, asked: &Inspect<'_>) -> Result<Inspected> {
             measured,
         });
     }
-    let (checkout, doc) = scan_checkout(&model)?;
+    let (checkout, doc) = scan_checkout(&model, asked.code)?;
     let scan = doc.as_ref().map_err(Clone::clone);
     let infra = read_infra(&checkout);
     let scanned = doc.as_ref().ok();
@@ -2766,6 +2872,7 @@ fn inspected(root: &Path, asked: &Inspect<'_>) -> Result<Inspected> {
             report,
             drawn,
             scan_error,
+            code_skipped,
         },
     })
 }
@@ -2932,9 +3039,21 @@ fn print_group(model: &Model, group: &inspect::GroupReport) {
     println!("  neighbours: {}", named(&group.neighbours));
 }
 
+/// Refuses `CHECKOUT_REQUIRED` for a private vault, which has no checkout's commits to read.
+fn needs_checkout(vault: &Path, command: &str) -> Result<()> {
+    if !vault::is_private(vault) {
+        return Ok(());
+    }
+    let message = format!(
+        "{command} reads a Git checkout's commits, and this vault is private, outside every checkout; run it in the repository"
+    );
+    Err(Refusal::new(Code::CheckoutRequired, message).into())
+}
+
 /// `model locality`: co-change locality of the current state's modules over Git history.
 fn model_locality(root: &Path, markdown: bool, since: Option<&str>, limit: usize) -> Result<()> {
     let (model, _, _) = load_for_read(root, None)?;
+    needs_checkout(&model.dir, "model locality")?;
     let history = locality::read(&checkpoint::checkout(&model.dir)?, since, limit)?;
     let report = locality::measure(&model.manifest.id, &model.modules, &history.changes);
     if markdown {
@@ -3023,7 +3142,9 @@ fn model_footprint(
     head: Option<&str>,
     proposal: Option<&str>,
 ) -> Result<Option<AgainstProposal>> {
-    let checkout = checkpoint::checkout(&vault::path(root)?)?;
+    let vault = vault::path(root)?;
+    needs_checkout(&vault, "model footprint")?;
+    let checkout = checkpoint::checkout(&vault)?;
     let range = footprint::range(&checkout, base, head)?;
     // The proposal is read from the checkout's vault, whatever head the footprint reads.
     let drawn = proposal
@@ -3136,7 +3257,7 @@ fn footprint_scan(
     if files.is_empty() {
         return Ok((Err(CrossingsSkipped::NotNeeded), None));
     }
-    Ok(match scan_checkout(model)?.1 {
+    Ok(match scan_checkout(model, None)?.1 {
         Ok(doc) => {
             let failed: Vec<String> = (doc.scan_failures.iter())
                 .filter(|f| f.files.iter().any(|file| files.binary_search(file).is_ok()))

@@ -14210,3 +14210,445 @@ fn printed_reference_and_binding_paths_escape_control_characters() {
     assert!(text.contains("pay\\u{1b}[31mments/lib/pay.rs"), "{text}");
     assert!(!text.contains('\u{1b}'), "{text}");
 }
+
+impl Checkout {
+    /// A private vault made by `model init --private` in a new folder outside every checkout,
+    /// with `extra` arguments, whose history has its own identity and never signs; and the
+    /// init output.
+    fn private(extra: &[&str]) -> (Self, Value) {
+        let folder = Self::outside();
+        let path = folder.path().to_str().unwrap().to_owned();
+        let out = folder.ok(&[&["init", "--private", &path][..], extra].concat());
+        identify(folder.path(), out["history"].as_str().unwrap());
+        (folder, out)
+    }
+}
+
+/// Gives the private history `history` of the vault in `folder` its own identity, never signing.
+fn identify(folder: &Path, history: &str) {
+    for (key, value) in [
+        ("user.name", "tester"),
+        ("user.email", "tester@example.com"),
+        ("commit.gpgsign", "false"),
+    ] {
+        git_in(folder, &["--git-dir", history, "config", key, value]);
+    }
+}
+
+#[test]
+fn a_private_vault_keeps_its_history_beside_it_and_refuses_what_needs_a_checkout() {
+    let (private, init) = Checkout::private(&["--name", "Review"]);
+    let history = init["history"].as_str().unwrap().to_owned();
+    assert_eq!(
+        Path::new(&history),
+        private
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join(".boundrail/history.git")
+    );
+    assert!(!private.path().join(".git").exists());
+    assert!(!Path::new(&history).join("hooks").exists());
+
+    let edited = private.edited(json!([
+        {"type": "add-module", "module": {"name": "Gateway", "kind": "service", "order": 0}},
+    ]));
+    let checkpoint = edited["checkpoint"]["id"].as_str().unwrap().to_owned();
+    let log = git_in(
+        private.path(),
+        &[
+            "--git-dir",
+            &history,
+            "log",
+            "--format=%s",
+            "refs/boundrail/history",
+        ],
+    );
+    assert!(log.contains("testing edits"), "{log}");
+    let listed = private.ok(&["checkpoints"]);
+    assert_eq!(listed["checkpoints"][0]["id"], checkpoint.as_str());
+    assert_eq!(listed["checkpoints"][0]["source_status"], "unavailable");
+    let read = private.ok(&["read", "--checkpoint", &checkpoint]);
+    assert_eq!(names(&read), ["Gateway"]);
+    let (code, svg) = private.run_raw(&["render"]);
+    assert_eq!(code, 0);
+    assert!(svg.contains("Gateway"), "{svg}");
+
+    let (code, checked) = private.run(&["check"]);
+    assert_eq!(code, 0, "{checked:#}");
+    let model = init["manifest"]["id"].clone();
+    assert_eq!(
+        checked["skips"],
+        json!([{"subject": model, "site": "code", "reason": "no-checkout"}])
+    );
+    assert!(checked.get("units").is_none());
+    let (code, text) = private.run_raw(&["--format", "markdown", "check"]);
+    assert_eq!(code, 0);
+    assert!(text.contains("- code no-checkout: 1"), "{text}");
+
+    for args in [&["footprint"][..], &["locality"], &["history", "push"]] {
+        private.refused(args, "CHECKOUT_REQUIRED");
+    }
+    let remote = bare();
+    let url = remote.path().to_str().unwrap();
+    git_in(
+        private.path(),
+        &["--git-dir", &history, "remote", "add", "origin", url],
+    );
+    let pushed = private.ok(&["history", "push"]);
+    assert_eq!(pushed["checkpoints"], json!([checkpoint]));
+}
+
+#[test]
+fn a_private_vault_refuses_a_checkout_a_link_and_an_existing_vault() {
+    let checkout = Checkout::new();
+    let inside = checkout.path().join("evidence");
+    let refused = checkout.refused(
+        &["init", "--private", inside.to_str().unwrap(), "--name", "X"],
+        "REQUEST_INVALID",
+    );
+    assert!(
+        refused["message"]
+            .as_str()
+            .unwrap()
+            .contains("inside the Git checkout")
+    );
+    assert!(!inside.exists(), "the refused folder was left behind");
+
+    let (private, _) = Checkout::private(&["--name", "Review"]);
+    let path = private.path().to_str().unwrap();
+    private.refused(
+        &["init", "--private", path, "--name", "Again"],
+        "VAULT_EXISTS",
+    );
+    let outside = Checkout::outside();
+    let link = outside.path().join("link");
+    std::os::unix::fs::symlink(private.path(), &link).unwrap();
+    outside.refused(
+        &["init", "--private", link.to_str().unwrap(), "--name", "X"],
+        "REQUEST_INVALID",
+    );
+
+    let planted = checkout.path().join(".boundrail/history.git");
+    git_in(
+        checkout.path(),
+        &["init", "-q", "--bare", planted.to_str().unwrap()],
+    );
+    shop(&checkout);
+    checkout
+        .edited(json!([{"type": "edit-module", "subject": "Web", "set": {"name": "Shopfront"}}]));
+    git(
+        &checkout,
+        &["rev-parse", "--verify", "refs/boundrail/history"],
+    );
+    let planted = planted.to_str().unwrap();
+    let refs = git_in(checkout.path(), &["--git-dir", planted, "for-each-ref"]);
+    assert_eq!(refs, "");
+}
+
+#[test]
+fn a_temporary_pull_request_model_compares_with_the_repository_and_leaves_it_alone() {
+    let repo = Checkout::new();
+    typescript(&repo);
+    let model = shop(&repo);
+    let q = |id: &str| format!("{model}#{id}");
+    bind(&repo, "Platfrm1", "src");
+    bind(&repo, "WebApp01", "src/web");
+    bind(&repo, "Billing1", "src/billing");
+    let mut ghost = module("Ghost001", "Ghost", "module", 3);
+    ghost["parent"] = q("Platfrm1").into();
+    ghost["binding"] = json!({"path": "src/ghost"});
+    repo.module(ghost);
+    let before = repo.ok(&["read"])["revision"].clone();
+
+    let elsewhere = propose(&repo, "Elsewhere", "current");
+    let (code, proposal) = repo.run(&["export", "--proposal", &elsewhere]);
+    assert_eq!(code, 0);
+    let (code, bundle) = repo.run_raw(&["export"]);
+    assert_eq!(code, 0);
+    let status = ["status", "--porcelain", "--untracked-files=all"];
+    let untouched = git(&repo, &status);
+    let evidence = Checkout::outside();
+    let current = evidence.path().join("current.json");
+    fs::write(&current, &bundle).unwrap();
+    let proposal_file = evidence.path().join("proposal.json");
+    fs::write(&proposal_file, proposal.to_string()).unwrap();
+    let folder = evidence.path().join("model");
+    let path = folder.to_str().unwrap();
+    let from = |bundle: &Path| {
+        let bundle = bundle.to_str().unwrap().to_owned();
+        evidence.run(&["init", "--private", path, "--from", &bundle])
+    };
+    let (code, out) = from(&proposal_file);
+    assert_eq!((code, &out["error"]["code"]), (2, &json!("BUNDLE_INVALID")));
+    assert!(!folder.join(".boundrail").exists());
+    let (code, out) = from(&current);
+    assert_eq!(code, 0, "{out:#}");
+    assert_eq!(out["manifest"]["id"], model.as_str());
+    assert_eq!(out["revision"], before);
+    identify(&folder, out["history"].as_str().unwrap());
+
+    let run = |args: &[&str]| evidence.ok(&[&["--root", path][..], args].concat());
+    let drawn = run(&[
+        "propose",
+        "--name",
+        "PR: queue payments",
+        "--doing",
+        "draw the pull request",
+        "--writer",
+        "tester",
+        "--operation-id",
+        &operation(),
+    ]);
+    let id = local(drawn["allocated"][0]["id"].as_str().unwrap()).to_owned();
+    let read = run(&["read", "--proposal", &id]);
+    let request = json!({
+        "target": {"model": model, "state": id},
+        "expected_revision": read["revision"]["digest"],
+        "operation_id": operation(),
+        "writer": "tester",
+        "changes": [
+            {"type": "add-module", "module": {"name": "Queue", "kind": "service", "order": 4, "parent": "Platform"}},
+        ],
+    });
+    let args = [
+        "--root",
+        path,
+        "edit",
+        "--doing",
+        "queue payments",
+        "--proposal",
+        &id,
+    ];
+    let (code, out) = evidence.pipe(&args, &request);
+    assert_eq!(code, 0, "{out:#}");
+
+    let compared = run(&["compare", &id]);
+    assert_eq!(compared["modules"]["added"][0]["name"], "Queue");
+    assert_eq!(compared["modules"]["removed"], json!([]));
+    assert_eq!(compared["modules"]["changed"], json!([]));
+    let picture = evidence.path().join("after.svg");
+    let output = picture.to_str().unwrap();
+    let rendered = [
+        "--root",
+        path,
+        "render",
+        "--proposal",
+        &id,
+        "--output",
+        output,
+    ];
+    assert_eq!(evidence.run_raw(&rendered).0, 0);
+    assert!(fs::read_to_string(&picture).unwrap().contains("Queue"));
+
+    let (code, checked) = evidence.run(&["--root", path, "check"]);
+    assert_eq!(code, 0, "{checked:#}");
+    assert_eq!(checked["skips"][0]["reason"], "no-checkout");
+    let repo_path = repo.path().to_str().unwrap();
+    let (code, checked) = evidence.run(&["--root", path, "check", "--code", repo_path]);
+    assert_eq!(code, 1, "{checked:#}");
+    assert_eq!(found(&checked), ["BINDING_PATH_MISSING Ghost001"]);
+    let inspected = run(&["inspect"]);
+    assert!(
+        (inspected["code_skipped"].as_str().unwrap()).starts_with("no-checkout"),
+        "{inspected:#}"
+    );
+    assert_eq!(inspected["modules"], json!([]));
+    let inspected = run(&["inspect", "--code", repo_path]);
+    assert_eq!(inspected["code_skipped"], Value::Null);
+    assert!(
+        (inspected["modules"].as_array().unwrap().iter()).any(|m| m["name"] == "Web"),
+        "{inspected:#}"
+    );
+
+    fs::remove_dir_all(&folder).unwrap();
+    assert_eq!(repo.ok(&["read"])["revision"], before);
+    assert_eq!(git(&repo, &status), untouched);
+    let checkpoints = repo.ok(&["checkpoints"])["checkpoints"].clone();
+    assert!(
+        (checkpoints.as_array().unwrap().iter())
+            .all(|c| c["doing"] != "queue payments" && c["doing"] != "draw the pull request"),
+        "{checkpoints:#}"
+    );
+}
+
+#[test]
+fn a_private_history_takes_corrections_and_restores_into_a_checkout_but_not_into_itself() {
+    let repo = committed();
+    shop(&repo);
+    let drafted = propose(&repo, "Elsewhere", "current");
+    let carried = export(&repo, &["--with-history"]);
+    assert!(carried["files"][format!("proposals/{drafted}/proposal.json")].is_string());
+    let evidence = Checkout::outside();
+    let current = evidence.path().join("current.json");
+    fs::write(&current, carried.to_string()).unwrap();
+    let folder = evidence.path().join("model");
+    let path = folder.to_str().unwrap();
+    let seeded = evidence.ok(&[
+        "init",
+        "--private",
+        path,
+        "--from",
+        current.to_str().unwrap(),
+    ]);
+    assert_eq!(seeded["revision"]["digest"], repo.digest());
+    let history = seeded["history"].as_str().unwrap().to_owned();
+    identify(&folder, &history);
+    assert!(!folder.join(".boundrail/model/proposals").exists());
+    let run = |args: &[&str]| evidence.run(&[&["--root", path][..], args].concat());
+    let (code, out) = run(&["checkpoints"]);
+    assert_eq!(code, 0, "{out:#}");
+    assert_eq!(out["checkpoints"], json!([]));
+
+    let (code, out) = run(&[
+        "retain",
+        "--doing",
+        "the review as drawn",
+        "--writer",
+        "tester",
+    ]);
+    assert_eq!(code, 0, "{out:#}");
+    let drawn = out["checkpoint"]["id"].as_str().unwrap().to_owned();
+    let release = head(&repo);
+    let correct = |operation: &str| {
+        run(&[
+            "history",
+            "correct",
+            &drawn,
+            "--source",
+            &release,
+            "--doing",
+            "it was drawn from the release",
+            "--writer",
+            "fixer",
+            "--operation-id",
+            operation,
+        ])
+    };
+    let (code, out) = correct("fix-1");
+    assert_eq!(
+        (code, &out["error"]["code"]),
+        (2, &json!("REQUEST_INVALID")),
+        "{out:#}"
+    );
+    let repo_path = repo.path().to_str().unwrap();
+    git_in(
+        &folder,
+        &["--git-dir", &history, "fetch", "-q", repo_path, "HEAD"],
+    );
+    let (code, out) = correct("fix-1");
+    assert_eq!(code, 0, "{out:#}");
+    assert_eq!(out["corrected"]["source"], release.as_str());
+    let (_, listed) = run(&["checkpoints"]);
+    let ours = listed["checkpoints"].as_array().unwrap().clone();
+    assert_eq!(ours[1]["id"], drawn.as_str());
+    assert_eq!(ours[1]["source"], release.as_str());
+    assert_eq!(ours[1]["source_status"], "available");
+    assert_eq!(ours[1]["corrections"][0]["writer"], "fixer");
+
+    let (code, private) = run(&["export", "--with-history"]);
+    assert_eq!(code, 0, "{private:#}");
+    let bundle = folder.join("restore.bundle.json");
+    fs::write(&bundle, private.to_string()).unwrap();
+    let (code, out) = run(&["import", "--restore", bundle.to_str().unwrap()]);
+    assert_eq!((code, &out["error"]["code"]), (2, &json!("VAULT_EXISTS")));
+    let message = out["error"]["message"].as_str().unwrap();
+    assert!(message.contains("needs a checkout without one"), "{out:#}");
+    let nowhere = Checkout::outside();
+    let (code, out) = restore(&nowhere, &private);
+    assert_eq!(
+        (code, &out["error"]["code"]),
+        (2, &json!("CHECKOUT_NOT_FOUND")),
+        "{out:#}"
+    );
+
+    let restored = bare_clone(&repo);
+    let (code, out) = restore(&restored, &private);
+    assert_eq!(code, 0, "{out:#}");
+    assert_eq!(out["revision"]["digest"], repo.digest());
+    assert_eq!(by_content(&checkpoints(&restored)), by_content(&ours));
+}
+
+#[test]
+fn a_plain_init_below_a_private_vault_and_a_private_vault_inside_a_checkout_are_refused_or_warned()
+{
+    let (private, _) = Checkout::private(&["--name", "Review"]);
+    let below = private.path().join("below");
+    fs::create_dir(&below).unwrap();
+    let below = below.to_str().unwrap();
+    private.refused(
+        &["--root", below, "init", "--name", "X"],
+        "CHECKOUT_NOT_FOUND",
+    );
+    assert!(!private.path().join("below/.boundrail").exists());
+
+    let outer = Checkout::outside();
+    let folder = outer.path().join("model");
+    let path = folder.to_str().unwrap();
+    outer.ok(&["init", "--private", path, "--name", "Review"]);
+    git_in(outer.path(), &["init", "-q"]);
+    let out = Command::new(env!("CARGO_BIN_EXE_boundrail"))
+        .args(["model", "--root", path, "read"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("lies inside the Git checkout"), "{stderr}");
+}
+
+/// Makes the repository `git_dir` beside `dir` a partial clone whose promisor remote reaches
+/// `script` over SSH, even past `protocol.allow`, and deletes the history's `model.json` blob.
+fn promise(dir: &Path, git_dir: &str, script: &Path) {
+    let git = |args: &[&str]| git_in(dir, &[&["--git-dir", git_dir][..], args].concat());
+    for (key, value) in [
+        ("core.repositoryformatversion", "1"),
+        ("extensions.partialClone", "origin"),
+        ("remote.origin.url", "evil.example:x"),
+        ("remote.origin.promisor", "true"),
+        ("protocol.ssh.allow", "always"),
+        ("core.sshCommand", script.to_str().unwrap()),
+    ] {
+        git(&["config", key, value]);
+    }
+    let blob = git(&["rev-parse", "refs/boundrail/history:model.json"]);
+    let objects = dir.join(git_dir).join("objects");
+    fs::remove_file(objects.join(&blob[..2]).join(&blob[2..])).unwrap();
+}
+
+#[test]
+fn reading_a_history_never_runs_the_program_a_promisor_remote_names() {
+    let scripts = Checkout::outside();
+    let ran = scripts.path().join("ran");
+    let script = scripts.path().join("ssh");
+    fs::write(
+        &script,
+        format!("#!/bin/sh\ntouch '{}'\nexit 1\n", ran.display()),
+    )
+    .unwrap();
+    let mode = <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755);
+    fs::set_permissions(&script, mode).unwrap();
+
+    let checkout = Checkout::new();
+    checkout.init();
+    let (private, init) = Checkout::private(&["--name", "Review"]);
+    let history = init["history"].as_str().unwrap().to_owned();
+    for (vault, git_dir) in [(&checkout, ".git"), (&private, history.as_str())] {
+        let edited = vault.edited(json!([
+            {"type": "add-module", "module": {"name": "Gateway", "kind": "service", "order": 0}},
+        ]));
+        let checkpoint = edited["checkpoint"]["id"].as_str().unwrap().to_owned();
+        let commit = git_in(
+            vault.path(),
+            &["--git-dir", git_dir, "rev-parse", "refs/boundrail/history"],
+        );
+        promise(vault.path(), git_dir, &script);
+        vault.run_raw(&["checkpoints"]);
+        vault.run_raw(&["read", "--checkpoint", &checkpoint]);
+        vault.run_raw(&["export", "--with-history"]);
+        correct(vault, &checkpoint, &commit, "promised");
+        assert!(
+            !ran.exists(),
+            "{} ran the promisor's SSH command",
+            vault.path().display()
+        );
+    }
+}
