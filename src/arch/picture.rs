@@ -31,7 +31,7 @@ const RASTERIZERS: [(&str, &[&str]); 3] = [
     ("rsvg-convert", &["-o", "out.png", "in.svg"]),
     ("magick", &["in.svg", "out.png"]),
 ];
-const SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+pub(crate) const SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 /// A chunk's length and type, before its data.
 const CHUNK_HEAD: usize = 8;
 /// A chunk's CRC, after its data.
@@ -89,7 +89,8 @@ pub enum Found {
     Blocked(String),
 }
 
-/// Why a PNG was not rasterized: `reason` is `no-rasterizer` or `rasterizer-failed`.
+/// Why a tool made no file: `reason` is `no-rasterizer` or `rasterizer-failed` for a PNG, and
+/// names the missing or failing speaker or encoder for a recording (`super::record`).
 #[derive(Debug)]
 pub struct Unrendered {
     pub reason: &'static str,
@@ -256,44 +257,72 @@ pub fn reframe(svg: &str, scale: f64, region: Option<[f64; 4]>) -> Result<String
     Ok(format!("{}{size}{}", &svg[..start], &svg[end + 1..]))
 }
 
+/// A rasterizer found on `PATH` outside the checkout.
+pub struct Rasterizer {
+    pub name: &'static str,
+    args: &'static [&'static str],
+    program: PathBuf,
+}
+
+/// The first of `RASTERIZERS` on `PATH` outside `checkout`; `no-rasterizer` when none is.
+pub fn rasterizer(checkout: &Path) -> Result<Rasterizer, Unrendered> {
+    let found = (RASTERIZERS.iter()).find_map(|(name, args)| {
+        let program = collect::resolve_program(name, checkout).ok()?;
+        Some(Rasterizer {
+            name,
+            args,
+            program,
+        })
+    });
+    found.ok_or_else(|| {
+        let names: Vec<&str> = RASTERIZERS.iter().map(|(name, _)| *name).collect();
+        Unrendered {
+            reason: "no-rasterizer",
+            message: format!("no rasterizer on PATH; tried {}", names.join(", ")),
+        }
+    })
+}
+
 /// The PNG of `drawing` from the first rasterizer on `PATH` outside `checkout`, carrying the
 /// SVG's digest.
 pub fn rasterize(drawing: &Drawing, checkout: &Path) -> Result<Vec<u8>, Unrendered> {
-    let found = (RASTERIZERS.iter()).find_map(|(name, args)| {
-        let program = collect::resolve_program(name, checkout).ok()?;
-        Some((*name, *args, program))
-    });
-    let Some((name, args, program)) = found else {
-        let names: Vec<&str> = RASTERIZERS.iter().map(|(name, _)| *name).collect();
-        return Err(Unrendered {
-            reason: "no-rasterizer",
-            message: format!("no rasterizer on PATH; tried {}", names.join(", ")),
-        });
-    };
-    let failed = |message: String| Unrendered {
-        reason: "rasterizer-failed",
-        message: format!("{name} ({}): {message}", program.display()),
-    };
-    let dir = TempDir::new("picture").map_err(|e| failed(format!("{e:#}")))?;
-    fs::write(dir.path().join("in.svg"), &drawing.svg).map_err(|e| failed(e.to_string()))?;
-    let mut command = Command::new(&program);
-    command
-        .args(args)
-        .current_dir(dir.path())
-        .env("PATH", collect::path_outside(checkout));
-    let out = collect::run(&mut command).map_err(|e| failed(format!("{e:#}")))?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let last = stderr.lines().rev().find(|l| !l.trim().is_empty());
-        return Err(failed(format!(
-            "{}: {}",
-            out.status,
-            last.unwrap_or_default()
-        )));
+    rasterizer(checkout)?.rasterize(drawing, checkout)
+}
+
+impl Rasterizer {
+    /// The PNG of `drawing`, carrying the SVG's digest; `rasterizer-failed` when the program
+    /// fails or writes no valid PNG.
+    pub fn rasterize(&self, drawing: &Drawing, checkout: &Path) -> Result<Vec<u8>, Unrendered> {
+        let Rasterizer {
+            name,
+            args,
+            program,
+        } = self;
+        let failed = |message: String| Unrendered {
+            reason: "rasterizer-failed",
+            message: format!("{name} ({}): {message}", program.display()),
+        };
+        let dir = TempDir::new("picture").map_err(|e| failed(format!("{e:#}")))?;
+        fs::write(dir.path().join("in.svg"), &drawing.svg).map_err(|e| failed(e.to_string()))?;
+        let mut command = Command::new(program);
+        command
+            .args(*args)
+            .current_dir(dir.path())
+            .env("PATH", collect::path_outside(checkout));
+        let out = collect::run(&mut command).map_err(|e| failed(format!("{e:#}")))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let last = stderr.lines().rev().find(|l| !l.trim().is_empty());
+            return Err(failed(format!(
+                "{}: {}",
+                out.status,
+                last.unwrap_or_default()
+            )));
+        }
+        let png = fs::read(dir.path().join("out.png")).map_err(|e| failed(e.to_string()))?;
+        let tagged = with_source(&png, &drawing.digest);
+        tagged.map_err(|why| failed(format!("wrote no valid PNG: {why}")))
     }
-    let png = fs::read(dir.path().join("out.png")).map_err(|e| failed(e.to_string()))?;
-    let tagged = with_source(&png, &drawing.digest);
-    tagged.map_err(|why| failed(format!("wrote no valid PNG: {why}")))
 }
 
 /// The CRC-32 (ISO 3309, as PNG uses it) of `parts` in order.

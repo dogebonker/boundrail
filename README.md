@@ -89,6 +89,25 @@ boundrail model render --format json
 without one. A dark or auto theme in a PNG is only as dark as the rasterizer's CSS support makes
 it.
 
+### Recording a walkthrough
+
+`model record` turns a walkthrough into an MP4: each beat's picture stays on screen while a local
+voice reads its narration, then half a second more.
+
+```sh
+# Record Tour at 1280x720; writes tour.mp4 and the talk folder tour.talk/.
+boundrail model record Tour --output tour.mp4 --voice Samantha --rate 180 --width 1280 --height 720
+
+# Encode the MP4 again from the talk folder, without drawing or speaking.
+boundrail model record --replay tour.talk --output tour-24fps.mp4 --fps 24
+```
+
+It needs a rasterizer (as `--png` does), a voice (`say` on macOS, `espeak-ng` or `piper`
+elsewhere; `piper` takes its voice model file as `--voice`) and `ffmpeg`, all on PATH outside the
+checkout. A missing tool refuses before anything is written, naming it in `details.reason`. The
+talk folder holds each beat's PNG and audio and `talk.json` with each beat's title, narration and
+length. Nothing goes over the network.
+
 ## Footprint
 
 `boundrail model footprint` lists the modules a branch changes, the relationships its changed

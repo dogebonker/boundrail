@@ -26,7 +26,11 @@
 //! pictures --write` runs for PNG pictures are no exception: Boundrail picks them from a fixed
 //! list (`resvg`, `rsvg-convert`, `magick`), finds
 //! them in absolute `PATH` folders outside the checkout, and runs them in a private temporary
-//! folder holding only the SVG it drew; the repository names none of them. `model history push`
+//! folder holding only the SVG it drew; the repository names none of them. The text-to-speech
+//! programs and ffmpeg `model record` runs are the same accepted scope: fixed lists (`say`,
+//! `espeak-ng`, `piper`; `ffmpeg`), found the same way, with arguments Boundrail builds, run
+//! without a shell in a private temporary folder holding only their inputs, the narration passed
+//! in a file or on stdin, never as an argument. `model history push`
 //! and `model history fetch` reach a remote the user configured and names by its `git remote`
 //! name, never a URL or option, so Git runs the transport that config names (`ssh`,
 //! `core.sshCommand`, `remote.<name>.uploadpack` and `receivepack`, credential helpers): the

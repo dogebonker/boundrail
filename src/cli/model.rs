@@ -40,6 +40,8 @@ use serde_json::{Value, json};
 mod language_server;
 #[path = "pictures.rs"]
 mod pictures;
+#[path = "record.rs"]
+mod record;
 #[path = "setup.rs"]
 mod setup;
 pub(super) use pictures::pictures_output;
@@ -137,6 +139,11 @@ enum Command {
         #[arg(long)]
         only: Option<String>,
     },
+    /// Record a walkthrough to an MP4: each beat's picture held while a local text-to-speech
+    /// program (say, espeak-ng or piper on PATH outside the checkout) reads its narration,
+    /// encoded with ffmpeg, beside a talk folder of each beat's PNG, audio and talk.json that
+    /// --replay encodes again. Nothing is written when a tool is missing or a beat fails
+    Record(record::RecordArgs),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -630,6 +637,9 @@ pub(super) fn run(args: ModelArgs) -> Result<ExitCode> {
         Command::View(view) => super::view_cli::run(&args.root, &view).map(|()| ExitCode::SUCCESS),
         Command::Pictures { write, only } => {
             pictures::list(&args.root, markdown, only.as_deref(), write)
+        }
+        Command::Record(record) => {
+            record::run(&args.root, markdown, &record).map(|()| ExitCode::SUCCESS)
         }
         Command::Footprint {
             base,
@@ -1383,10 +1393,7 @@ fn render_model(root: &Path, format: Option<ModelFormat>, args: &RenderArgs) -> 
             let framed = picture::reframe(&rendered.svg, scale, region).map_err(invalid)?;
             let checkout = checkpoint::checkout(&vault::path(root)?)?;
             let drawing = picture::Drawing::new(framed);
-            let bytes = picture::rasterize(&drawing, &checkout).map_err(|failed| {
-                let details = json!({"reason": failed.reason});
-                Refusal::new(Code::RequestInvalid, failed.message).with_details(details)
-            })?;
+            let bytes = picture::rasterize(&drawing, &checkout).map_err(refused)?;
             Some((path, bytes))
         }
         None => None,
@@ -1816,6 +1823,14 @@ fn print_published(markdown: bool, pushing: bool, published: &Published) -> Resu
         println!("replayed: {}", published.replayed.join(", "));
     }
     Ok(())
+}
+
+/// A missing or failing tool as `REQUEST_INVALID`, its reason in `details.reason`.
+fn refused(failed: picture::Unrendered) -> anyhow::Error {
+    let details = json!({"reason": failed.reason});
+    Refusal::new(Code::RequestInvalid, failed.message)
+        .with_details(details)
+        .into()
 }
 
 fn check_output(root: &Path, output: &Path, flag: &str) -> Result<()> {

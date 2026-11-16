@@ -19,6 +19,7 @@ pub mod lsp;
 mod merge;
 pub mod picture;
 pub mod proposal;
+pub mod record;
 pub mod render;
 pub mod request;
 pub mod revision;

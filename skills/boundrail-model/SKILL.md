@@ -103,6 +103,9 @@ Other codes explain themselves in their message. `skips` list what the check cou
   list a flow's `participants` to fix the order of its sequence diagram.
 - A walkthrough is ordered beats, each with a narration and a reading (what to draw). Preview a
   beat with `boundrail model render --walkthrough <id> --beat <n> --output <file.svg>`.
+- Record a walkthrough with a local voice: `boundrail model record <id> --output <file.mp4>`. It
+  needs a rasterizer, `say`, `espeak-ng` or `piper`, and `ffmpeg` on PATH; `details.reason` names
+  a missing one. `--replay <file>.talk --output <file.mp4>` encodes it again without the model.
 - A picture is a reading with an `output` path (`.svg` or `.png`) outside `.boundrail`. Draw stale
   pictures with `boundrail model pictures --write`; `model check --only embeds` lists stale ones.
 - See the model in a browser with `boundrail model view`.

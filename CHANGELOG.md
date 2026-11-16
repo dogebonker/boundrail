@@ -97,6 +97,12 @@
   `language_server_runs` in the JSON of `model check` and `model inspect` lists each server's
   outcome and the milliseconds of its start, initialize, queries and shutdown, which stderr also
   prints.
+- `model record <walkthrough> --output <file.mp4>`: each beat's picture held while a local voice
+  (`say`, `espeak-ng` or `piper`) reads its narration, encoded with `ffmpeg`, with `--voice`,
+  `--rate`, `--width`, `--height` and `--fps`. A talk folder beside the MP4 keeps each beat's PNG,
+  audio and `talk.json`, and `--replay <talk folder>` encodes the MP4 again from it alone. A
+  missing rasterizer, voice or ffmpeg refuses `REQUEST_INVALID` with `details.reason`
+  (`no-rasterizer`, `no-text-to-speech`, `no-ffmpeg`) before anything is written.
 
 ### Changed
 

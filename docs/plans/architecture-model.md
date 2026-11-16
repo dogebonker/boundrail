@@ -66,7 +66,7 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 | T32 | Language servers: `model language-server` add, remove and list; defaults for C-family, C# and Swift; on by default through user config outside the checkout; `unready` diagnostic and step timings | done |
 | T33 | Browser: multi-select, relationship-kind filter, URL state for proposal, focus and flow with Back and Forward; an agent shows a reading in the user's open pane | open |
 | T34 | `model explain`: ask the local agent about a selection, relationship, flow or proposal | open |
-| T35 | Walkthrough recording: render a walkthrough to MP4 with local voice and replay it | open |
+| T35 | Walkthrough recording: render a walkthrough to MP4 with local voice and replay it | done |
 | T36 | Agent workflow: plan skill slices per ticket with the footprint gate; pull request skill body, state marker, temporary model and split guidance; action reads the proposal and skips held subjects; design guidance for inspect and locality | open |
 
 ## Notes
@@ -1033,6 +1033,65 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   rewrite the root's size and viewBox before rasterizing, so every rasterizer honors them. A missing
   or failing rasterizer refuses `REQUEST_INVALID` with `details.reason` `no-rasterizer` or
   `rasterizer-failed`.
+- T35: `model record <walkthrough> --output <file> [--voice <name>] [--rate <wpm>] [--width N
+  --height N] [--fps N]` draws each beat's reading through the beat path, rasterizes it with the T15
+  discovery, scaled to fit the frame (default 1920 by 1080, even sides from 16 to 7680, 30 fps, at
+  most 60), speaks the narration with the first of `SPEAKERS` in `src/arch/record.rs`: `say` (`-o
+  out.aiff -f in.txt [-v voice] [-r rate]`, AIFF), `espeak-ng` (`-w out.wav -f in.txt [-v voice] [-s
+  rate]`, WAV) and `piper` (`--model <voice> --output_file out.wav [--length_scale 175/rate]`, the
+  narration on stdin; it needs `--voice` naming its model file, made absolute against the current
+  folder before piper runs in its temporary folder). The narration goes in a file or on stdin, never
+  as an argument; `--voice` may not be empty or start with `-`, and `--rate` is 80 to 450. A beat
+  lasts its narration plus 0.5 s (`PAD`), the narration's length read from the WAV or AIFF header
+  (AIFF-C too, its 80-bit sample rate decoded by hand). One `ffmpeg` run encodes every beat: per
+  beat `-protocol_whitelist file -f image2 -pattern_type none -loop 1 -framerate F -t S -i
+  beat-NNN.png -protocol_whitelist file -f aiff|wav -i beat-NNN.<audio>`, each input's format forced
+  and only the `file` protocol allowed, a filter that fits each image into the frame on white
+  (`scale` with `force_original_aspect_ratio=decrease`, `pad`), resamples the audio to 44.1 kHz mono
+  and pads and trims it to S, then `concat`, written as `-f mp4 out.mp4` with `yuv420p` and AAC; the
+  video codec is ffmpeg's default for MP4. Speakers and ffmpeg are found like the rasterizers (bare
+  name, absolute `PATH` folder outside the checkout), run with that `PATH`, without a shell, in a
+  private temporary folder (mode 0700) holding their inputs, under the tool timeout. No title card;
+  no network.
+- T35: order. Refusals come before any file is written: the output's folder (`render --output`
+  rules: it must exist, outside the vault and the Git folder), then ffmpeg; for a recording, then an
+  output ending in `.talk`, a talk folder that is not one Boundrail wrote, the flags, the
+  walkthrough (`SUBJECT_NOT_FOUND`; one without beats `REQUEST_INVALID`), the rasterizer and the
+  speaker. An `--output` that is a symbolic link or a folder refuses with the output checks. A
+  missing tool refuses `REQUEST_INVALID` with `details.reason` `no-ffmpeg`, `no-rasterizer` or
+  `no-text-to-speech` (naming the programs tried). Every beat is drawn before any is rasterized and
+  every PNG made before any narration is spoken. A failing tool refuses with `rasterizer-failed`,
+  `text-to-speech-failed` or `ffmpeg-failed`; a recorded beat whose length `talk_problem` refuses
+  (an AIFF rate near 0 makes it infinite) is `text-to-speech-failed`. The rasterizer is resolved
+  once per recording. Only after ffmpeg succeeds are the talk folder and the MP4 written.
+- T35: the talk folder is the output's path with the extension `.talk` (`out/tour.mp4` →
+  `out/tour.talk/`): `beat-NNN.png`, `beat-NNN.aiff` or `.wav`, and `talk.json` `{schema_version: 1,
+  walkthrough, name, revision, width, height, fps, speaker, voice?, rate?, beats: [{id, title,
+  narration, image, audio, narration_seconds, seconds}]}`. It is written whole into a new folder
+  beside it, which then takes the old one's place, so a beat left from a longer recording goes. An
+  existing path there that is not a folder holding a `talk.json` that parses as a talk, a symbolic
+  link included, refuses, checked again just before the old folder is replaced. The MP4 is replaced
+  through a temporary file and a rename. `--replay <talk folder> --output <file>` reads `talk.json`
+  (a regular file, not a link, pipe or device, at most 1 MiB), takes `--width`, `--height` and
+  `--fps` in place of its own, copies each beat's files (each a regular file of at most 64 MiB whose
+  bytes are a PNG, or a WAV or AIFF header Boundrail reads) into a private temporary folder and
+  encodes them again; it needs only ffmpeg, renders and speaks nothing, writes only the MP4 and
+  refuses `REQUEST_INVALID` a manifest that does not read, has another schema version, no beats, a
+  beat of 0 or over 3600 seconds, or a file name that is not plain (letters, digits, `.`, `_`, `-`,
+  starting with a letter or digit, so ffmpeg reads no folder, protocol, option or image-sequence
+  pattern), an image not ending in `.png` or an audio not ending in `.wav` or `.aiff` (a `.m3u8`
+  would let ffmpeg's HLS demuxer read absolute paths outside the folder). `--voice` and `--rate`
+  refuse beside `--replay`.
+- T35: tests. A fake `say` logs its arguments and the narration file and writes a one-second AIFF; a
+  fake `ffmpeg` logs its arguments, fails unless every `-i` file exists in its folder, and writes
+  its last argument; the fake `resvg` stands in for the rasterizer. Missing tools are tested with a
+  `PATH` of links to the chosen fakes, Git and `cat`. A real run (macOS `say`, ffmpeg 9, a fake
+  rasterizer) made a 1280 by 720 H.264 and AAC MP4 of the summed length, and `--replay` the same;
+  with real ffmpeg a `.png` or `.aiff` holding an HLS playlist of an outside file is refused before
+  ffmpeg runs (forced `image2` alone stops the outside read, but `-loop 1` then spins on the
+  undecodable file until the tool timeout). Known ceiling (ponytail): one ffmpeg run takes every
+  beat as two inputs, so a 200-beat walkthrough opens 400 inputs; encode in batches joined with the
+  concat demuxer if that strains ffmpeg.
 - Open after T21 and the view redesign:
   - The view's CSS keys on the renderer's hex color literals and baked opacity values. The
     renderer should emit classes or CSS variables for the note, the kind line, containers,

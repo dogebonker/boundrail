@@ -9964,6 +9964,428 @@ fn pictures_never_write_through_a_linked_folder() {
     assert_eq!(fs::read_dir(elsewhere.path()).unwrap().count(), 0);
 }
 
+fn tiny_aiff() -> Vec<u8> {
+    let mut out = b"FORM\0\0\0\x1eAIFFCOMM\0\0\0\x12".to_vec();
+    out.extend([
+        0, 1, 0, 0, 0x56, 0x22, 0, 16, 0x40, 0x0d, 0xac, 0x44, 0, 0, 0, 0, 0, 0,
+    ]);
+    out
+}
+
+#[cfg(unix)]
+fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[cfg(unix)]
+fn fake_recorders() -> (TempDir, std::ffi::OsString) {
+    let (dir, path) = fake_rasterizer();
+    let d = dir.path().display().to_string();
+    fs::write(dir.path().join("one.aiff"), tiny_aiff()).unwrap();
+    script(
+        dir.path(),
+        "say",
+        &format!(
+            "printf '%s\\n' \"$*\" >> '{d}/say.log'\n/bin/cat in.txt >> '{d}/say.log'\n\
+             while [ $# -gt 0 ]; do [ \"$1\" = -o ] && out=$2; shift; done\n\
+             /bin/cat '{d}/one.aiff' > \"$out\"\n"
+        ),
+    );
+    script(
+        dir.path(),
+        "ffmpeg",
+        &format!(
+            "printf '%s\\n' \"$*\" >> '{d}/ffmpeg.log'\n\
+             prev=; for a; do [ \"$prev\" = -i ] && {{ test -s \"$a\" || exit 4; }}; prev=$a; done\n\
+             printf mp4 > \"$a\"\n"
+        ),
+    );
+    (dir, path)
+}
+
+#[cfg(unix)]
+fn path_of(programs: &[PathBuf]) -> (TempDir, std::ffi::OsString) {
+    let system = std::env::var_os("PATH").unwrap_or_default();
+    let git = (std::env::split_paths(&system))
+        .map(|dir| dir.join("git"))
+        .find(|candidate| candidate.is_file())
+        .unwrap();
+    let bin = TempDir::new("record-bin").unwrap();
+    let cat = PathBuf::from("/bin/cat");
+    for program in programs.iter().chain([&git, &cat]) {
+        let link = bin.path().join(program.file_name().unwrap());
+        std::os::unix::fs::symlink(program, link).unwrap();
+    }
+    let path = bin.path().as_os_str().to_owned();
+    (bin, path)
+}
+
+#[cfg(unix)]
+#[test]
+fn record_speaks_and_encodes_each_beat_and_replays_its_talk_folder() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let (_, tour) = add_tour(&checkout);
+    fs::create_dir(checkout.path().join("out")).unwrap();
+    let (bin, path) = fake_recorders();
+    let args = [
+        "record",
+        "Tour",
+        "--output",
+        "out/tour.mp4",
+        "--voice",
+        "Alex",
+        "--rate",
+        "200",
+    ];
+    let (code, out) = run_on_path(&checkout, &path, &args);
+    assert_eq!(code, 0, "{out:#}");
+    assert_eq!(out["kind"], "record");
+    assert_eq!(out["replayed"], false);
+    assert_eq!(out["walkthrough"], tour[0]);
+    assert_eq!((&out["beats"], &out["seconds"]), (&json!(3), &json!(4.5)));
+    assert_eq!(out["talk"], "out/tour.talk");
+    assert_eq!(
+        out["tools"],
+        json!({"rasterizer": "resvg", "speaker": "say", "encoder": "ffmpeg"})
+    );
+    assert_eq!(
+        fs::read(checkout.path().join("out/tour.mp4")).unwrap(),
+        b"mp4"
+    );
+
+    let talk = checkout.path().join("out/tour.talk");
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(talk.join("talk.json")).unwrap()).unwrap();
+    assert_eq!(
+        (&manifest["walkthrough"], &manifest["name"]),
+        (&json!(tour[0]), &json!("Tour"))
+    );
+    assert_eq!(
+        (&manifest["width"], &manifest["height"], &manifest["fps"]),
+        (&json!(1920), &json!(1080), &json!(30))
+    );
+    assert_eq!(
+        (&manifest["speaker"], &manifest["voice"], &manifest["rate"]),
+        (&json!("say"), &json!("Alex"), &json!(200))
+    );
+    assert_eq!(
+        manifest["beats"][0],
+        json!({"id": tour[1], "title": "The shop", "narration": "Web sells.\nBilling charges.",
+            "image": "beat-001.png", "audio": "beat-001.aiff",
+            "narration_seconds": 1.0, "seconds": 1.5})
+    );
+    let mut files: Vec<String> = (fs::read_dir(&talk).unwrap())
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    files.sort();
+    let expected = [
+        "beat-001.aiff",
+        "beat-001.png",
+        "beat-002.aiff",
+        "beat-002.png",
+        "beat-003.aiff",
+        "beat-003.png",
+        "talk.json",
+    ];
+    assert_eq!(files, expected);
+    assert!(
+        fs::read(talk.join("beat-003.png"))
+            .unwrap()
+            .starts_with(b"\x89PNG")
+    );
+    assert_eq!(fs::read(talk.join("beat-002.aiff")).unwrap(), tiny_aiff());
+
+    let said = fs::read_to_string(bin.path().join("say.log")).unwrap();
+    assert!(
+        said.starts_with("-o out.aiff -f in.txt -v Alex -r 200\nWeb sells.\nBilling charges."),
+        "{said}"
+    );
+    assert_eq!(said.matches("-o out.aiff").count(), 3);
+    let encoded = fs::read_to_string(bin.path().join("ffmpeg.log")).unwrap();
+    assert_eq!(encoded.lines().count(), 1);
+    assert!(
+        encoded.contains(
+            "-protocol_whitelist file -f image2 -pattern_type none -loop 1 -framerate 30 -t 1.500 \
+             -i beat-001.png -protocol_whitelist file -f aiff -i beat-001.aiff \
+             -protocol_whitelist file -f image2 -pattern_type none -loop 1 -framerate 30 -t 1.500 \
+             -i beat-002.png -protocol_whitelist file -f aiff -i beat-002.aiff -protocol_whitelist"
+        ),
+        "{encoded}"
+    );
+    assert!(encoded.contains("concat=n=3:v=1:a=1[v][a]"), "{encoded}");
+    assert!(encoded.trim_end().ends_with("-f mp4 out.mp4"), "{encoded}");
+
+    let (_only, only) = path_of(&[bin.path().join("ffmpeg")]);
+    let replay = [
+        "record",
+        "--replay",
+        "out/tour.talk",
+        "--output",
+        "out/again.mp4",
+        "--fps",
+        "10",
+    ];
+    let (code, out) = run_on_path(&checkout, &only, &replay);
+    assert_eq!(code, 0, "{out:#}");
+    assert_eq!(out["replayed"], true);
+    assert_eq!(out["tools"], json!({"encoder": "ffmpeg"}));
+    assert_eq!(
+        fs::read(checkout.path().join("out/again.mp4")).unwrap(),
+        b"mp4"
+    );
+    let encoded = fs::read_to_string(bin.path().join("ffmpeg.log")).unwrap();
+    let last = encoded.lines().last().unwrap();
+    assert!(
+        last.contains("-framerate 10 -t 1.500 -i beat-001.png"),
+        "{last}"
+    );
+    assert_eq!(
+        said,
+        fs::read_to_string(bin.path().join("say.log")).unwrap()
+    );
+    assert!(!checkout.path().join("out/again.talk").exists());
+
+    fs::write(talk.join("beat-009.png"), "left over").unwrap();
+    let (code, out) = run_on_path(
+        &checkout,
+        &path,
+        &["record", "Tour", "--output", "out/tour.mp4"],
+    );
+    assert_eq!(code, 0, "{out:#}");
+    assert!(!talk.join("beat-009.png").exists());
+    assert!(talk.join("talk.json").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn record_refuses_before_writing_when_a_tool_or_the_walkthrough_is_missing() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    add_tour(&checkout);
+    fs::create_dir(checkout.path().join("out")).unwrap();
+    let (bin, path) = fake_recorders();
+    let tool = |name: &str| bin.path().join(name);
+    let failing = TempDir::new("failing-ffmpeg").unwrap();
+    let broken = script(failing.path(), "ffmpeg", "echo 'no encoder' >&2\nexit 1\n");
+    let record = ["record", "Tour", "--output", "out/t.mp4"];
+    for (tools, reason, says) in [
+        (vec![tool("resvg"), tool("say")], "no-ffmpeg", "ffmpeg"),
+        (
+            vec![tool("resvg"), tool("ffmpeg")],
+            "no-text-to-speech",
+            "say, espeak-ng, piper",
+        ),
+        (vec![tool("say"), tool("ffmpeg")], "no-rasterizer", "resvg"),
+        (
+            vec![tool("resvg"), tool("say"), broken],
+            "ffmpeg-failed",
+            "no encoder",
+        ),
+    ] {
+        let (_only, only) = path_of(&tools);
+        let (code, out) = run_on_path(&checkout, &only, &record);
+        assert_eq!(code, 2, "{out:#}");
+        assert_eq!(out["error"]["code"], "REQUEST_INVALID", "{out:#}");
+        assert_eq!(out["error"]["details"]["reason"], reason, "{out:#}");
+        let message = out["error"]["message"].as_str().unwrap();
+        assert!(message.contains(says), "{message}");
+        let spoke = bin.path().join("say.log").exists();
+        assert_eq!(spoke, reason == "ffmpeg-failed", "{reason}");
+    }
+    assert!(!checkout.path().join("out/t.mp4").exists());
+    assert!(!checkout.path().join("out/t.talk").exists());
+    fs::remove_file(bin.path().join("say.log")).unwrap();
+
+    let (code, out) = run_on_path(
+        &checkout,
+        &path,
+        &["record", "Nope", "--output", "out/t.mp4"],
+    );
+    assert_eq!(
+        (code, &out["error"]["code"]),
+        (2, &json!("SUBJECT_NOT_FOUND"))
+    );
+    fs::create_dir(checkout.path().join("out/x.talk")).unwrap();
+    fs::write(checkout.path().join("out/x.talk/notes.txt"), "mine").unwrap();
+    fs::create_dir(checkout.path().join("out/y.talk")).unwrap();
+    fs::write(checkout.path().join("out/y.talk/talk.json"), "{}").unwrap();
+    fs::create_dir(checkout.path().join("out/dir.mp4")).unwrap();
+    let outside = TempDir::new("record-outside").unwrap();
+    fs::write(outside.path().join("film.mp4"), "theirs").unwrap();
+    std::os::unix::fs::symlink(
+        outside.path().join("film.mp4"),
+        checkout.path().join("out/link.mp4"),
+    )
+    .unwrap();
+    for (args, says) in [
+        (
+            vec!["record", "Tour", "--output", ".boundrail/model/t.mp4"],
+            "inside the model vault",
+        ),
+        (
+            vec!["record", "Tour", "--output", ".git/t.mp4"],
+            "inside the Git folder",
+        ),
+        (
+            vec!["record", "Tour", "--output", "out/x.mp4"],
+            "not a talk folder Boundrail wrote",
+        ),
+        (
+            vec!["record", "Tour", "--output", "out/y.mp4"],
+            "not a talk folder Boundrail wrote",
+        ),
+        (
+            vec!["record", "Tour", "--output", "out/dir.mp4"],
+            "is a folder",
+        ),
+        (
+            vec!["record", "Tour", "--output", "out/link.mp4"],
+            "symbolic link",
+        ),
+        (
+            vec!["record", "Tour", "--output", "out/t.mp4", "--width", "641"],
+            "even",
+        ),
+        (
+            vec!["record", "Tour", "--output", "out/t.mp4", "--rate", "5"],
+            "--rate",
+        ),
+        (
+            vec!["record", "--replay", "out/x.talk", "--output", "out/t.mp4"],
+            "talk.json cannot be read",
+        ),
+    ] {
+        let (code, out) = run_on_path(&checkout, &path, &args);
+        assert_eq!(code, 2, "{out:#}");
+        assert_eq!(out["error"]["code"], "REQUEST_INVALID", "{out:#}");
+        let message = out["error"]["message"].as_str().unwrap();
+        assert!(message.contains(says), "{message}");
+    }
+    assert_eq!(
+        fs::read_to_string(checkout.path().join("out/x.talk/notes.txt")).unwrap(),
+        "mine"
+    );
+    assert_eq!(
+        fs::read_to_string(checkout.path().join("out/y.talk/talk.json")).unwrap(),
+        "{}"
+    );
+    assert_eq!(
+        fs::read_to_string(outside.path().join("film.mp4")).unwrap(),
+        "theirs"
+    );
+    assert!(!checkout.path().join("out/dir.talk").exists());
+    assert!(!checkout.path().join("out/link.talk").exists());
+    assert!(!checkout.path().join("out/t.mp4").exists());
+    assert!(!checkout.vault().join("t.mp4").exists());
+    assert!(!bin.path().join("say.log").exists());
+
+    let mut endless = tiny_aiff();
+    endless[28..30].copy_from_slice(&[0x3c, 0x03]);
+    fs::write(bin.path().join("one.aiff"), endless).unwrap();
+    let (code, out) = run_on_path(&checkout, &path, &record);
+    assert_eq!(code, 2, "{out:#}");
+    assert_eq!(
+        out["error"]["details"]["reason"], "text-to-speech-failed",
+        "{out:#}"
+    );
+    assert!(!checkout.path().join("out/t.mp4").exists());
+    assert!(!checkout.path().join("out/t.talk").exists());
+    assert!(!bin.path().join("ffmpeg.log").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn replay_refuses_files_ffmpeg_could_follow_outside_the_talk_folder() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    let (bin, path) = fake_recorders();
+    let outside = TempDir::new("replay-outside").unwrap();
+    let secret = outside.path().join("secret.png");
+    fs::write(&secret, "secret").unwrap();
+    let talk = checkout.path().join("evil.talk");
+    fs::create_dir(&talk).unwrap();
+    let manifest = |image: &str, audio: &str| {
+        json!({"schema_version": 1, "walkthrough": "M#W", "name": "Tour", "revision": "r",
+            "width": 640, "height": 360, "fps": 10, "speaker": "say",
+            "beats": [{"id": "M#B1", "title": "B", "narration": "N", "image": image,
+                "audio": audio, "narration_seconds": 1.0, "seconds": 1.5}]})
+        .to_string()
+    };
+    let playlist = format!(
+        "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\n{}\n#EXT-X-ENDLIST\n",
+        secret.display()
+    );
+    fs::write(talk.join("beat-001.m3u8"), &playlist).unwrap();
+    fs::write(talk.join("beat-001.aiff"), tiny_aiff()).unwrap();
+    let replay = ["record", "--replay", "evil.talk", "--output", "out.mp4"];
+    let refused = |says: &str| {
+        let (code, out) = run_on_path(&checkout, &path, &replay);
+        assert_eq!(code, 2, "{out:#}");
+        assert_eq!(out["error"]["code"], "REQUEST_INVALID", "{out:#}");
+        let message = out["error"]["message"].as_str().unwrap();
+        assert!(message.contains(says), "{message}");
+    };
+
+    fs::write(
+        talk.join("talk.json"),
+        manifest("beat-001.m3u8", "beat-001.aiff"),
+    )
+    .unwrap();
+    refused("not a plain file name ending in .png");
+    fs::write(
+        talk.join("talk.json"),
+        manifest("beat-001.png", "beat-001.m3u8"),
+    )
+    .unwrap();
+    refused("not a plain file name ending in .wav or .aiff");
+
+    fs::write(
+        talk.join("talk.json"),
+        manifest("beat-001.png", "beat-001.aiff"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&secret, talk.join("beat-001.png")).unwrap();
+    refused("beat-001.png cannot be read: it is not a regular file");
+
+    fs::remove_file(talk.join("beat-001.png")).unwrap();
+    fs::write(talk.join("beat-001.png"), &playlist).unwrap();
+    refused("beat-001.png cannot be read: it is not a PNG");
+    fs::write(talk.join("beat-001.png"), tiny_png()).unwrap();
+    fs::write(talk.join("beat-001.aiff"), &playlist).unwrap();
+    refused("beat-001.aiff cannot be read: it is not WAV or AIFF");
+    fs::remove_file(talk.join("beat-001.aiff")).unwrap();
+    let made = Command::new("mkfifo")
+        .arg(talk.join("beat-001.aiff"))
+        .status()
+        .unwrap();
+    assert!(made.success());
+    refused("beat-001.aiff cannot be read: it is not a regular file");
+
+    fs::remove_file(talk.join("beat-001.aiff")).unwrap();
+    fs::write(talk.join("beat-001.aiff"), tiny_aiff()).unwrap();
+    let elsewhere = outside.path().join("talk.json");
+    fs::rename(talk.join("talk.json"), &elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, talk.join("talk.json")).unwrap();
+    refused("talk.json cannot be read: it is not a regular file");
+
+    fs::remove_file(talk.join("talk.json")).unwrap();
+    let padded = format!(
+        "{}{}",
+        manifest("beat-001.png", "beat-001.aiff"),
+        " ".repeat(1 << 20)
+    );
+    fs::write(talk.join("talk.json"), padded).unwrap();
+    refused("talk.json cannot be read: it is larger than");
+
+    assert!(!bin.path().join("ffmpeg.log").exists());
+    assert!(!checkout.path().join("out.mp4").exists());
+}
+
 #[test]
 fn view_lists_pictures_and_draws_one_with_its_focus() {
     let checkout = Checkout::new();

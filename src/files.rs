@@ -14,7 +14,7 @@ pub fn hash(bytes: &[u8]) -> String {
 }
 
 /// Refuses a symbolic link at `path`, which would redirect a write outside its folder.
-pub(crate) fn refuse_symlink(path: &Path) -> Result<()> {
+pub fn refuse_symlink(path: &Path) -> Result<()> {
     if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
         bail!(
             "{} is a symbolic link; refusing to write through it",
