@@ -1225,9 +1225,6 @@ pub(super) fn walkthrough_output(root: &Path, subject: &str) -> Result<Value> {
     output.context("a JSON reading returns its output")
 }
 
-/// `model render`: the SVG on stdout or in `--output`; with `--format json`, a receipt with the
-/// drawn state's revision, the picture's size, the modules and relationships drawn and the SVG's
-/// digest, around the SVG. `--png` rasterizes it too.
 fn render_model(root: &Path, format: Option<ModelFormat>, args: &RenderArgs) -> Result<()> {
     let invalid =
         |message: String| anyhow::Error::from(Refusal::new(Code::RequestInvalid, message));
@@ -1276,16 +1273,7 @@ fn render_model(root: &Path, format: Option<ModelFormat>, args: &RenderArgs) -> 
         }
         None => None,
     };
-    // The PNG is written last, so a failed write of the output leaves no PNG behind; printing
-    // to standard output waits for it too.
-    let save_png = || match &png {
-        Some((path, bytes)) => write_file(path, bytes),
-        None => Ok(()),
-    };
-    if output.is_none() {
-        save_png()?;
-    }
-    if matches!(format, Some(ModelFormat::Json)) {
+    let text = if matches!(format, Some(ModelFormat::Json)) {
         let mut envelope = json!({
             "schema": MODEL_SCHEMA,
             "kind": "render",
@@ -1302,22 +1290,24 @@ fn render_model(root: &Path, format: Option<ModelFormat>, args: &RenderArgs) -> 
         if let Some((path, _)) = &png {
             envelope["png"] = json!(path);
         }
-        write(output, &envelope)?;
+        Some(serde_json::to_string_pretty(&envelope)? + "\n")
+    } else if output.is_some() || png.is_none() {
+        Some(rendered.svg)
     } else {
-        match output {
-            Some(path) => write_file(path, rendered.svg.as_bytes())?,
-            None if png.is_some() => {}
-            None => print!("{}", rendered.svg),
-        }
+        None
+    };
+    if let (Some(path), Some(text)) = (output, &text) {
+        write_file(path, text.as_bytes())?;
     }
-    if output.is_some() {
-        save_png()?;
+    if let Some((path, bytes)) = &png {
+        write_file(path, bytes)?;
+    }
+    if let (None, Some(text)) = (output, text) {
+        print!("{text}");
     }
     Ok(())
 }
 
-/// Whether `a` and `b` name the same file: equal, or the same name in the same folder once
-/// links in the folders are resolved.
 fn same_file(a: &Path, b: &Path) -> bool {
     let resolved = |path: &Path| {
         let parent = (path.parent())
@@ -1328,12 +1318,8 @@ fn same_file(a: &Path, b: &Path) -> bool {
     a == b || resolved(a).is_some_and(|r| Some(r) == resolved(b))
 }
 
-/// The largest `--scale`, so a PNG stays a few tens of megapixels.
 const MAX_SCALE: f64 = 8.0;
 
-/// The drawing of what `spec` asks for, with the name of the view drawn, refusing an `output` it
-/// could not write to. A walkthrough beat or a picture is drawn as its reading says, with its
-/// focus.
 pub(super) fn render_svg(
     root: &Path,
     spec: &RenderSpec,
@@ -1358,7 +1344,6 @@ pub(super) fn render_svg(
     draw_reading(root, reading, output, &mut States::new(&current))
 }
 
-/// The drawing of what the flags of `spec` ask for, and the name of the view drawn.
 fn draw(
     root: &Path,
     spec: &RenderSpec,
@@ -1386,8 +1371,6 @@ fn draw(
     )
 }
 
-/// The drawing of what `reading` draws with its focus, and the name of the view drawn. Each
-/// state it reads loads once into `states`.
 fn draw_reading(
     root: &Path,
     reading: &BeatReading,
@@ -1428,8 +1411,6 @@ fn again(error: &anyhow::Error) -> anyhow::Error {
     }
 }
 
-/// Draws `view` of the state `drawn` (its model and title name) with `options`, compared with
-/// `base` when given, refusing an `output` it could not write to.
 fn paint<'m>(
     root: &Path,
     view: &View<'_>,
@@ -1715,15 +1696,12 @@ fn print_published(markdown: bool, pushing: bool, published: &Published) -> Resu
     Ok(())
 }
 
-/// Refuses an `output`, given by `flag`, whose folder is missing or lies inside the model vault
-/// or the Git folder. The folder is resolved first, so a linked folder on the way cannot reach
-/// either.
 fn check_output(root: &Path, output: &Path, flag: &str) -> Result<()> {
     let parent = match output.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
     };
-    let folder = fs::canonicalize(parent).map_err(|error| {
+    let resolved_folder = fs::canonicalize(parent).map_err(|error| {
         Refusal::new(
             Code::RequestInvalid,
             format!(
@@ -1741,7 +1719,7 @@ fn check_output(root: &Path, output: &Path, flag: &str) -> Result<()> {
         (common, "the Git folder"),
     ];
     for (inside, place) in places {
-        if inside.is_ok_and(|inside| folder.starts_with(inside)) {
+        if inside.is_ok_and(|inside| resolved_folder.starts_with(inside)) {
             return Err(Refusal::new(
                 Code::RequestInvalid,
                 format!(

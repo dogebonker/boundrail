@@ -137,7 +137,6 @@ const RULE: Style<'static> = Style {
 const LEGEND_SWATCH: f64 = 14.0;
 const LEGEND_STEP: f64 = 96.0;
 const LEGEND_GAP: f64 = 6.0;
-/// The length of a relationship kind's sample line, and the space after each name.
 const LEGEND_LINE: f64 = 28.0;
 const LEGEND_SPACE: f64 = 18.0;
 const SWATCH_RADIUS: f64 = 2.0;
@@ -281,7 +280,6 @@ impl Context<'_> {
         svg.text((MARGIN, MARGIN + TITLE_SIZE), &self.title, &font);
     }
 
-    /// Where the title line sits, which routes and labels keep clear of.
     fn title_area(&self) -> layout::Rect {
         layout::Rect {
             x: MARGIN,
@@ -291,8 +289,6 @@ impl Context<'_> {
         }
     }
 
-    /// Below everything drawn so far, one row naming the node kinds `nodes` with their fills and
-    /// one naming the relationship kinds `lines` with their dashes, in configured names.
     fn kinds(&self, svg: &mut Svg, nodes: &BTreeSet<&str>, lines: &BTreeSet<&str>) {
         let mut y = svg.bottom() + MARGIN;
         svg.group("legend kinds", None);
@@ -345,7 +341,6 @@ impl Context<'_> {
     }
 }
 
-/// `name` after a legend sample ending at `at`; returns where the next sample starts.
 fn legend_name(svg: &mut Svg, at: Point, name: &str) -> f64 {
     let x = at.0 + LEGEND_GAP;
     svg.text((x, at.1 + LEGEND_SWATCH - BASELINE), name, &label(None));
@@ -366,8 +361,6 @@ fn themed(svg: String, theme: Theme) -> String {
     format!("{}<style>{sheet}</style>\n{}", &svg[..at], &svg[at..])
 }
 
-/// The dark sheet: each light color the drawing writes, by attribute, and the color replacing
-/// it. Built from the light constants, so changing one keeps the sheet matching it.
 fn dark() -> String {
     let swaps = [
         ("fill", svg::BACKGROUND, "#16191d"),
@@ -548,8 +541,6 @@ pub fn render(
     })
 }
 
-/// `modules` without those of the node kinds `hide`; the parts of a module left out move to
-/// its nearest ancestor drawn, so they stay in their containers.
 fn without_kinds<'a>(
     model: &str,
     modules: Cow<'a, [Module]>,

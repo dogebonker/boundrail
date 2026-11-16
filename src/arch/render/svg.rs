@@ -5,6 +5,7 @@ use std::fmt::Write as _;
 
 use super::{INK, MARGIN};
 
+pub(super) const DECIMALS: usize = 1;
 pub(super) const FONT_SIZE: f64 = 12.0;
 /// The mark on every drawing's root element, by which `model pictures` knows a file it may
 /// overwrite.
@@ -97,7 +98,7 @@ impl Svg {
     }
 
     fn num(&mut self, key: &str, value: f64) {
-        let _ = write!(self.body, " {key}=\"{value:.1}\"");
+        let _ = write!(self.body, " {key}=\"{value:.DECIMALS$}\"");
     }
 
     fn style(&mut self, style: &Style<'_>) {
@@ -124,7 +125,7 @@ impl Svg {
         self.body.push_str(" points=\"");
         for (k, &(x, y)) in points.iter().enumerate() {
             let space = if k == 0 { "" } else { " " };
-            let _ = write!(self.body, "{space}{x:.1},{y:.1}");
+            let _ = write!(self.body, "{space}{x:.DECIMALS$},{y:.DECIMALS$}");
             self.grow((x, y), (x, y));
         }
         self.body.push('"');
@@ -254,7 +255,6 @@ impl Svg {
         self.bounds.map_or(0.0, |(_, high)| high.1)
     }
 
-    /// The viewBox of the finished document: left, top, width and height.
     pub(super) fn frame(&self) -> (f64, f64, f64, f64) {
         let ((x0, y0), (x1, y1)) = self.bounds.unwrap_or(((0.0, 0.0), (0.0, 0.0)));
         let (left, top) = (
@@ -269,8 +269,6 @@ impl Svg {
         )
     }
 
-    /// The finished document: the body on a light background, sized with its viewBox to what was
-    /// drawn plus a margin, and never starting right or below the origin.
     pub(super) fn finish(self) -> String {
         let (left, top, w, h) = self.frame();
         let mut out = String::with_capacity(self.body.len() + 256);
@@ -278,7 +276,7 @@ impl Svg {
             out,
             "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w:.0}\" height=\"{h:.0}\" \
              viewBox=\"{left:.0} {top:.0} {w:.0} {h:.0}\" font-family=\"{FONT_FAMILY}\" \
-             font-size=\"{FONT_SIZE:.1}\" color=\"{INK}\" {GENERATOR}>"
+             font-size=\"{FONT_SIZE:.DECIMALS$}\" color=\"{INK}\" {GENERATOR}>"
         );
         let _ = writeln!(
             out,

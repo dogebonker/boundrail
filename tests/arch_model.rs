@@ -4531,7 +4531,6 @@ fn render_marks_what_a_proposal_changes() {
         group_holding(&svg, "module changed", ">Payments<").is_some(),
         "{svg}"
     );
-    // The route and its label are drawn apart, each marked, with the same ID.
     let score = group_holding(&svg, "relationship label added", ">score<").unwrap();
     let drawn = attr(score, "data-id").unwrap();
     let route = format!("<g class=\"relationship added\" data-id=\"{drawn}\">\n<polyline");
@@ -4680,7 +4679,6 @@ fn render_refuses_flags_that_do_not_go_together() {
     checkout.refused(&["render", "--flow", "Nowhere"], "SUBJECT_NOT_FOUND");
 }
 
-/// A rectangle read from a render.
 #[derive(Clone, Copy, Debug)]
 struct Area {
     x: f64,
@@ -4696,7 +4694,6 @@ impl Area {
     fn bottom(&self) -> f64 {
         self.y + self.h
     }
-    /// Whether the insides of the two meet; touching edges do not.
     fn overlaps(&self, other: &Area) -> bool {
         self.x < other.right()
             && other.x < self.right()
@@ -4709,7 +4706,6 @@ impl Area {
             && other.right() <= self.right()
             && other.bottom() <= self.bottom()
     }
-    /// Whether `p` lies on the outline.
     fn on_edge(&self, p: (f64, f64)) -> bool {
         let near = |a: f64, b: f64| (a - b).abs() < 0.11;
         let across = p.0 >= self.x - 0.11 && p.0 <= self.right() + 0.11;
@@ -4719,7 +4715,6 @@ impl Area {
     }
 }
 
-/// The value of attribute `key` in `tag`.
 fn attr<'a>(tag: &'a str, key: &str) -> Option<&'a str> {
     let start = tag.find(&format!(" {key}=\""))? + key.len() + 3;
     Some(&tag[start..start + tag[start..].find('"')?])
@@ -4729,7 +4724,6 @@ fn number(tag: &str, key: &str) -> f64 {
     attr(tag, key).unwrap().parse().unwrap()
 }
 
-/// The tags named `name` in `body`, each up to its `>`.
 fn tags<'a>(body: &'a str, name: &str) -> Vec<&'a str> {
     let opening = format!("<{name} ");
     (body.match_indices(&opening))
@@ -4737,7 +4731,6 @@ fn tags<'a>(body: &'a str, name: &str) -> Vec<&'a str> {
         .collect()
 }
 
-/// Where each text of `body` sits, at the estimated width the renderer uses.
 fn text_areas(body: &str) -> Vec<Area> {
     (body.match_indices("<text "))
         .map(|(at, _)| {
@@ -4767,8 +4760,6 @@ fn text_areas(body: &str) -> Vec<Area> {
         .collect()
 }
 
-/// The bodies of the groups of `svg` whose class starts with `class`, each up to its `</g>`,
-/// with where each starts; a relationship's label group is not one of its `relationship` groups.
 fn placed_groups<'a>(svg: &'a str, class: &str) -> Vec<(usize, &'a str)> {
     let opening = format!("<g class=\"{class}");
     (svg.match_indices(&opening))
@@ -4786,11 +4777,6 @@ fn groups<'a>(svg: &'a str, class: &str) -> Vec<&'a str> {
         .collect()
 }
 
-/// Asserts the architecture drawing `svg` is laid out cleanly: every relationship runs in
-/// horizontal and vertical segments that pass through no box but its ends and the containers
-/// around them; every label is drawn after every route, so no route crosses a label plate; no
-/// two labels meet; and no label meets a box, a box's text, or a container's border, though it
-/// may sit inside a container below its title.
 fn assert_clean_layout(svg: &str) {
     let modules: Vec<(Area, Vec<Area>)> = (groups(svg, "module").into_iter())
         .map(|body| {
@@ -4816,7 +4802,6 @@ fn assert_clean_layout(svg: &str) {
                 (x.parse().unwrap(), y.parse().unwrap())
             })
             .collect();
-        // An end's box is the smallest box whose outline holds the end.
         let end = |p: (f64, f64)| {
             (boxes.iter().enumerate())
                 .filter(|(_, b)| b.on_edge(p))
@@ -4847,7 +4832,6 @@ fn assert_clean_layout(svg: &str) {
     let last_route = routes.iter().copied().max().unwrap_or(0);
     let mut labels = Vec::new();
     for (at, body) in placed_groups(svg, "relationship label") {
-        // Drawn after every route, an opaque plate is crossed by none.
         assert!(at > last_route, "a label is drawn before a route: {body}");
         let rect = tags(body, "rect")[0];
         assert!(
@@ -4882,8 +4866,6 @@ fn assert_clean_layout(svg: &str) {
     }
 }
 
-/// A model of eleven modules: a platform of five parts, two clients above it, and a datastore,
-/// a cache and an external service below, with thirteen labelled relationships.
 fn platform(checkout: &Checkout) {
     checkout.init();
     let mut changes = Vec::new();
@@ -4957,7 +4939,6 @@ fn render_routes_around_boxes_and_keeps_labels_apart() {
 fn render_focus_hides_kinds_and_draws_a_legend_and_theme() {
     let checkout = Checkout::new();
     platform(&checkout);
-    // Orders and its direct neighbours stay lit; the rest dims.
     let focused = checkout.render(&["--focus", "Orders"]);
     let dimmed = |svg: &str, name: &str| {
         svg.split("<g class=\"dimmed\"").skip(1).any(|part| {
@@ -4975,8 +4956,6 @@ fn render_focus_hides_kinds_and_draws_a_legend_and_theme() {
     }
     checkout.refused(&["render", "--focus", "Nowhere"], "SUBJECT_NOT_FOUND");
 
-    // A hidden kind leaves its modules out with their relationships; a hidden container's
-    // parts stay.
     let hidden = checkout.render(&["--hide-kind", "job", "--hide-kind", "system"]);
     assert!(!hidden.contains(">Worker</text>") && !hidden.contains(">Platform</text>"));
     assert!(hidden.contains(">Orders</text>") && !hidden.contains(">enqueue</text>"));
@@ -4990,7 +4969,6 @@ fn render_focus_hides_kinds_and_draws_a_legend_and_theme() {
         "REQUEST_INVALID",
     );
 
-    // The legend names the kinds drawn by their configured names, with their dashes.
     let legend = checkout.render(&["--legend"]);
     let kinds = group_holding(&legend, "legend kinds", ">Datastore<").unwrap();
     for name in [">Service<", ">External<", ">HTTP<", ">Data<", ">Queue<"] {
@@ -4999,7 +4977,6 @@ fn render_focus_hides_kinds_and_draws_a_legend_and_theme() {
     assert!(!kinds.contains(">Function<") && kinds.contains("stroke-dasharray=\"2 3\""));
     assert!(!checkout.render(&[]).contains("legend kinds"));
 
-    // Light adds nothing; dark recolors always; auto when the viewer prefers dark.
     let plain = checkout.render(&[]);
     assert_eq!(checkout.render(&["--theme", "light"]), plain);
     let dark = checkout.render(&["--theme", "dark"]);
@@ -5013,7 +4990,6 @@ fn render_focus_hides_kinds_and_draws_a_legend_and_theme() {
     let end = auto.find("</style>\n").unwrap() + "</style>\n".len();
     assert_eq!(format!("{}{}", &auto[..start], &auto[end..]), plain);
 
-    // Hidden kinds and the legend draw the architecture only.
     let checkout = Checkout::new();
     shop(&checkout);
     add_checkout(&checkout);
@@ -5055,7 +5031,6 @@ fn render_json_is_a_receipt_of_what_it_drew() {
         sorted(&out["relationships"]),
         [q("RelBil01"), q("RelWeb01")]
     );
-    // Collapsed, Platform stands for its parts and only the relationship leaving it is drawn.
     let collapsed = checkout.ok(&["render", "--format", "json", "--depth", "1"]);
     assert_eq!(
         sorted(&collapsed["modules"]),
@@ -5064,7 +5039,6 @@ fn render_json_is_a_receipt_of_what_it_drew() {
     assert_eq!(sorted(&collapsed["relationships"]), [q("RelBil01")]);
 }
 
-/// `model render` with `path` as PATH: exit code and stdout.
 fn render_on_path(checkout: &Checkout, path: &std::ffi::OsStr, args: &[&str]) -> (i32, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_boundrail"))
         .args(["model", "render"])
@@ -5097,7 +5071,6 @@ fn render_writes_a_png_scaled_and_cut_to_a_region() {
     assert_eq!((code, stdout.as_str()), (0, ""));
     let png = fs::read(checkout.path().join("out/a.png")).unwrap();
     assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
-    // The PNG names the SVG it was drawn from: the picture, scaled and cut.
     let region = Some([10.0, 20.0, 100.0, 50.0]);
     let framed = boundrail::arch::picture::reframe(&svg, 2.0, region).unwrap();
     let size = r#" width="200" height="100" viewBox="10 20 100 50""#;
@@ -5106,7 +5079,6 @@ fn render_writes_a_png_scaled_and_cut_to_a_region() {
         boundrail::arch::picture::source(&png),
         Some(sha256(framed.as_bytes()))
     );
-    // The receipt names the PNG; --output still writes the SVG.
     let mut json = vec!["--png", "out/b.png", "--format", "json"];
     let (code, stdout) = render_on_path(&checkout, &path, &json);
     let out: Value = serde_json::from_str(&stdout).unwrap();
@@ -5149,7 +5121,6 @@ fn render_writes_a_png_scaled_and_cut_to_a_region() {
     }
     assert!(!checkout.path().join("out/c.png").exists());
 
-    // Without a rasterizer the render refuses and writes nothing.
     let system = std::env::var_os("PATH").unwrap_or_default();
     let found = (std::env::split_paths(&system))
         .map(|dir| dir.join("git"))

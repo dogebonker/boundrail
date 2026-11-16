@@ -1,11 +1,7 @@
-//! Pure geometry for the architecture view: a layered layout inside each container, containers
-//! sized to enclose their parts, edge routes between box sides around the boxes in between,
-//! and label places where no two labels, and no label and box, meet.
-
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 
-use super::svg::Point;
+use super::svg::{DECIMALS, Point};
 
 /// Space around a container's parts, and the band above them that holds its label.
 pub(super) const PAD: f64 = 16.0;
@@ -14,25 +10,16 @@ const H_GAP: f64 = 48.0;
 const V_GAP: f64 = 72.0;
 /// Barycenter sweeps, each one down and one up.
 const SWEEPS: usize = 4;
-/// How far a fallback edge between nested boxes runs out to the right before it turns.
 const LOOP_OUT: f64 = 24.0;
-/// How far routes keep from the boxes they pass, and how far they leave a port straight.
 const CLEAR: f64 = 10.0;
-/// The widest spacing of the lines routes run on.
 const STEP: f64 = 12.0;
-/// What a route pays for a bend and for crossing another route, in picture units of length.
 const BEND: f64 = 40.0;
 const CROSS: f64 = 30.0;
-/// How many times its length a segment costs more for each route already on it.
 const SHARED: f64 = 4.0;
-/// Space kept around a label, and the spacing of the places tried for it.
 const LABEL_GAP: f64 = 2.0;
 const LABEL_STEP: f64 = 8.0;
-/// How many rings of places around its route a label tries before giving up.
 const RINGS: i32 = 400;
-/// How close two coordinates lie to count as the same grid line.
 const NEAR: f64 = 0.05;
-/// How thick a route segment counts as when a label is tested against it.
 const HAIRLINE: f64 = 0.1;
 
 #[derive(Clone, Default)]
@@ -331,7 +318,6 @@ enum Side {
 }
 
 impl Side {
-    /// The direction leaving the box by this side.
     fn out(self) -> Dir {
         match self {
             Side::Top => Dir::Up,
@@ -368,7 +354,6 @@ fn port(r: &Rect, side: Side, t: f64) -> Point {
     }
 }
 
-/// `at` moved `by` in the direction `dir`.
 fn step(at: Point, dir: Dir, by: f64) -> Point {
     match dir {
         Dir::Up => (at.0, at.1 - by),
@@ -381,8 +366,6 @@ fn step(at: Point, dir: Dir, by: f64) -> Point {
 /// The edge ends on each side of each box: where the other end is, the edge, and which end.
 type Ports = BTreeMap<(usize, Side), Vec<(f64, usize, usize)>>;
 
-/// What routes and labels steer around: the boxes, the box holding each, each container's
-/// title, and areas drawn apart from the boxes, such as the picture's title.
 pub(super) struct Scene<'a> {
     pub(super) rects: &'a [Rect],
     pub(super) parents: Vec<Option<usize>>,
@@ -391,7 +374,6 @@ pub(super) struct Scene<'a> {
 }
 
 impl Scene<'_> {
-    /// The boxes holding box `i`, nearest first.
     fn holders(&self, mut i: usize) -> Vec<usize> {
         let mut out = Vec::new();
         while let Some(parent) = self.parents[i] {
@@ -405,9 +387,6 @@ impl Scene<'_> {
         self.parents.contains(&Some(i))
     }
 
-    /// What a route between boxes `a` and `b` may not enter: every box but those holding an
-    /// end, kept `CLEAR` away; and, when `strict`, the titles of those holders and the fixed
-    /// areas.
     fn obstacles(&self, a: usize, b: usize, strict: bool) -> Vec<Rect> {
         let holders: BTreeSet<usize> = (self.holders(a).into_iter())
             .chain(self.holders(b))
@@ -433,22 +412,15 @@ fn inflate(r: &Rect, by: f64) -> Rect {
     }
 }
 
-/// Whether `a` and `b` overlap by more than an edge.
 fn overlaps(a: &Rect, b: &Rect) -> bool {
     a.x < b.right() && b.x < a.right() && a.y < b.bottom() && b.y < a.bottom()
 }
 
-/// A coordinate rounded to a tenth, the precision the picture is written in, so equal
-/// coordinates compare equal.
 fn snap(v: f64) -> f64 {
-    (v * 10.0).round() / 10.0
+    let scale = 10f64.powi(DECIMALS as i32);
+    (v * scale).round() / scale
 }
 
-/// An orthogonal polyline for each edge from a side of its source to a side of its target,
-/// around every box it does not connect. Edges sharing a side spread evenly along it, ordered
-/// by where their other end is. Each route leaves its port straight for `CLEAR`, then follows
-/// the cheapest path through the gaps between boxes: shortest, fewest bends, and away from the
-/// routes drawn before it, shorter edges first.
 pub(super) fn routes(scene: &Scene<'_>, edges: &[(usize, usize)]) -> Vec<Vec<Point>> {
     let rects = scene.rects;
     let sides: Vec<(Side, Side)> = (edges.iter())
@@ -514,7 +486,6 @@ pub(super) fn routes(scene: &Scene<'_>, edges: &[(usize, usize)]) -> Vec<Vec<Poi
     out
 }
 
-/// `points` without repeats and without points in the middle of a straight run.
 fn simplify(points: Vec<Point>) -> Vec<Point> {
     let mut out: Vec<Point> = Vec::with_capacity(points.len());
     for p in points {
@@ -532,8 +503,6 @@ fn simplify(points: Vec<Point>) -> Vec<Point> {
     out
 }
 
-/// An orthogonal polyline from `a`, leaving by side `sa`, to `b`, entering by side `sb`, turning
-/// halfway: the route when no path around the boxes exists.
 fn bend(a: Point, b: Point, sa: Side, sb: Side) -> Vec<Point> {
     match (sa, sb) {
         (Side::Top | Side::Bottom, _) => {
@@ -576,33 +545,23 @@ impl Dir {
     }
 }
 
-/// The lines routes run on: every edge of every box kept `CLEAR` away, of every title and fixed
-/// area, the routes' first and last points, two rings around everything, and lines between
-/// those no more than `STEP` apart, so parallel routes find room.
-// ponytail: one grid point per crossing of lines, searched per edge; fine for tens of boxes,
-// use a sparse visibility graph if pictures of hundreds of boxes get slow.
 struct Grid {
     xs: Vec<f64>,
     ys: Vec<f64>,
 }
 
-/// Which grid points, and which grid segments between neighbouring points, lie inside an
-/// obstacle; a segment's index is its lower or left point's.
 struct Blocked {
     node: Vec<bool>,
     across: Vec<bool>,
     down: Vec<bool>,
 }
 
-/// What a search reuses from edge to edge: the blocked grid, and each state's cost and
-/// predecessor.
 struct Scratch {
     blocked: Blocked,
     cost: Vec<f64>,
     from: Vec<usize>,
 }
 
-/// How many routes use each grid segment, and whether one runs across or down each point.
 struct Used {
     across: Vec<u32>,
     down: Vec<u32>,
@@ -610,7 +569,6 @@ struct Used {
     node_down: Vec<bool>,
 }
 
-/// A search state's priority: lowest estimate first, then lowest state.
 #[derive(PartialEq)]
 struct Key(f64, usize);
 
@@ -670,7 +628,6 @@ impl Grid {
         (self.xs[node % nx], self.ys[node / nx])
     }
 
-    /// Room for one search at a time, refilled by each.
     fn scratch(&self) -> Scratch {
         let n = self.xs.len() * self.ys.len();
         Scratch {
@@ -684,37 +641,43 @@ impl Grid {
         }
     }
 
-    /// Marks in `b` the grid points and segments inside `obstacles`, and only those. Every
-    /// obstacle's edges are grid lines, so a segment lies wholly inside or outside each.
     fn block(&self, obstacles: &[Rect], b: &mut Blocked) {
         let nx = self.xs.len();
         for marks in [&mut b.node, &mut b.across, &mut b.down] {
             marks.fill(false);
         }
-        // Indices strictly inside (low, high), and segments within [low, high].
-        let inside = |values: &[f64], low: f64, high: f64| {
+        let points_in_open = |values: &[f64], low: f64, high: f64| {
             values.partition_point(|&v| v <= low + NEAR)
                 ..values.partition_point(|&v| v < high - NEAR)
         };
-        let within = |values: &[f64], low: f64, high: f64| {
+        let segments_in_closed = |values: &[f64], low: f64, high: f64| {
             let start = values.partition_point(|&v| v < low - NEAR);
             let end = values.partition_point(|&v| v <= high + NEAR);
             start..end.saturating_sub(1).max(start)
         };
+        let on_line =
+            |values: &[f64], v: f64| (values.binary_search_by(|x| x.total_cmp(&snap(v)))).is_ok();
         for r in obstacles {
+            debug_assert!(
+                on_line(&self.xs, r.x)
+                    && on_line(&self.xs, r.right())
+                    && on_line(&self.ys, r.y)
+                    && on_line(&self.ys, r.bottom()),
+                "obstacle edges lie on grid lines"
+            );
             let (ix, iy) = (
-                inside(&self.xs, r.x, r.right()),
-                inside(&self.ys, r.y, r.bottom()),
+                points_in_open(&self.xs, r.x, r.right()),
+                points_in_open(&self.ys, r.y, r.bottom()),
             );
             for j in iy.clone() {
                 for i in ix.clone() {
                     b.node[j * nx + i] = true;
                 }
-                for i in within(&self.xs, r.x, r.right()) {
+                for i in segments_in_closed(&self.xs, r.x, r.right()) {
                     b.across[j * nx + i] = true;
                 }
             }
-            for j in within(&self.ys, r.y, r.bottom()) {
+            for j in segments_in_closed(&self.ys, r.y, r.bottom()) {
                 for i in ix.clone() {
                     b.down[j * nx + i] = true;
                 }
@@ -722,7 +685,6 @@ impl Grid {
         }
     }
 
-    /// The neighbour of `node` in direction `dir`, the segment between them, and its length.
     fn next(&self, node: usize, dir: Dir) -> Option<(usize, usize, f64)> {
         let nx = self.xs.len();
         let (i, j) = (node % nx, node / nx);
@@ -736,9 +698,6 @@ impl Grid {
         Some((to, segment, (a.0 - b.0).abs() + (a.1 - b.1).abs()))
     }
 
-    /// The cheapest grid path from `start`, leaving in direction `out`, to `goal`, arriving in
-    /// direction `inward`, as grid points; `None` when an end lies inside an obstacle or no
-    /// path exists. A* over (point, direction) with Manhattan distance as the estimate.
     fn search(
         &self,
         scratch: &mut Scratch,
@@ -763,15 +722,17 @@ impl Grid {
         let slot = |node: usize, dir: Dir| node * dirs + dir as usize;
         cost.fill(f64::INFINITY);
         from.fill(usize::MAX);
+        let is_stale = |cost: &[f64], priority: f64, state: usize| {
+            priority > cost[state] + estimate(state / dirs)
+        };
         let mut queue = BinaryHeap::new();
         cost[slot(s, out)] = 0.0;
         queue.push(Key(estimate(s), slot(s, out)));
         while let Some(Key(priority, state)) = queue.pop() {
-            let (node, dir) = (state / dirs, Dir::ALL[state % dirs]);
-            // A state reached more cheaply after this entry was queued is already expanded.
-            if priority > cost[state] + estimate(node) {
+            if is_stale(cost, priority, state) {
                 continue;
             }
+            let (node, dir) = (state / dirs, Dir::ALL[state % dirs]);
             if node == g {
                 let mut path = vec![node];
                 let mut at = state;
@@ -827,8 +788,6 @@ impl Grid {
     }
 }
 
-/// `values` sorted, snapped and without repeats, with lines added between neighbours more than
-/// `STEP` apart.
 fn lines(values: Vec<f64>) -> Vec<f64> {
     let mut values: Vec<f64> = values.into_iter().map(snap).collect();
     values.sort_by(f64::total_cmp);
@@ -858,7 +817,6 @@ impl Used {
         }
     }
 
-    /// Marks the segments and points of `path` as used.
     fn add(&mut self, grid: &Grid, path: &[usize]) {
         let nx = grid.xs.len();
         for pair in path.windows(2) {
@@ -880,11 +838,6 @@ impl Used {
     }
 }
 
-/// The center of each label, `sizes` wide and high, beside its route: on the route where the
-/// label meets no other label, no box or container title, and no other route; else where it
-/// meets only other routes; else just beside the route; else at the nearest free spot. A label
-/// may sit inside a container, below its title band, but never across its border. Labels are
-/// placed in edge order, so the same picture places them the same way.
 pub(super) fn labels(scene: &Scene<'_>, routes: &[Vec<Point>], sizes: &[Point]) -> Vec<Point> {
     let mut placed: Vec<Rect> = Vec::new();
     let mut centers = Vec::with_capacity(routes.len());
@@ -902,8 +855,7 @@ pub(super) fn labels(scene: &Scene<'_>, routes: &[Vec<Point>], sizes: &[Point]) 
         let mut segments: Vec<usize> = (0..route.len().saturating_sub(1)).collect();
         let middle = segments.len().saturating_sub(1) / 2;
         segments.sort_by_key(|&s| (s.abs_diff(middle), s));
-        // The middle of the middle segment: where rings start, and the place of last resort.
-        let origin = segments.first().map_or((0.0, 0.0), |&s| {
+        let ring_center_and_fallback = segments.first().map_or((0.0, 0.0), |&s| {
             let (a, b) = (route[s], route[s + 1]);
             ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0)
         });
@@ -933,15 +885,14 @@ pub(super) fn labels(scene: &Scene<'_>, routes: &[Vec<Point>], sizes: &[Point]) 
                     .flat_map(|&s| beside(s))
                     .find(|&c| free(c, false))
             })
-            .or_else(|| rings(origin).find(|&c| free(c, false)));
-        let center = found.unwrap_or(origin);
+            .or_else(|| rings(ring_center_and_fallback).find(|&c| free(c, false)));
+        let center = found.unwrap_or(ring_center_and_fallback);
         placed.push(rect(center));
         centers.push(center);
     }
     centers
 }
 
-/// Points on the segment from `a` to `b`: its middle, then `LABEL_STEP` apart outward.
 fn along(a: Point, b: Point) -> Vec<Point> {
     let length = (b.0 - a.0).abs() + (b.1 - a.1).abs();
     let middle = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
@@ -960,8 +911,6 @@ fn along(a: Point, b: Point) -> Vec<Point> {
     out
 }
 
-/// Points on square rings around `origin`, `LABEL_STEP` apart, nearest rings first; the last
-/// ring lies far outside any picture.
 fn rings(origin: Point) -> impl Iterator<Item = Point> {
     (1..=RINGS).flat_map(move |ring: i32| {
         let r = f64::from(ring) * LABEL_STEP;
@@ -980,8 +929,6 @@ fn rings(origin: Point) -> impl Iterator<Item = Point> {
     })
 }
 
-/// Whether a label at `r` meets a placed label, a box, a container's title band or border, or
-/// a fixed area.
 fn blocks_label(scene: &Scene<'_>, placed: &[Rect], r: &Rect) -> bool {
     let boxes = scene.rects.iter().enumerate().any(|(i, b)| {
         if !overlaps(r, b) {
@@ -1004,7 +951,6 @@ fn blocks_label(scene: &Scene<'_>, placed: &[Rect], r: &Rect) -> bool {
     boxes || placed.iter().chain(&scene.fixed).any(|p| overlaps(r, p))
 }
 
-/// Whether `r` meets a segment of any route but route `own`.
 fn crosses_route(routes: &[Vec<Point>], own: usize, r: &Rect) -> bool {
     (routes.iter().enumerate())
         .filter(|(k, _)| *k != own)
@@ -1125,7 +1071,6 @@ mod tests {
         }
     }
 
-    /// Whether the segment from `a` to `b` runs through the inside of `r`.
     fn cuts(a: Point, b: Point, r: &Rect) -> bool {
         let line = rect(
             a.0.min(b.0),
@@ -1152,7 +1097,6 @@ mod tests {
             );
             assert!(!cuts(pair[0], pair[1], &rects[2]), "{route:?}");
         }
-        // The same boxes route the same way.
         assert_eq!(&routes(&scene(&rects), &[(0, 1)])[0], route);
     }
 

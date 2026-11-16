@@ -996,8 +996,10 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   containers, every label group comes after every route, no two labels meet, and no label meets a
   box, a box's text or a container border; it fails on the T9 layout of the eleven-module fixture.
   The new layout changes every architecture picture's bytes, so pictures drawn before T21 report
-  stale until `model pictures --write`. ponytail: one grid per edge search, fine for tens of
-  boxes; use a sparse visibility graph if large pictures get slow.
+  stale until `model pictures --write`. Known ceiling (ponytail): the grid has one point per
+  crossing of its lines, and every edge searches it anew, so cost grows with the number of lines
+  squared times the number of edges. Fine for tens of boxes; for pictures of hundreds, replace
+  the grid with a sparse visibility graph over box corners.
 - T21: `model render` flags. `--focus <subject>` (repeatable) lights the subject, its parts and the
   other end of every relationship from or to them, through the beat focus, and dims the rest.
   `--hide-kind <key>` (repeatable) leaves out modules of a configured node kind; their parts move
@@ -1021,3 +1023,11 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   picture) rewrite the root's size and viewBox before rasterizing, so every rasterizer honors
   them. A missing or failing rasterizer refuses `REQUEST_INVALID` with `details.reason`
   `no-rasterizer` or `rasterizer-failed`.
+- Open after T21 and the view redesign:
+  - The view's CSS keys on the renderer's hex color literals and baked opacity values. The
+    renderer should emit classes or CSS variables for the note, the kind line, containers,
+    emphasis and dimmed groups, so the view styles roles rather than colors.
+  - `MAX_SCALE` caps the `--scale` factor, not the PNG's pixels, so a large picture at scale 8
+    can still produce a huge PNG. It should cap the output's pixel count.
+  - HOLD: the pane outline's painting order. Check it in Chrome, Firefox and Safari before
+    calling the redesign done.
