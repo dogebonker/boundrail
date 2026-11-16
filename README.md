@@ -96,6 +96,25 @@ It exits 1 when a module the proposal does not name changed and holds nothing, n
 standard error, and 0 otherwise. Changed files that no module binds are listed but never fail
 the gate. A ref or proposal it cannot read refuses with exit 2.
 
+## Inspect
+
+`boundrail model inspect <module>` reads a module's interface two ways. From the model alone it
+lists the parts that outside relationships reach (`entry_points`), the parts none reaches
+(`hidden_parts`), the outside modules relating to it (`callers`, `outgoing`), entry parts
+without parts of their own that send outside and relate to nothing inside, so they only forward
+(`pass_through`, not the `CONTAINER_PASS_THROUGH` diagnostic, which flags a container with
+exactly one part), relationships drawn on the container instead of a part (`on_container`), and
+five counts in `measures`. Relationships with a container above the module count nowhere. From
+a scan of the checkout it counts entry files, exported and used symbols, imports past the entry
+points and import edges per neighbour. Markdown prints the drawn interface only for a subject,
+JSON carries every module's.
+
+```sh
+boundrail model inspect Billing --format markdown
+boundrail model inspect Billing --checkpoint <id>   # a retained state; the code is not scanned
+boundrail model inspect --group payments            # members, internal and boundary relationships, neighbours
+```
+
 ## In CI
 
 The GitHub Action runs `model check`, annotates its findings, and on a pull request comments the

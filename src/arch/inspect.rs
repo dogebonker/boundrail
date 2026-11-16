@@ -9,7 +9,7 @@ use std::path::Path;
 use serde::Serialize;
 
 use super::code::{self, NoScan, Ownership, SkipReason};
-use super::index::Index;
+use super::index::{Index, Line};
 use super::infra::Infra;
 use super::lsp::Facts;
 use super::types::{Evidence, Module};
@@ -191,6 +191,261 @@ fn interface(
         outgoing: neighbours(&grouped.outgoing, true),
         hops_in: hops(own, id, false),
         hops_out: hops(own, id, true),
+    }
+}
+
+/// One module's interface as the model draws it, read from relationships alone with no scan.
+/// Inside the module means the module and every module below it; a relationship with one end
+/// inside reaches the direct part holding that end, or the module itself when the end is the
+/// module. Outside means neither inside nor a module holding this one: a relationship between
+/// the module and a container above it joins a container and its own part
+/// (`CONTAINER_LINE_TO_OWN_PART`) and counts nowhere here.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct Drawn {
+    pub module: String,
+    pub name: String,
+    /// Direct parts an outside relationship reaches, or the module itself when it has no parts
+    /// and one reaches it, each with those relationships.
+    pub entry_points: Vec<Reach>,
+    /// Direct parts no outside relationship reaches.
+    pub hidden_parts: Vec<String>,
+    /// Outside modules with relationships into the module, each with those relationships.
+    pub callers: Vec<Reach>,
+    /// Outside modules the module's relationships go to, each with those relationships.
+    pub outgoing: Vec<Reach>,
+    /// Entry points without parts of their own that send a relationship outside and whose every
+    /// relationship has its other end outside the module: they only forward from outside to
+    /// outside. Not the `CONTAINER_PASS_THROUGH` diagnostic, which flags a container with
+    /// exactly one part.
+    pub pass_through: Vec<String>,
+    /// Relationships between the module itself and the outside while it has parts: they name
+    /// the container rather than the part that does the work.
+    pub on_container: Vec<String>,
+    pub measures: Measures,
+}
+
+/// A module and the relationships joining it with the inspected one or group.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct Reach {
+    pub module: String,
+    pub relationships: Vec<String>,
+}
+
+/// The counts of a [`Drawn`] interface.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct Measures {
+    pub entry_points: usize,
+    pub hidden_parts: usize,
+    pub callers: usize,
+    pub outgoing: usize,
+    /// Levels of containment below the module: 0 without parts, 1 with parts that have none.
+    pub depth: usize,
+}
+
+/// The drawn interface of every module of `modules`, or of `subject` alone (a qualified ID),
+/// sorted by qualified ID.
+pub fn drawn(model: &str, modules: &[Module], subject: Option<&str>) -> Vec<Drawn> {
+    let index = Index::new(model, modules);
+    // Each relationship under every module holding one of its ends, so each module reads only
+    // the relationships with an end inside it.
+    let mut touching: HashMap<&str, Vec<&Line<'_>>> = HashMap::new();
+    for line in &index.lines {
+        let mut holders = index.chain(&line.from);
+        holders.extend(index.chain(line.to));
+        holders.sort_unstable();
+        holders.dedup();
+        for holder in holders {
+            touching.entry(holder).or_default().push(line);
+        }
+    }
+    let read = |(id, module): (&String, &&Module)| {
+        let lines = touching.get(id.as_str()).map_or(&[][..], Vec::as_slice);
+        drawn_interface(&index, lines, id, &module.name)
+    };
+    match subject {
+        Some(subject) => index
+            .by_id
+            .get_key_value(subject)
+            .map(read)
+            .into_iter()
+            .collect(),
+        None => index.by_id.iter().map(read).collect(),
+    }
+}
+
+/// The drawn interface of module `id` from `lines`, the relationships with an end inside it.
+fn drawn_interface(index: &Index<'_>, lines: &[&Line<'_>], id: &str, name: &str) -> Drawn {
+    let parts = index.parts_of(id);
+    let place = places(index, id);
+    let container = !parts.is_empty();
+    let mut reached: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let mut callers: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let mut outgoing: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let (mut sends, mut joined) = (HashSet::new(), HashSet::new());
+    let mut on_container = Vec::new();
+    for line in lines {
+        let (from, to, rel) = (line.from.as_str(), line.to, line.id.as_str());
+        match (place.get(from), place.get(to)) {
+            // The outside end holds this module: a container and its own part.
+            (None, Some(_)) if index.is_below(id, from) => {}
+            (Some(_), None) if index.is_below(id, to) => {}
+            (None, Some(&inside)) => {
+                callers.entry(from).or_default().push(rel);
+                if container && inside == id {
+                    on_container.push(rel);
+                } else {
+                    reached.entry(inside).or_default().push(rel);
+                }
+            }
+            (Some(&inside), None) => {
+                outgoing.entry(to).or_default().push(rel);
+                if container && inside == id {
+                    on_container.push(rel);
+                } else {
+                    sends.insert(inside);
+                }
+            }
+            (Some(&from), Some(&to)) => joined.extend([from, to]),
+            (None, None) => {}
+        }
+    }
+    let reach = |found: BTreeMap<&str, Vec<&str>>| -> Vec<Reach> {
+        (found.into_iter())
+            .map(|(module, mut relationships)| {
+                relationships.sort_unstable();
+                Reach {
+                    module: module.to_owned(),
+                    relationships: relationships.into_iter().map(str::to_owned).collect(),
+                }
+            })
+            .collect()
+    };
+    let mut hidden_parts: Vec<String> = (parts.iter())
+        .filter(|(part, _)| !reached.contains_key(part.as_str()))
+        .map(|(part, _)| part.clone())
+        .collect();
+    hidden_parts.sort();
+    let pass_through: Vec<String> = (reached.keys())
+        .filter(|p| **p != id && !index.is_container(p))
+        .filter(|p| sends.contains(*p) && !joined.contains(*p))
+        .map(|p| (*p).to_owned())
+        .collect();
+    on_container.sort_unstable();
+    let (entry_points, callers, outgoing) = (reach(reached), reach(callers), reach(outgoing));
+    Drawn {
+        module: id.to_owned(),
+        name: name.to_owned(),
+        measures: Measures {
+            entry_points: entry_points.len(),
+            hidden_parts: hidden_parts.len(),
+            callers: callers.len(),
+            outgoing: outgoing.len(),
+            depth: depth(index, id),
+        },
+        entry_points,
+        hidden_parts,
+        callers,
+        outgoing,
+        pass_through,
+        on_container: on_container.into_iter().map(str::to_owned).collect(),
+    }
+}
+
+/// The direct part of `id` holding each module inside it, and `id` itself for itself.
+fn places<'s>(index: &'s Index<'_>, id: &'s str) -> HashMap<&'s str, &'s str> {
+    let mut place = HashMap::from([(id, id)]);
+    for (part, _) in index.parts_of(id) {
+        place.insert(part, part);
+        place.extend((index.descendants(part).into_iter()).map(|(d, _)| (d, part.as_str())));
+    }
+    place
+}
+
+/// Levels of containment below `id`: 0 without parts, 1 when no part has parts.
+fn depth(index: &Index<'_>, id: &str) -> usize {
+    (index.parts_of(id).iter())
+        .map(|(part, _)| 1 + depth(index, part))
+        .max()
+        .unwrap_or(0)
+}
+
+/// A configured group as the model draws it.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct GroupReport {
+    /// The group's key in the config.
+    pub group: String,
+    pub name: String,
+    /// Modules naming the group, by qualified ID.
+    pub members: Vec<String>,
+    /// Relationships between two different members.
+    pub internal: Vec<String>,
+    /// Relationships with one end inside a member and the other outside every member.
+    pub boundary: Vec<Crossing>,
+    /// The outside modules at the other end of a boundary relationship.
+    pub neighbours: Vec<String>,
+}
+
+/// A relationship crossing a group's boundary.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct Crossing {
+    pub relationship: String,
+    pub direction: Direction,
+    /// The innermost member holding the inside end.
+    pub member: String,
+    /// The outside end.
+    pub neighbour: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Direction {
+    /// Into the group.
+    In,
+    /// Out of the group.
+    Out,
+}
+
+/// Group `key` (named `name`) of the model's `modules`. A relationship reaching a member's part
+/// reaches that member, the innermost one when members nest; one within a single member joins
+/// no two members and crosses no boundary.
+pub fn group(model: &str, modules: &[Module], key: &str, name: &str) -> GroupReport {
+    let index = Index::new(model, modules);
+    let members: BTreeSet<&str> = (index.by_id.iter())
+        .filter(|(_, m)| m.groups.iter().any(|g| g == key))
+        .map(|(id, _)| id.as_str())
+        .collect();
+    let member =
+        |module: &str| (index.chain(module).into_iter()).find_map(|m| members.get(m).copied());
+    let (mut internal, mut boundary, mut neighbours) = (Vec::new(), Vec::new(), BTreeSet::new());
+    for line in &index.lines {
+        let (from, to) = (line.from.as_str(), line.to);
+        let crossing = match (member(from), member(to)) {
+            (Some(a), Some(b)) if a != b => {
+                internal.push(line.id.clone());
+                continue;
+            }
+            (Some(member), None) => (Direction::Out, member, to),
+            (None, Some(member)) => (Direction::In, member, from),
+            _ => continue,
+        };
+        let (direction, member, neighbour) = crossing;
+        neighbours.insert(neighbour.to_owned());
+        boundary.push(Crossing {
+            relationship: line.id.clone(),
+            direction,
+            member: member.to_owned(),
+            neighbour: neighbour.to_owned(),
+        });
+    }
+    internal.sort();
+    boundary.sort();
+    GroupReport {
+        group: key.to_owned(),
+        name: name.to_owned(),
+        members: members.into_iter().map(str::to_owned).collect(),
+        internal,
+        boundary,
+        neighbours: neighbours.into_iter().collect(),
     }
 }
 

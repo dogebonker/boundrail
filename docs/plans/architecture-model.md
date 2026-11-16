@@ -53,7 +53,7 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 | T19 | Footprint against a proposal: modules the proposal names and the branch changes, changes outside it, named but unchanged, held subjects, large changes, `--fail-outside` exit 1, exit 2 on an unreadable ref | done |
 | T20 | Check correctness: infrastructure-unit bindings exempt from `CONTAINER_PARTS_OUTSIDE`; the code check scans every language in the checkout, not one; `check --every-draft` | done |
 | T21 | Render quality and options: edges route around boxes and labels never collide; `--focus`, `--hide-kind`, legend, `--theme auto`; JSON receipt with dimensions, placed IDs and digest; direct PNG with `--scale` and `--region` | done |
-| T22 | Model-side inspect: entry points, hidden parts, callers, outgoing, pass-through, container relationships and measures read from the model, `--checkpoint`, and `inspect --group` | open |
+| T22 | Model-side inspect: entry points, hidden parts, callers, outgoing, pass-through, container relationships and measures read from the model, `--checkpoint`, and `inspect --group` | done |
 | T23 | Compare: interface changes and interface measures between states, `--beside` alternatives, `--against` a checkpoint | open |
 | T24 | Schema: relationship traffic, step anchors, authored flow participant order, flow summary required on write (`FLOW_SUMMARY_REQUIRED`) | open |
 | T25 | History on every write: each edit, including in proposals, retains a checkpoint with its doing line; publication destination with per-checkpoint status; source-commit availability on checkpoint reads | open |
@@ -1031,3 +1031,44 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
     can still produce a huge PNG. It should cap the output's pixel count.
   - HOLD: the pane outline's painting order. Check it in Chrome, Firefox and Safari before
     calling the redesign done.
+- T22: `model inspect` adds `model_interfaces` beside the scan's `modules`: each module's
+  interface as the model draws it, from relationships alone, every relationship kind counted and
+  flow steps not, one per module sorted by qualified ID, or the subject's alone. Inside a module
+  means the module and every module below it; outside means neither inside nor a module holding
+  it. A relationship with one end inside reaches the direct part holding that end, or the module
+  itself when the end is the module. A relationship between the module, or a module inside it,
+  and a container above the module joins a container and its own part, which
+  `CONTAINER_LINE_TO_OWN_PART` flags, and counts in no list or measure. `entry_points`
+  are the direct parts an outside relationship reaches, each with those relationships; a module
+  without parts is its own entry point when one reaches it. `hidden_parts` are the direct parts
+  none reaches. `callers` are the outside modules with relationships into the module, `outgoing`
+  the outside modules its relationships go to, each with those relationships; a relationship
+  from or to a part of an outside container names that part. `pass_through` are entry points
+  without parts of their own that send a relationship outside and whose every relationship has
+  its other end outside the module, so no sibling, no part and not the container: such a part
+  only forwards from outside to outside. It is not the `CONTAINER_PASS_THROUGH` diagnostic, which
+  flags a container with exactly one part; the list names part-less entry parts and judges
+  relationships, the diagnostic names containers and counts parts.
+  `on_container` are the relationships between the module itself and the outside while it has
+  parts, the ones `RELATIONSHIP_ON_CONTAINER` flags; they count among `callers` and `outgoing`
+  but reach no entry point. `measures` counts entry points, hidden parts, callers and outgoing
+  modules, and `depth`, the levels of containment below the module (0 without parts, 1 when no
+  part has parts), chosen over a ratio because the four counts already give the hidden share
+  (`hidden_parts / (entry_points + hidden_parts)` for a container) while depth adds what they do
+  not show. Markdown prints the drawn interface only when a subject is given, since one
+  paragraph per module would bury the scan; JSON carries every module's.
+- T22: `model inspect --checkpoint <id>` (not with `--proposal` or `--language-servers`) loads
+  the checkpoint as `read --checkpoint` does and reads its interfaces from the model alone. The
+  scan is skipped, since the checkout's code is not that state's code: `modules`, `skips` and
+  `language_servers` are empty and `code_skipped` says why; Markdown prints the checkpoint line
+  and `Code not scanned: ...`. `model inspect --group <key>` (not with a subject or
+  `--language-servers`) reads one group of `config.yaml` by its key from the model alone, in the
+  current state, a proposal or a checkpoint, and prints `group` instead of the interfaces:
+  `members` (modules naming the group), `internal` (relationships between two different
+  members), `boundary` (relationships with exactly one end inside, each with `direction` `in` or
+  `out`, the `member` holding the inside end and the `neighbour` at the outside end) and
+  `neighbours` (those outside ends). A relationship reaching a member's part reaches that
+  member, the innermost one when members nest, so one within a single member is neither internal
+  nor boundary. A key the config lacks refuses `SUBJECT_NOT_FOUND`. `/api/inspect` serializes
+  the same output, so it carries `model_interfaces`; it takes no checkpoint or group yet, and
+  the page still shows only the scanned interface.

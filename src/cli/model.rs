@@ -463,14 +463,26 @@ enum ModelCmd {
         #[arg(long)]
         limit: Option<usize>,
     },
-    /// Report each bound module's interface from a scan: entry points, exported, used and unused
-    /// symbols, imports past its entry points, and import edges per neighbouring module
+    /// Report each module's interface as the model draws it (entry points, hidden parts, callers,
+    /// outgoing, part-less entry parts that only forward, relationships on the container,
+    /// measures; Markdown prints it for a subject only) and each bound module's interface from a
+    /// scan: entry points, exported, used and unused symbols, imports past its entry points, and
+    /// import edges per neighbouring module
     Inspect {
         /// One module: its ID or unique current or former name
+        #[arg(conflicts_with = "group")]
         subject: Option<String>,
         /// Inspect this proposal instead of the current state
         #[arg(long)]
         proposal: Option<String>,
+        /// Inspect the model a checkpoint holds: its ID or a unique commit prefix. The code is
+        /// not scanned, as the checkout's code is not that state's code
+        #[arg(long, conflicts_with_all = ["proposal", "language_servers"])]
+        checkpoint: Option<String>,
+        /// Report one group the config names, by its key, from the model alone: its members,
+        /// relationships between them, relationships crossing its boundary, and neighbours
+        #[arg(long, conflicts_with = "language_servers")]
+        group: Option<String>,
         /// Run the language servers .boundrail/language-servers.json names, for references to each interface symbol.
         /// They run code from the checkout (a workspace tsserver.js under node_modules,
         /// rust-analyzer build scripts and proc macros, jdtls Gradle and Maven imports): use it on
@@ -1034,10 +1046,18 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
         ModelCmd::Inspect {
             subject,
             proposal,
+            checkpoint,
+            group,
             language_servers,
         } => {
-            let (subject, proposal) = (subject.as_deref(), proposal.as_deref());
-            inspect_model(root, markdown, subject, proposal, language_servers)
+            let asked = Inspect {
+                subject: subject.as_deref(),
+                proposal: proposal.as_deref(),
+                checkpoint: checkpoint.as_deref(),
+                group: group.as_deref(),
+                language_servers,
+            };
+            inspect_model(root, markdown, &asked)
         }
         ModelCmd::Locality { since, limit } => {
             model_locality(root, markdown, since.as_deref(), limit)
@@ -2045,38 +2065,57 @@ fn language_server_facts(
     Ok(facts)
 }
 
-/// `model inspect`: each bound module's interface, or one module's.
-fn inspect_model(
-    root: &Path,
-    markdown: bool,
-    subject: Option<&str>,
-    proposal: Option<&str>,
-    language_servers: bool,
-) -> Result<()> {
+/// What `model inspect` was asked: one module or every one, or one group, in the current state,
+/// a proposal or a checkpoint.
+#[derive(Default)]
+pub(super) struct Inspect<'a> {
+    pub(super) subject: Option<&'a str>,
+    pub(super) proposal: Option<&'a str>,
+    pub(super) checkpoint: Option<&'a str>,
+    pub(super) group: Option<&'a str>,
+    pub(super) language_servers: bool,
+}
+
+/// Why a checkpoint's inspection has no code section.
+const CHECKPOINT_CODE_SKIPPED: &str = "the checkout's code is not the checkpoint's code";
+
+/// `model inspect`: each module's interface, or one module's or group's.
+fn inspect_model(root: &Path, markdown: bool, asked: &Inspect<'_>) -> Result<()> {
     if !markdown {
-        return write(
-            None,
-            &inspect_output(root, subject, proposal, language_servers)?,
-        );
+        return write(None, &inspect_output(root, asked)?);
     }
-    let Inspected { model, report, .. } = inspected(root, subject, proposal, language_servers)?;
+    let Inspected {
+        model,
+        checkpoint,
+        measured,
+    } = inspected(root, asked)?;
+    if let Some(checkpoint) = &checkpoint {
+        print_checkpoint(checkpoint);
+    }
     print_proposal(&model);
-    print_inspect(&model, &report);
+    match measured {
+        Measured::Group(group) => print_group(&model, &group),
+        Measured::Modules { report, drawn, .. } => {
+            match checkpoint {
+                Some(_) => println!("Code not scanned: {CHECKPOINT_CODE_SKIPPED}"),
+                None => print_inspect(&model, &report),
+            }
+            // Every module's drawn interface would bury the scan; JSON keeps them all.
+            if asked.subject.is_some() {
+                print_drawn(&model, &drawn);
+            }
+        }
+    }
     Ok(())
 }
 
 /// The JSON output of `model inspect`.
-pub(super) fn inspect_output(
-    root: &Path,
-    subject: Option<&str>,
-    proposal: Option<&str>,
-    language_servers: bool,
-) -> Result<Value> {
+pub(super) fn inspect_output(root: &Path, asked: &Inspect<'_>) -> Result<Value> {
     let Inspected {
         model,
-        report,
-        scan_error,
-    } = inspected(root, subject, proposal, language_servers)?;
+        checkpoint,
+        measured,
+    } = inspected(root, asked)?;
     let mut output = json!({
         "schema": MODEL_SCHEMA,
         "kind": "inspect",
@@ -2084,45 +2123,103 @@ pub(super) fn inspect_output(
         "vault": model.dir,
         "revision": model.revision,
     });
-    extend(&mut output, &report)?;
+    let scan_error = match measured {
+        Measured::Group(group) => {
+            output["group"] = json!(group);
+            None
+        }
+        Measured::Modules {
+            report,
+            drawn,
+            scan_error,
+        } => {
+            extend(&mut output, &report)?;
+            output["model_interfaces"] = json!(drawn);
+            if checkpoint.is_some() {
+                output["code_skipped"] = json!(CHECKPOINT_CODE_SKIPPED);
+            }
+            scan_error
+        }
+    };
     extend(&mut output, json!({ "proposal": model.proposal }))?;
     if let Some(error) = scan_error {
         output["scan_error"] = json!(error);
     }
+    if let Some(checkpoint) = checkpoint {
+        output["checkpoint"] = json!(checkpoint);
+    }
     Ok(output)
 }
 
-/// What `model inspect` measured.
+/// What `model inspect` measured, in the state it read.
 struct Inspected {
     model: Model,
-    report: InspectReport,
-    /// The error of a failed scan.
-    scan_error: Option<String>,
+    checkpoint: Option<Checkpoint>,
+    measured: Measured,
 }
 
-fn inspected(
-    root: &Path,
-    subject: Option<&str>,
-    proposal: Option<&str>,
-    language_servers: bool,
-) -> Result<Inspected> {
-    let (model, _, _) = load_for_read(root, proposal)?;
+enum Measured {
+    Group(inspect::GroupReport),
+    Modules {
+        /// The interfaces the scan shows; empty for a checkpoint.
+        report: InspectReport,
+        /// The interfaces the model draws.
+        drawn: Vec<inspect::Drawn>,
+        /// The error of a failed scan.
+        scan_error: Option<String>,
+    },
+}
+
+fn inspected(root: &Path, asked: &Inspect<'_>) -> Result<Inspected> {
+    let Loaded {
+        model, checkpoint, ..
+    } = load_reading(root, asked.checkpoint, asked.proposal)?;
     let id = &model.manifest.id;
-    let subject = subject
+    if let Some(key) = asked.group {
+        let group = model.config.groups.get(key).ok_or_else(|| {
+            let message = format!("no group has the key `{key}` in config.yaml");
+            Refusal::new(Code::SubjectNotFound, message)
+        })?;
+        let group = inspect::group(id, &model.modules, key, &group.name);
+        return Ok(Inspected {
+            model,
+            checkpoint,
+            measured: Measured::Group(group),
+        });
+    }
+    let subject = (asked.subject)
         .map(|s| vault::find(id, &model.modules, s).map(|m| model.qualify(&m.id)))
         .transpose()?;
+    let subject = subject.as_deref();
+    let drawn = inspect::drawn(id, &model.modules, subject);
+    if checkpoint.is_some() {
+        let measured = Measured::Modules {
+            report: InspectReport::default(),
+            drawn,
+            scan_error: None,
+        };
+        return Ok(Inspected {
+            model,
+            checkpoint,
+            measured,
+        });
+    }
     let (checkout, doc) = scan_checkout(&model)?;
     let scan = doc.as_ref().map_err(Clone::clone);
     let infra = read_infra(&checkout);
     let scanned = doc.as_ref().ok();
-    let lsp = language_server_facts(&model, &checkout, scanned, &infra, language_servers)?;
-    let (modules, subject) = (&model.modules, subject.as_deref());
+    let lsp = language_server_facts(&model, &checkout, scanned, &infra, asked.language_servers)?;
+    let modules = &model.modules;
     let report = inspect::inspect(id, modules, &checkout, scan, &infra, subject, &lsp);
     let scan_error = (scan_error(&doc).or(infra.error.as_deref())).map(str::to_owned);
     Ok(Inspected {
         model,
-        report,
-        scan_error,
+        checkpoint,
+        measured: Measured::Modules {
+            report,
+            drawn,
+            scan_error,
+        },
     })
 }
 
@@ -2212,6 +2309,80 @@ fn print_inspect(model: &Model, report: &InspectReport) {
     for (subject, reason) in modules.chain(servers) {
         println!("- {subject} {}", reason.as_str());
     }
+}
+
+/// The interfaces the model draws, one paragraph per module.
+fn print_drawn(model: &Model, drawn: &[inspect::Drawn]) {
+    let names = names(model);
+    let relationships = relationship_names(model);
+    for d in drawn {
+        let m = &d.measures;
+        println!(
+            "{} as drawn: {}, {}, {}, {} outgoing, depth {}",
+            d.name,
+            count(m.entry_points, "entry point"),
+            count(m.hidden_parts, "hidden part"),
+            count(m.callers, "caller"),
+            m.outgoing,
+            m.depth
+        );
+        let lists = [
+            ("entry point", &d.entry_points),
+            ("caller", &d.callers),
+            ("outgoing", &d.outgoing),
+        ];
+        for (label, list) in lists {
+            for r in list {
+                let drawn = drawn_as(&relationships, &r.relationships);
+                println!("  {label} {}: {drawn}", name_of(&names, &r.module));
+            }
+        }
+        for (label, list) in [
+            ("hidden part", &d.hidden_parts),
+            ("pass-through", &d.pass_through),
+        ] {
+            (list.iter()).for_each(|id| println!("  {label} {}", name_of(&names, id)));
+        }
+        for id in &d.on_container {
+            let read = relationships.get(id).unwrap_or(id);
+            println!("  on container: {read}");
+        }
+    }
+}
+
+/// A group's members, internal and boundary relationships, and neighbours.
+fn print_group(model: &Model, group: &inspect::GroupReport) {
+    let names = names(model);
+    let relationships = relationship_names(model);
+    let read = |id: &String| relationships.get(id).unwrap_or(id).clone();
+    let named = |ids: &[String]| -> String {
+        let list: Vec<&str> = ids.iter().map(|id| name_of(&names, id)).collect();
+        if list.is_empty() {
+            "none".to_owned()
+        } else {
+            list.join(", ")
+        }
+    };
+    println!(
+        "Group {} ({}): {}, {}, {}",
+        group.name,
+        group.group,
+        count(group.members.len(), "member"),
+        count(group.internal.len(), "internal relationship"),
+        count(group.boundary.len(), "boundary relationship")
+    );
+    println!("  members: {}", named(&group.members));
+    for id in &group.internal {
+        println!("  internal: {}", read(id));
+    }
+    for c in &group.boundary {
+        let arrow = match c.direction {
+            inspect::Direction::In => "in",
+            inspect::Direction::Out => "out",
+        };
+        println!("  {arrow}: {}", read(&c.relationship));
+    }
+    println!("  neighbours: {}", named(&group.neighbours));
 }
 
 /// `model locality`: co-change locality of the current state's modules over Git history.

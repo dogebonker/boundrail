@@ -19,6 +19,11 @@
   changed parts that hold a module's changes in `holds`, `large` for a change of more than 30
   files, and `--fail-outside`, which exits 1 when a module outside the proposal changed and
   holds nothing.
+- `model inspect` reads each module's interface from the model as well as the code: entry
+  points, hidden parts, callers, outgoing modules, pass-through parts, relationships on the
+  container and five measures, in `model_interfaces`. `--checkpoint <id>` inspects a retained
+  state from the model alone, and `--group <key>` lists a configured group's members, internal
+  and boundary relationships and neighbouring modules.
 - `model check --every-draft` checks the current state and then every draft proposal, reports
   each, and exits 1 when any has a warning or does not load.
 - The code check, `inspect` and `footprint` scan every language in the checkout, such as a Go

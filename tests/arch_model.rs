@@ -5307,8 +5307,350 @@ fn inspect_counts_entry_points_deep_imports_and_unused_exports() {
          unused outside: withheld, symbol coverage is incomplete\n  \
          deep import: src/web/index.ts -> src/billing/fee.ts\n  \
          -> Bank: 1 edge, undrawn\n  \
-         <- Web: 2 edges, drawn as Web -> Billing [call]\n"
+         <- Web: 2 edges, drawn as Web -> Billing [call]\n\
+         Billing as drawn: 1 entry point, 0 hidden parts, 1 caller, 0 outgoing, depth 0\n  \
+         entry point Billing: drawn as Web -> Billing [call]\n  \
+         caller Web: drawn as Web -> Billing [call]\n"
     );
+}
+
+/// Platform holds Api, Relay, Core (holding Ledger) and Store. Client calls Api and Relay;
+/// Relay only forwards to Bank; Api calls Core; Ledger calls Bank; Platform itself calls Bank and
+/// Monitor calls Platform. Group `core-path` holds Api and Core.
+fn drawn_platform(checkout: &Checkout) -> String {
+    let model = checkout.init();
+    let q = |id: &str| format!("{model}#{id}");
+    let path = checkout.vault().join("config.yaml");
+    let mut config: Value = serde_yaml_ng::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    config["groups"] = json!({"core-path": {"name": "Core path"}});
+    fs::write(&path, serde_yaml_ng::to_string(&config).unwrap()).unwrap();
+    let rel = |id: &str, to: &str| json!({"id": id, "to": q(to), "kind": "call", "order": 0});
+    let modules = [
+        (
+            "Platfrm1",
+            "Platform",
+            None,
+            vec![rel("RelPlBnk", "BankApi1")],
+            false,
+        ),
+        (
+            "ApiPart1",
+            "Api",
+            Some("Platfrm1"),
+            vec![rel("RelApCor", "CorePart")],
+            true,
+        ),
+        (
+            "RelayPt1",
+            "Relay",
+            Some("Platfrm1"),
+            vec![rel("RelRlBnk", "BankApi1")],
+            false,
+        ),
+        ("CorePart", "Core", Some("Platfrm1"), vec![], true),
+        ("StorePt1", "Store", Some("Platfrm1"), vec![], false),
+        (
+            "LedgerP1",
+            "Ledger",
+            Some("CorePart"),
+            vec![rel("RelLgBnk", "BankApi1")],
+            false,
+        ),
+        (
+            "Client01",
+            "Client",
+            None,
+            vec![rel("RelCliAp", "ApiPart1"), rel("RelCliRl", "RelayPt1")],
+            false,
+        ),
+        (
+            "Monitor1",
+            "Monitor",
+            None,
+            vec![rel("RelMonPl", "Platfrm1")],
+            false,
+        ),
+        ("BankApi1", "Bank", None, vec![], false),
+    ];
+    for (order, (id, name, parent, outgoing, grouped)) in (0..).zip(modules) {
+        let mut value = module(id, name, "service", order);
+        if let Some(parent) = parent {
+            value["parent"] = q(parent).into();
+        }
+        let outgoing = (0..).zip(outgoing).map(|(n, mut r): (u32, Value)| {
+            r["order"] = n.into();
+            r
+        });
+        value["outgoing"] = outgoing.collect();
+        if grouped {
+            value["groups"] = json!(["core-path"]);
+        }
+        checkout.module(value);
+    }
+    model
+}
+
+#[test]
+fn inspect_reads_each_interface_from_the_model() {
+    let checkout = committed();
+    let model = drawn_platform(&checkout);
+    let q = |id: &str| format!("{model}#{id}");
+    let reach = |module: &str, relationships: &[&str]| json!({"module": q(module), "relationships": relationships.iter().map(|r| q(r)).collect::<Vec<_>>()});
+    let out = checkout.ok(&["inspect", "Platform"]);
+    // The code section stays: Platform is unbound.
+    assert_eq!(
+        out["skips"],
+        json!([{"module": q("Platfrm1"), "reason": "unbound"}])
+    );
+    assert_eq!(out["code_skipped"], Value::Null);
+    let platform = &out["model_interfaces"][0];
+    assert_eq!(out["model_interfaces"].as_array().unwrap().len(), 1);
+    assert_eq!(platform["module"], q("Platfrm1"));
+    assert_eq!(
+        platform["entry_points"],
+        json!([
+            reach("ApiPart1", &["RelCliAp"]),
+            reach("RelayPt1", &["RelCliRl"])
+        ])
+    );
+    // Core is reached only from its sibling Api; Store from nowhere.
+    assert_eq!(
+        platform["hidden_parts"],
+        json!([q("CorePart"), q("StorePt1")])
+    );
+    assert_eq!(
+        platform["callers"],
+        json!([
+            reach("Client01", &["RelCliAp", "RelCliRl"]),
+            reach("Monitor1", &["RelMonPl"])
+        ])
+    );
+    // Ledger's call leaves through Core, so it counts with the rest of Platform's.
+    assert_eq!(
+        platform["outgoing"],
+        json!([reach("BankApi1", &["RelLgBnk", "RelPlBnk", "RelRlBnk"])])
+    );
+    // Api is reached from outside but calls its sibling, so only Relay forwards.
+    assert_eq!(platform["pass_through"], json!([q("RelayPt1")]));
+    assert_eq!(
+        platform["on_container"],
+        json!([q("RelMonPl"), q("RelPlBnk")])
+    );
+    assert_eq!(
+        platform["measures"],
+        json!({"entry_points": 2, "hidden_parts": 2, "callers": 2, "outgoing": 1, "depth": 2})
+    );
+
+    // A module without parts is its own entry point.
+    let relay = &checkout.ok(&["inspect", "Relay"])["model_interfaces"][0];
+    assert_eq!(
+        relay["entry_points"],
+        json!([reach("RelayPt1", &["RelCliRl"])])
+    );
+    assert_eq!(relay["hidden_parts"], json!([]));
+    assert_eq!(relay["pass_through"], json!([]));
+    assert_eq!(relay["on_container"], json!([]));
+    assert_eq!(
+        relay["measures"],
+        json!({"entry_points": 1, "hidden_parts": 0, "callers": 1, "outgoing": 1, "depth": 0})
+    );
+    // Without a subject every module is read, sorted by qualified ID.
+    let every = checkout.ok(&["inspect"])["model_interfaces"].clone();
+    let ids: Vec<&str> = (every.as_array().unwrap().iter())
+        .map(|d| d["module"].as_str().unwrap())
+        .collect();
+    let mut sorted = ids.clone();
+    sorted.sort_unstable();
+    assert_eq!((ids.len(), &ids), (9, &sorted));
+    // Markdown prints drawn interfaces only for a subject; JSON above keeps every module's.
+    let (code, text) = checkout.run_raw(&["inspect", "--format", "markdown"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(!text.contains(" as drawn: "), "{text}");
+
+    let (code, text) = checkout.run_raw(&["inspect", "Relay", "--format", "markdown"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.ends_with(
+            "Relay as drawn: 1 entry point, 0 hidden parts, 1 caller, 1 outgoing, depth 0\n  \
+             entry point Relay: drawn as Client -> Relay [call]\n  \
+             caller Client: drawn as Client -> Relay [call]\n  \
+             outgoing Bank: drawn as Relay -> Bank [call]\n"
+        ),
+        "{text}"
+    );
+    let (_, text) = checkout.run_raw(&["inspect", "Platform", "--format", "markdown"]);
+    for line in [
+        "  hidden part Store\n",
+        "  pass-through Relay\n",
+        "  on container: Monitor -> Platform [call]\n",
+    ] {
+        assert!(text.contains(line), "{text}");
+    }
+}
+
+#[test]
+fn inspect_counts_no_relationship_with_a_container_above_the_module() {
+    let checkout = committed();
+    let model = drawn_platform(&checkout);
+    let q = |id: &str| format!("{model}#{id}");
+    let reach = |module: &str, relationships: &[&str]| json!({"module": q(module), "relationships": relationships.iter().map(|r| q(r)).collect::<Vec<_>>()});
+    // The container Core calls its own container Platform; the leaf Ledger calls its parent Core
+    // and its grandparent Platform.
+    let mut core = checkout.read_module("CorePart");
+    core["outgoing"] = json!([{"id": "RelCoPl1", "to": q("Platfrm1"), "kind": "call", "order": 0}]);
+    checkout.module(core);
+    let mut ledger = checkout.read_module("LedgerP1");
+    ledger["outgoing"] = json!([
+        {"id": "RelLgBnk", "to": q("BankApi1"), "kind": "call", "order": 0},
+        {"id": "RelLgCor", "to": q("CorePart"), "kind": "call", "order": 1},
+        {"id": "RelLgPl1", "to": q("Platfrm1"), "kind": "call", "order": 2},
+    ]);
+    checkout.module(ledger);
+
+    let core = &checkout.ok(&["inspect", "Core"])["model_interfaces"][0];
+    // Api is a sibling, so its call stays on the container; Platform holds Core.
+    assert_eq!(core["callers"], json!([reach("ApiPart1", &["RelApCor"])]));
+    assert_eq!(core["outgoing"], json!([reach("BankApi1", &["RelLgBnk"])]));
+    assert_eq!(core["on_container"], json!([q("RelApCor")]));
+    assert_eq!(core["entry_points"], json!([]));
+    assert_eq!(core["pass_through"], json!([]));
+    assert_eq!(
+        core["measures"],
+        json!({"entry_points": 0, "hidden_parts": 1, "callers": 1, "outgoing": 1, "depth": 1})
+    );
+
+    let ledger = &checkout.ok(&["inspect", "Ledger"])["model_interfaces"][0];
+    assert_eq!(ledger["callers"], json!([]));
+    assert_eq!(
+        ledger["outgoing"],
+        json!([reach("BankApi1", &["RelLgBnk"])])
+    );
+    assert_eq!(
+        (&ledger["entry_points"], &ledger["on_container"]),
+        (&json!([]), &json!([]))
+    );
+
+    // Inside Platform the new lines join its own modules, so its interface is unchanged.
+    let platform = &checkout.ok(&["inspect", "Platform"])["model_interfaces"][0];
+    assert_eq!(
+        platform["on_container"],
+        json!([q("RelMonPl"), q("RelPlBnk")])
+    );
+    assert_eq!(
+        platform["outgoing"],
+        json!([reach("BankApi1", &["RelLgBnk", "RelPlBnk", "RelRlBnk"])])
+    );
+}
+
+#[test]
+fn inspect_group_reports_members_internal_and_boundary_relationships() {
+    let checkout = committed();
+    let model = drawn_platform(&checkout);
+    let q = |id: &str| format!("{model}#{id}");
+    let out = checkout.ok(&["inspect", "--group", "core-path"]);
+    assert_eq!(out["modules"], Value::Null, "a group reads the model alone");
+    let crossing = |r: &str, direction: &str, member: &str, neighbour: &str| json!({"relationship": q(r), "direction": direction, "member": q(member), "neighbour": q(neighbour)});
+    // Ledger's call reaches the boundary through its member Core.
+    assert_eq!(
+        out["group"],
+        json!({
+            "group": "core-path",
+            "name": "Core path",
+            "members": [q("ApiPart1"), q("CorePart")],
+            "internal": [q("RelApCor")],
+            "boundary": [
+                crossing("RelCliAp", "in", "ApiPart1", "Client01"),
+                crossing("RelLgBnk", "out", "CorePart", "BankApi1"),
+            ],
+            "neighbours": [q("BankApi1"), q("Client01")],
+        })
+    );
+    let (code, text) =
+        checkout.run_raw(&["inspect", "--group", "core-path", "--format", "markdown"]);
+    assert_eq!(code, 0, "{text}");
+    assert_eq!(
+        text,
+        "Group Core path (core-path): 2 members, 1 internal relationship, 2 boundary relationships\n  \
+         members: Api, Core\n  \
+         internal: Api -> Core [call]\n  \
+         in: Client -> Api [call]\n  \
+         out: Ledger -> Bank [call]\n  \
+         neighbours: Bank, Client\n"
+    );
+
+    checkout.refused(&["inspect", "--group", "nowhere"], "SUBJECT_NOT_FOUND");
+    let (code, text) = checkout.run_raw(&["inspect", "Api", "--group", "core-path"]);
+    assert_eq!(
+        (code, text.as_str()),
+        (2, ""),
+        "a subject and a group conflict"
+    );
+}
+
+#[test]
+fn inspect_reads_a_checkpoint_without_scanning() {
+    let checkout = committed();
+    let model = drawn_platform(&checkout);
+    let q = |id: &str| format!("{model}#{id}");
+    let id = retain(&checkout, "the platform as drawn");
+    // Relay stops forwarding in the current state.
+    let mut relay = checkout.read_module("RelayPt1");
+    relay["outgoing"] = json!([]);
+    checkout.module(relay);
+    let current = checkout.ok(&["inspect", "Platform"]);
+    assert_eq!(current["model_interfaces"][0]["pass_through"], json!([]));
+
+    let out = checkout.ok(&["inspect", "Platform", "--checkpoint", &id]);
+    assert_eq!(out["checkpoint"]["id"], id.as_str());
+    assert_eq!(
+        out["model_interfaces"][0]["pass_through"],
+        json!([q("RelayPt1")])
+    );
+    assert_eq!(
+        out["code_skipped"],
+        "the checkout's code is not the checkpoint's code"
+    );
+    assert_eq!((&out["modules"], &out["skips"]), (&json!([]), &json!([])));
+    let group = checkout.ok(&["inspect", "--group", "core-path", "--checkpoint", &id]);
+    assert_eq!(
+        group["group"]["members"],
+        json!([q("ApiPart1"), q("CorePart")])
+    );
+    assert_eq!(group["checkpoint"]["id"], id.as_str());
+
+    let (code, text) = checkout.run_raw(&[
+        "inspect",
+        "Relay",
+        "--checkpoint",
+        &id,
+        "--format",
+        "markdown",
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.starts_with(&format!("Checkpoint {id} by tester")),
+        "{text}"
+    );
+    assert!(
+        text.contains("Code not scanned: the checkout's code is not the checkpoint's code\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("  outgoing Bank: drawn as Relay -> Bank [call]\n"),
+        "{text}"
+    );
+
+    checkout.refused(
+        &["inspect", "--checkpoint", "Unknown1"],
+        "CHECKPOINT_NOT_FOUND",
+    );
+    for args in [
+        &["inspect", "--checkpoint", &id, "--proposal", "Draft001"][..],
+        &["inspect", "--checkpoint", &id, "--language-servers"],
+    ] {
+        let (code, text) = checkout.run_raw(args);
+        assert_eq!((code, text.as_str()), (2, ""), "{args:?} conflict");
+    }
 }
 
 /// Appends a line to each of `paths` and commits them.

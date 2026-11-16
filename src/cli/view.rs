@@ -435,7 +435,12 @@ impl Server {
                 model_cli::compare_output(root, proposal, against)?
             }
             "/api/inspect" => {
-                model_cli::inspect_output(root, param("subject"), param("proposal"), false)?
+                let asked = model_cli::Inspect {
+                    subject: param("subject"),
+                    proposal: param("proposal"),
+                    ..Default::default()
+                };
+                model_cli::inspect_output(root, &asked)?
             }
             "/api/walkthrough" => {
                 let id = param("id").ok_or_else(|| invalid("walkthrough needs id"))?;
