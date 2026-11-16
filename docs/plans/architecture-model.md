@@ -51,7 +51,7 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 | T17 | Reconcile drafts after current changes, export/import bundles, history publication | done |
 | T18 | Remove scan-era code that the model does not use | done |
 | T19 | Footprint against a proposal: modules the proposal names and the branch changes, changes outside it, named but unchanged, held subjects, large changes, `--fail-outside` exit 1, exit 2 on an unreadable ref | done |
-| T20 | Check correctness: infrastructure-unit bindings exempt from `CONTAINER_PARTS_OUTSIDE`; the code check scans every language in the checkout, not one; `check --every-draft` | open |
+| T20 | Check correctness: infrastructure-unit bindings exempt from `CONTAINER_PARTS_OUTSIDE`; the code check scans every language in the checkout, not one; `check --every-draft` | done |
 | T21 | Render quality and options: edges route around boxes and labels never collide; `--focus`, `--hide-kind`, legend, `--theme auto`; JSON receipt with dimensions, placed IDs and digest; direct PNG with `--scale` and `--region` | open |
 | T22 | Model-side inspect: entry points, hidden parts, callers, outgoing, pass-through, container relationships and measures read from the model, `--checkpoint`, and `inspect --group` | open |
 | T23 | Compare: interface changes and interface measures between states, `--beside` alternatives, `--against` a checkpoint | open |
@@ -71,12 +71,11 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 
 ## Notes
 
-- T5: the code check scans the checkout once with the native engine, which picks one language per
-  checkout. Bound code in any other language holds no scanned file and is skipped as
-  `not-scanned` (polyglot gap). The TypeScript and Python collectors scan only under `src/` when
-  it exists, so bindings outside it show as `not-scanned` too. A failed scan is a warning
-  (`SCAN_FAILED`) that fails the check; paths it would have judged are skipped as `scan-failed`
-  and the semantic check still reports. `--only semantic` opts out of the scan.
+- T5: the code check scans the checkout once with the native engine, every language present
+  (T20). The Python collector scans one top-level package under `src/` when it exists, so Python
+  outside it shows as `not-scanned`. A failed scan is a warning (`SCAN_FAILED`) that fails the
+  check; paths it would have judged are skipped as `scan-failed` and the semantic check still
+  reports. `--only semantic` opts out of the scan.
 - T5: import edges stand in for call evidence until T13. Only kinds whose evidence is entirely
   import or call (`call`, `render` by default) get the strict check: no edge is unsupported, or
   backwards. A kind with other evidence too (HTTP, RPC, event, queue, data, dependency) is
@@ -477,7 +476,7 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   files of one folder are one project, so two projects need two folders; Kubernetes Services and
   ConfigMaps are indexed by name and filtered by namespace, since an object may name none. Env
   files are read even when gitignored, as compose reads them. A module whose code is not scanned
-  (the T5 polyglot gap) keeps its `not-scanned` skips, and a compose service built from its folder
+  (Python outside its package) keeps its `not-scanned` skips, and a compose service built from its folder
   shows as `infra-unbound`. The scan-era service inference reads code facts, not infrastructure,
   so it is not reused.
 - T13: config. Two files, each read only when it is a regular file under 1 MiB (else
@@ -592,7 +591,7 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   child is killed on timeout, so a server's own helper processes may outlive it, as for the
   collectors. Languages are whatever servers the config names; the evidence needs the scan's
   symbol data, so it reaches the languages the native engine indexes, and modules the scan does
-  not judge (the T5 polyglot gap) stay `not-scanned`. Tried by hand with
+  not judge (Python outside its package) stay `not-scanned`. Tried by hand with
   `typescript-language-server --stdio` on a three-module TypeScript checkout: references
   supported the drawn calls, a line without one reported `never calls`, and inspect counted uses.
 - T13: tests. No real language server runs in CI. `tests/fake_lsp/server.rs` is a standard-library
@@ -932,7 +931,7 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   `known`, `exposure`, `grabbag`, `quality`, `graph`, `resolution`, `simulate`, `codeowners`,
   `bisect`, `early_smells` and `diff`. A collector-to-model path that builds only files, edges,
   package entries and symbols could delete them. It could also drop the parameters every caller
-  now passes the same value: `native::typescript::collect`'s `scan_all` (always false),
+  now passes the same value: `native::typescript::collect`'s `scan_all` (always true since T20),
   `native::python::collect`'s `package` (always none) and `python_paths` (always empty),
   `native::go::collect`'s `go` (always `go`), `grimp::package`'s `explicit`, `analyze`'s
   `cochange` (always none), the constant `Config` fields `live` fills (`granularity`, `includes`,
@@ -942,3 +941,37 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   workspaces and `simulate`, so only its scan-era parts go; and the validators that can raise
   `SCAN_FAILED`, which a lean path must keep or replace. Before switching, compare the lean path's
   output with the current one on the same checkouts.
+- T20: a binding to an infrastructure unit names a deployment file, not code, so
+  `CONTAINER_PARTS_OUTSIDE` never judges it and `Index::bound_ancestor` passes over it to the
+  closest ancestor bound to code.
+- T20: `scan::live` runs the T18 pipeline once per language `collect::detect_languages` finds,
+  most files first, and merges files, edges, package entries and symbols (`complete` only when
+  every language's is); each file keeps its language in `File::language`, which the entry-point
+  test reads, and the document's `source.language` is the first. Detection counts TypeScript
+  anywhere, since the collector now runs with `scan_all`, and Python under `source_dir` only: its
+  collector resolves one top-level package (`grimp::package`) from one import root, so lifting
+  that needs a scan per package root. Intended change: a TypeScript checkout with `src/` now
+  scans outside it too (source root `.`), so files beside `src/` are judged rather than
+  `not-scanned`. Since TypeScript counts anywhere, the TypeScript policy, which detection also
+  walks with, leaves out the build output of each language whose manifest sits at the root:
+  `target/` with a `Cargo.toml`, `target/` and `out/` with a `pom.xml` or Gradle build, `_build/`
+  and `deps/` with a `mix.exs`. Otherwise `cargo doc`'s JavaScript under `target/doc` would make
+  a TypeScript scan. Without that manifest the folders stay, so TypeScript in `src/out` counts.
+  Rust needs a `Cargo.toml` and Go a `go.mod` or `go.work` anywhere in the checkout, as their
+  collectors find nested manifests. Each language is collected under its own policy, built once.
+  A language whose collector fails while another succeeds warns on stderr and lands in
+  `Document::scan_failures` with its detected files that its own policy keeps (so Rust test
+  files stay `not-scanned`); a binding or anchor whose path holds none of the scanned files but
+  some of those is `scan-failed`, and one `SCAN_FAILED` names those subjects with each language's
+  error (`go: ...; python: ...`). A path holding scanned files beside such files is judged on
+  the scanned ones and named by that `SCAN_FAILED` too, so the check fails rather than passing
+  on part of the code. Only when every language fails does the whole scan fail. `inspect` sees
+  the merged scan; `footprint` skips its crossings as `scan-failed`, with each failed language's
+  error in `scan_error`, when a changed file is one of a failed language's.
+- T20: `model check --every-draft` (not with `--proposal`) runs `run_check` on the current
+  state, then on every proposal whose `proposal.json` reads as a draft or does not read, and
+  prints `{"kind": "check-every-draft", "passed", "states"}` with each state's check output, or
+  its refusal output with `proposal.id`; Markdown prints each state in turn. Exit 1 when any
+  state has a warning or refuses. `--format annotations` and `--only embeds` refuse
+  `REQUEST_INVALID`. The states share one scan of the checkout, made the first time a state needs
+  it; a draft's error other than a refusal stops the command with `checking draft <id>`.

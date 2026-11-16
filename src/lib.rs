@@ -275,6 +275,7 @@ fn build(
                 class: (!config.legacy_module_classes && tests.contains(path))
                     .then_some(model::ModuleClass::Tests),
                 owners: owners.map(|o| o.owners(path)).unwrap_or_default(),
+                language: Some(source.language),
             })
             .collect(),
         source,
@@ -292,6 +293,7 @@ fn build(
         package_splits: None,
         target: None,
         stale_known: Vec::new(),
+        scan_failures: Vec::new(),
     };
     known::mark(&mut doc);
     if owners.is_some() {

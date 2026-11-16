@@ -63,6 +63,18 @@ pub struct Document {
     /// Entries of the rules' known list that no forbidden import matches.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub stale_known: Vec<crate::known::Entry>,
+    /// The languages of a scan of several whose collector failed; their files are not scanned.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub scan_failures: Vec<ScanFailure>,
+}
+
+/// A language whose collector failed while the others' succeeded.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanFailure {
+    pub language: Language,
+    pub error: String,
+    /// The language's source files, which the scan holds none of.
+    pub files: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -91,6 +103,20 @@ pub enum Language {
     Rust,
     Java,
     Elixir,
+}
+
+impl Language {
+    /// The lowercase name the JSON and the command line use.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Typescript => "typescript",
+            Self::Python => "python",
+            Self::Go => "go",
+            Self::Rust => "rust",
+            Self::Java => "java",
+            Self::Elixir => "elixir",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -234,6 +260,9 @@ pub struct File {
     pub class: Option<ModuleClass>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub owners: Vec<String>,
+    /// The language whose collector found the file, which a scan of several languages keeps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<Language>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

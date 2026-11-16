@@ -73,6 +73,10 @@ enum Command {
         /// Check this proposal instead of the current state
         #[arg(long)]
         proposal: Option<String>,
+        /// Check the current state and then every draft proposal, reporting each; exits 1 when
+        /// any of them has a warning or does not load
+        #[arg(long, conflicts_with = "proposal")]
+        every_draft: bool,
         /// Run the language servers .boundrail/language-servers.json names, for call references and symbols.
         /// They run code from the checkout (a workspace tsserver.js under node_modules,
         /// rust-analyzer build scripts and proc macros, jdtls Gradle and Maven imports): use it on
@@ -497,8 +501,15 @@ pub(super) fn run(args: ModelArgs) -> Result<ExitCode> {
     let result = refuse_format(args.format, &args.command).and_then(|()| match args.command {
         Command::Check {
             only,
+            every_draft: true,
+            language_servers,
+            ..
+        } => check_every_draft(&args.root, args.format, only, language_servers),
+        Command::Check {
+            only,
             proposal,
             language_servers,
+            ..
         } => check(
             &args.root,
             args.format,
@@ -1603,31 +1614,120 @@ fn check(
     proposal: Option<&str>,
     language_servers: bool,
 ) -> Result<ExitCode> {
-    let checked = run_check(root, only, proposal, language_servers)?;
+    let checked = run_check(root, only, proposal, language_servers, &SharedScan::new())?;
     let code = ExitCode::from(u8::from(checked.warning > 0));
     if format == Some(ModelFormat::Annotations) {
         print!("{}", github::annotations(&checked.output()?));
         return Ok(code);
     }
     if format == Some(ModelFormat::Markdown) {
-        let Checked {
-            model,
-            diagnostics,
-            skips,
-            units,
-            warning,
-            information,
-            ..
-        } = &checked;
-        print_proposal(model);
-        let skipped = Skipped {
-            skips: skips.as_deref().unwrap_or_default(),
-            units: units.as_deref().unwrap_or_default(),
-        };
-        print_diagnostics(diagnostics, skipped, *warning, *information);
+        print_checked(&checked);
         return Ok(code);
     }
     write(None, &checked.output()?)?;
+    Ok(code)
+}
+
+/// What `model check --format markdown` prints for one state.
+fn print_checked(checked: &Checked) {
+    let Checked {
+        model,
+        diagnostics,
+        skips,
+        units,
+        warning,
+        information,
+        ..
+    } = checked;
+    print_proposal(model);
+    let skipped = Skipped {
+        skips: skips.as_deref().unwrap_or_default(),
+        units: units.as_deref().unwrap_or_default(),
+    };
+    print_diagnostics(diagnostics, skipped, *warning, *information);
+}
+
+/// `model check --every-draft`: the current state, then every draft proposal as `--proposal`
+/// checks it, in `states`. A proposal whose `proposal.json` does not read is checked too, since
+/// it may be a draft, and a draft that refuses is reported in its place by its refusal. Exits 1
+/// when any state has a warning or refuses. The states share one scan of the checkout.
+fn check_every_draft(
+    root: &Path,
+    format: Option<ModelFormat>,
+    only: Option<CheckOnly>,
+    language_servers: bool,
+) -> Result<ExitCode> {
+    let refuse = |message: &str| Err(Refusal::new(Code::RequestInvalid, message).into());
+    if format == Some(ModelFormat::Annotations) {
+        return refuse("--format annotations reports one state; check without --every-draft");
+    }
+    if only == Some(CheckOnly::Embeds) {
+        return refuse("pictures belong to the current state; check embeds without --every-draft");
+    }
+    let dir = vault::locate(root)?;
+    let drafts: Vec<String> = (proposal::list(&dir)?.into_iter())
+        .filter(|listed| {
+            (listed.proposal.as_ref()).map_or(true, |p| p.status == types::ProposalStatus::Draft)
+        })
+        .map(|listed| listed.id)
+        .collect();
+    let scan = SharedScan::new();
+    let current = run_check(root, only, None, language_servers, &scan)?;
+    let mut passed = current.warning == 0;
+    let mut states = vec![Ok(current)];
+    for id in drafts {
+        match run_check(root, only, Some(&id), language_servers, &scan) {
+            Ok(checked) => {
+                passed &= checked.warning == 0;
+                states.push(Ok(checked));
+            }
+            Err(error) => {
+                passed = false;
+                let refusal = (error.downcast::<Refusal>())
+                    .with_context(|| format!("checking draft {id}"))?;
+                states.push(Err((id, refusal)));
+            }
+        }
+    }
+    let code = ExitCode::from(u8::from(!passed));
+    if format == Some(ModelFormat::Markdown) {
+        for state in &states {
+            match state {
+                Ok(checked) if checked.model.proposal.is_none() => {
+                    println!("Current state, revision {}", checked.model.revision.digest);
+                    print_checked(checked);
+                }
+                Ok(checked) => print_checked(checked),
+                Err((id, refusal)) => {
+                    println!(
+                        "Proposal {id}: {}: {}",
+                        refusal.code.as_str(),
+                        refusal.message
+                    );
+                }
+            }
+        }
+        return Ok(code);
+    }
+    let states = (states.into_iter())
+        .map(|state| match state {
+            Ok(checked) => checked.output(),
+            Err((id, refusal)) => {
+                let mut output = refusal_output(&refusal);
+                output["proposal"] = json!({ "id": id });
+                Ok(output)
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let output = json!({
+        "schema": MODEL_SCHEMA,
+        "kind": "check-every-draft",
+        "success": true,
+        "vault": dir,
+        "passed": passed,
+        "states": states,
+    });
+    write(None, &output)?;
     Ok(code)
 }
 
@@ -1651,6 +1751,7 @@ pub(super) fn run_check(
     only: Option<CheckOnly>,
     proposal: Option<&str>,
     language_servers: bool,
+    scan: &SharedScan,
 ) -> Result<Checked> {
     if proposal.is_some() && only == Some(CheckOnly::Embeds) {
         let message = "pictures belong to the current state; check embeds without --proposal";
@@ -1673,7 +1774,7 @@ pub(super) fn run_check(
         Vec::new()
     };
     if runs(CheckOnly::Code) {
-        let report = code_check(&model, language_servers)?;
+        let report = code_check(&model, language_servers, scan)?;
         diagnostics.extend(report.diagnostics);
         skips.get_or_insert_with(Vec::new).extend(report.skips);
         units = Some(report.units);
@@ -1734,12 +1835,21 @@ impl Checked {
 fn scan_checkout(model: &Model) -> Result<(PathBuf, Result<Document, NoScan>)> {
     let checkout = checkpoint::checkout(&model.dir)?;
     let doc = if code::needs_scan(&model.modules, &checkout) {
-        super::scan_cli::live(&checkout).map_err(|error| NoScan::Failed(format!("{error:#}")))
+        live_scan(&checkout)
     } else {
         Err(NoScan::NotNeeded)
     };
     Ok((checkout, doc))
 }
+
+/// The scan of `checkout`, or its error.
+fn live_scan(checkout: &Path) -> Result<Document, NoScan> {
+    super::scan_cli::live(checkout).map_err(|error| NoScan::Failed(format!("{error:#}")))
+}
+
+/// The scan of the checkout, made at most once for the states one command checks: it reads the
+/// checkout, whichever state asks.
+pub(super) type SharedScan = std::cell::OnceCell<Result<Document, NoScan>>;
 
 /// The error of a failed scan, for the output of a measure that went without it.
 fn scan_error(doc: &Result<Document, NoScan>) -> Option<&str> {
@@ -1759,20 +1869,26 @@ fn read_infra(checkout: &Path) -> Infra {
     })
 }
 
-/// The code check against the model's checkout and its infrastructure, scanning it once when a
-/// binding or anchor names code there. A failed scan or infrastructure read becomes a
+/// The code check against the model's checkout and its infrastructure, with `scan`, made when
+/// a binding or anchor names code there. A failed scan or infrastructure read becomes a
 /// `SCAN_FAILED` warning.
-fn code_check(model: &Model, language_servers: bool) -> Result<CodeReport> {
-    let (checkout, doc) = scan_checkout(model)?;
+fn code_check(model: &Model, language_servers: bool, scan: &SharedScan) -> Result<CodeReport> {
+    let checkout = checkpoint::checkout(&model.dir)?;
     let checkout = checkout.as_path();
+    let doc = if code::needs_scan(&model.modules, checkout) {
+        (scan.get_or_init(|| live_scan(checkout)).as_ref()).map_err(Clone::clone)
+    } else {
+        Err(NoScan::NotNeeded)
+    };
     let infra = read_infra(checkout);
-    let lsp = language_server_facts(model, checkout, &doc, &infra, language_servers)?;
+    let scanned = doc.as_ref().ok().copied();
+    let lsp = language_server_facts(model, checkout, scanned, &infra, language_servers)?;
     Ok(code::check(
         &model.manifest.id,
         &model.modules,
         &model.config,
         checkout,
-        doc.as_ref().map_err(Clone::clone),
+        doc,
         &infra,
         &lsp,
     ))
@@ -1784,17 +1900,17 @@ fn code_check(model: &Model, language_servers: bool) -> Result<CodeReport> {
 fn language_server_facts(
     model: &Model,
     checkout: &Path,
-    doc: &Result<Document, NoScan>,
+    doc: Option<&Document>,
     infra: &Infra,
     enabled: bool,
 ) -> Result<Facts> {
     let (servers, skips) = lsp::configured(checkout, enabled)?;
     let mut facts = match doc {
-        Ok(doc) => {
+        Some(doc) => {
             let (id, modules) = (&model.manifest.id, &model.modules);
             lsp::gather(checkout, &servers, id, modules, doc, infra)
         }
-        Err(_) => Facts::default(),
+        None => Facts::default(),
     };
     facts.skips.extend(skips);
     Ok(facts)
@@ -1869,7 +1985,8 @@ fn inspected(
     let (checkout, doc) = scan_checkout(&model)?;
     let scan = doc.as_ref().map_err(Clone::clone);
     let infra = read_infra(&checkout);
-    let lsp = language_server_facts(&model, &checkout, &doc, &infra, language_servers)?;
+    let scanned = doc.as_ref().ok();
+    let lsp = language_server_facts(&model, &checkout, scanned, &infra, language_servers)?;
     let (modules, subject) = (&model.modules, subject.as_deref());
     let report = inspect::inspect(id, modules, &checkout, scan, &infra, subject, &lsp);
     let scan_error = (scan_error(&doc).or(infra.error.as_deref())).map(str::to_owned);
@@ -2159,7 +2276,8 @@ fn model_footprint(
 }
 
 /// The scan footprint crossings read, or why there is none, with the error of a failed scan.
-/// The scan reads the checkout, so it serves only a head that is checked out.
+/// The scan reads the checkout, so it serves only a head that is checked out. A changed file of
+/// a language whose collector failed fails it too: its edges are missing.
 fn footprint_scan(
     model: &Model,
     range: &Range,
@@ -2172,7 +2290,17 @@ fn footprint_scan(
         return Ok((Err(CrossingsSkipped::NotNeeded), None));
     }
     Ok(match scan_checkout(model)?.1 {
-        Ok(doc) => (Ok(doc), None),
+        Ok(doc) => {
+            let failed: Vec<String> = (doc.scan_failures.iter())
+                .filter(|f| f.files.iter().any(|file| files.binary_search(file).is_ok()))
+                .map(|f| format!("{}: {}", f.language.as_str(), f.error))
+                .collect();
+            if failed.is_empty() {
+                (Ok(doc), None)
+            } else {
+                (Err(CrossingsSkipped::ScanFailed), Some(failed.join("; ")))
+            }
+        }
         Err(NoScan::NotNeeded) => (Err(CrossingsSkipped::NotNeeded), None),
         Err(NoScan::Failed(error)) => (Err(CrossingsSkipped::ScanFailed), Some(error)),
     })

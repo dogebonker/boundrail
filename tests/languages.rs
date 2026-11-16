@@ -2,7 +2,8 @@ mod common;
 
 use std::path::Path;
 
-use boundrail::collect::{detect_language, source_dir};
+use boundrail::collect::excludes::Options;
+use boundrail::collect::{detect_language, detect_languages, source_dir};
 use boundrail::model::Language;
 
 #[test]
@@ -61,4 +62,17 @@ fn detection_finds_elixir_umbrella_sources_and_ignores_dependencies() {
         detect_language(root, source_dir(root)).unwrap(),
         Language::Typescript
     );
+}
+
+#[test]
+fn detection_leaves_out_javascript_that_cargo_doc_writes() {
+    let manifest = common::write_tmp("detect-rust-doc/Cargo.toml", "[package]\n");
+    let root = Path::new(&manifest).parent().unwrap();
+    common::write_tmp("detect-rust-doc/src/lib.rs", "");
+    for n in 0..3 {
+        common::write_tmp(&format!("detect-rust-doc/target/doc/{n}.js"), "");
+    }
+    let found = detect_languages(root, source_dir(root), Options::default()).unwrap();
+    let languages: Vec<Language> = found.into_iter().map(|(language, _)| language).collect();
+    assert_eq!(languages, [Language::Rust]);
 }

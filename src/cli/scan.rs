@@ -1,18 +1,68 @@
 //! The live native scan the model commands read code evidence from.
 use super::*;
+use anyhow::bail;
 use boundrail::collect::excludes::{self, Policy};
-use boundrail::model::{CollectionOptions, Config};
+use boundrail::model::{CollectionOptions, Config, ScanFailure};
 
 /// Live native evidence for `model check`, `inspect` and `footprint`: files, edges, package
-/// entries, the language and symbols of the checkout at `root`, under the default excludes.
+/// entries, each file's language and symbols of the checkout at `root`, under the default
+/// excludes. Every language present is scanned on its own and the results merged; the first,
+/// the one with the most files, names the document's language. A language whose collector fails
+/// is warned about and listed in `scan_failures` with the files its own policy selects; only
+/// when every one fails does the scan fail.
 pub(super) fn live(root: &Path) -> Result<Document> {
     let source_dir = collect::source_dir(root);
-    let language =
-        collect::detect_language_with_options(root, source_dir, excludes::Options::default())?;
-    let policy = Policy::new(root, language, excludes::Options::default())?;
-    let (output, python_package) = collect_native(root, source_dir, language, &policy)?;
+    let found = collect::detect_languages(root, source_dir, excludes::Options::default())?;
+    let (mut merged, mut failures) = (None::<Document>, Vec::new());
+    for (language, files) in found {
+        let policy = Policy::new(root, language, excludes::Options::default())?;
+        match scan(root, source_dir, language, &policy) {
+            Ok(doc) => match &mut merged {
+                None => merged = Some(doc),
+                Some(into) => merge(into, doc),
+            },
+            Err(error) => failures.push(ScanFailure {
+                language,
+                error: format!("{error:#}"),
+                files: policy.select(&files)?,
+            }),
+        }
+    }
+    let Some(mut doc) = merged else {
+        let errors: Vec<_> = failures.into_iter().map(|f| f.error).collect();
+        bail!("{}", errors.join("; "));
+    };
+    for failure in &failures {
+        let name = failure.language.as_str();
+        eprintln!("warning: the {name} scan failed: {}", failure.error);
+    }
+    doc.files.sort_by(|a, b| a.path.cmp(&b.path));
+    doc.scan_failures = failures;
+    Ok(doc)
+}
+
+/// Adds the files, edges, package entries and symbols of `doc`, a scan of another language, to
+/// `into`.
+fn merge(into: &mut Document, doc: Document) {
+    into.files.extend(doc.files);
+    into.edges.extend(doc.edges);
+    into.package_entries.extend(doc.package_entries);
+    match (&mut into.symbols, doc.symbols) {
+        (Some(symbols), Some(more)) => {
+            symbols.complete &= more.complete;
+            symbols.exports.extend(more.exports);
+            symbols.imports.extend(more.imports);
+            symbols.limitations.extend(more.limitations);
+        }
+        (symbols, more) => *symbols = symbols.take().or(more),
+    }
+}
+
+/// The scan of the files of one language under its exclude policy.
+fn scan(root: &Path, source_dir: &str, language: Language, policy: &Policy) -> Result<Document> {
+    let (output, python_package) = collect_native(root, source_dir, language, policy)?;
     let (mut raw, symbols) = (output.raw, output.symbols);
-    let excluded_files = keep_selected(&mut raw, &policy)?;
+    let excluded_files = keep_selected(&mut raw, policy)?;
     let mut config = config(language, &mut raw, output.source_root, python_package);
     config.excludes = policy.patterns().to_vec();
     config.excluded_files = excluded_files;
@@ -113,8 +163,10 @@ fn collect_native(
     policy: &Policy,
 ) -> Result<(collect::native::Output, Option<String>)> {
     let mut output = match language {
+        // The whole checkout, not only `source_dir`: in a checkout of several languages the
+        // TypeScript often sits beside `src/`.
         Language::Typescript => {
-            collect::native::typescript::collect(root, source_dir, policy, false)?
+            collect::native::typescript::collect(root, source_dir, policy, true)?
         }
         Language::Python => collect::native::python::collect(root, source_dir, None, &[], policy)?,
         Language::Go => collect::native::go::collect(root, "go", policy)?,

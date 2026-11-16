@@ -119,6 +119,9 @@ pub struct CodeReport {
     pub skips: Vec<Skip>,
     /// Every infrastructure unit found, with the module it maps to.
     pub units: Vec<UnitStatus>,
+    /// Sites judged on their scanned files while holding code of a language whose collector
+    /// failed, which went unjudged.
+    partly_failed: BTreeSet<String>,
 }
 
 /// An infrastructure unit and the module it maps to.
@@ -246,8 +249,11 @@ pub fn needs_scan(modules: &[Module], root: &Path) -> bool {
 /// Every code diagnostic of model `model` against the checkout at `root`, its scan, its
 /// infrastructure and what language servers found, sorted, with what was not judged. Without a
 /// scan, existing paths are skipped as `not-scanned`, or as `scan-failed` with a `SCAN_FAILED`
-/// warning; infrastructure that failed to read does the same to modules bound to units. The
-/// modules must have loaded, so parents and targets exist and containment has no cycle.
+/// warning; so are paths holding only code of a language whose collector failed while others
+/// succeeded, and a path holding scanned code beside such code is judged on the scanned files
+/// and named by the `SCAN_FAILED` too. Infrastructure that failed to read does the same to
+/// modules bound to units. The modules must have loaded, so parents and targets exist and
+/// containment has no cycle.
 pub fn check(
     model: &str,
     modules: &[Module],
@@ -480,14 +486,14 @@ pub(super) fn written(edge: &Edge) -> &str {
 }
 
 /// `SCAN_FAILED`: a read the check needed failed, as `what` says. Its subjects are the
-/// `scan-failed` skips `left` accepts; with none, every path it was needed for turned out
-/// missing and already warns.
+/// `scan-failed` skips and the sites judged on part of their code that `left` accepts; with
+/// none, every path it was needed for turned out missing and already warns.
 fn scan_failed(what: &str, error: &str, left: impl Fn(&str) -> bool, report: &mut CodeReport) {
-    let subjects: BTreeSet<&str> = report
-        .skips
-        .iter()
-        .filter(|s| s.reason == SkipReason::ScanFailed && left(&s.subject))
-        .map(|s| s.subject.as_str())
+    let skipped = (report.skips.iter())
+        .filter(|s| s.reason == SkipReason::ScanFailed)
+        .map(|s| s.subject.as_str());
+    let subjects: BTreeSet<&str> = (skipped.chain(report.partly_failed.iter().map(String::as_str)))
+        .filter(|s| left(s))
         .collect();
     if subjects.is_empty() {
         return;
@@ -502,7 +508,10 @@ struct Scan<'d> {
     /// Sorted.
     files: Vec<&'d str>,
     edges: &'d [Edge],
-    language: Option<Language>,
+    /// Each scanned file's language.
+    languages: HashMap<&'d str, Language>,
+    /// Sorted source files of the languages whose collector failed.
+    failed: Vec<&'d str>,
     /// `None` without symbol data; otherwise the files exporting each name.
     exporters: Option<HashMap<&'d str, Vec<&'d str>>>,
     exports_of: HashMap<&'d str, Vec<&'d SymbolExport>>,
@@ -514,10 +523,17 @@ struct Scan<'d> {
 }
 
 impl<'d> Scan<'d> {
-    /// The scan the check reads, and the error of a failed scan.
+    /// The scan the check reads, and the error of a failed scan or of the languages that failed
+    /// in it.
     fn of(scan: Result<&'d Document, NoScan>) -> (Self, Option<String>) {
         match scan {
-            Ok(doc) => (Self::new(Ok(doc)), None),
+            Ok(doc) => {
+                let failed: Vec<String> = (doc.scan_failures.iter())
+                    .map(|f| format!("{}: {}", f.language.as_str(), parse_message(&f.error)))
+                    .collect();
+                let error = (!failed.is_empty()).then(|| failed.join("; "));
+                (Self::new(Ok(doc)), error)
+            }
             Err(NoScan::NotNeeded) => (Self::new(Err(SkipReason::NotScanned)), None),
             Err(NoScan::Failed(error)) => (Self::new(Err(SkipReason::ScanFailed)), Some(error)),
         }
@@ -527,7 +543,8 @@ impl<'d> Scan<'d> {
         let mut this = Self {
             files: Vec::new(),
             edges: &[],
-            language: None,
+            languages: HashMap::new(),
+            failed: Vec::new(),
             exporters: None,
             exports_of: HashMap::new(),
             limited: HashSet::new(),
@@ -544,7 +561,13 @@ impl<'d> Scan<'d> {
         this.files = doc.files.iter().map(|f| f.path.as_str()).collect();
         this.files.sort_unstable();
         this.edges = &doc.edges;
-        this.language = Some(doc.source.language);
+        this.languages = (doc.files.iter())
+            .filter_map(|f| Some((f.path.as_str(), f.language?)))
+            .collect();
+        this.failed = (doc.scan_failures.iter())
+            .flat_map(|f| f.files.iter().map(String::as_str))
+            .collect();
+        this.failed.sort_unstable();
         this.package_entries = &doc.package_entries;
         if let Some(symbols) = &doc.symbols {
             let mut exporters: HashMap<_, Vec<_>> = HashMap::new();
@@ -571,17 +594,7 @@ impl<'d> Scan<'d> {
 
     /// The scanned files at the normalized `path`: the file itself, or every file below it.
     fn files_under(&self, path: &str) -> &[&'d str] {
-        if path.is_empty() {
-            return &self.files;
-        }
-        if let Ok(at) = self.files.binary_search(&path) {
-            return &self.files[at..=at];
-        }
-        // Every path from `<path>/` up to, not including, `<path>0` starts with `<path>/`.
-        let (low, high) = (format!("{path}/"), format!("{path}0"));
-        let start = self.files.partition_point(|f| *f < low.as_str());
-        let end = self.files.partition_point(|f| *f < high.as_str());
-        &self.files[start..end]
+        under(&self.files, path)
     }
 
     /// Whether one of the sorted `files` exports `name`, or `None` without symbol data.
@@ -596,9 +609,23 @@ impl<'d> Scan<'d> {
 
     fn is_entry(&self, file: &str) -> bool {
         let exports = self.exports_of.get(file).map_or(&[][..], Vec::as_slice);
-        self.language
-            .is_some_and(|language| is_entry_file(file, language, exports))
+        (self.languages.get(file)).is_some_and(|&language| is_entry_file(file, language, exports))
     }
+}
+
+/// The sorted `files` at the normalized `path`: the file itself, or every file below it.
+fn under<'f, 'd>(files: &'f [&'d str], path: &str) -> &'f [&'d str] {
+    if path.is_empty() {
+        return files;
+    }
+    if let Ok(at) = files.binary_search(&path) {
+        return &files[at..=at];
+    }
+    // Every path from `<path>/` up to, not including, `<path>0` starts with `<path>/`.
+    let (low, high) = (format!("{path}/"), format!("{path}0"));
+    let start = files.partition_point(|f| *f < low.as_str());
+    let end = files.partition_point(|f| *f < high.as_str());
+    &files[start..end]
 }
 
 /// Whether `edge` exists at run time: type-only edges do not.
@@ -689,6 +716,11 @@ impl Site<'_> {
             },
             (Ok(_), None) => {}
         }
+        if let Ok(found) = &found
+            && !under(&scan.failed, &found.path).is_empty()
+        {
+            report.partly_failed.insert(subject.to_owned());
+        }
         found
     }
 
@@ -707,6 +739,9 @@ impl Site<'_> {
                 dir: metadata.is_dir(),
                 path,
             })
+        } else if !under(&scan.failed, &path).is_empty() {
+            // Code of a language whose collector failed, and of no other.
+            Err(SkipReason::ScanFailed)
         } else if spelled_exactly(root, &path) {
             Err(scan.absent)
         } else {

@@ -151,11 +151,34 @@ pub fn is_rust_test(path: &str) -> bool {
 
 impl Policy {
     pub fn new(root: &Path, language: Language, options: Options) -> Result<Self> {
-        let defaults = if options.no_defaults {
+        let mut defaults = if options.no_defaults {
             Vec::new()
         } else {
             active_defaults(language, options.include_tests, options.include_generated)
         };
+        // TypeScript is collected, and languages are detected, anywhere in the checkout, so its
+        // policy also leaves out the build output of each language whose manifest is at the
+        // root: `cargo doc` writes JavaScript under `target/`.
+        if language == Language::Typescript && !options.no_defaults && !options.include_generated {
+            let built: [(&[&str], Language); 3] = [
+                (&["Cargo.toml"], Language::Rust),
+                (
+                    &["pom.xml", "build.gradle", "build.gradle.kts"],
+                    Language::Java,
+                ),
+                (&["mix.exs"], Language::Elixir),
+            ];
+            for (manifests, built) in built {
+                if !manifests.iter().any(|m| root.join(m).is_file()) {
+                    continue;
+                }
+                for glob in output_globs(built) {
+                    if !defaults.contains(&glob) {
+                        defaults.push(glob);
+                    }
+                }
+            }
+        }
         let explicit: Vec<_> = options
             .excludes
             .into_iter()

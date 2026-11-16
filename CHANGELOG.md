@@ -19,6 +19,14 @@
   changed parts that hold a module's changes in `holds`, `large` for a change of more than 30
   files, and `--fail-outside`, which exits 1 when a module outside the proposal changed and
   holds nothing.
+- `model check --every-draft` checks the current state and then every draft proposal, reports
+  each, and exits 1 when any has a warning or does not load.
+- The code check, `inspect` and `footprint` scan every language in the checkout, such as a Go
+  backend beside a TypeScript frontend, and TypeScript outside `src/`. A collector that fails
+  skips only its language's code as `scan-failed`, and `SCAN_FAILED` names every module holding
+  that code.
+- A module bound to a compose service, Kubernetes workload or Terraform resource is exempt from
+  `CONTAINER_PARTS_OUTSIDE`, and its parts are judged against the closest ancestor bound to code.
 
 ### Removed
 

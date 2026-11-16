@@ -8,6 +8,7 @@ use super::checkpoint;
 use super::code::{Skip, SkipReason, SkipSite};
 use super::diagnostic::{Diagnostic, DiagnosticCode};
 use super::index::Index;
+use super::infra;
 use super::types::{BeatReading, Binding, Collection, Module, ReadingState, Step, walk};
 use super::vault::{self, Model};
 use super::{ids, segments};
@@ -138,12 +139,17 @@ fn containers(index: &Index<'_>, out: &mut Vec<Diagnostic>) {
     }
 }
 
-/// `CONTAINER_PARTS_OUTSIDE`: a bound module outside its closest bound ancestor.
+/// `CONTAINER_PARTS_OUTSIDE`: a module bound to code outside its closest ancestor bound to code.
+/// A binding to an infrastructure unit names a deployment file wherever it sits, so it is never
+/// judged.
 fn parts_outside(index: &Index<'_>, out: &mut Vec<Diagnostic>) {
     for (id, module) in &index.by_id {
         let Some(inner) = &module.binding else {
             continue;
         };
+        if infra::is_unit_binding(inner) {
+            continue;
+        }
         if let Some((above_id, above, outer)) = index.bound_ancestor(id)
             && !encloses(outer, inner)
         {
@@ -573,6 +579,26 @@ mod tests {
         );
         let leaf = &of(ContainerPartsOutside, &modules)[2];
         assert_eq!(leaf.message, "Leaf is bound to lib/x, outside App at app");
+    }
+
+    #[test]
+    fn infrastructure_unit_bindings_neither_hold_nor_place_parts() {
+        let mut runner = module("Runner", None, Some("docker-compose.yml"));
+        runner.binding.as_mut().unwrap().symbol = Some("api".to_owned());
+        let mut job = module("Job", Some("App"), Some("deploy/k8s/job.yml"));
+        job.binding.as_mut().unwrap().symbol = Some("job".to_owned());
+        let modules = [
+            runner,
+            module("Api", Some("Runner"), Some("src/api")),
+            module("App", None, Some("app")),
+            job,
+            module("Deep", Some("Job"), Some("lib/deep")),
+        ];
+        // Job sits outside App unjudged; Deep's closest ancestor bound to code is App.
+        assert_eq!(
+            subjects(ContainerPartsOutside, &modules),
+            [vec![q("App"), q("Deep")]]
+        );
     }
 
     #[test]

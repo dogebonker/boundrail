@@ -3836,6 +3836,83 @@ fn a_shelved_proposal_reads_only() {
 }
 
 #[test]
+fn check_every_draft_reports_the_current_state_and_each_draft() {
+    let checkout = Checkout::new();
+    shop(&checkout);
+    bind(&checkout, "Platfrm1", "shop");
+    bind(&checkout, "WebApp01", "shop/web");
+    bind(&checkout, "Billing1", "shop/billing");
+    let web_at = |path: &str| json!([{"type": "edit-module", "subject": "Web", "set": {"binding": {"path": path}}}]);
+    let moved = propose(&checkout, "Moved", "current");
+    edited_proposal(&checkout, &moved, web_at("web"));
+    let shelved = propose(&checkout, "Shelved", "current");
+    edited_proposal(&checkout, &shelved, web_at("web"));
+    let digest = proposal_digest(&checkout, &shelved);
+    checkout.ok(&[
+        "shelve",
+        &shelved,
+        "--expected-revision",
+        &digest,
+        "--doing",
+        "not now",
+        "--writer",
+        "tester",
+        "--operation-id",
+        &operation(),
+    ]);
+
+    // The shelved proposal is not a draft; the draft's warning fails the whole check.
+    let every = ["check", "--only", "semantic", "--every-draft"];
+    let (code, out) = checkout.run(&every);
+    assert_eq!(code, 1, "{out:#}");
+    assert_eq!(out["kind"], "check-every-draft");
+    assert_eq!(out["passed"], false);
+    let states = out["states"].as_array().unwrap();
+    assert_eq!(states.len(), 2, "{out:#}");
+    assert_eq!(states[0]["proposal"], Value::Null);
+    assert_eq!(states[0]["passed"], true);
+    assert_eq!(states[1]["proposal"]["id"], moved.as_str());
+    assert_eq!(states[1]["passed"], false);
+    assert_eq!(
+        found(&states[1]),
+        ["CONTAINER_PARTS_OUTSIDE Platfrm1, WebApp01"]
+    );
+    let (code, text) = checkout.run_raw(&[&every[..], &["--format", "markdown"]].concat());
+    assert_eq!(code, 1, "{text}");
+    assert!(text.starts_with("Current state, revision "), "{text}");
+    assert!(
+        text.contains("\nCheck passed: warnings: 0, information: 0\nProposal Moved ("),
+        "{text}"
+    );
+    assert!(
+        text.ends_with("Check failed: warnings: 1, information: 0\n"),
+        "{text}"
+    );
+
+    edited_proposal(&checkout, &moved, web_at("shop/web"));
+    assert_eq!(checkout.ok(&every)["passed"], true);
+
+    // A proposal that does not read may be a draft: its refusal stands in its place.
+    let file = checkout
+        .vault()
+        .join(format!("proposals/{moved}/proposal.json"));
+    fs::write(file, "{").unwrap();
+    let (code, out) = checkout.run(&every);
+    assert_eq!(code, 1, "{out:#}");
+    assert_eq!(out["states"][1]["kind"], "refusal");
+    assert_eq!(out["states"][1]["proposal"]["id"], moved.as_str());
+
+    checkout.refused(
+        &["check", "--every-draft", "--format", "annotations"],
+        "REQUEST_INVALID",
+    );
+    checkout.refused(
+        &["check", "--every-draft", "--only", "embeds"],
+        "REQUEST_INVALID",
+    );
+}
+
+#[test]
 fn a_planning_model_works_in_proposals_until_the_first_adoption() {
     let checkout = Checkout::new();
     let out = checkout.ok(&["init", "--name", "Shop", "--planning"]);
@@ -5594,6 +5671,219 @@ fn composed(checkout: &Checkout) -> String {
     rabbit["binding"] = json!({"path": "docker-compose.yml", "symbol": "rabbit"});
     checkout.module(rabbit);
     model
+}
+
+#[test]
+fn a_module_bound_to_a_compose_service_holds_parts_bound_to_code_anywhere() {
+    let checkout = Checkout::new();
+    source(
+        &checkout,
+        &[
+            ("package.json", r#"{"name": "runner"}"#),
+            ("src/api/index.ts", "export const api = 1;\n"),
+            ("docker-compose.yml", "services:\n  api:\n    image: api\n"),
+        ],
+    );
+    let model = checkout.init();
+    let mut runner = module("Runner01", "Runner", "system", 0);
+    runner["binding"] = json!({"path": "docker-compose.yml", "symbol": "api"});
+    checkout.module(runner);
+    let mut api = module("ApiSvc01", "Api", "service", 0);
+    api["parent"] = format!("{model}#Runner01").into();
+    api["binding"] = json!({"path": "src/api"});
+    checkout.module(api);
+
+    // The compose file says nothing about where Api's code lives: no CONTAINER_PARTS_OUTSIDE.
+    let out = checkout.ok(&["check"]);
+    assert_eq!(found(&out), ["CONTAINER_PASS_THROUGH Runner01, ApiSvc01"]);
+}
+
+/// A checkout holding a Go backend under `src/` and a TypeScript frontend under `web/`, beside
+/// `src/`: in each, one package imports the other. The model binds the four packages and draws
+/// no relationship. A fake `go` in the returned folder prints `go list` package metadata, or
+/// fails when `go_fails`.
+#[cfg(unix)]
+fn polyglot(checkout: &Checkout, go_fails: bool) -> TempDir {
+    source(
+        checkout,
+        &[
+            ("go.mod", "module example.test/app\n\ngo 1.21\n"),
+            (
+                "src/api/api.go",
+                "package api\n\nimport \"example.test/app/src/store\"\n\nfunc Run() string { return store.Get() }\n",
+            ),
+            (
+                "src/store/store.go",
+                "package store\n\nfunc Get() string { return \"x\" }\n",
+            ),
+            ("package.json", r#"{"name": "frontend"}"#),
+            (
+                "web/app/index.ts",
+                "import { lib } from \"../lib\";\nexport const app = () => lib();\n",
+            ),
+            ("web/lib/index.ts", "export const lib = () => 1;\n"),
+        ],
+    );
+    let bin = TempDir::new("fake-go").unwrap();
+    let package = |dir: &str, name: &str, file: &str| {
+        let path = checkout.path().join(dir);
+        json!({"Dir": path, "ImportPath": format!("example.test/app/{dir}"), "Name": name, "GoFiles": [file]}).to_string()
+    };
+    let script = if go_fails {
+        "#!/bin/sh\necho 'go: broken toolchain' >&2\nexit 1\n".to_owned()
+    } else {
+        let api = package("src/api", "api", "api.go");
+        let store = package("src/store", "store", "store.go");
+        format!("#!/bin/sh\ncat <<'EOF'\n{api}\n{store}\nEOF\n")
+    };
+    let go = bin.path().join("go");
+    fs::write(&go, script).unwrap();
+    let mode = <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755);
+    fs::set_permissions(&go, mode).unwrap();
+    checkout.init();
+    for (order, (id, name, path)) in [
+        ("ApiPkg01", "Api", "src/api"),
+        ("Store001", "Store", "src/store"),
+        ("WebApp01", "App", "web/app"),
+        ("WebLib01", "Lib", "web/lib"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut part = module(id, name, "module", u32::try_from(order).unwrap());
+        part["binding"] = json!({ "path": path });
+        checkout.module(part);
+    }
+    bin
+}
+
+#[cfg(unix)]
+#[test]
+fn the_code_check_scans_every_language_in_the_checkout() {
+    let checkout = Checkout::new();
+    let bin = polyglot(&checkout, false);
+    let (code, out, _) =
+        checkout.run_served_after(&[bin.path()], bin.path(), &["check", "--only", "code"]);
+    assert_eq!(code, 1, "{out:#}");
+    assert_eq!(out["skips"], json!([]), "{out:#}");
+    assert_eq!(
+        found(&out),
+        [
+            "RELATIONSHIP_UNDRAWN ApiPkg01, Store001",
+            "RELATIONSHIP_UNDRAWN WebApp01, WebLib01"
+        ]
+    );
+    assert_eq!(
+        out["diagnostics"][0]["message"],
+        "Api uses Store but no relationship is drawn: src/api/api.go:3 imports src/store/store.go"
+    );
+    assert_eq!(
+        out["diagnostics"][1]["message"],
+        "App uses Lib but no relationship is drawn: web/app/index.ts:1 imports web/lib/index.ts"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_collector_fails_only_the_code_of_its_language() {
+    let checkout = Checkout::new();
+    let bin = polyglot(&checkout, true);
+    let (code, out, stderr) =
+        checkout.run_served_after(&[bin.path()], bin.path(), &["check", "--only", "code"]);
+    assert_eq!(code, 1, "{out:#}");
+    assert_eq!(
+        found(&out),
+        [
+            "RELATIONSHIP_UNDRAWN WebApp01, WebLib01",
+            "SCAN_FAILED ApiPkg01, Store001"
+        ]
+    );
+    let message = out["diagnostics"][1]["message"].as_str().unwrap();
+    assert!(
+        message.starts_with(
+            "the scan of the checkout failed: go: native Go metadata failed: go: broken toolchain"
+        ),
+        "{message}"
+    );
+    assert!(stderr.contains("warning: the go scan failed: "), "{stderr}");
+    let model = checkout.ok(&["read"])["manifest"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let skip = |id: &str| json!({"subject": format!("{model}#{id}"), "site": "binding", "reason": "scan-failed"});
+    assert_eq!(out["skips"], json!([skip("ApiPkg01"), skip("Store001")]));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_collector_fails_a_module_whose_code_mixes_languages() {
+    let checkout = Checkout::new();
+    let bin = polyglot(&checkout, true);
+    source(
+        &checkout,
+        &[("src/api/client.ts", "export const client = 1;\n")],
+    );
+    // Api is judged on its TypeScript, but its Go went unread: SCAN_FAILED still names it.
+    let (code, out, _) =
+        checkout.run_served_after(&[bin.path()], bin.path(), &["check", "--only", "code"]);
+    assert_eq!(code, 1, "{out:#}");
+    assert_eq!(
+        found(&out),
+        [
+            "RELATIONSHIP_UNDRAWN WebApp01, WebLib01",
+            "SCAN_FAILED ApiPkg01, Store001"
+        ]
+    );
+    let skipped: Vec<&Value> = out["skips"].as_array().unwrap().iter().collect();
+    assert_eq!(skipped.len(), 1, "{out:#}");
+    assert!(
+        skipped[0]["subject"]
+            .as_str()
+            .unwrap()
+            .ends_with("#Store001"),
+        "{out:#}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn footprint_skips_crossings_when_a_changed_file_is_of_a_failed_language() {
+    let checkout = committed();
+    let bin = polyglot(&checkout, true);
+    git(&checkout, &["add", "-A"]);
+    git(&checkout, &["commit", "-q", "-m", "polyglot"]);
+    let footprint = || {
+        let args = ["footprint", "--base", "HEAD"];
+        let (code, out, _) = checkout.run_served_after(&[bin.path()], bin.path(), &args);
+        assert_eq!(code, 0, "{out:#}");
+        out
+    };
+
+    // A TypeScript change crosses on the TypeScript edges, which the scan holds.
+    source(
+        &checkout,
+        &[("web/lib/index.ts", "export const lib = () => 2;\n")],
+    );
+    let out = footprint();
+    assert_eq!(out["crossings_skipped"], Value::Null, "{out:#}");
+    assert!(out["crossings"].is_array(), "{out:#}");
+
+    // A Go change would cross on edges the failed Go scan never found.
+    source(
+        &checkout,
+        &[(
+            "src/store/store.go",
+            "package store\n\nfunc Get() string { return \"y\" }\n",
+        )],
+    );
+    let out = footprint();
+    assert_eq!(out["crossings"], Value::Null, "{out:#}");
+    assert_eq!(out["crossings_skipped"], "scan-failed");
+    let error = out["scan_error"].as_str().unwrap();
+    assert!(
+        error.starts_with("go: native Go metadata failed: go: broken toolchain"),
+        "{error}"
+    );
 }
 
 #[test]

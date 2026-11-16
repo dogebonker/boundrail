@@ -111,9 +111,12 @@ it on trusted checkouts only: the servers run code from the repository.
 
 ## Limits
 
-The code check reads one language per checkout, the one detected at its root. Bound code in
-another language is skipped as `not-scanned`, and the TypeScript and Python collectors read only
-under `src/` when it exists.
+The code check reads every language in the checkout and merges what each collector finds. Rust
+needs a `Cargo.toml` and Go a `go.mod` or `go.work` somewhere in the checkout. The Python
+collector reads one top-level package, under `src/` when it exists and else under the root, so
+Python code outside it is skipped as `not-scanned`. When one language's collector fails, code of
+that language alone is skipped as `scan-failed` under a `SCAN_FAILED` warning; a module whose
+code mixes languages is judged on the languages that were read, and the warning names it too.
 
 The scan leaves out, by default:
 

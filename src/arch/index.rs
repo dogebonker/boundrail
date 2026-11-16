@@ -2,8 +2,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use super::ids;
 use super::types::{Anchor, Binding, Module};
+use super::{ids, infra};
 
 /// One relationship, with the qualified IDs of itself and its source.
 pub(super) struct Line<'a> {
@@ -80,13 +80,16 @@ impl<'a> Index<'a> {
         found
     }
 
-    /// The closest module above `id` that has a binding, with that binding.
+    /// The closest module above `id` bound to code, with that binding: a binding to an
+    /// infrastructure unit names a deployment file, not where its parts' code lives.
     pub(super) fn bound_ancestor(&self, id: &str) -> Option<(&str, &'a Module, &'a Binding)> {
         let module: &'a Module = self.by_id.get(id)?;
         let mut at = module.parent.as_deref();
         while let Some(parent) = at {
             let (key, &above) = self.by_id.get_key_value(parent)?;
-            if let Some(binding) = &above.binding {
+            if let Some(binding) = &above.binding
+                && !infra::is_unit_binding(binding)
+            {
                 return Some((key, above, binding));
             }
             at = above.parent.as_deref();
