@@ -2,15 +2,21 @@
 //! history of why the architecture changed. Each checkpoint is a commit on [`HISTORY`] in the
 //! source repository, never on the working branch: its tree holds the vault's recognized files at
 //! their vault-relative paths, its parent is the previous checkpoint, and its message is the
-//! `--doing` line followed by `Checkpoint`, `Revision`, `Source`, `Writer` and `Operation`
-//! trailers (`Source` and `Operation` only when there is one). Commits are built with Git
-//! plumbing, so the checkout's HEAD, index and working tree never change; every worktree of the
-//! repository shares the one history ref. With `commit.gpgSign` set, checkpoints are signed with
-//! the user's signing program and key.
+//! `--doing` line followed by `Checkpoint`, `Revision`, `Proposal`, `Source`, `Uncommitted`,
+//! `Writer` and `Operation` trailers (`Proposal`, `Source`, `Uncommitted` and `Operation` only
+//! when there is one). Every journaled write retains one, and `model retain` retains the current
+//! state with a reason of its own. A checkpoint holds the current state, or with `Proposal` one
+//! proposal with the manifest and config its load reads. Commits are built with Git plumbing, so
+//! the checkout's HEAD, index and working tree never change; every worktree of the repository
+//! shares the one history ref. With `commit.gpgSign` set, checkpoints are signed with the user's
+//! signing program and key; a write's checkpoint is committed, and signed, before the write
+//! changes the vault.
 
-use std::collections::BTreeMap;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
@@ -18,14 +24,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::request::{INPUT_MAX, check_doing, check_operation, check_writer};
+use super::revision::Revision;
 use super::state::{self, Operation};
-use super::vault::{self, Model};
+use super::vault::{self, FileWrite, Model, Scope};
 use super::{Code, Refusal, ids, revision};
 use crate::collect::TempDir;
+use crate::files::hash;
 use crate::git;
 
 mod publish;
-pub use publish::{DEFAULT_REMOTE, Published, fetch, push};
+pub use publish::{DEFAULT_REMOTE, Destination, Published, configure, destination, fetch, push};
 
 /// The history ref, one per repository.
 pub const HISTORY: &str = "refs/boundrail/history";
@@ -37,6 +45,11 @@ const PREFIX_MIN: usize = 4;
 const MODE: &str = "100644";
 /// The mode of an executable file, which a committed vault may hold.
 const EXECUTABLE: &str = "100755";
+/// What a checkpoint's `Uncommitted` change check leaves out: Boundrail's own folder, whose model
+/// the checkpoint holds.
+const OWN_FOLDER: &str = ":(top,exclude).boundrail";
+/// How often a write's checkpoint is built again on a history tip that moved meanwhile.
+const ATTEMPTS: usize = 3;
 
 /// One checkpoint, read back from its commit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,12 +69,73 @@ pub struct Checkpoint {
     pub time: String,
     /// The ID of the checkpoint before it.
     pub parent: Option<String>,
+    /// The proposal it holds; `None` for the current state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<String>,
+    /// Whether the checkout had changes outside `.boundrail` that `source` lacks when it was
+    /// retained. Checkpoints retained before this was recorded read `false`.
+    #[serde(default)]
+    pub uncommitted: bool,
+    /// Whether this repository holds `source`, read when the checkpoint is read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_status: Option<SourceStatus>,
+    /// Whether the history remote holds it, read from refs when the checkpoint is read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication: Option<Publication>,
+}
+
+/// Whether the code a checkpoint was drawn against can be read here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SourceStatus {
+    /// The source commit is in this repository and the checkout had no other change.
+    Available,
+    /// The source commit is here, but the checkout also had uncommitted changes it lacks.
+    Uncommitted,
+    /// No source commit was recorded, or this repository does not hold it.
+    Unavailable,
+}
+
+impl SourceStatus {
+    /// The name it serializes as.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::Uncommitted => "uncommitted",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// Where a checkpoint stands against the history remote, judged from local refs only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Publication {
+    /// Neither published nor pending.
+    SavedLocally,
+    /// A push holding it started and has not been confirmed.
+    Pending,
+    /// The remote's history held it at the last push or fetch.
+    Published,
+}
+
+impl Publication {
+    /// The name it serializes as.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SavedLocally => "saved-locally",
+            Self::Pending => "pending",
+            Self::Published => "published",
+        }
+    }
 }
 
 /// Retains the current model of the vault folder `vault` as a new checkpoint. `writer` defaults
 /// to the Git author name. With `expected`, refuses `STALE_REVISION` unless the model's revision
-/// is that digest. Repeating `operation` with the same writer, `doing` and `expected` returns the
-/// checkpoint it made, from this worktree's journal or, from another worktree, the history ref.
+/// is that digest. Refuses `NOTHING_TO_RETAIN` when the latest checkpoint of the current state
+/// holds this revision with the same `doing`; a new reason retains the same model again.
+/// Repeating `operation` with the same writer, `doing` and `expected` returns the checkpoint it
+/// made, from this worktree's journal or, from another worktree, the history ref.
 pub fn retain(
     vault: &Path,
     doing: &str,
@@ -80,7 +154,8 @@ pub fn retain(
     let state = state::lock(vault)?;
     // The tip read here is what the new commit builds on and what the ref must still hold: it
     // may be a commit without checkpoint trailers, which `history` skips, or a tag.
-    let (tip, history) = history(&root, None)?;
+    let read = history(&root, None)?;
+    let history = &read.list;
     let mut request = json!({ "kind": KIND, "writer": writer, "doing": doing });
     if let Some(expected) = expected {
         request["expected_revision"] = expected.into();
@@ -89,11 +164,11 @@ pub fn retain(
         Ok(history.iter().any(|h| h.commit == c.commit))
     })?;
     if let Operation::Done(checkpoint) = journal {
-        return Ok(as_held(&history, checkpoint));
+        return annotated(&root, as_held(history, checkpoint));
     }
-    if let Some(found) = retained_elsewhere(&history, operation, &writer, doing, expected)? {
+    if let Some(found) = retained_elsewhere(history, operation, &writer, doing, expected)? {
         journal.done(&state.dir, found)?;
-        return Ok(found.clone());
+        return annotated(&root, found.clone());
     }
     state::refuse_interrupted(&state.dir)?;
     let model = vault::load_dir(vault.to_path_buf())?;
@@ -107,40 +182,336 @@ pub fn retain(
         .with_details(json!({ "current": model.revision.digest }))
         .into());
     }
-    let latest = history.first();
+    let snapshot = Snapshot::read(vault, None)?;
+    if snapshot.revision != model.revision.digest {
+        return Err(changed_meanwhile(&snapshot.revision));
+    }
+    let latest = history.iter().find(|c| c.proposal.is_none());
     if let Some(latest) = latest
         && latest.revision == model.revision.digest
+        && latest.doing == doing
     {
         return Err(Refusal::new(
             Code::NothingToRetain,
             format!(
-                "the model has not changed since checkpoint {}; edit it before retaining again",
+                "checkpoint {} already holds this model with the same --doing; give a new reason or edit the model first",
                 latest.id
             ),
         )
         .with_details(json!({ "checkpoint": latest.id, "commit": latest.commit }))
         .into());
     }
-    let id =
-        ids::allocate(|candidate| history.iter().any(|c| c.id.eq_ignore_ascii_case(candidate)))?;
-    let message = message(&root, &model, &id, doing, &writer, operation)?;
-    let parent = tip.as_ref().map(|(_, commit)| commit.as_str());
-    let commit = write_commit(&root, &model, &message, parent)?;
-    let checkpoint = walk(&root, &commit, Some(1))?
-        .pop()
-        .context("reading back the checkpoint commit")?;
+    let tree = write_tree(&root, vault, &snapshot, &BTreeMap::new())?;
+    let draft = Draft::new(&root, tree, &snapshot, doing, &writer, operation)?;
+    let checkpoint = draft.commit(&read)?;
     journal.pending(&state.dir, &checkpoint)?;
-    let old = tip.as_ref().map(|(object, _)| object.as_str());
-    update_ref(&root, &commit, old, doing)?;
+    update_ref(&root, &checkpoint.commit, read.old(), doing)?;
     journal.done(&state.dir, &checkpoint)?;
-    Ok(checkpoint)
+    Ok(fresh(checkpoint))
+}
+
+/// The checkpoint of one journaled write: drafted from the files the write plans, and committed
+/// on the history tip before the write once [`Prepared::build`] ran.
+pub(super) struct Prepared {
+    draft: Draft,
+    /// The commit built before the write, with the history tip it was built on.
+    built: Option<(Option<Tip>, Checkpoint)>,
+}
+
+impl Prepared {
+    /// Commits the checkpoint on the history tip, signing it when `commit.gpgSign` is set, so a
+    /// missing Git identity or a failing signer refuses before the write changes anything.
+    pub(super) fn build(&mut self) -> Result<()> {
+        let root = &self.draft.root;
+        for ident in ["GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"] {
+            git::text(root, &["var", ident])?;
+        }
+        let read = history(root, None)?;
+        let checkpoint = self.draft.commit(&read)?;
+        self.built = Some((read.tip, checkpoint));
+        Ok(())
+    }
+}
+
+/// Drafts the checkpoint of the journaled write `operation` by `writer` saying `doing`: the
+/// current state, or the proposal `proposal`, as the vault folder `vault` holds it once `writes`
+/// bring the files of the write's scope to the planned revision `after`. The files the write
+/// leaves are read from the vault once and nothing is written there. Refuses `MODEL_INVALID` for
+/// a file larger than [`INPUT_MAX`], which no checkpoint reader accepts, and `STALE_REVISION` for
+/// a vault file that no longer holds its planned digest.
+pub(super) fn draft_write(
+    vault: &Path,
+    proposal: Option<&str>,
+    writes: &[FileWrite],
+    after: &Revision,
+    doing: &str,
+    writer: &str,
+    operation: &str,
+) -> Result<Prepared> {
+    let root = checkout(vault)?;
+    let snapshot = Snapshot::planned(vault, proposal, after)?;
+    let written: BTreeMap<&str, &str> = (writes.iter())
+        .filter_map(|w| Some((w.path.as_str(), w.content.as_deref()?)))
+        .collect();
+    let tree = write_tree(&root, vault, &snapshot, &written)?;
+    let draft = Draft::new(&root, tree, &snapshot, doing, writer, Some(operation))?;
+    Ok(Prepared { draft, built: None })
+}
+
+/// Retains `prepared`, the checkpoint of a journaled write, once the write reached the vault. When
+/// the history already holds a checkpoint of that operation, writer, state, revision and doing
+/// line, that one is returned, so finishing an interrupted write never retains it twice. The
+/// commit built before the write lands while the history tip is the one it was built on; on a tip
+/// that moved it is committed, and signed, again, up to three times. Refuses as `model retain`
+/// does (`SIGNING_FAILED`, `HISTORY_MOVED`). The caller holds the vault lock.
+pub(super) fn retain_write(prepared: Prepared) -> Result<Checkpoint> {
+    let Prepared { draft, mut built } = prepared;
+    let root = &draft.root;
+    let mut lost = None;
+    for _ in 0..ATTEMPTS {
+        let read = history(root, None)?;
+        if let Some(found) = read.list.iter().find(|c| draft.made(c)) {
+            return annotated(root, found.clone());
+        }
+        let checkpoint = match &built {
+            Some((tip, checkpoint)) if *tip == read.tip => checkpoint.clone(),
+            _ => {
+                let checkpoint = draft.commit(&read)?;
+                built = Some((read.tip.clone(), checkpoint.clone()));
+                checkpoint
+            }
+        };
+        match update_ref(root, &checkpoint.commit, read.old(), &draft.doing) {
+            Ok(()) => return Ok(fresh(checkpoint)),
+            Err(e) if is_code(&e, Code::HistoryMoved) => lost = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(lost.context("the history ref kept moving")?)
+}
+
+/// `checkpoint`, a finished write's stored one, as the history now holds it (see [`as_held`]),
+/// with its statuses read now.
+pub(super) fn held(vault: &Path, checkpoint: Checkpoint) -> Result<Checkpoint> {
+    let root = checkout(vault)?;
+    let list = history(&root, None)?.list;
+    annotated(&root, as_held(&list, checkpoint))
+}
+
+/// Whether a checkpoint of the proposal `proposal`, or of the current state, holds the
+/// vault-relative `path`: a proposal's holds the manifest, the config and its own folder.
+fn holds(proposal: Option<&str>, path: &str) -> bool {
+    match proposal {
+        None => !vault::is_proposal_path(path),
+        Some(id) => {
+            path == vault::MANIFEST || path == vault::CONFIG || path.starts_with(&vault::prefix(id))
+        }
+    }
+}
+
+/// What a checkpoint holds: each vault file it takes by vault-relative path with its SHA-256,
+/// the revision of the state it holds, and the proposal it holds.
+struct Snapshot {
+    files: BTreeMap<String, String>,
+    revision: String,
+    proposal: Option<String>,
+}
+
+impl Snapshot {
+    /// The current state of the vault folder `dir`, or the proposal `proposal` with the manifest
+    /// and config, as the folder holds them now. The revision covers what a load of that state
+    /// covers.
+    fn read(dir: &Path, proposal: Option<&str>) -> Result<Self> {
+        let Some(id) = proposal else {
+            let files = vault::file_digests(dir, &Scope::Current)?;
+            let revision = revision::of_digests(files.clone()).digest;
+            return Ok(Self {
+                files,
+                revision,
+                proposal: None,
+            });
+        };
+        let own = vault::file_digests(dir, &Scope::Proposal(id.to_owned()))?;
+        let revision = revision::of_digests(own.clone()).digest;
+        let mut files = own;
+        let current = vault::file_digests(dir, &Scope::Current)?;
+        files.extend(
+            current
+                .into_iter()
+                .filter(|(path, _)| holds(Some(id), path)),
+        );
+        Ok(Self {
+            files,
+            revision,
+            proposal: Some(id.to_owned()),
+        })
+    }
+
+    /// The current state, or the proposal `proposal` with the manifest and config, as the planned
+    /// revision `after` of a write's scope holds them. A proposal write's scope lacks the manifest
+    /// and config, which it never changes, so those are read from the vault folder `dir`.
+    fn planned(dir: &Path, proposal: Option<&str>, after: &Revision) -> Result<Self> {
+        let mut files: BTreeMap<String, String> = (after.files.iter())
+            .filter(|f| holds(proposal, &f.path))
+            .map(|f| (f.path.clone(), f.sha256.clone()))
+            .collect();
+        let Some(id) = proposal else {
+            let revision = revision::of_digests(files.clone()).digest;
+            return Ok(Self {
+                files,
+                revision,
+                proposal: None,
+            });
+        };
+        let own = vault::prefix(id);
+        let revision = revision::of_digests(
+            (files.iter())
+                .filter(|(path, _)| path.starts_with(&own))
+                .map(|(path, digest)| (path.clone(), digest.clone()))
+                .collect(),
+        )
+        .digest;
+        for path in [vault::MANIFEST, vault::CONFIG] {
+            if !files.contains_key(path)
+                && let Some(bytes) = read_regular(dir, path)?
+            {
+                files.insert(path.to_owned(), hash(&bytes));
+            }
+        }
+        Ok(Self {
+            files,
+            revision,
+            proposal: Some(id.to_owned()),
+        })
+    }
+}
+
+/// A checkpoint to commit: the tree of what it holds and what its message records, read once
+/// however often it is committed again on a history tip that moved.
+struct Draft {
+    root: PathBuf,
+    tree: String,
+    revision: String,
+    proposal: Option<String>,
+    /// The checkout's HEAD commit; `None` on an unborn branch.
+    source: Option<String>,
+    uncommitted: bool,
+    sign: bool,
+    doing: String,
+    writer: String,
+    operation: Option<String>,
+}
+
+impl Draft {
+    /// The draft of the checkpoint of `snapshot` whose tree is `tree`, reading the checkout's
+    /// HEAD, whether it has uncommitted changes and whether to sign from the checkout `root`.
+    fn new(
+        root: &Path,
+        tree: String,
+        snapshot: &Snapshot,
+        doing: &str,
+        writer: &str,
+        operation: Option<&str>,
+    ) -> Result<Self> {
+        let source = source(root)?;
+        let uncommitted = source.is_some() && uncommitted(root)?;
+        Ok(Self {
+            root: root.to_path_buf(),
+            tree,
+            revision: snapshot.revision.clone(),
+            proposal: snapshot.proposal.clone(),
+            source,
+            uncommitted,
+            sign: signing(root)?,
+            doing: doing.to_owned(),
+            writer: writer.to_owned(),
+            operation: operation.map(str::to_owned),
+        })
+    }
+
+    /// The checkpoint commit after the tip of the history `read`, with an ID none of its
+    /// checkpoints holds in any case, read back. Nothing points at it yet, so a failure leaves
+    /// only unreachable objects.
+    fn commit(&self, read: &History) -> Result<Checkpoint> {
+        let id = ids::allocate(|candidate| {
+            (read.list.iter()).any(|c| c.id.eq_ignore_ascii_case(candidate))
+        })?;
+        let parent = read.tip.as_ref().map(|(_, commit)| commit.as_str());
+        let message = self.message(&id)?;
+        let commit = commit_tree(&self.root, &self.tree, &message, parent, self.sign, &[])?;
+        walk(&self.root, &commit, Some(1))?
+            .pop()
+            .context("reading back the checkpoint commit")
+    }
+
+    fn message(&self, id: &str) -> Result<String> {
+        let mut message = format!(
+            "{}\n\nCheckpoint: {id}\nRevision: {}\n",
+            self.doing, self.revision
+        );
+        if let Some(proposal) = &self.proposal {
+            writeln!(message, "Proposal: {proposal}")?;
+        }
+        if let Some(source) = &self.source {
+            writeln!(message, "Source: {source}")?;
+            if self.uncommitted {
+                writeln!(message, "Uncommitted: true")?;
+            }
+        }
+        writeln!(message, "Writer: {}", self.writer)?;
+        if let Some(operation) = &self.operation {
+            writeln!(message, "Operation: {operation}")?;
+        }
+        Ok(message)
+    }
+
+    /// Whether `checkpoint` is the one this draft retains: the same operation, writer, state,
+    /// revision and doing line.
+    fn made(&self, checkpoint: &Checkpoint) -> bool {
+        checkpoint.operation_id == self.operation
+            && checkpoint.writer == self.writer
+            && checkpoint.proposal == self.proposal
+            && checkpoint.revision == self.revision
+            && checkpoint.doing == self.doing
+    }
+}
+
+/// `checkpoint`, just committed, with the statuses [`annotate`] would read without asking Git:
+/// its source is the checkout's HEAD, and no push or fetch has seen it yet.
+fn fresh(mut checkpoint: Checkpoint) -> Checkpoint {
+    checkpoint.source_status = Some(match (&checkpoint.source, checkpoint.uncommitted) {
+        (None, _) => SourceStatus::Unavailable,
+        (Some(_), true) => SourceStatus::Uncommitted,
+        (Some(_), false) => SourceStatus::Available,
+    });
+    checkpoint.publication = Some(Publication::SavedLocally);
+    checkpoint
+}
+
+/// Whether `error` is a refusal with `code`.
+fn is_code(error: &anyhow::Error, code: Code) -> bool {
+    error
+        .downcast_ref::<Refusal>()
+        .is_some_and(|r| r.code == code)
+}
+
+/// `STALE_REVISION` for vault files that changed outside the lock while a checkpoint was taken.
+fn changed_meanwhile(current: &str) -> anyhow::Error {
+    Refusal::new(
+        Code::StaleRevision,
+        "vault files changed while the checkpoint was written; retry",
+    )
+    .with_details(json!({ "current": current }))
+    .into()
 }
 
 /// The checkpoints of the repository around `start`, newest first, at most `limit`; none when
 /// the history ref does not exist. The checkout needs no vault.
 pub fn list(start: &Path, limit: Option<usize>) -> Result<Vec<Checkpoint>> {
     let (_, root) = locations(start)?;
-    Ok(history(&root, limit)?.1)
+    let mut list = history(&root, limit)?.list;
+    annotate(&root, &mut list)?;
+    Ok(list)
 }
 
 /// Whether the repository around `start` holds the history ref. A clone does not fetch it unless
@@ -151,8 +522,9 @@ pub fn history_is_local(start: &Path) -> Result<bool> {
 }
 
 /// The checkpoint `which` names (its ID, else a unique commit prefix of at least 4 hex digits)
-/// and the model it holds, loaded from its tree without touching the checkout, which needs no
-/// vault. The model's `dir` is where the checkout's vault folder is.
+/// and the model it holds, the current state or its proposal, loaded from its tree without
+/// touching the checkout, which needs no vault. The model's `dir` is where the checkout's vault
+/// folder is.
 pub fn load(start: &Path, which: &str) -> Result<(Checkpoint, Model)> {
     load_files(start, which).map(|(checkpoint, model, _)| (checkpoint, model))
 }
@@ -160,7 +532,7 @@ pub fn load(start: &Path, which: &str) -> Result<(Checkpoint, Model)> {
 /// [`load`], with the bytes of every file of the checkpoint's tree.
 pub fn load_files(start: &Path, which: &str) -> Result<(Checkpoint, Model, Blobs)> {
     let (vault, root) = locations(start)?;
-    let checkpoint = find(history(&root, None)?.1, which)?;
+    let checkpoint = annotated(&root, find(history(&root, None)?.list, which)?)?;
     let files = blobs(&root, &files(&root, &checkpoint)?)?;
     let temp = TempDir::new("checkpoint")?;
     let dir = temp.path().join("model");
@@ -170,7 +542,11 @@ pub fn load_files(start: &Path, which: &str) -> Result<(Checkpoint, Model, Blobs
         checkpoint.id, checkpoint.commit
     );
     let found = json!({ "checkpoint": checkpoint.id, "commit": checkpoint.commit });
-    let mut model = vault::load_dir(dir).map_err(|error| located(error, &place, &found))?;
+    let loaded = match &checkpoint.proposal {
+        Some(id) => vault::load_proposal(dir, id),
+        None => vault::load_dir(dir),
+    };
+    let mut model = loaded.map_err(|error| located(error, &place, &found))?;
     model.dir = vault;
     Ok((checkpoint, model, files))
 }
@@ -329,7 +705,8 @@ pub fn checkout(vault: &Path) -> Result<PathBuf> {
 
 /// The checkpoint an earlier attempt of `operation` from another worktree left on the shared
 /// history ref, since each worktree keeps its own journal. Refuses `OPERATION_REUSED` when it
-/// was made for another writer or reason, or from another revision than `expected`.
+/// was made for another writer or reason, from another revision than `expected`, or holds a
+/// proposal.
 fn retained_elsewhere<'a>(
     history: &'a [Checkpoint],
     operation: Option<&str>,
@@ -343,7 +720,8 @@ fn retained_elsewhere<'a>(
     else {
         return Ok(None);
     };
-    if found.writer != writer
+    if found.proposal.is_some()
+        || found.writer != writer
         || found.doing != doing
         || expected.is_some_and(|e| e != found.revision)
     {
@@ -357,7 +735,7 @@ fn retained_elsewhere<'a>(
     Ok(Some(found))
 }
 
-/// `checkpoint`, a journaled retain's output, as `history` now holds it: a fetch that replayed
+/// `checkpoint`, a journaled retain's or write's output, as `history` now holds it: a fetch that replayed
 /// it moved it to another commit with the same ID, operation and revision. Any other match is
 /// not this checkpoint, so the recorded one stands.
 fn as_held(history: &[Checkpoint], checkpoint: Checkpoint) -> Checkpoint {
@@ -409,8 +787,10 @@ fn find(history: Vec<Checkpoint>, which: &str) -> Result<Checkpoint> {
 }
 
 /// The files of a checkpoint's tree as (vault-relative path, object, size). Refuses
-/// `MODEL_INVALID` for a tree that holds anything `model retain` never writes: a path that is not
-/// a vault file, another mode or object type, a file larger than [`INPUT_MAX`], or no manifest.
+/// `MODEL_INVALID` for a tree that holds anything a retain never writes: a path that is not a
+/// vault file (for a proposal's checkpoint, not the manifest, the config or a file of that
+/// proposal's folder), another mode or object type, a file larger than [`INPUT_MAX`], no
+/// manifest, or for a proposal's checkpoint no `proposal.json`.
 fn files(root: &Path, checkpoint: &Checkpoint) -> Result<Vec<(String, String, usize)>> {
     let invalid = |path: &str, reason: &str| -> anyhow::Error {
         Refusal::new(
@@ -434,7 +814,14 @@ fn files(root: &Path, checkpoint: &Checkpoint) -> Result<Vec<(String, String, us
         let [mode, kind, object, size] = meta.as_slice() else {
             return Err(invalid(path, "is not a file"));
         };
-        if !vault::is_vault_file(path) {
+        let held = match &checkpoint.proposal {
+            Some(id) => match path.strip_prefix(&vault::prefix(id)) {
+                Some(rest) => vault::is_proposal_file(rest),
+                None => path == vault::MANIFEST || path == vault::CONFIG,
+            },
+            None => vault::is_vault_file(path),
+        };
+        if !held {
             return Err(invalid(path, "is not a vault file"));
         }
         if *mode != MODE || *kind != "blob" {
@@ -450,8 +837,13 @@ fn files(root: &Path, checkpoint: &Checkpoint) -> Result<Vec<(String, String, us
             usize::try_from(size)?,
         ));
     }
-    if !files.iter().any(|(path, _, _)| path == "model.json") {
-        return Err(invalid("model.json", "is missing"));
+    let required = (checkpoint.proposal.as_deref().map(vault::proposal_file))
+        .into_iter()
+        .chain([vault::MANIFEST.to_owned()]);
+    for path in required {
+        if !files.iter().any(|(held, _, _)| *held == path) {
+            return Err(invalid(&path, "is missing"));
+        }
     }
     Ok(files)
 }
@@ -477,33 +869,11 @@ fn source(root: &Path) -> Result<Option<String>> {
     }
 }
 
-fn message(
-    root: &Path,
-    model: &Model,
-    id: &str,
-    doing: &str,
-    writer: &str,
-    operation: Option<&str>,
-) -> Result<String> {
-    let mut message = format!(
-        "{doing}\n\nCheckpoint: {id}\nRevision: {}\n",
-        model.revision.digest
-    );
-    if let Some(source) = source(root)? {
-        writeln!(message, "Source: {source}")?;
-    }
-    writeln!(message, "Writer: {writer}")?;
-    if let Some(operation) = operation {
-        writeln!(message, "Operation: {operation}")?;
-    }
-    Ok(message)
-}
-
-/// The checkpoint commit of `model` after the commit `parent`, signed when the user set
-/// `commit.gpgSign`. Nothing points at it yet, so a failure leaves only unreachable objects.
-fn write_commit(root: &Path, model: &Model, message: &str, parent: Option<&str>) -> Result<String> {
-    let tree = write_tree(root, model)?;
-    commit_tree(root, &tree, message, parent, signing(root)?, &[])
+/// Whether the checkout has changes outside `.boundrail`, tracked or untracked, that HEAD
+/// lacks.
+fn uncommitted(root: &Path) -> Result<bool> {
+    let args = ["status", "--porcelain", "-z", "--", ":/", OWN_FOLDER];
+    Ok(!git::run(root, &args)?.is_empty())
 }
 
 /// Whether the user set `commit.gpgSign`, so checkpoints are signed.
@@ -552,54 +922,53 @@ fn commit_tree(
     }
 }
 
-/// The tree of the vault's recognized files, written to the object store through a disposable
-/// index. Refuses `MODEL_INVALID` for a file larger than [`INPUT_MAX`], which no checkpoint
-/// reads back, and `STALE_REVISION` when a file changed outside the lock after the model loaded.
-fn write_tree(root: &Path, model: &Model) -> Result<String> {
-    let paths: Vec<&str> = model
-        .revision
-        .files
-        .iter()
-        .map(|f| f.path.as_str())
-        .collect();
-    for path in &paths {
-        let file = model.dir.join(path);
-        let size = fs::symlink_metadata(&file)
-            .with_context(|| format!("reading {}", file.display()))?
-            .len();
-        if size > INPUT_MAX {
-            return Err(Refusal::new(
-                Code::ModelInvalid,
-                format!("`{path}` is larger than {INPUT_MAX} bytes, more than a checkpoint holds"),
-            )
-            .with_details(json!({ "path": path }))
-            .into());
-        }
+/// The tree of the files of `snapshot`, each `written` one with the content given and every other
+/// read from the vault folder `dir`, written to the object store through a disposable index; the
+/// vault is never written. Refuses `MODEL_INVALID` for a file larger than [`INPUT_MAX`], which no
+/// checkpoint reads back, and `STALE_REVISION` for a file read from `dir` that does not hold the
+/// digest `snapshot` gives it, as when it changed outside the lock.
+fn write_tree(
+    root: &Path,
+    dir: &Path,
+    snapshot: &Snapshot,
+    written: &BTreeMap<&str, &str>,
+) -> Result<String> {
+    let temp = TempDir::new("checkpoint-tree")?;
+    let mut copies = Vec::with_capacity(snapshot.files.len());
+    for (path, digest) in &snapshot.files {
+        let bytes = match written.get(path.as_str()) {
+            Some(content) => {
+                check_size(path, u64::try_from(content.len())?)?;
+                Some(Cow::Borrowed(content.as_bytes()))
+            }
+            None => read_regular(dir, path)?.map(Cow::Owned),
+        };
+        let Some(bytes) = bytes.filter(|bytes| hash(bytes) == *digest) else {
+            let now = Snapshot::read(dir, snapshot.proposal.as_deref())?;
+            return Err(changed_meanwhile(&now.revision));
+        };
+        put(temp.path(), [(path.as_str(), &*bytes)])?;
+        let copy = temp.path().join(path);
+        copies.push(
+            copy.to_str()
+                .context("the temporary folder is not UTF-8")?
+                .to_owned(),
+        );
     }
     let mut args = vec!["hash-object", "-w", "--no-filters", "--"];
-    args.extend(&paths);
-    let objects = git::text(&model.dir, &args)?;
-    let now = revision::of_digests(vault::file_digests(&model.dir, &vault::Scope::Current)?);
-    if now.digest != model.revision.digest {
-        return Err(Refusal::new(
-            Code::StaleRevision,
-            "vault files changed while the checkpoint was written; retry",
-        )
-        .with_details(json!({ "current": now.digest }))
-        .into());
-    }
+    args.extend(copies.iter().map(String::as_str));
+    let objects = git::text(root, &args)?;
     let entries: Vec<String> = objects
         .lines()
-        .zip(&paths)
+        .zip(snapshot.files.keys())
         .map(|(object, path)| format!("{MODE},{object},{path}"))
         .collect();
     ensure!(
-        entries.len() == paths.len(),
+        entries.len() == snapshot.files.len(),
         "git hash-object wrote {} objects for {} files",
         entries.len(),
-        paths.len()
+        snapshot.files.len()
     );
-    let temp = TempDir::new("checkpoint-index")?;
     let index = temp.path().join("index");
     let mut args = vec!["update-index", "--add"];
     for entry in &entries {
@@ -611,6 +980,36 @@ fn write_tree(root: &Path, model: &Model) -> Result<String> {
         .context("git write-tree output is not UTF-8")?
         .trim()
         .to_owned())
+}
+
+/// The bytes of the vault file `path` of the vault folder `dir`, `None` when it is missing or not
+/// a regular file. Refuses `MODEL_INVALID` for one larger than [`INPUT_MAX`] before reading it.
+fn read_regular(dir: &Path, path: &str) -> Result<Option<Vec<u8>>> {
+    let file = dir.join(path);
+    match fs::symlink_metadata(&file) {
+        Ok(meta) if meta.is_file() => {
+            check_size(path, meta.len())?;
+            let bytes = fs::read(&file).with_context(|| format!("reading {}", file.display()))?;
+            Ok(Some(bytes))
+        }
+        Ok(_) => Ok(None),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", file.display())),
+    }
+}
+
+/// `MODEL_INVALID` for the vault file `path` of `size` bytes when it is larger than
+/// [`INPUT_MAX`], more than a checkpoint reader accepts.
+fn check_size(path: &str, size: u64) -> Result<()> {
+    if size <= INPUT_MAX {
+        return Ok(());
+    }
+    Err(Refusal::new(
+        Code::ModelInvalid,
+        format!("`{path}` is larger than {INPUT_MAX} bytes, more than a checkpoint holds"),
+    )
+    .with_details(json!({ "path": path }))
+    .into())
 }
 
 /// The object the ref `name` names, `None` when it does not exist. Only the ref itself counts,
@@ -667,17 +1066,37 @@ fn update_ref(root: &Path, new: &str, old: Option<&str>, doing: &str) -> Result<
 /// the next checkpoint's parent, which differ when the ref holds a tag.
 type Tip = (String, String);
 
+/// The history ref's [`Tip`] and the checkpoints from it, newest first.
+struct History {
+    /// `None` when the ref does not exist.
+    tip: Option<Tip>,
+    list: Vec<Checkpoint>,
+}
+
+impl History {
+    /// What the ref holds, the compare-and-swap's old value; `None` when it does not exist.
+    fn old(&self) -> Option<&str> {
+        self.tip.as_ref().map(|(object, _)| object.as_str())
+    }
+}
+
 /// The history ref's [`Tip`] and the checkpoints from it, newest first, at most `limit`.
-fn history(root: &Path, limit: Option<usize>) -> Result<(Option<Tip>, Vec<Checkpoint>)> {
+fn history(root: &Path, limit: Option<usize>) -> Result<History> {
     let Some(object) = tip(root)? else {
-        return Ok((None, Vec::new()));
+        return Ok(History {
+            tip: None,
+            list: Vec::new(),
+        });
     };
     let peel = format!("{object}^{{commit}}");
     let commit = git::text(root, &["rev-parse", "--verify", "--quiet", &peel])?
         .trim()
         .to_owned();
     let list = walk(root, &commit, limit)?;
-    Ok((Some((object, commit)), list))
+    Ok(History {
+        tip: Some((object, commit)),
+        list,
+    })
 }
 
 /// The checkpoints from `commit` back along first parents, newest first, at most `limit`. A
@@ -705,7 +1124,9 @@ fn walk(root: &Path, commit: &str, limit: Option<usize>) -> Result<Vec<Checkpoin
 }
 
 /// One `git log` entry of [`walk`]: commit, time and message, the message's first line the
-/// `--doing` and its other lines `Key: value` trailers.
+/// `--doing` and its other lines `Key: value` trailers. A `Proposal` that is not a local ID, or
+/// an `Uncommitted` other than `true` after a `Source`, is not one a retain writes, so the commit
+/// is not a checkpoint.
 fn parse(entry: &str) -> Option<Checkpoint> {
     let mut fields = entry.trim_start_matches('\n').splitn(3, '\x1f');
     let (commit, time, message) = (fields.next()?, fields.next()?, fields.next()?);
@@ -713,6 +1134,15 @@ fn parse(entry: &str) -> Option<Checkpoint> {
     let doing = lines.next()?.to_owned();
     let trailers: BTreeMap<&str, &str> = lines.filter_map(|l| l.split_once(": ")).collect();
     let value = |key: &str| trailers.get(key).map(|v| (*v).to_owned());
+    let proposal = value("Proposal");
+    if proposal.as_deref().is_some_and(|p| !ids::is_local(p)) {
+        return None;
+    }
+    let uncommitted = match trailers.get("Uncommitted") {
+        None => false,
+        Some(&"true") if trailers.contains_key("Source") => true,
+        Some(_) => return None,
+    };
     Some(Checkpoint {
         id: value("Checkpoint")?,
         commit: commit.to_owned(),
@@ -723,7 +1153,69 @@ fn parse(entry: &str) -> Option<Checkpoint> {
         operation_id: value("Operation"),
         time: time.to_owned(),
         parent: None,
+        proposal,
+        uncommitted,
+        source_status: None,
+        publication: None,
     })
+}
+
+/// `checkpoint` with [`annotate`]'s statuses.
+fn annotated(root: &Path, mut checkpoint: Checkpoint) -> Result<Checkpoint> {
+    annotate(root, std::slice::from_mut(&mut checkpoint))?;
+    Ok(checkpoint)
+}
+
+/// Sets each checkpoint's `source_status` and `publication` from what this repository holds now,
+/// without the network. The source is available when the repository holds its commit, unless
+/// the checkpoint was retained with uncommitted changes. A checkpoint is published when the ref
+/// the last push or fetch left for the history remote reaches it, pending when the ref a push
+/// leaves until the remote confirms it reaches it, and saved locally otherwise.
+fn annotate(root: &Path, list: &mut [Checkpoint]) -> Result<()> {
+    let sources: Vec<&str> = (list.iter())
+        .filter_map(|c| c.source.as_deref())
+        .filter(|s| git::is_full_hash(s))
+        .collect();
+    let present = if sources.is_empty() {
+        BTreeSet::new()
+    } else {
+        reachable(root, &["--no-walk"], &sources)?
+    };
+    let remote = publish::destination_of(root)?.remote;
+    let published = publish::published_ref(&remote);
+    let published_set = reachable(root, &[], &[&published])?;
+    let pushing = publish::pushing_ref(&remote);
+    let pending_set = reachable(root, &[], &[&pushing, &format!("^{published}")])?;
+    for checkpoint in list {
+        let held = checkpoint
+            .source
+            .as_ref()
+            .is_some_and(|s| present.contains(s));
+        checkpoint.source_status = Some(match (held, checkpoint.uncommitted) {
+            (false, _) => SourceStatus::Unavailable,
+            (true, true) => SourceStatus::Uncommitted,
+            (true, false) => SourceStatus::Available,
+        });
+        checkpoint.publication = Some(if published_set.contains(&checkpoint.commit) {
+            Publication::Published
+        } else if pending_set.contains(&checkpoint.commit) {
+            Publication::Pending
+        } else {
+            Publication::SavedLocally
+        });
+    }
+    Ok(())
+}
+
+/// The commits `git rev-list` with `options` lists for `revisions`, a missing object or ref
+/// counting as none.
+fn reachable(root: &Path, options: &[&str], revisions: &[&str]) -> Result<BTreeSet<String>> {
+    let mut all = vec!["rev-list", "--ignore-missing"];
+    all.extend(options);
+    all.push("--end-of-options");
+    all.extend(revisions);
+    let out = git::text(root, &all)?;
+    Ok(out.lines().map(str::to_owned).collect())
 }
 
 #[cfg(test)]
@@ -823,6 +1315,21 @@ mod tests {
         assert_eq!(checkpoint.source, None);
         assert_eq!(checkpoint.writer, "a: b");
         assert_eq!(checkpoint.operation_id.as_deref(), Some("op-1"));
+        assert_eq!((checkpoint.proposal, checkpoint.uncommitted), (None, false));
         assert!(parse("abc\x1ft\x1fa plain commit\n").is_none());
+        let head = "\nabc\x1ft\x1fdrawn\n\nCheckpoint: Ckpt0002\nRevision: r2\nWriter: w\n";
+        let checkpoint = parse(&format!(
+            "{head}Proposal: Next0001\nSource: s\nUncommitted: true\n"
+        ));
+        let checkpoint = checkpoint.unwrap();
+        assert_eq!(checkpoint.proposal.as_deref(), Some("Next0001"));
+        assert!(checkpoint.uncommitted);
+        for forged in [
+            "Proposal: ../up\n",
+            "Uncommitted: true\n",
+            "Source: s\nUncommitted: 1\n",
+        ] {
+            assert!(parse(&format!("{head}{forged}")).is_none(), "{forged}");
+        }
     }
 }

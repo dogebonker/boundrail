@@ -5,7 +5,7 @@ use std::io::Read as _;
 use std::iter;
 
 use boundrail::arch::bundle::{self, Exported};
-use boundrail::arch::checkpoint::{self, Checkpoint, Published};
+use boundrail::arch::checkpoint::{self, Checkpoint, Publication, Published, SourceStatus};
 use boundrail::arch::claims::{self, Claim};
 use boundrail::arch::code::{self, CodeReport, NoScan, Skip, SkipReason, UnitStatus};
 use boundrail::arch::compare::{self, Comparison};
@@ -399,7 +399,8 @@ enum ModelCmd {
         #[command(flatten)]
         writing: WritingArgs,
     },
-    /// Push (fast-forward only) or fetch the checkpoint history on a configured Git remote
+    /// Push (fast-forward only) or fetch the checkpoint history on a configured Git remote, or
+    /// name the remote they publish to
     History {
         #[command(subcommand)]
         command: HistoryCmd,
@@ -449,7 +450,8 @@ enum ModelCmd {
     },
     /// List active claims and revoked ones not yet released
     Claims,
-    /// Retain the current model as a checkpoint on the history ref, with why it changed
+    /// Retain the current model as a checkpoint on the history ref with a reason of its own;
+    /// every write already retains one with its --doing
     Retain {
         /// One line saying why the model changed, 1 to 140 characters
         #[arg(long)]
@@ -465,7 +467,8 @@ enum ModelCmd {
         #[arg(long)]
         expected_revision: Option<String>,
     },
-    /// List checkpoints, newest first
+    /// List checkpoints, newest first, with whether their source commit is here and whether the
+    /// history remote holds them, judged from local refs without the network
     Checkpoints {
         /// List at most this many
         #[arg(long)]
@@ -514,22 +517,31 @@ enum ModelCmd {
 
 #[derive(Subcommand)]
 enum HistoryCmd {
+    /// Name the remote push and fetch default to and checkpoints are published to, in the
+    /// repository's Git config; nothing is sent
+    ///
+    /// The history has one authoritative remote: configure that one.
+    Configure {
+        /// A remote `git remote` lists
+        #[arg(long)]
+        remote: String,
+    },
     /// Push refs/boundrail/history to the same ref on the remote
     ///
     /// The history has one authoritative remote: push to and fetch from only that one.
     Push {
-        /// A remote `git remote` lists
-        #[arg(long, default_value = checkpoint::DEFAULT_REMOTE)]
-        remote: String,
+        /// A remote `git remote` lists [default: the configured history remote, else origin]
+        #[arg(long)]
+        remote: Option<String>,
     },
     /// Fetch the remote's refs/boundrail/history into the local one, replaying local checkpoints
     /// the remote lacks
     ///
     /// The history has one authoritative remote: push to and fetch from only that one.
     Fetch {
-        /// A remote `git remote` lists
-        #[arg(long, default_value = checkpoint::DEFAULT_REMOTE)]
-        remote: String,
+        /// A remote `git remote` lists [default: the configured history remote, else origin]
+        #[arg(long)]
+        remote: Option<String>,
     },
 }
 
@@ -899,18 +911,33 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
             }
             print_written(markdown, "import", &dir, &receipt, None)
         }
-        ModelCmd::History { command } => {
-            let (pushing, remote) = match &command {
-                HistoryCmd::Push { remote } => (true, remote),
-                HistoryCmd::Fetch { remote } => (false, remote),
-            };
-            let published = if pushing {
-                checkpoint::push(root, remote)?
-            } else {
-                checkpoint::fetch(root, remote)?
-            };
-            print_published(markdown, pushing, &published)
-        }
+        ModelCmd::History { command } => match command {
+            HistoryCmd::Configure { remote } => {
+                let before = checkpoint::configure(root, &remote)?;
+                if markdown {
+                    println!("History remote: {remote}");
+                    return Ok(());
+                }
+                write(
+                    None,
+                    &json!({
+                        "schema": MODEL_SCHEMA,
+                        "kind": "history-configure",
+                        "success": true,
+                        "remote": remote,
+                        "before": before,
+                    }),
+                )
+            }
+            HistoryCmd::Push { remote } => {
+                let published = checkpoint::push(root, remote.as_deref())?;
+                print_published(markdown, true, &published)
+            }
+            HistoryCmd::Fetch { remote } => {
+                let published = checkpoint::fetch(root, remote.as_deref())?;
+                print_published(markdown, false, &published)
+            }
+        },
         ModelCmd::Shelve {
             proposal,
             expected_revision,
@@ -1101,6 +1128,16 @@ fn execute(root: &Path, markdown: bool, command: ModelCmd) -> Result<()> {
             // Outside a checkout this refuses, as the JSON output does by naming the vault.
             let _vault = vault::path(root)?;
             let list = checkpoint::list(root, limit)?;
+            let destination = checkpoint::destination(root)?;
+            let how = if destination.configured {
+                "configured"
+            } else {
+                "default"
+            };
+            println!(
+                "History remote: {} ({how})",
+                escape_controls(&destination.remote)
+            );
             if list.is_empty() {
                 println!("No checkpoints");
             }
@@ -2925,8 +2962,8 @@ fn print_claim(claim: &Claim) {
     }
 }
 
-/// Prints `checkpoint`, whose ID, writer, doing and revision are history text a commit made
-/// outside `model retain` may fill with control characters, so those are escaped.
+/// Prints `checkpoint`, whose ID, writer, doing, revision and source are history text a commit
+/// made outside a retain may fill with control characters, so those are escaped.
 fn print_checkpoint(checkpoint: &Checkpoint) {
     println!(
         "Checkpoint {} by {} at {}: {}",
@@ -2940,6 +2977,20 @@ fn print_checkpoint(checkpoint: &Checkpoint) {
         checkpoint.commit,
         escape_controls(&checkpoint.revision)
     );
+    if let Some(proposal) = &checkpoint.proposal {
+        println!("  proposal {proposal}");
+    }
+    let source = checkpoint
+        .source
+        .as_deref()
+        .map_or("none".into(), escape_controls);
+    let status = checkpoint
+        .source_status
+        .map_or("unknown", SourceStatus::as_str);
+    let publication = checkpoint
+        .publication
+        .map_or("unknown", Publication::as_str);
+    println!("  source {source} ({status}), {publication}");
 }
 
 /// Prints a journaled write's receipt inside the output envelope, with the current state's
@@ -3010,6 +3061,9 @@ fn print_receipt(label: &str, receipt: &Receipt) {
     for allocation in &receipt.allocated {
         println!("allocated {} for {}", allocation.id, allocation.name);
     }
+    if let Some(checkpoint) = &receipt.checkpoint {
+        println!("checkpoint {}", checkpoint.id);
+    }
 }
 
 /// `model proposals`: every proposal folder with its ID, name, status and predecessor, or why
@@ -3072,6 +3126,7 @@ pub(super) fn checkpoints_output(root: &Path, limit: Option<usize>) -> Result<Va
         "kind": "checkpoints",
         "success": true,
         "vault": dir,
+        "destination": checkpoint::destination(root)?,
         "checkpoints": list,
     }))
 }

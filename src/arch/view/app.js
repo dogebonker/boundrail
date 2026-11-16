@@ -627,10 +627,14 @@ function renderLists() {
     ? app.proposals.map((p) => item({ onclick: () => setState({ kind: 'proposal', id: p.id }) }, p.name, p.status))
     : [note('No proposals yet.')]));
   $('#history').replaceChildren(...(app.checkpoints.length
-    ? app.checkpoints.map((c) => item({
-      title: `${c.id} by ${c.writer} at ${c.time}`,
-      onclick: () => setState({ kind: 'checkpoint', id: c.id }),
-    }, c.doing, c.time.slice(0, 10)))
+    ? app.checkpoints.map((c) => {
+      const proposal = c.proposal && (app.proposals.find((p) => p.id === c.proposal)?.name ?? c.proposal);
+      const date = c.time.slice(0, 10);
+      return item({
+        title: `${c.id} by ${c.writer} at ${c.time}${proposal ? `, in proposal ${proposal}` : ''}`,
+        onclick: () => setState({ kind: 'checkpoint', id: c.id }),
+      }, c.doing, proposal ? `${proposal}, ${date}` : date);
+    })
     : [note('No checkpoints yet.')]));
 }
 

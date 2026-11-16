@@ -32,8 +32,9 @@ touches, which relationships its changed imports cross, and what it changes in t
    State only what the footprint and the check printed.
 5. **After the merge.** On the default branch, retain the merged model as a checkpoint:
    `boundrail model retain --doing "<what changed and why>" --operation-id <operation-id> --expected-revision <revision.digest>`.
-   It records the model on `refs/boundrail/history`, never on the working branch. On
-   `NOTHING_TO_RETAIN` the model did not change since the last checkpoint: skip it. On
+   It records the model on `refs/boundrail/history`, never on the working branch, beside the
+   checkpoints every edit already retained. On `NOTHING_TO_RETAIN` the latest checkpoint already
+   holds this model with the same reason: skip it. On
    `HISTORY_MOVED` another checkpoint landed first: retry. Then publish it with
    `boundrail model history push`. On `HISTORY_DIVERGED` with `details.related: false` or
    `details.clashing`, stop and report the message: no fetch converges those. On any other

@@ -56,7 +56,7 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
 | T22 | Model-side inspect: entry points, hidden parts, callers, outgoing, pass-through, container relationships and measures read from the model, `--checkpoint`, and `inspect --group` | done |
 | T23 | Compare: interface changes and interface measures between states, `--beside` alternatives, `--against` a checkpoint | done |
 | T24 | Schema: relationship traffic, step anchors, authored flow participant order, flow summary required on write (`FLOW_SUMMARY_REQUIRED`) | done |
-| T25 | History on every write: each edit, including in proposals, retains a checkpoint with its doing line; publication destination with per-checkpoint status; source-commit availability on checkpoint reads | open |
+| T25 | History on every write: each edit, including in proposals, retains a checkpoint with its doing line; publication destination with per-checkpoint status; source-commit availability on checkpoint reads | done |
 | T26 | Proposal metadata: summary, linked documents, rename and edit through `set`, select by unique name; walkthroughs authored inside proposals | open |
 | T27 | Proposal families: child proposals of a draft, family reconcile, standing, settle conflicts by mine, theirs or edited; `INHERITANCE_DROPPED` and `PART_RECREATED` confirmations | open |
 | T28 | Readings: group regions and group filter; beat selection apart from focus, relationship filters, groups, visibility; saved views that need no output file | open |
@@ -113,8 +113,8 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   state; drafts travel with the committed vault or in bundles (T17), and `model history push` and
   `fetch` publish the history ref (T17); once fetched, checkpoint readings resolve. A vault file
   larger than the 4 MiB a checkpoint reader accepts refuses `MODEL_INVALID` before anything is
-  written. Retaining an unchanged model refuses `NOTHING_TO_RETAIN`. Trailers `Source` and
-  `Operation` appear only when there is a value.
+  written. Retaining an unchanged model refuses `NOTHING_TO_RETAIN` (since T25, only with the
+  same `--doing`). Trailers `Source` and `Operation` appear only when there is a value.
 - T7: `model retain` takes flags, not a request body. `--writer` defaults to the Git author name.
   `--expected-revision` refuses `STALE_REVISION` when the model is at another revision; agents
   should pass the revision they reviewed. Its operation fingerprint covers the writer, `--doing` and
@@ -1135,3 +1135,68 @@ Status: `open`, `wip`, `done`. Each task is one or more commits with tests.
   `edit-flow` clearing it and setting it blank. The check runs after the collection or flow resolves, so a missing subject refuses `SUBJECT_NOT_FOUND` first. Other
   writes to a flow without a summary still apply, and the semantic check keeps reporting it as
   `FLOW_SUMMARY_MISSING`.
+- T25: every journaled write (`edit` of the current state or a proposal, `propose`, `adopt`,
+  `shelve`, `reconcile`, `import`) retains one checkpoint through the retain machinery, carrying
+  the write's `--doing`, writer and operation ID, and its receipt gains `checkpoint`. The
+  checkpoint is part of the journaled operation: the record stays `pending` until it lands.
+  Before the record is written, `checkpoint::draft_write` builds the checkpoint's tree from the
+  planned files (the write's contents and the files it leaves, read once from the vault and
+  checked against their planned digests) without touching the vault, and the checkpoint commit is
+  made, signed when `commit.gpgSign` is set, on the history tip. So a Git identity `git var`
+  cannot find, a file larger than the 4 MiB a checkpoint reader accepts (`MODEL_INVALID`) or a
+  signer that fails (`SIGNING_FAILED`, as with a locked key) refuses with nothing written and no
+  record. After the vault writes reach their planned digests, `checkpoint::retain_write` looks
+  for a checkpoint of the same operation, writer, state, revision and `--doing` on the history
+  and returns it, else moves the ref to the commit made before the write by compare-and-swap; on
+  a tip that moved it commits, and signs, again, up to three times; then the record is `done`.
+  So a replay returns the stored receipt, its checkpoint as the history holds it now (a fetch
+  may have replayed it onto another commit) with statuses read now, and retains nothing; a write
+  interrupted after its vault writes, before or after the ref moved, is finished by `model
+  recover` (or a retry of the operation) with exactly one checkpoint, drafted again from the
+  record. A checkpoint that fails after the vault was written (a signing failure when the tip
+  moved, a ref that kept moving) refuses `RECOVERY_REQUIRED` with the cause in `details.cause`
+  (`code`, `message`, `details`) and leaves the record pending. Every write now needs a Git
+  identity; test fixtures set one and `commit.gpgsign=false`.
+- T25: a proposal write or reconcile retains the proposal: the tree holds `model.json`,
+  `config.yaml` and `proposals/<id>/` (its `proposal.json`, modules, collections and base), the
+  files its load reads, and a `Proposal: <id>` trailer names it. `Revision` is the proposal's
+  revision, the one `read --proposal` shows. An adoption retains the current state it makes.
+  `read --checkpoint` (and every reader of `checkpoint::load`) loads a proposal checkpoint as that
+  proposal; its tree may hold nothing else (`MODEL_INVALID`), and must hold `proposal.json`.
+  `export --checkpoint` of one writes a proposal bundle (`source.kind: "proposal"`, the
+  checkpoint's revision, proposal-relative files, and `checkpoint` and `commit` naming where it
+  came from), so `import` restores it as a draft.
+- T25: explicit `model retain` stays, for retaining the current state with a reason of its own
+  (a release, a review). Since every write retains, it refuses `NOTHING_TO_RETAIN` only when the
+  latest current-state checkpoint (proposal checkpoints are skipped) holds the same revision with
+  the same `--doing`. Its cross-worktree replay refuses `OPERATION_REUSED` for a proposal
+  checkpoint with that operation ID.
+- T25: `Uncommitted: true` follows `Source` when `git status --porcelain` lists any change,
+  tracked or untracked, outside `.boundrail` (`:/` and `:(top,exclude).boundrail`), so model
+  files never count. Readings add `uncommitted` and `source_status`: `unavailable` when there is
+  no `Source` or this repository lacks that commit (one `git rev-list --no-walk
+  --ignore-missing` over the full-hash sources of a listing), `uncommitted` when it holds the
+  commit and the trailer is set, `available` otherwise. Checkpoints retained before T25 have no
+  such trailer and read `available` when their commit is here.
+- T25: the publication destination is `boundrail.historyRemote` in the repository's Git config,
+  which every worktree shares, written by `model history configure --remote <name>` (a name `git
+  remote` lists whose refs below are well-formed, `REQUEST_INVALID` otherwise; JSON `{kind:
+  "history-configure", remote, before}` with the destination it replaced). A configured name
+  that is no longer such a remote reads as `origin` with a warning on stderr. It is Git config,
+  not `config.yaml`: that file is part of every revision, no journaled write may change it, and
+  remote names belong to a clone. `history push` and `fetch` default to it, else `origin`. The
+  remote name is one ref component below `refs/boundrail/pushing/` and
+  `refs/boundrail/published/`, with `%` and `/` percent-encoded so remotes `a` and `a/b` never
+  clash. A push writes the pushing ref with the object it sends before `git push` runs and, once
+  the push succeeds, sets the published ref to it and deletes the pushing ref; a push that fails
+  deletes the pushing ref once the remote can be asked what it holds (recording it as published
+  when it holds the object), and leaves it pending only when it cannot; a push that finds the
+  remote already at the local object records it as published too. A fetch that succeeds sets
+  the published ref to the fetched object, and a remote without the history ref deletes it.
+  `model checkpoints` (and checkpoint readings) judge publication against the destination from
+  refs only: `published` when the published ref reaches the commit, `pending` when the pushing
+  ref reaches it and the published ref does not, `saved-locally` otherwise; `model checkpoints`
+  prints the `destination` (`remote`, `configured`). Replayed commits are new commits, so they
+  read `saved-locally` until pushed. New trailers are optional, so older histories read and
+  publish as before; a `Proposal` that is not a local ID or an `Uncommitted` other than `true`
+  after a `Source` is not a checkpoint, which fetch and push refuse as for other forged trailers.

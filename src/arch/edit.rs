@@ -1,6 +1,8 @@
 //! `model edit`: one batch of model changes, applied in order in memory and
 //! validated as a whole, then written through a journal under the edit lock so an interrupted
-//! write can be completed and every operation replays its receipt.
+//! write can be completed and every operation replays its receipt. Every journaled write retains
+//! a checkpoint of what it wrote before its record is done; the checkpoint is committed, and
+//! signed, before the write changes the vault.
 
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(debug_assertions)]
@@ -13,6 +15,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use super::checkpoint::{self, Checkpoint};
 use super::claims;
 use super::request::{
     OPERATION_MAX, OPERATION_PATTERN, Target, WRITER_MAX, check_doing, check_model,
@@ -44,6 +47,10 @@ const CHANGES_MAX: usize = 1000;
 /// Debug builds stop after writing the journal when this is set, so tests can simulate a crash.
 #[cfg(debug_assertions)]
 const STOP_AFTER_JOURNAL: &str = "BOUNDRAIL_TEST_STOP_AFTER_JOURNAL";
+/// Debug builds stop after writing the vault, before (`before`) or after (`after`) retaining the
+/// write's checkpoint, when this is set, so tests can simulate a crash there.
+#[cfg(debug_assertions)]
+const STOP_AT_CHECKPOINT: &str = "BOUNDRAIL_TEST_STOP_AT_CHECKPOINT";
 /// Debug builds append a newline to this vault-relative file after planning, so tests can
 /// simulate a write from outside the lock while an edit is planned.
 #[cfg(debug_assertions)]
@@ -346,6 +353,10 @@ pub struct Receipt {
     pub after: Revision,
     pub subjects: Subjects,
     pub allocated: Vec<Allocation>,
+    /// The checkpoint the write retained; receipts written before every write retained one have
+    /// none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<Checkpoint>,
 }
 
 /// Qualified IDs of the modules, relationships, collections, flows, walkthroughs and pictures the
@@ -476,6 +487,7 @@ impl Plan {
                 after,
                 subjects: self.subjects,
                 allocated: self.allocated,
+                checkpoint: None,
             },
         }
     }
@@ -495,7 +507,13 @@ pub(super) fn journaled<R: Serialize>(
     let (fingerprint, record) = journal.read(operation, &request)?;
     if let Some(record) = record {
         return match record.status {
-            Status::Done => Ok((record.output, None)),
+            Status::Done => {
+                let mut receipt = record.output;
+                if let Some(stored) = receipt.checkpoint.take() {
+                    receipt.checkpoint = Some(checkpoint::held(vault, stored)?);
+                }
+                Ok((receipt, None))
+            }
             Status::Pending => {
                 let scope = record.scope.clone();
                 complete(vault, &journal, record).map(|receipt| (receipt, Some(scope)))
@@ -529,14 +547,17 @@ pub(super) fn journaled<R: Serialize>(
         .with_details(json!({ "paths": changed, "current": current }))
         .into());
     }
-    // A write the journal could never apply refuses before it is recorded.
+    // A write the journal could never apply, or whose checkpoint could not be committed and
+    // signed, refuses before it is recorded.
     vault::check_writes(vault, record.writes.as_deref().unwrap_or_default())?;
+    let mut prepared = drafted(vault, &record)?;
+    prepared.build()?;
     journal.write_pending(&record)?;
     #[cfg(debug_assertions)]
     if std::env::var_os(STOP_AFTER_JOURNAL).is_some() {
         anyhow::bail!("stopped after writing the journal because {STOP_AFTER_JOURNAL} is set");
     }
-    apply(vault, &journal, record).map(|receipt| (receipt, None))
+    apply(vault, &journal, record, Some(prepared)).map(|receipt| (receipt, None))
 }
 
 /// An interrupted write `model recover` finished: its kind, the vault files it covers, and its
@@ -761,7 +782,7 @@ fn complete(vault: &Path, journal: &Journal, record: Record) -> Result<Receipt> 
         .with_details(json!({ "operation_id": operation, "paths": changed }))
         .into());
     }
-    apply(vault, journal, record)
+    apply(vault, journal, record, None)
 }
 
 /// The vault paths whose current content is neither what `record` found before planning nor what
@@ -809,13 +830,25 @@ type Digests<'a> = (
     BTreeMap<String, String>,
 );
 
-/// Applies a pending record's writes, checks every vault file reached its planned digest and
-/// marks it done, without loading the model: a newer build may judge a record an older one
-/// planned otherwise. Every failure here may follow a vault write, so it is an error rather than
-/// a refusal.
-fn apply(vault: &Path, journal: &Journal, mut record: Record) -> Result<Receipt> {
+/// Applies a pending record's writes, checks every vault file reached its planned digest,
+/// retains the write's checkpoint, `prepared` before the write or else drafted now, and marks the
+/// record done, without loading the model: a newer build may judge a record an older one planned
+/// otherwise. Every failure here may follow a vault write, so it is an error rather than a
+/// refusal, except a checkpoint that was not retained, which refuses `RECOVERY_REQUIRED` with its
+/// cause.
+fn apply(
+    vault: &Path,
+    journal: &Journal,
+    mut record: Record,
+    prepared: Option<checkpoint::Prepared>,
+) -> Result<Receipt> {
     let operation = record.output.operation_id.clone();
-    let finished = (|| -> Result<()> {
+    let not_complete = |e: anyhow::Error| {
+        anyhow!("{e:#}").context(format!(
+            "operation {operation} is not complete; run `boundrail model recover` to finish it"
+        ))
+    };
+    let written = (|| -> Result<()> {
         vault::apply_writes(vault, record.writes.as_deref().unwrap_or_default())?;
         let reached = revision::of_digests(vault::file_digests(vault, &record.scope)?);
         let planned = &record.output.after;
@@ -825,18 +858,80 @@ fn apply(vault: &Path, journal: &Journal, mut record: Record) -> Result<Receipt>
             reached.digest,
             planned.digest
         );
-        record.status = Status::Done;
-        record.before = None;
-        record.after = None;
-        record.writes = None;
-        journal.finish(&record)
+        Ok(())
     })();
-    finished.map_err(|e| {
-        anyhow!("{e:#}").context(format!(
-            "operation {operation} is not complete; run `boundrail model recover` to finish it"
-        ))
-    })?;
+    written.map_err(not_complete)?;
+    #[cfg(debug_assertions)]
+    stop_at_checkpoint("before")?;
+    let prepared = match prepared {
+        Some(prepared) => Ok(prepared),
+        None => drafted(vault, &record),
+    };
+    let retained = prepared.and_then(checkpoint::retain_write);
+    record.output.checkpoint = Some(retained.map_err(|e| unretained(&operation, &e))?);
+    #[cfg(debug_assertions)]
+    stop_at_checkpoint("after")?;
+    record.status = Status::Done;
+    record.before = None;
+    record.after = None;
+    record.writes = None;
+    journal.finish(&record).map_err(not_complete)?;
     Ok(record.output)
+}
+
+/// The checkpoint `record` retains, drafted from the files it plans.
+fn drafted(vault: &Path, record: &Record) -> Result<checkpoint::Prepared> {
+    let output = &record.output;
+    checkpoint::draft_write(
+        vault,
+        checkpointed(&record.scope),
+        record.writes.as_deref().unwrap_or_default(),
+        &output.after,
+        &output.doing,
+        &output.writer,
+        &output.operation_id,
+    )
+}
+
+/// The proposal a write of `scope` retains a checkpoint of: the one a proposal write or a
+/// reconcile changes. An adoption's checkpoint holds the current state it makes.
+fn checkpointed(scope: &Scope) -> Option<&str> {
+    match scope {
+        Scope::Proposal(id) | Scope::Reconcile(id) => Some(id),
+        Scope::Current | Scope::Adoption(_) => None,
+    }
+}
+
+/// `RECOVERY_REQUIRED` for the write `operation`, which wrote the vault but did not retain its
+/// checkpoint because of `cause`; finishing it again retains the checkpoint.
+fn unretained(operation: &str, cause: &anyhow::Error) -> anyhow::Error {
+    let (message, details) = match cause.downcast_ref::<Refusal>() {
+        Some(refusal) => (
+            refusal.message.clone(),
+            json!({ "code": refusal.code, "message": refusal.message, "details": refusal.details }),
+        ),
+        None => {
+            let message = format!("{cause:#}");
+            (message.clone(), json!({ "message": message }))
+        }
+    };
+    Refusal::new(
+        Code::RecoveryRequired,
+        format!(
+            "operation {operation} wrote the vault but did not retain its checkpoint: {message}; fix that, then run `boundrail model recover` to retain it"
+        ),
+    )
+    .with_details(json!({ "operation_id": operation, "cause": details }))
+    .into()
+}
+
+/// Stops when [`STOP_AT_CHECKPOINT`] names `point`.
+#[cfg(debug_assertions)]
+fn stop_at_checkpoint(point: &str) -> Result<()> {
+    if std::env::var_os(STOP_AT_CHECKPOINT).is_some_and(|v| v == point) {
+        anyhow::bail!("stopped {point} the checkpoint because {STOP_AT_CHECKPOINT} is set");
+    }
+    Ok(())
 }
 
 /// What the batch, or an adopted proposal, changed against the loaded model.

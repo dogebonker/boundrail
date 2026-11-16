@@ -3,7 +3,9 @@
 //! that fetches it resolves checkpoint readings. A push only fast-forwards the remote; a fetch
 //! fast-forwards the local ref, or replays the local checkpoints onto the fetched history when
 //! the two diverged. Both are network operations the user starts explicitly; Git runs them with
-//! the hardening of `crate::git`.
+//! the hardening of `crate::git`. `model history configure` names the remote they default to,
+//! and each records what the remote holds in local refs, which checkpoint readings judge
+//! publication by without the network.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -14,17 +16,23 @@ use serde::Serialize;
 use serde_json::json;
 
 use super::{
-    Checkpoint, HISTORY, commit_tree, history, locations, parse, ref_target, signing, tip,
+    Checkpoint, HISTORY, History, commit_tree, history, locations, parse, ref_target, signing, tip,
     update_ref, walk,
 };
 use crate::arch::request::{check_doing, check_operation, check_writer};
 use crate::arch::{Code, Refusal, ids};
 use crate::git;
 
-/// The remote `--remote` names when absent.
+/// The remote push, fetch and publication status use when none is configured.
 pub const DEFAULT_REMOTE: &str = "origin";
+/// The repository config key naming the history remote, shared by every worktree.
+const REMOTE_KEY: &str = "boundrail.historyRemote";
 /// The namespace of the per-run refs a remote's history lands on before it is checked.
 const FETCHING: &str = "refs/boundrail/fetching";
+/// The namespace of the refs holding what each remote's history held at the last push or fetch.
+const PUBLISHED: &str = "refs/boundrail/published";
+/// The namespace of the refs holding what a push to each remote sent before it was confirmed.
+const PUSHING: &str = "refs/boundrail/pushing";
 /// How often a fetch recomputes after a checkpoint landed locally while it ran.
 const ATTEMPTS: usize = 3;
 
@@ -46,20 +54,108 @@ pub struct Published {
     pub replayed: Vec<String>,
 }
 
-/// Pushes the history ref to `remote`, a configured remote name, when the remote's ref is absent
-/// or an ancestor of the local one, and every first-parent commit it adds is one a fetch takes
-/// (`MODEL_INVALID` otherwise). Refuses `HISTORY_DIVERGED` when the remote holds checkpoints this
-/// repository lacks, saying whether the remote is only ahead or the two diverged. The push
-/// leases the remote tip it checked against, so it moves only from that tip.
-pub fn push(start: &Path, remote: &str) -> Result<Published> {
+/// The history's publication destination: the remote `boundrail.historyRemote` names, else
+/// [`DEFAULT_REMOTE`].
+#[derive(Debug, Serialize)]
+pub struct Destination {
+    pub remote: String,
+    /// Whether `model history configure` named it.
+    pub configured: bool,
+}
+
+/// The publication destination of the repository around `start`.
+pub fn destination(start: &Path) -> Result<Destination> {
+    destination_of(&locations(start)?.1)
+}
+
+/// The publication destination of the checkout `root`. A configured name that is not a usable
+/// remote (see [`check_remote`]) falls back to [`DEFAULT_REMOTE`] with a warning on stderr.
+pub(super) fn destination_of(root: &Path) -> Result<Destination> {
+    let args = ["config", "--default=", "--get", REMOTE_KEY];
+    let configured = git::text(root, &args)?.trim().to_owned();
+    let fallback = Destination {
+        remote: DEFAULT_REMOTE.to_owned(),
+        configured: false,
+    };
+    if configured.is_empty() {
+        return Ok(fallback);
+    }
+    if let Err(error) = check_remote(root, &configured) {
+        if error.downcast_ref::<Refusal>().is_none() {
+            return Err(error);
+        }
+        eprintln!(
+            "warning: {REMOTE_KEY} names `{}`, which is not a usable remote; using {DEFAULT_REMOTE}",
+            configured.escape_debug()
+        );
+        return Ok(fallback);
+    }
+    Ok(Destination {
+        remote: configured,
+        configured: true,
+    })
+}
+
+/// Makes `remote`, a remote `git remote` lists (`REQUEST_INVALID` otherwise), the publication
+/// destination of the repository around `start`, in the repository config every worktree
+/// shares. Push and fetch then default to it, and checkpoint readings judge publication against
+/// it. It sends nothing. Returns the destination it replaced.
+pub fn configure(start: &Path, remote: &str) -> Result<Destination> {
     let (_, root) = locations(start)?;
     check_remote(&root, remote)?;
-    let (local, list) = history(&root, None)?;
+    let before = destination_of(&root)?;
+    git::run(&root, &["config", "--local", REMOTE_KEY, remote])?;
+    Ok(before)
+}
+
+/// `remote`, else the configured destination.
+fn chosen(root: &Path, remote: Option<&str>) -> Result<String> {
+    match remote {
+        Some(remote) => Ok(remote.to_owned()),
+        None => Ok(destination_of(root)?.remote),
+    }
+}
+
+/// The ref holding what `remote`'s history held at the last push or fetch.
+pub(super) fn published_ref(remote: &str) -> String {
+    remote_ref(PUBLISHED, remote)
+}
+
+/// The ref holding what a push to `remote` sent until the push is confirmed.
+pub(super) fn pushing_ref(remote: &str) -> String {
+    remote_ref(PUSHING, remote)
+}
+
+/// The ref for `remote` in `namespace`, one path component with `%` and `/` percent-encoded, so
+/// the refs of remotes named `a` and `a/b` never clash.
+fn remote_ref(namespace: &str, remote: &str) -> String {
+    let encoded = remote.replace('%', "%25").replace('/', "%2F");
+    format!("{namespace}/{encoded}")
+}
+
+/// Records that `remote`'s history holds `object`, which this repository holds too.
+fn record_published(root: &Path, remote: &str, object: &str) -> Result<()> {
+    git::run(root, &["update-ref", &published_ref(remote), object])?;
+    Ok(())
+}
+
+/// Pushes the history ref to `remote`, a configured remote name (default: the configured
+/// destination), when the remote's ref is absent or an ancestor of the local one, and every
+/// first-parent commit it adds is one a fetch takes (`MODEL_INVALID` otherwise). Refuses
+/// `HISTORY_DIVERGED` when the remote holds checkpoints this repository lacks, saying whether the
+/// remote is only ahead or the two diverged. The push leases the remote tip it checked against,
+/// so it moves only from that tip. What it sends is pending until the remote takes it.
+pub fn push(start: &Path, remote: Option<&str>) -> Result<Published> {
+    let (_, root) = locations(start)?;
+    let remote = &chosen(&root, remote)?;
+    check_remote(&root, remote)?;
+    let History { tip: local, list } = history(&root, None)?;
     let theirs = remote_tip(&root, remote)?;
     let Some((object, commit)) = local else {
         return Ok(unchanged(remote, theirs));
     };
     if theirs.as_deref() == Some(object.as_str()) {
+        record_published(&root, remote, &object)?;
         return Ok(unchanged(remote, theirs));
     }
     let known = id_counts(&list);
@@ -84,14 +180,24 @@ pub fn push(start: &Path, remote: &str) -> Result<Published> {
         remote,
         &refspec,
     ];
+    let pushing = pushing_ref(remote);
+    git::run(&root, &["update-ref", &pushing, &object])?;
     if let Err(error) = git::run(&root, &args) {
-        // The remote moved between the check and the push.
+        // What the remote holds now says whether it took the push; while it cannot be asked,
+        // what was sent stays pending.
         let now = remote_tip(&root, remote)?;
+        if now.as_deref() == Some(object.as_str()) {
+            record_published(&root, remote, &object)?;
+        }
+        git::run(&root, &["update-ref", "-d", &pushing])?;
+        // The remote moved between the check and the push.
         if !holds(&root, &commit, now.as_deref())? {
             return Err(refused_push(&root, remote, (&object, &commit), &known)?);
         }
         return Err(error);
     }
+    record_published(&root, remote, &object)?;
+    git::run(&root, &["update-ref", "-d", &pushing])?;
     Ok(Published {
         checkpoints: new.into_iter().map(|c| c.id).collect(),
         ..moved(remote, theirs, object)
@@ -119,19 +225,24 @@ fn refused_push(
     })
 }
 
-/// Fetches `remote`'s history ref into the local one. A local ref that is absent or an ancestor
-/// of the remote's fast-forwards; one already holding it stays; one that diverged from it gets its
-/// local checkpoints replayed onto the remote's. The remote's ref lands on a per-run ref first
-/// and must be a commit whose first-parent commits this repository lacks are checkpoints `model
-/// retain` could have written (`MODEL_INVALID`); the local ref then moves by compare-and-swap.
-pub fn fetch(start: &Path, remote: &str) -> Result<Published> {
+/// Fetches `remote`'s history ref (default: the configured destination's) into the local one. A
+/// local ref that is absent or an ancestor of the remote's fast-forwards; one already holding it
+/// stays; one that diverged from it gets its local checkpoints replayed onto the remote's. The
+/// remote's ref lands on a per-run ref first and must be a commit whose first-parent commits this
+/// repository lacks are checkpoints a retain could have written (`MODEL_INVALID`); the local ref
+/// then moves by compare-and-swap. What the remote holds is recorded as published.
+pub fn fetch(start: &Path, remote: Option<&str>) -> Result<Published> {
     let (_, root) = locations(start)?;
+    let remote = &chosen(&root, remote)?;
     check_remote(&root, remote)?;
     if remote_tip(&root, remote)?.is_none() {
+        git::run(&root, &["update-ref", "-d", &published_ref(remote)])?;
         return Ok(unchanged(remote, tip(&root)?));
     }
     fetched(&root, remote, |object, commit| {
-        take(&root, remote, object, commit)
+        let published = take(&root, remote, object, commit)?;
+        record_published(&root, remote, object)?;
+        Ok(published)
     })
 }
 
@@ -391,12 +502,15 @@ fn moved(remote: &str, before: Option<String>, after: String) -> Published {
     }
 }
 
-/// Refuses `REQUEST_INVALID` unless `remote` is a name `git remote` lists, so a URL or an option
-/// never reaches Git as a remote.
+/// Refuses `REQUEST_INVALID` unless `remote` is a name `git remote` lists whose publication refs
+/// are well-formed, so a URL or an option never reaches Git as a remote.
 fn check_remote(root: &Path, remote: &str) -> Result<()> {
     let listed = git::text(root, &["remote"])?;
     let remotes: Vec<&str> = listed.lines().collect();
-    if !remote.starts_with('-') && remotes.contains(&remote) {
+    if !remote.starts_with('-')
+        && remotes.contains(&remote)
+        && git::run(root, &["check-ref-format", &published_ref(remote)]).is_ok()
+    {
         return Ok(());
     }
     Err(Refusal::new(

@@ -61,6 +61,12 @@ pub enum Source {
         proposal: String,
         name: String,
         revision: String,
+        /// The ID of the checkpoint the proposal was exported from, when it was.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        checkpoint: Option<String>,
+        /// That checkpoint's commit.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        commit: Option<String>,
     },
     Checkpoint {
         checkpoint: String,
@@ -79,7 +85,8 @@ pub enum Exported<'a> {
 /// One exported file: its path in the bundle, SHA-256 and text.
 type Text = (String, String, String);
 
-/// The bundle of what `what` names in the checkout around `start`.
+/// The bundle of what `what` names in the checkout around `start`. A proposal's checkpoint
+/// exports as that proposal does, with its own files.
 pub fn export(start: &Path, what: Exported<'_>) -> Result<Bundle> {
     let (model, source, files) = match what {
         Exported::Current => {
@@ -99,19 +106,35 @@ pub fn export(start: &Path, what: Exported<'_>) -> Result<Bundle> {
                 proposal,
                 name,
                 revision,
+                checkpoint: None,
+                commit: None,
             };
             (model, source, files)
         }
         Exported::Checkpoint(which) => {
             let (found, model, blobs) = checkpoint::load_files(start, which)?;
+            let own = found.proposal.as_deref().map(vault::prefix);
             let files = (blobs.iter())
+                .filter_map(|(path, bytes)| match &own {
+                    Some(prefix) => path.strip_prefix(prefix.as_str()).map(|rest| (rest, bytes)),
+                    None => Some((path, bytes)),
+                })
                 .map(|(path, bytes)| text(path.to_owned(), hash(bytes), bytes.to_vec()))
                 .collect::<Result<_>>()?;
             let (checkpoint, commit, revision) = (found.id, found.commit, found.revision);
-            let source = Source::Checkpoint {
-                checkpoint,
-                commit,
-                revision,
+            let source = match &model.proposal {
+                Some(drawn) => Source::Proposal {
+                    proposal: drawn.id.clone(),
+                    name: drawn.name.clone(),
+                    revision,
+                    checkpoint: Some(checkpoint),
+                    commit: Some(commit),
+                },
+                None => Source::Checkpoint {
+                    checkpoint,
+                    commit,
+                    revision,
+                },
             };
             (model, source, files)
         }

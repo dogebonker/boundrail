@@ -59,9 +59,30 @@
   `details.flows`.
 - A vault that uses `traffic`, `participants` or step `anchor` cannot be read by a binary older
   than this change, which refuses the unknown fields.
+- History on every write: an edit of the current state or a proposal, `propose`, `adopt`,
+  `shelve`, `reconcile` and `import` each retain one checkpoint with their `--doing` line, writer
+  and operation ID, shown in the receipt's `checkpoint`. A replay retains nothing new, and a write
+  interrupted before its checkpoint landed retains it once on `model recover`. A proposal's
+  checkpoints carry a `Proposal` trailer and read back as that proposal with `read --checkpoint`;
+  `export --checkpoint` of one writes a proposal bundle.
+- `model history configure --remote <name>` names the history remote in the repository's Git
+  config (`boundrail.historyRemote`); `history push` and `fetch` default to it, else `origin`.
+  `model checkpoints` lists the `destination`, and each checkpoint's `publication`
+  (`saved-locally`, `pending` while a push holding it is unconfirmed, `published` once a push or
+  fetch saw the remote hold it), judged from local refs without the network.
+- Checkpoints record `Uncommitted: true` when the checkout had changes outside `.boundrail`, and
+  readings report `source_status`: `available`, `uncommitted`, or `unavailable` when no source
+  commit was recorded or this repository lacks it.
 
 ### Changed
 
+- `model retain` refuses `NOTHING_TO_RETAIN` only when the latest checkpoint of the current state
+  holds the same revision with the same `--doing`, so it retains an unchanged model with a new
+  reason. A write whose checkpoint cannot be retained fails before anything is written: without
+  a Git identity, with a vault file over 4 MiB (`MODEL_INVALID`), or when `commit.gpgSign` is on
+  and the signer fails (`SIGNING_FAILED`), since the checkpoint is signed before the vault is
+  written. One whose checkpoint fails after the vault was written, as when the history moved and
+  signing it again fails, refuses `RECOVERY_REQUIRED` with the cause in `details.cause`.
 - `add-flow` without a non-blank `summary` refuses `FLOW_SUMMARY_REQUIRED` (exit 2), and
   `edit-flow` cannot clear or blank one. Flows written before keep loading and keep raising
   `FLOW_SUMMARY_MISSING`.

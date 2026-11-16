@@ -20,14 +20,22 @@ fn sha256(bytes: &[u8]) -> String {
 /// A temporary directory, a Git checkout unless made with `outside`.
 struct Checkout(TempDir);
 impl Checkout {
+    /// Every write retains a checkpoint, so the checkout has its own identity and never signs.
     fn new() -> Self {
         let checkout = Self::outside();
-        let out = Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(checkout.path())
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "{out:?}");
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.name", "tester"],
+            &["config", "user.email", "tester@example.com"],
+            &["config", "commit.gpgsign", "false"],
+        ] {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(checkout.path())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+        }
         checkout
     }
     fn outside() -> Self {
@@ -3142,17 +3150,13 @@ fn a_vault_written_before_traffic_anchors_and_participants_loads_unchanged() {
     checkout.edited(json!([{"type": "edit-flow", "subject": "Refund", "set": {"order": 1}}]));
 }
 
-/// A checkout with an initial commit and a local identity, so checkpoints can be committed.
+/// A checkout with an initial commit, so checkpoints name a source commit.
 fn committed() -> Checkout {
     let checkout = Checkout::new();
-    for args in [
-        &["config", "user.name", "tester"][..],
-        &["config", "user.email", "tester@example.com"],
-        &["config", "commit.gpgsign", "false"],
+    git(
+        &checkout,
         &["commit", "-q", "--allow-empty", "-m", "initial"],
-    ] {
-        git(&checkout, args);
-    }
+    );
     checkout
 }
 
@@ -3216,20 +3220,26 @@ fn checkpoints_keep_the_model_history_off_the_working_branch() {
         ]
     );
 
-    let error = checkout.refused(&["retain", "--doing", "again"], "NOTHING_TO_RETAIN");
+    let again = ["retain", "--doing", "the shop as built"];
+    let error = checkout.refused(&again, "NOTHING_TO_RETAIN");
     assert_eq!(error["details"]["checkpoint"], first["id"]);
 
-    checkout.edited(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 4}}]));
+    // The edit retains its own checkpoint; a retain gives the same model a reason of its own.
+    let edited = checkout.edited(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 4}}]))
+        ["checkpoint"]
+        .clone();
+    assert_eq!(edited["parent"], first["id"]);
     let second =
         checkout.ok(&["retain", "--doing", "move the bank", "--writer", "none"])["checkpoint"]
             .clone();
-    assert_eq!(second["parent"], first["id"]);
+    assert_eq!(second["parent"], edited["id"]);
+    assert_eq!(second["revision"], edited["revision"]);
     assert_eq!(second["writer"], "none");
     assert_eq!(second["operation_id"], Value::Null);
     assert_eq!(checkout_state(&checkout), before);
 
     let list = checkout.ok(&["checkpoints"])["checkpoints"].clone();
-    assert_eq!(list, json!([second, first]));
+    assert_eq!(list, json!([second, edited, first]));
     let list = checkout.ok(&["checkpoints", "--limit", "1"])["checkpoints"].clone();
     assert_eq!(list, json!([second]));
 
@@ -3313,9 +3323,10 @@ fn retain_is_idempotent_by_operation_id() {
     let (code, again) = checkout.run_raw(&args);
     assert_eq!(code, 0, "{again}");
     assert_eq!(again, first);
+    // The edit retained the newer checkpoint.
     let list = checkout.ok(&["checkpoints"])["checkpoints"].clone();
-    assert_eq!(list.as_array().unwrap().len(), 1);
-    assert_eq!(list[0]["operation_id"], "retain-1");
+    assert_eq!(list.as_array().unwrap().len(), 2);
+    assert_eq!(list[1]["operation_id"], "retain-1");
 
     checkout.refused(
         &[
@@ -3392,8 +3403,10 @@ fn worktrees_share_the_history_and_its_operation_ids() {
 fn a_locked_history_ref_refuses_and_leaves_it_unchanged() {
     let checkout = committed();
     shop(&checkout);
-    let first = checkout.ok(&["retain", "--doing", "the shop as built"])["checkpoint"].clone();
-    checkout.edited(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 4}}]));
+    checkout.ok(&["retain", "--doing", "the shop as built"]);
+    let first = checkout.edited(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 4}}]))
+        ["checkpoint"]
+        .clone();
     let lock = checkout.path().join(".git/refs/boundrail/history.lock");
     fs::write(&lock, "").unwrap();
     let error = checkout.refused(&["retain", "--doing", "move the bank"], "HISTORY_MOVED");
@@ -3432,8 +3445,10 @@ fn retain_builds_on_a_history_tip_that_is_not_a_checkpoint() {
         &["update-ref", "refs/boundrail/history", foreign],
     );
 
-    checkout.edited(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 4}}]));
-    let second = checkout.ok(&["retain", "--doing", "move the bank"])["checkpoint"].clone();
+    // The edit's checkpoint builds on it.
+    let second = checkout.edited(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 4}}]))
+        ["checkpoint"]
+        .clone();
     assert_eq!(second["parent"], first["id"]);
     let parent = git(&checkout, &["rev-parse", "refs/boundrail/history^"]);
     assert_eq!(parent.trim(), foreign);
@@ -3462,7 +3477,6 @@ fn retain_builds_on_a_history_tip_that_is_not_a_checkpoint() {
         &checkout,
         &["config", "gpg.program", signer.to_str().unwrap()],
     );
-    checkout.edited(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 5}}]));
     let error = checkout.refused(&["retain", "--doing", "move it again"], "HISTORY_MOVED");
     assert_eq!(error["details"]["expected"], second["commit"]);
     assert_eq!(error["details"]["current"], foreign);
@@ -3481,8 +3495,10 @@ fn retain_builds_on_a_history_ref_holding_an_annotated_tag() {
         &["update-ref", "refs/boundrail/history", tag.trim()],
     );
 
-    checkout.edited(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 4}}]));
-    let second = checkout.ok(&["retain", "--doing", "move the bank"])["checkpoint"].clone();
+    // The edit's checkpoint builds on the tagged commit and swaps the ref from the tag.
+    let second = checkout.edited(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 4}}]))
+        ["checkpoint"]
+        .clone();
     assert_eq!(second["parent"], first["id"]);
     let parent = git(&checkout, &["rev-parse", "refs/boundrail/history^"]);
     assert_eq!(parent.trim(), commit);
@@ -3499,7 +3515,8 @@ fn retain_checks_the_expected_revision_when_given() {
     let stale = [&retain[..], &[reviewed.as_str().unwrap()]].concat();
     let error = checkout.refused(&stale, "STALE_REVISION");
     assert_eq!(error["details"]["current"], current);
-    assert_eq!(checkout.ok(&["checkpoints"])["checkpoints"], json!([]));
+    // Only the edit's own checkpoint.
+    assert_eq!(checkpoints(&checkout).len(), 1);
 
     let fresh = [&retain[..], &[current.as_str().unwrap()]].concat();
     let retained = checkout.ok(&fresh)["checkpoint"].clone();
@@ -3518,7 +3535,14 @@ fn retain_refuses_a_vault_file_too_large_to_read_back() {
     fs::write(&file, text).unwrap();
     let error = checkout.refused(&["retain", "--doing", "the shop as built"], "MODEL_INVALID");
     assert_eq!(error["details"]["path"], path);
-    assert_eq!(checkout.ok(&["checkpoints"])["checkpoints"], json!([]));
+    // Only the edit's own checkpoint.
+    assert_eq!(checkpoints(&checkout).len(), 1);
+    // An edit whose checkpoint would hold the file refuses before writing anything.
+    let request =
+        checkout.request(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 4}}]));
+    let error = checkout.edit_refused(&request, "MODEL_INVALID");
+    assert_eq!(error["details"]["path"], path);
+    assert_eq!(checkpoints(&checkout).len(), 1);
 }
 
 /// A `Revision` trailer in the shape `model retain` writes, for forged checkpoints that must pass
@@ -3614,7 +3638,11 @@ fn checkpoints_follow_the_users_signing_config() {
         &["config", "gpg.program", signer.to_str().unwrap()],
     );
 
-    let first = checkout.ok(&["retain", "--doing", "the shop as built"])["checkpoint"].clone();
+    checkout.ok(&["retain", "--doing", "the shop as built"]);
+    // A write's checkpoint is signed too.
+    let first = checkout.edited(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 4}}]))
+        ["checkpoint"]
+        .clone();
     let commit = git(
         &checkout,
         &["cat-file", "commit", first["commit"].as_str().unwrap()],
@@ -3638,13 +3666,384 @@ fn checkpoints_follow_the_users_signing_config() {
         &checkout,
         &["config", "user.signingkey", key.to_str().unwrap()],
     );
-    checkout.edited(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 4}}]));
     let before = checkout_state(&checkout);
     let error = checkout.refused(&["retain", "--doing", "move the bank"], "SIGNING_FAILED");
     assert_eq!(error["details"]["stderr"], "error: no secret key");
     let tip = git(&checkout, &["rev-parse", "refs/boundrail/history"]);
     assert_eq!(tip.trim(), first["commit"]);
     assert_eq!(checkout_state(&checkout), before);
+
+    // A write signs its checkpoint before it writes the vault, so a failing signer refuses it
+    // with nothing written and nothing left to recover.
+    let request =
+        checkout.request(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 5}}]));
+    let error = checkout.edit_refused(&request, "SIGNING_FAILED");
+    assert_eq!(error["details"]["stderr"], "error: no secret key");
+    assert_eq!(checkout.read_module("BankApi1")["order"], 4);
+    let tip = git(&checkout, &["rev-parse", "refs/boundrail/history"]);
+    assert_eq!(tip.trim(), first["commit"]);
+    assert_eq!(checkout_state(&checkout), before);
+    assert_eq!(checkout.ok(&["recover"])["completed"], json!([]));
+
+    // A history that moves while the checkpoint is signed needs it signed again after the vault
+    // was written: when that fails, the write refuses `RECOVERY_REQUIRED` with the cause, and
+    // `model recover` retains the checkpoint once the signer works.
+    let tree = git(&checkout, &["rev-parse", "refs/boundrail/history^{tree}"]);
+    let tree = tree.trim();
+    let moved = git(
+        &checkout,
+        &[
+            "commit-tree",
+            tree,
+            "-p",
+            "refs/boundrail/history",
+            "-m",
+            "not a checkpoint",
+        ],
+    );
+    let marker = tools.path().join("signed");
+    script(&format!(
+        "if [ -e '{}' ]; then echo 'no secret key' >&2; exit 1; fi\n\
+         touch '{}'\n\
+         git update-ref refs/boundrail/history {}\n\
+         printf '\\n[GNUPG:] SIG_CREATED D 1 8 00 1 FAKE\\n' >&2\n\
+         printf -- '-----BEGIN PGP SIGNATURE-----\\n\\nfake\\n-----END PGP SIGNATURE-----\\n'\n",
+        marker.display(),
+        marker.display(),
+        moved.trim()
+    ));
+    git(&checkout, &["config", "gpg.format", "openpgp"]);
+    let (code, out) = checkout.edit(&request);
+    assert_eq!(code, 2, "{out:#}");
+    assert_eq!(out["error"]["code"], "RECOVERY_REQUIRED", "{out:#}");
+    assert_eq!(out["error"]["details"]["cause"]["code"], "SIGNING_FAILED");
+    assert_eq!(checkout.read_module("BankApi1")["order"], 5);
+    let tip = git(&checkout, &["rev-parse", "refs/boundrail/history"]);
+    assert_eq!(tip.trim(), moved.trim());
+    git(&checkout, &["config", "commit.gpgsign", "false"]);
+    let recovered = checkout.ok(&["recover"])["completed"][0]["checkpoint"].clone();
+    assert_eq!(recovered["operation_id"], request["operation_id"]);
+    assert_eq!(recovered["parent"], first["id"]);
+    assert_eq!(checkpoints(&checkout)[0], recovered);
+    let parent = git(&checkout, &["rev-parse", "refs/boundrail/history^"]);
+    assert_eq!(parent.trim(), moved.trim());
+}
+
+#[test]
+fn every_write_retains_one_checkpoint_with_its_doing_line() {
+    let checkout = committed();
+    shop(&checkout);
+    let request =
+        checkout.request(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 4}}]));
+    let (code, out) = checkout.edit(&request);
+    assert_eq!(code, 0, "{out:#}");
+    let edited = out["checkpoint"].clone();
+    assert_eq!(edited["doing"], "testing edits");
+    assert_eq!(edited["writer"], "tester");
+    assert_eq!(edited["operation_id"], request["operation_id"]);
+    assert_eq!(edited["revision"], out["after"]["digest"]);
+    assert_eq!(edited["proposal"], Value::Null);
+    assert_eq!(checkpoints(&checkout), std::slice::from_ref(&edited));
+    // A replay returns the same receipt and retains nothing.
+    let (code, again) = checkout.edit(&request);
+    assert_eq!(code, 0, "{again:#}");
+    assert_eq!(again, out);
+    assert_eq!(checkpoints(&checkout).len(), 1);
+
+    // A proposal's writes retain checkpoints of the proposal, named by a trailer.
+    let id = propose(&checkout, "Next", "current");
+    let drawn = checkpoints(&checkout)[0].clone();
+    assert_eq!(drawn["proposal"], id);
+    assert_eq!(drawn["doing"], "draw a plan");
+    let out = edited_proposal(
+        &checkout,
+        &id,
+        json!([{"type": "remove-module", "subject": "Bank"}]),
+    );
+    let planned = out["checkpoint"].clone();
+    assert_eq!(planned["proposal"], id);
+    assert_eq!(planned["doing"], "plan ahead");
+    assert_eq!(planned["parent"], drawn["id"]);
+    assert_eq!(planned["revision"], proposal_digest(&checkout, &id));
+    let commit = planned["commit"].as_str().unwrap();
+    let message = git(&checkout, &["log", "-1", "--format=%B", commit]);
+    assert!(
+        message.contains(&format!("\nProposal: {id}\n")),
+        "{message}"
+    );
+    let files = git(&checkout, &["ls-tree", "-r", "--name-only", commit]);
+    assert!(
+        files.lines().all(|f| {
+            ["model.json", "config.yaml"].contains(&f) || f.starts_with(&format!("proposals/{id}/"))
+        }),
+        "{files}"
+    );
+    let planned_id = planned["id"].as_str().unwrap();
+    let read = checkout.ok(&["read", "--checkpoint", planned_id]);
+    assert_eq!(read["checkpoint"], planned);
+    assert_eq!(read["proposal"]["id"], id);
+    assert_eq!(read["revision"]["digest"], planned["revision"]);
+    assert_eq!(names(&read), ["Billing", "Platform", "Web"]);
+    let (code, text) =
+        checkout.run_raw(&["read", "--checkpoint", planned_id, "--format", "markdown"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains(&format!("\n  proposal {id}\n")), "{text}");
+    // It exports as the proposal it holds.
+    let (code, bundle) = checkout.run(&["export", "--checkpoint", planned_id]);
+    assert_eq!(code, 0, "{bundle:#}");
+    assert_eq!(bundle["source"]["kind"], "proposal");
+    assert_eq!(bundle["source"]["revision"], planned["revision"]);
+    assert_eq!(bundle["source"]["checkpoint"], planned["id"]);
+    assert_eq!(bundle["source"]["commit"], planned["commit"]);
+    assert!(bundle["files"]["proposal.json"].is_string(), "{bundle:#}");
+
+    // An adoption retains the current state it makes.
+    let (code, adopted) = adopt(&checkout, &id, &checkout.digest());
+    assert_eq!(code, 0, "{adopted:#}");
+    assert_eq!(adopted["checkpoint"]["proposal"], Value::Null);
+    assert_eq!(adopted["checkpoint"]["revision"], checkout.digest());
+    assert_eq!(adopted["checkpoint"]["doing"], "adopt the plan");
+    let list = checkpoints(&checkout);
+    let doings: Vec<&str> = list.iter().map(|c| c["doing"].as_str().unwrap()).collect();
+    assert_eq!(
+        doings,
+        [
+            "adopt the plan",
+            "plan ahead",
+            "draw a plan",
+            "testing edits"
+        ]
+    );
+}
+
+#[test]
+fn a_write_interrupted_around_its_checkpoint_retains_it_once_on_recover() {
+    let checkout = committed();
+    shop(&checkout);
+    for (order, point, landed) in [(4, "before", 0), (5, "after", 1)] {
+        let before = checkpoints(&checkout).len();
+        let request = checkout
+            .request(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": order}}]));
+        let stop = [("BOUNDRAIL_TEST_STOP_AT_CHECKPOINT", point)];
+        let (code, text) = checkout.edit_with(&request, "move the bank", &stop);
+        assert_ne!(code, 0, "{text}");
+        assert_eq!(checkout.read_module("BankApi1")["order"], order);
+        assert_eq!(checkpoints(&checkout).len(), before + landed, "{point}");
+        checkout.refused(&["retain", "--doing", "meanwhile"], "RECOVERY_REQUIRED");
+
+        let out = checkout.ok(&["recover"]);
+        let recovered = out["completed"][0]["checkpoint"].clone();
+        assert_eq!(
+            recovered["operation_id"], request["operation_id"],
+            "{out:#}"
+        );
+        assert_eq!(recovered["doing"], "move the bank");
+        let list = checkpoints(&checkout);
+        assert_eq!(list.len(), before + 1, "{point}");
+        assert_eq!(list[0], recovered);
+        // A replay returns the receipt with that checkpoint and retains nothing more.
+        let (code, again) = checkout.edit(&request);
+        assert_eq!(code, 0, "{again:#}");
+        assert_eq!(again["checkpoint"], recovered);
+        assert_eq!(checkpoints(&checkout).len(), before + 1);
+    }
+}
+
+#[test]
+fn checkpoints_report_their_source_commit() {
+    let checkout = committed();
+    shop(&checkout);
+    let head = git(&checkout, &["rev-parse", "HEAD"]);
+    // Model files are not code: an edit with only those changed leaves the source available.
+    let clean = checkout.edited(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 4}}]))
+        ["checkpoint"]
+        .clone();
+    assert_eq!(clean["source"], head.trim());
+    assert_eq!(clean["uncommitted"], false);
+    assert_eq!(clean["source_status"], "available");
+
+    source(&checkout, &[("src/billing.ts", "export const fee = 1;\n")]);
+    let dirty =
+        checkout.ok(&["retain", "--doing", "billing code in progress"])["checkpoint"].clone();
+    assert_eq!(dirty["uncommitted"], true);
+    assert_eq!(dirty["source_status"], "uncommitted");
+    let message = git(
+        &checkout,
+        &[
+            "log",
+            "-1",
+            "--format=%B",
+            dirty["commit"].as_str().unwrap(),
+        ],
+    );
+    assert!(message.contains("\nUncommitted: true\n"), "{message}");
+    let read = checkout.ok(&["read", "--checkpoint", dirty["id"].as_str().unwrap()]);
+    assert_eq!(read["checkpoint"]["source_status"], "uncommitted");
+
+    // A clone that lacks the source commit reads the checkpoint, but not its code.
+    let (code, text) = checkout.run_raw(&["checkpoints", "--format", "markdown"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.contains(&format!(
+            "  source {} (uncommitted), saved-locally",
+            head.trim()
+        )),
+        "{text}"
+    );
+    let unborn = Checkout::new();
+    unborn.init();
+    let none = unborn.ok(&["retain", "--doing", "no code yet"])["checkpoint"].clone();
+    assert_eq!(none["source"], Value::Null);
+    assert_eq!(none["source_status"], "unavailable");
+    let remote = bare();
+    let url = remote.path().to_str().unwrap();
+    git(&checkout, &["remote", "add", "origin", url]);
+    checkout.ok(&["history", "push"]);
+    let other = Checkout::new();
+    git(&other, &["remote", "add", "origin", url]);
+    other.ok(&["history", "fetch"]);
+    let fetched = checkpoints(&other);
+    assert!(
+        fetched.iter().all(|c| c["source_status"] == "unavailable"),
+        "{fetched:#?}"
+    );
+    let read = other.ok(&["read", "--checkpoint", clean["id"].as_str().unwrap()]);
+    assert_eq!(read["checkpoint"]["source_status"], "unavailable");
+}
+
+#[test]
+fn checkpoints_show_their_publication_on_the_configured_remote() {
+    let remote = bare();
+    let checkout = with_origin(&remote);
+    shop(&checkout);
+    let backup = bare();
+    git(
+        &checkout,
+        &["remote", "add", "backup", backup.path().to_str().unwrap()],
+    );
+    let publication = |checkout: &Checkout| -> Vec<String> {
+        checkpoints(checkout)
+            .iter()
+            .map(|c| c["publication"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let destination = checkout.ok(&["checkpoints"])["destination"].clone();
+    assert_eq!(
+        destination,
+        json!({"remote": "origin", "configured": false})
+    );
+
+    retain(&checkout, "drawn");
+    assert_eq!(publication(&checkout), ["saved-locally"]);
+    checkout.ok(&["history", "push"]);
+    assert_eq!(publication(&checkout), ["published"]);
+    checkout.edited(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 4}}]));
+    assert_eq!(publication(&checkout), ["saved-locally", "published"]);
+
+    // A configured destination is where push and fetch go, and what publication is judged by.
+    let out = checkout.ok(&["history", "configure", "--remote", "backup"]);
+    assert_eq!(out["kind"], "history-configure");
+    assert_eq!(
+        out["before"],
+        json!({"remote": "origin", "configured": false})
+    );
+    let destination = checkout.ok(&["checkpoints"])["destination"].clone();
+    assert_eq!(destination, json!({"remote": "backup", "configured": true}));
+    assert_eq!(publication(&checkout), ["saved-locally", "saved-locally"]);
+    checkout.refused(
+        &["history", "configure", "--remote", "nope"],
+        "REQUEST_INVALID",
+    );
+    assert_eq!(checkout.ok(&["history", "push"])["remote"], "backup");
+    assert_eq!(publication(&checkout), ["published", "published"]);
+    let linked = worktree(&checkout);
+    let destination = linked.ok(&["checkpoints"])["destination"].clone();
+    assert_eq!(destination["remote"], "backup");
+
+    // A push the remote refuses after it started leaves nothing pending: the remote, asked
+    // after, does not hold what was sent.
+    checkout.edited(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 5}}]));
+    git(&checkout, &["config", "remote.backup.receivepack", "false"]);
+    let (code, _) = checkout.run_raw(&["history", "push"]);
+    assert_ne!(code, 0);
+    let pushing = |checkout: &Checkout| {
+        let args = [
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/boundrail/pushing",
+        ];
+        git(checkout, &args)
+    };
+    assert_eq!(pushing(&checkout), "");
+    assert_eq!(
+        publication(&checkout),
+        ["saved-locally", "published", "published"]
+    );
+    git(
+        &checkout,
+        &["config", "--unset", "remote.backup.receivepack"],
+    );
+    checkout.ok(&["history", "push"]);
+    assert_eq!(
+        publication(&checkout),
+        ["published", "published", "published"]
+    );
+    assert_eq!(pushing(&checkout), "");
+
+    // Remotes `backup` and `backup/nested`, which only a hand-written config holds, keep refs of
+    // their own.
+    let nested = bare();
+    let url = nested.path().to_str().unwrap();
+    git(&checkout, &["config", "remote.backup/nested.url", url]);
+    checkout.ok(&["history", "push", "--remote", "backup/nested"]);
+    let refs = git(
+        &checkout,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/boundrail/published",
+        ],
+    );
+    assert_eq!(
+        refs.lines().collect::<Vec<_>>(),
+        [
+            "refs/boundrail/published/backup",
+            "refs/boundrail/published/backup%2Fnested",
+            "refs/boundrail/published/origin",
+        ]
+    );
+    // A configured name that is no longer a remote reads as origin.
+    git(
+        &checkout,
+        &["config", "--remove-section", "remote.backup/nested"],
+    );
+    git(
+        &checkout,
+        &["config", "boundrail.historyRemote", "backup/nested"],
+    );
+    let destination = checkout.ok(&["checkpoints"])["destination"].clone();
+    assert_eq!(
+        destination,
+        json!({"remote": "origin", "configured": false})
+    );
+    git(&checkout, &["config", "boundrail.historyRemote", "backup"]);
+
+    // A fetch records what the remote holds.
+    let (_, second) = clones();
+    git(
+        &second,
+        &["remote", "add", "backup", backup.path().to_str().unwrap()],
+    );
+    second.ok(&["history", "fetch", "--remote", "backup"]);
+    assert_eq!(
+        publication(&second),
+        ["saved-locally", "saved-locally", "saved-locally"]
+    );
+    second.ok(&["history", "configure", "--remote", "backup"]);
+    assert_eq!(
+        publication(&second),
+        ["published", "published", "published"]
+    );
 }
 
 /// A fresh operation ID for a proposal write.
@@ -6978,10 +7377,11 @@ fn view_events_tell_the_page_when_the_model_changes() {
         {"type": "add-module", "module": {"name": "Ledger", "kind": "service", "order": 2}},
     ]));
     let revision = out["after"]["digest"].as_str().unwrap();
-    // The edit's lock and journal are Boundrail state too, so `state` may come with `model`.
-    let changed =
-        format!("event: changed\ndata: {{\"revision\":\"{revision}\",\"parts\":[\"model\"");
+    // The edit's lock and journal are Boundrail state too, and its checkpoint moves the history,
+    // so `history` and `state` may come with `model`, in one event or several.
+    let changed = format!("event: changed\ndata: {{\"revision\":\"{revision}\",\"parts\":[");
     read_until(&mut events, &mut seen, &changed);
+    read_until(&mut events, &mut seen, "\"model\"");
 
     // A claim changes no vault file; the page reloads claims and checks only. The edit made the
     // state folder, which the watcher follows from then on.
@@ -8567,6 +8967,8 @@ fn readings_of_checkpoints_skip_without_the_history_ref() {
         .map(|a| a["id"].as_str().unwrap())
         .collect();
     let (beat, picture) = (ids[1], ids[2]);
+    // As in a clone that never fetched the history the edit retained a checkpoint on.
+    git(&checkout, &["update-ref", "-d", "refs/boundrail/history"]);
     for (part, subject, site) in [
         ("semantic", beat, "walkthrough"),
         ("embeds", picture, "picture"),
@@ -9600,6 +10002,13 @@ fn clones() -> (Checkout, Checkout) {
         .output()
         .unwrap();
     assert!(out.status.success(), "{out:?}");
+    for (key, value) in [
+        ("user.name", "tester"),
+        ("user.email", "tester@example.com"),
+        ("commit.gpgsign", "false"),
+    ] {
+        git(&second, &["config", key, value]);
+    }
     (first, second)
 }
 
@@ -9726,37 +10135,29 @@ fn a_pushed_history_fetched_into_another_clone_resolves_checkpoint_readings() {
     assert!(bundle["files"]["modules/Billing1.module.json"].is_string());
 
     // A fetched history grows by fast-forward.
-    first.edited(json!([{"type": "edit-module", "subject": "Web", "set": {"order": 3}}]));
+    let edited =
+        first.edited(json!([{"type": "edit-module", "subject": "Web", "set": {"order": 3}}]));
     let later = retain(&first, "web moves");
     first.ok(&["history", "push"]);
     assert_eq!(
         second.ok(&["history", "fetch"])["checkpoints"],
-        json!([later])
+        json!([later, edited["checkpoint"]["id"]])
     );
 }
 
 /// Two clones of one committed vault with `remote` as origin, whose histories hold one
-/// checkpoint the first retained and pushed, and its ID. The second's model is then edited, so it
-/// has a change of its own to retain.
+/// checkpoint the first retained and pushed, and its ID.
 fn clones_on_one_checkpoint(remote: &TempDir) -> (Checkout, Checkout, String) {
     let (first, second) = clones();
     let url = remote.path().to_str().unwrap();
     git(&first, &["remote", "add", "origin", url]);
     git(&second, &["remote", "set-url", "origin", url]);
-    for (key, value) in [
-        ("user.name", "tester"),
-        ("user.email", "tester@example.com"),
-        ("commit.gpgsign", "false"),
-    ] {
-        git(&second, &["config", key, value]);
-    }
     let base = retain(&first, "the shop as drawn");
     first.ok(&["history", "push"]);
     assert_eq!(
         second.ok(&["history", "fetch"])["checkpoints"],
         json!([base])
     );
-    second.edited(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 4}}]));
     (first, second, base)
 }
 
@@ -9798,16 +10199,24 @@ fn refused_push(checkout: &Checkout, says: &str) -> Value {
 fn diverged_histories_refuse_to_push_and_replay_on_fetch() {
     let remote = bare();
     let (first, second, base) = clones_on_one_checkpoint(&remote);
-    first.edited(json!([{"type": "edit-module", "subject": "Web", "set": {"order": 3}}]));
+    let moved =
+        first.edited(json!([{"type": "edit-module", "subject": "Web", "set": {"order": 3}}]));
+    let moved = &moved["checkpoint"]["id"];
     let ahead = retain(&first, "web moves");
     first.ok(&["history", "push"]);
     assert_eq!(refused_push(&second, "is ahead")["local_only"], json!([]));
 
+    // The second's edit and retain are its own checkpoints.
+    let request =
+        second.request(json!([{"type": "edit-module", "subject": "Bank", "set": {"order": 4}}]));
+    let (code, receipt) = second.edit(&request);
+    assert_eq!(code, 0, "{receipt:#}");
+    let edited = &receipt["checkpoint"]["id"];
     let retained = retain_once(&second);
     let (local, original) = (&retained["id"], retained["commit"].as_str().unwrap());
     assert_eq!(
         refused_push(&second, "replays")["local_only"],
-        json!([local])
+        json!([local, edited])
     );
     assert_eq!(history_tip(&second).trim(), original);
 
@@ -9815,8 +10224,8 @@ fn diverged_histories_refuse_to_push_and_replay_on_fetch() {
     let format = ["log", "-1", "--format=%B%x1f%ad%x1f%cd%x1f%T"];
     let kept = git(&second, &[&format[..], &[original]].concat());
     let out = second.ok(&["history", "fetch"]);
-    assert_eq!(out["checkpoints"], json!([ahead]));
-    assert_eq!(out["replayed"], json!([local]));
+    assert_eq!(out["checkpoints"], json!([ahead, moved]));
+    assert_eq!(out["replayed"], json!([local, edited]));
     let replayed = checkpoint_commit(&second, local.as_str().unwrap());
     assert_ne!(replayed, original);
     assert_eq!(git(&second, &[&format[..], &[&replayed]].concat()), kept);
@@ -9824,9 +10233,27 @@ fn diverged_histories_refuse_to_push_and_replay_on_fetch() {
         .iter()
         .map(|c| c["id"].clone())
         .collect();
-    assert_eq!(ids, [local.clone(), json!(ahead), json!(base)]);
-    // A retry of the retain returns the checkpoint as the history now holds it.
+    assert_eq!(
+        ids,
+        [
+            local.clone(),
+            edited.clone(),
+            json!(ahead),
+            moved.clone(),
+            json!(base)
+        ]
+    );
+    // A retry of the retain returns the checkpoint as the history now holds it, and so does a
+    // replay of the edit.
     assert_eq!(retain_once(&second)["commit"], replayed);
+    let (code, again) = second.edit(&request);
+    assert_eq!(code, 0, "{again:#}");
+    let held = checkpoint_commit(&second, edited.as_str().unwrap());
+    assert_ne!(
+        again["checkpoint"]["commit"],
+        receipt["checkpoint"]["commit"]
+    );
+    assert_eq!(again["checkpoint"]["commit"], held);
     // So does a retry whose record a crash left pending on the commit the fetch replayed.
     let record = second.path().join(".git/boundrail/operations/local.json");
     let pending = fs::read_to_string(&record)
@@ -9838,9 +10265,9 @@ fn diverged_histories_refuse_to_push_and_replay_on_fetch() {
     assert_eq!(retain_once(&second)["commit"], replayed);
 
     let out = second.ok(&["history", "push"]);
-    assert_eq!(out["checkpoints"], json!([local]));
+    assert_eq!(out["checkpoints"], json!([local, edited]));
     let out = first.ok(&["history", "fetch"]);
-    assert_eq!(out["checkpoints"], json!([local]));
+    assert_eq!(out["checkpoints"], json!([local, edited]));
     assert_eq!(out["replayed"], json!([]));
     for clone in [&first, &second] {
         for id in [&base, &ahead, local.as_str().unwrap()] {
@@ -10216,6 +10643,15 @@ fn fetch_refuses_remote_checkpoint_trailers_retain_never_writes() {
         format!(
             "\u{1b}[2Jcleared\n\n{}",
             trailers("Doing001", FORGED_REVISION)
+        ),
+        format!(
+            "bad proposal\n\n{}Proposal: ../up\n",
+            trailers("Prop0001", FORGED_REVISION)
+        ),
+        format!(
+            "bad uncommitted\n\n{}Source: {}\nUncommitted: yes\n",
+            trailers("Unco0001", FORGED_REVISION),
+            tip.trim()
         ),
     ];
     for message in cases {

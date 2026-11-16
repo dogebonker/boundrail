@@ -142,6 +142,36 @@ boundrail model compare <id> --against-checkpoint <checkpoint>   # against a ret
 boundrail model compare <a> --beside <b> --beside <c>            # rank alternatives
 ```
 
+## History
+
+Every write (an edit of the current state or a proposal, `propose`, `adopt`, `shelve`,
+`reconcile`, `import`) retains a checkpoint on `refs/boundrail/history` with its `--doing` line,
+writer and operation ID, so the history says why the architecture changed. A proposal's
+checkpoints name it and read back as that proposal. `model retain --doing <why>` gives the
+current state a checkpoint with a reason of its own, such as a release.
+
+Each checkpoint is a Git commit, so every write runs a handful of Git commands and needs a Git
+identity. With `commit.gpgSign` on, every write also invokes your signer, before it changes the
+vault: a locked key refuses the write with nothing written. To stop signing checkpoints in one
+repository, run `git config commit.gpgSign false` there; it stops signing your own commits there
+too.
+
+```sh
+boundrail model checkpoints --format markdown       # newest first
+boundrail model read --checkpoint <id>               # the model a checkpoint holds
+boundrail model history configure --remote origin   # the remote the history is published to
+boundrail model history push                        # fast-forward that remote's history
+boundrail model history fetch                       # take its history, replaying local checkpoints
+```
+
+Each checkpoint reports `source_status`: `available` when this repository holds the commit it was
+drawn against, `uncommitted` when the checkout also had changes outside `.boundrail` that the
+commit lacks, and `unavailable` when no commit was recorded or this repository lacks it. Its
+`publication` is `published` when the remote's history held it at the last push or fetch,
+`pending` while a push holding it is unconfirmed, and `saved-locally` otherwise. Listing reads
+local refs only, never the network. A write interrupted before its checkpoint landed refuses
+`RECOVERY_REQUIRED`; `boundrail model recover` retains it once.
+
 ## In CI
 
 The GitHub Action runs `model check`, annotates its findings, and on a pull request comments the

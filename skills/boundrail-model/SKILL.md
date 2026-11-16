@@ -52,7 +52,9 @@ command prints JSON; add `--format markdown` for a readable summary. A refusal p
    }
    ```
 5. **Apply.** `boundrail model edit --doing "<why, one line>" --input <request.json>` (or the
-   request on standard input). The receipt's `allocated` lists the new IDs by name.
+   request on standard input). The receipt's `allocated` lists the new IDs by name, and its
+   `checkpoint` is the history entry the edit retained with your `--doing` line, so write that
+   line for a reader asking later why the model changed.
 6. **Verify.** Run `boundrail model check` again. Done when it reports no warning your change
    added, and every warning you leave is named in your reply with the reason.
 
@@ -94,6 +96,16 @@ Other codes explain themselves in their message. `skips` list what the check cou
   pictures with `boundrail model pictures --write`; `model check --only embeds` lists stale ones.
 - See the model in a browser with `boundrail model view`.
 
+## History
+
+Every write retains a checkpoint; you do not retain after an edit. To mark the current model for
+a reason of its own (a release, a review), run `boundrail model retain --doing "<why>"`.
+`boundrail model checkpoints` lists them newest first; `boundrail model read --checkpoint <id>`
+reads one. `source_status` says whether the code it was drawn against is here (`available`),
+was mixed with uncommitted changes (`uncommitted`), or is missing (`unavailable`). `publication`
+says whether the history remote holds it. Publish only when the user asks: `boundrail model
+history push` (the remote is `boundrail model history configure --remote <name>`, else `origin`).
+
 ## Claims
 
 When several writers share the model, reserve what you change first:
@@ -124,7 +136,9 @@ claim ID in every edit. List claims with `boundrail model claims`. Release yours
 ## Recovery
 
 - `RECOVERY_REQUIRED`: a write was interrupted. Run `boundrail model recover`, which finishes it,
-  then read the model again.
+  then read the model again. When `details.cause` is set, the write landed but its checkpoint did
+  not: fix the cause it names (for `SIGNING_FAILED`, ask the user to unlock the signing key),
+  then recover.
 - `RECOVERY_CONFLICT`: vault files changed after the write was planned. Restore them from Git, or
   drop the write with `boundrail model recover --abandon <operation_id>` and plan it again.
 - `OPERATION_ABANDONED`: that operation was dropped. Plan the change again with a new ID.
